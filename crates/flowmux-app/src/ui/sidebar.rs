@@ -129,25 +129,30 @@ fn row_widget(ws: &Workspace, on_close: Rc<dyn Fn(WorkspaceId)>) -> gtk::Widget 
     let row_for_click = row.clone();
     click.connect_pressed(move |gesture, _n_press, x, y| {
         let menu = gtk::gio::Menu::new();
+        let id_variant = id.to_string().to_variant();
 
         let rename_item = gtk::gio::MenuItem::new(Some("Change tab name"), None);
         rename_item.set_action_and_target_value(
             Some("win.rename-workspace"),
-            Some(&id.to_string().to_variant()),
+            Some(&id_variant),
         );
         menu.append_item(&rename_item);
 
+        let color_item = gtk::gio::MenuItem::new(Some("Change color…"), None);
+        color_item.set_action_and_target_value(
+            Some("win.recolor-workspace"),
+            Some(&id_variant),
+        );
+        menu.append_item(&color_item);
+
         let close_section = gtk::gio::Menu::new();
         let close_item = gtk::gio::MenuItem::new(Some("Close tab"), None);
-        // Reuse the on_close callback the X button uses by triggering
-        // it through a window action would require threading store —
-        // instead, pop the popover and call the callback directly.
-        // For now we fire on_close through a wrapper item that closes
-        // the popover and runs the row's existing on_close.
-        let _ = close_item;
-        // (kept simple: rename only for this commit; close-tab via
-        //  context menu is wired in a later commit alongside color.)
-        let _ = close_section;
+        close_item.set_action_and_target_value(
+            Some("win.close-tab"),
+            Some(&id_variant),
+        );
+        close_section.append_item(&close_item);
+        menu.append_section(None, &close_section);
 
         let popover = gtk::PopoverMenu::from_model(Some(&menu));
         popover.set_parent(&row_for_click);

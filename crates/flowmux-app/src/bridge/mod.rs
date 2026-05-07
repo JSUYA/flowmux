@@ -80,6 +80,12 @@ pub enum GtkCommand {
         name: String,
         ack: oneshot::Sender<()>,
     },
+    /// Recolor a workspace and refresh its sidebar row.
+    SetWorkspaceColor {
+        id: WorkspaceId,
+        color: String,
+        ack: oneshot::Sender<()>,
+    },
     /// A notification was raised on a pane (from VTE OSC signal). Update
     /// the pane border / sidebar badge.
     #[allow(dead_code)]

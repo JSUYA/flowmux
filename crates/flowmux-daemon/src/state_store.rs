@@ -237,6 +237,21 @@ impl StateStore {
         None
     }
 
+    /// Set a workspace's sidebar color. Returns true on success.
+    pub async fn set_workspace_color(&self, id: WorkspaceId, color: String) -> bool {
+        let mut s = self.inner.lock().await;
+        let mut updated = false;
+        if let Some(w) = s.workspaces.iter_mut().find(|w| w.id == id) {
+            w.color = Some(color);
+            updated = true;
+        }
+        drop(s);
+        if updated {
+            self.mark_dirty();
+        }
+        updated
+    }
+
     /// Rename a workspace. Returns true on success.
     pub async fn rename_workspace(&self, id: WorkspaceId, name: String) -> bool {
         let mut s = self.inner.lock().await;

@@ -289,6 +289,13 @@ impl WindowController {
                 }
                 let _ = ack.send(());
             }
+            GtkCommand::SetWorkspaceColor { id, color, ack } => {
+                self.store.set_workspace_color(id, color).await;
+                if let Some(ws) = self.store.get_workspace(id).await {
+                    self.sidebar.upsert(&ws);
+                }
+                let _ = ack.send(());
+            }
             GtkCommand::PaneSendKeys { pane, keys, ack } => {
                 let registry = self.pane_registry.borrow();
                 let res = match registry.terminals.get(&pane) {
@@ -470,7 +477,46 @@ fn register_workspace_actions(
         })
         .build();
 
-    window.add_action_entries([rename]);
+    // win.recolor-workspace(<uuid>) — opens a gtk::ColorDialog seeded
+    // with the current color and writes the picked one back.
+    let store_for_color = store.clone();
+    let bridge_for_color = bridge.clone();
+    let window_weak2 = window.downgrade();
+    let recolor = gio::ActionEntry::builder("recolor-workspace")
+        .parameter_type(Some(gtk::glib::VariantTy::STRING))
+        .activate(move |_, _, param| {
+            let Some(id_str) = param.and_then(|p| p.str().map(String::from)) else { return };
+            let Ok(id) = id_str.parse::<WorkspaceId>() else { return };
+            let store = store_for_color.clone();
+            let bridge = bridge_for_color.clone();
+            let window_weak = window_weak2.clone();
+            glib::MainContext::default().spawn_local(async move {
+                let current = store.get_workspace(id).await.and_then(|w| w.color);
+                let Some(window) = window_weak.upgrade() else { return };
+                show_color_dialog(&window, id, current.as_deref(), bridge);
+            });
+        })
+        .build();
+
+    // win.close-tab(<uuid>) — same effect as the hover X button, but
+    // routed through the right-click menu so the close path is
+    // discoverable.
+    let bridge_for_close = bridge.clone();
+    let close_tab = gio::ActionEntry::builder("close-tab")
+        .parameter_type(Some(gtk::glib::VariantTy::STRING))
+        .activate(move |_, _, param| {
+            let Some(id_str) = param.and_then(|p| p.str().map(String::from)) else { return };
+            let Ok(id) = id_str.parse::<WorkspaceId>() else { return };
+            let bridge = bridge_for_close.clone();
+            glib::MainContext::default().spawn_local(async move {
+                let (tx, rx) = oneshot::channel();
+                let _ = bridge.tx.send(GtkCommand::RemoveWorkspace { id, ack: tx }).await;
+                let _ = rx.await;
+            });
+        })
+        .build();
+
+    window.add_action_entries([rename, recolor, close_tab]);
 }
 
 fn show_rename_dialog(
@@ -509,6 +555,44 @@ fn show_rename_dialog(
         dialog.close();
     });
     dialog.present(Some(window));
+}
+
+fn show_color_dialog(
+    window: &adw::ApplicationWindow,
+    id: WorkspaceId,
+    current: Option<&str>,
+    bridge: Bridge,
+) {
+    let dialog = gtk::ColorDialog::builder()
+        .title("Tab Color")
+        .modal(true)
+        .with_alpha(false)
+        .build();
+    let initial = current
+        .and_then(|s| gtk::gdk::RGBA::parse(s).ok())
+        .unwrap_or_else(|| gtk::gdk::RGBA::new(0.5, 0.5, 0.5, 1.0));
+    dialog.choose_rgba(
+        Some(window),
+        Some(&initial),
+        gtk::gio::Cancellable::NONE,
+        move |result| {
+            let Ok(rgba) = result else { return };
+            let hex = format!(
+                "#{:02x}{:02x}{:02x}",
+                (rgba.red() * 255.0).clamp(0.0, 255.0) as u8,
+                (rgba.green() * 255.0).clamp(0.0, 255.0) as u8,
+                (rgba.blue() * 255.0).clamp(0.0, 255.0) as u8,
+            );
+            let bridge = bridge.clone();
+            glib::MainContext::default().spawn_local(async move {
+                let (tx, _rx) = oneshot::channel();
+                let _ = bridge
+                    .tx
+                    .send(GtkCommand::SetWorkspaceColor { id, color: hex, ack: tx })
+                    .await;
+            });
+        },
+    );
 }
 
 /// Spawn the GTK-side dispatch loop. Lives on the main context.
