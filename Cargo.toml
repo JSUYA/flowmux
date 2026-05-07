@@ -1,0 +1,66 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+# GUI crates require GTK4 system headers; default to headless members so
+# `cargo check` works on a fresh Ubuntu before `apt install libgtk-4-dev`.
+default-members = [
+    "crates/flowmux-core",
+    "crates/flowmux-config",
+    "crates/flowmux-notify",
+    "crates/flowmux-ipc",
+    "crates/flowmux-cli",
+    "crates/flowmux-state",
+    "crates/flowmux-vcs",
+    "crates/flowmux-procmon",
+    "crates/flowmux-ssh",
+    "crates/flowmux-daemon",
+    "crates/flowmux-cookies",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.75"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/junsuc/flowmux"
+authors = ["The flowmux Authors"]
+
+[workspace.dependencies]
+# Core
+anyhow = "1"
+thiserror = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["serde", "v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+# Async / IO
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "fs", "process", "signal", "time"] }
+futures = "0.3"
+
+# Logging / config
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive", "env"] }
+dirs = "5"
+
+# Notifications / D-Bus
+zbus = { version = "4", default-features = false, features = ["tokio"] }
+
+# Workspace-internal
+flowmux-core = { path = "crates/flowmux-core" }
+flowmux-config = { path = "crates/flowmux-config" }
+flowmux-terminal = { path = "crates/flowmux-terminal" }
+flowmux-notify = { path = "crates/flowmux-notify" }
+flowmux-ipc = { path = "crates/flowmux-ipc" }
+flowmux-state = { path = "crates/flowmux-state" }
+flowmux-vcs = { path = "crates/flowmux-vcs" }
+flowmux-procmon = { path = "crates/flowmux-procmon" }
+flowmux-ssh = { path = "crates/flowmux-ssh" }
+flowmux-daemon = { path = "crates/flowmux-daemon" }
+flowmux-cookies = { path = "crates/flowmux-cookies" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

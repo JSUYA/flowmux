@@ -1,0 +1,13 @@
+[package]
+name = "flowmux-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Domain types for flowmux: workspaces, surfaces, panes, notifications."
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }

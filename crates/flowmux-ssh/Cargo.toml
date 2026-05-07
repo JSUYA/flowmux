@@ -1,0 +1,16 @@
+[package]
+name = "flowmux-ssh"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "SSH workspace support: russh shell + scp upload + remote port forwarding."
+
+[dependencies]
+flowmux-core = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+async-trait = "0.1"
+russh = "0.46"
+russh-keys = "0.46"

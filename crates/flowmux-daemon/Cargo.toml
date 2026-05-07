@@ -1,0 +1,30 @@
+[package]
+name = "flowmux-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Headless flowmux daemon: IPC server + state without GTK. Useful for CI and for environments where the GUI isn't installed."
+
+[[bin]]
+name = "flowmux-daemon"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+flowmux-core = { workspace = true }
+flowmux-config = { workspace = true }
+flowmux-state = { workspace = true }
+flowmux-vcs = { workspace = true }
+flowmux-procmon = { workspace = true }
+flowmux-ssh = { workspace = true }
+flowmux-notify = { workspace = true }
+flowmux-ipc = { workspace = true }
+
+anyhow = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+chrono = { workspace = true }

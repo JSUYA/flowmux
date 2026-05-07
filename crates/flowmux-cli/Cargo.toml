@@ -1,0 +1,23 @@
+[package]
+name = "flowmux-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The `flowmux` command-line interface."
+
+[[bin]]
+name = "flowmux"
+path = "src/main.rs"
+
+[dependencies]
+flowmux-core = { workspace = true }
+flowmux-config = { workspace = true }
+flowmux-ipc = { workspace = true }
+flowmux-notify = { workspace = true }
+flowmux-cookies = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

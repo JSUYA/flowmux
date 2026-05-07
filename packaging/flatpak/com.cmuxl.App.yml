@@ -1,0 +1,36 @@
+app-id: com.flowmux.App
+runtime: org.gnome.Platform
+runtime-version: '46'
+sdk: org.gnome.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: flowmux-app
+finish-args:
+  - --share=network
+  - --share=ipc
+  - --socket=fallback-x11
+  - --socket=wayland
+  - --device=dri
+  - --filesystem=home
+  - --talk-name=org.freedesktop.Notifications
+  - --talk-name=org.freedesktop.secrets
+  # flowmux writes its socket into XDG_RUNTIME_DIR; Flatpak isolates this
+  # by default so the in-sandbox `flowmux` CLI uses the same path.
+
+modules:
+  - name: flowmux
+    buildsystem: simple
+    build-options:
+      append-path: /usr/lib/sdk/rust-stable/bin
+      build-args:
+        - --share=network
+    build-commands:
+      - cargo --offline build --release --manifest-path Cargo.toml -p flowmux-app -p flowmux-cli
+      - install -Dm755 target/release/flowmux-app /app/bin/flowmux-app
+      - install -Dm755 target/release/flowmux     /app/bin/flowmux
+      - install -Dm644 resources/desktop/com.flowmux.App.desktop /app/share/applications/com.flowmux.App.desktop
+      - install -Dm644 LICENSE /app/share/licenses/flowmux/LICENSE
+      - install -Dm644 NOTICE  /app/share/licenses/flowmux/NOTICE
+    sources:
+      - type: dir
+        path: ../..

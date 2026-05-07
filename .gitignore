@@ -1,0 +1,27 @@
+# Rust
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+/dist
+/build
+*.deb
+*.rpm
+*.AppImage
+
+# Local upstream checkout (created by scripts/sync-upstream.sh)
+/.upstream-cmux/
+
+# Generated
+/THIRD_PARTY_LICENSES.md

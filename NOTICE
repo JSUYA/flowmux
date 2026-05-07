@@ -1,0 +1,39 @@
+flowmux
+=====
+
+Copyright (C) 2026 The flowmux Authors.
+
+This program is free software: you can redistribute it and/or modify it
+under the terms of the GNU General Public License as published by the
+Free Software Foundation, either version 3 of the License, or (at your
+option) any later version. See the LICENSE file for the full text.
+
+flowmux is a clean Linux/GTK4 reimplementation inspired by cmux
+(https://github.com/manaflow-ai/cmux), a macOS/AppKit terminal for AI
+coding agents. cmux is dual-licensed (GPL-3.0-or-later OR commercial);
+flowmux is distributed only under GPL-3.0-or-later.
+
+Per the GPL-3.0 fork path, the upstream copyright notice is preserved:
+
+    Copyright (c) 2024-present Manaflow, Inc.
+
+flowmux does not redistribute cmux source code; it independently
+reimplements observable behavior described in cmux's public
+documentation (README, cmux.com/docs, CHANGELOG, configuration schemas)
+for Linux desktop environments. See docs/UPSTREAM.md for the upstream
+tracking policy and docs/upstream-mapping/ for the per-feature mapping.
+
+Trademarks
+----------
+
+"cmux" and "Manaflow" are not used as project, package, binary, or
+distribution names by flowmux. The "flowmux" name is intentionally distinct.
+References to cmux in documentation are for attribution and behavioral
+reference only.
+
+Third-party components
+----------------------
+
+Runtime dependencies retain their own licenses; see
+THIRD_PARTY_LICENSES.md (generated from `cargo about generate` once the
+build environment is set up).

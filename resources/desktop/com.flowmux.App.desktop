@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=flowmux
+GenericName=Terminal
+Comment=Linux/GTK4 terminal with vertical tabs and notifications for AI coding agents
+Exec=flowmux-app %U
+Icon=com.flowmux.App
+Terminal=false
+Categories=System;TerminalEmulator;Utility;Development;
+Keywords=terminal;tabs;agent;claude;codex;
+StartupWMClass=com.flowmux.App
+StartupNotify=true

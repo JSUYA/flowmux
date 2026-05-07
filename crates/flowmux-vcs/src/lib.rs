@@ -1,0 +1,121 @@
+//! Git + linked-PR detection for the workspace sidebar.
+//!
+//! `inspect(root)` returns a [`flowmux_core::GitInfo`] populated from the
+//! local repo (via gix) and, if `gh` is on PATH and the user is logged
+//! in, the linked PR for the current branch (via `gh pr view --json`).
+//!
+//! We do not fail if `gh` is missing or unauthenticated — the linked PR
+//! is purely a sidebar enrichment.
+
+use flowmux_core::{GitInfo, LinkedPr, PrState};
+use std::path::Path;
+use tokio::process::Command;
+use tracing::warn;
+
+#[derive(Debug, thiserror::Error)]
+pub enum VcsError {
+    #[error("not a git repository: {0}")]
+    NotARepo(std::path::PathBuf),
+    #[error("gix: {0}")]
+    Gix(String),
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+/// Inspect a directory. Returns `None` if it isn't a git repository.
+pub async fn inspect(root: &Path) -> Result<Option<GitInfo>, VcsError> {
+    let local = match local_info(root) {
+        Ok(Some(info)) => info,
+        Ok(None) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let pr = linked_pr(root, &local.branch).await.unwrap_or(None);
+    Ok(Some(GitInfo {
+        branch: local.branch,
+        remote_url: local.remote_url,
+        linked_pr: pr,
+    }))
+}
+
+struct Local {
+    branch: String,
+    remote_url: Option<String>,
+}
+
+fn local_info(root: &Path) -> Result<Option<Local>, VcsError> {
+    let repo = match gix::discover(root) {
+        Ok(r) => r,
+        Err(_) => return Ok(None),
+    };
+    let head = repo.head().map_err(|e| VcsError::Gix(e.to_string()))?;
+    let branch = head
+        .referent_name()
+        .map(|n| n.shorten().to_string())
+        .unwrap_or_else(|| {
+            // Detached HEAD — use a short OID.
+            head.id()
+                .map(|id| id.shorten_or_id().to_string())
+                .unwrap_or_else(|| "HEAD".into())
+        });
+    let remote_url = repo
+        .find_remote("origin")
+        .ok()
+        .and_then(|r| {
+            r.url(gix::remote::Direction::Fetch)
+                .map(|u| u.to_bstring().to_string())
+        });
+    Ok(Some(Local { branch, remote_url }))
+}
+
+async fn linked_pr(root: &Path, branch: &str) -> Result<Option<LinkedPr>, VcsError> {
+    let out = Command::new("gh")
+        .args([
+            "pr", "view", branch,
+            "--json", "number,state,url,isDraft",
+        ])
+        .current_dir(root)
+        .output()
+        .await;
+    let out = match out {
+        Ok(o) if o.status.success() => o,
+        Ok(o) => {
+            // gh exits non-zero for "no PR for this branch" — that's fine.
+            tracing::debug!(stderr = %String::from_utf8_lossy(&o.stderr), "no linked PR");
+            return Ok(None);
+        }
+        Err(e) => {
+            warn!(error = %e, "gh CLI not available; skipping PR enrichment");
+            return Ok(None);
+        }
+    };
+
+    #[derive(serde::Deserialize)]
+    struct Raw {
+        number: u64,
+        state: String,
+        url: String,
+        #[serde(default, rename = "isDraft")]
+        is_draft: bool,
+    }
+
+    let raw: Raw = match serde_json::from_slice(&out.stdout) {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(error = %e, "gh output parse failed");
+            return Ok(None);
+        }
+    };
+
+    let state = if raw.is_draft {
+        PrState::Draft
+    } else {
+        match raw.state.as_str() {
+            "OPEN" => PrState::Open,
+            "MERGED" => PrState::Merged,
+            "CLOSED" => PrState::Closed,
+            _ => PrState::Open,
+        }
+    };
+
+    Ok(Some(LinkedPr { number: raw.number, state, url: raw.url }))
+}

@@ -1,0 +1,29 @@
+# cargo-deb metadata for flowmux. Build with:
+#   cargo install cargo-deb
+#   cargo deb -p flowmux-app --variant=cargo-deb
+#
+# Two binaries ship: flowmux-app (GUI) and flowmux (CLI). flowmux-daemon is a
+# debug aid and isn't packaged; users run flowmux-app to get the daemon
+# alongside the GUI.
+
+[package.metadata.deb]
+name = "flowmux"
+maintainer = "The flowmux Authors <noreply@flowmux.invalid>"
+copyright = "2026 The flowmux Authors. Upstream cmux: 2024 Manaflow, Inc."
+license-file = ["LICENSE", "0"]
+extended-description = """
+A Linux/GTK4 terminal with vertical tabs and notifications for AI
+coding agents. Independent reimplementation of cmux for Linux desktops,
+released under GPL-3.0-or-later.
+"""
+section = "utils"
+priority = "optional"
+depends = "$auto, libgtk-4-1, libadwaita-1-0, libvte-2.91-gtk4-0, libwebkitgtk-6.0-4, libdbus-1-3, libsecret-1-0"
+assets = [
+    ["target/release/flowmux-app", "usr/bin/", "755"],
+    ["target/release/flowmux",     "usr/bin/", "755"],
+    ["resources/desktop/com.flowmux.App.desktop", "usr/share/applications/", "644"],
+    ["LICENSE", "usr/share/doc/flowmux/LICENSE", "644"],
+    ["NOTICE",  "usr/share/doc/flowmux/NOTICE",  "644"],
+    ["README.md", "usr/share/doc/flowmux/README.md", "644"],
+]
