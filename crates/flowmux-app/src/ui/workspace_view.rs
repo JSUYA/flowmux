@@ -525,15 +525,31 @@ fn attach_tab_dnd_handlers(
 
     let drop_target =
         gtk::DropTarget::new(gtk::glib::types::Type::STRING, gtk::gdk::DragAction::MOVE);
+    // motion 시그널의 x로 탭 좌/우 절반을 판정해 인디케이터 위치를 정한다.
+    // 드롭 로직도 같은 x 기준으로 final_index를 계산하므로, 사용자가 보는
+    // 파란 라인이 곧 드롭이 일어나는 위치다. 첫 탭의 왼쪽 절반에 호버하면
+    // 인디케이터가 첫 탭 왼쪽에 떠서 "맨 앞으로 이동" 시그널이 된다.
     let tab_for_motion = tab.clone();
-    drop_target.connect_motion(move |_, _, _| {
-        tracing::trace!(%pane_id, %surface_id, "tab drop motion");
-        tab_for_motion.add_css_class("flowmux-pane-tab-drop-hover");
+    drop_target.connect_motion(move |_, x, _y| {
+        let width = tab_for_motion.width();
+        let after = if width > 0 {
+            x > (width as f64) / 2.0
+        } else {
+            false
+        };
+        if after {
+            tab_for_motion.remove_css_class("flowmux-pane-tab-drop-before");
+            tab_for_motion.add_css_class("flowmux-pane-tab-drop-after");
+        } else {
+            tab_for_motion.remove_css_class("flowmux-pane-tab-drop-after");
+            tab_for_motion.add_css_class("flowmux-pane-tab-drop-before");
+        }
         gtk::gdk::DragAction::MOVE
     });
     let tab_for_leave = tab.clone();
     drop_target.connect_leave(move |_| {
-        tab_for_leave.remove_css_class("flowmux-pane-tab-drop-hover");
+        tab_for_leave.remove_css_class("flowmux-pane-tab-drop-before");
+        tab_for_leave.remove_css_class("flowmux-pane-tab-drop-after");
     });
     let target_pane = pane_id;
     let target_surface = surface_id;
@@ -542,7 +558,8 @@ fn attach_tab_dnd_handlers(
     let position_of_surface_cb = callbacks.position_of_surface_in_pane.clone();
     drop_target.connect_drop(move |_, value, x, _y| {
         tracing::debug!(%target_pane, %target_surface, "tab drop fired");
-        tab_for_drop.remove_css_class("flowmux-pane-tab-drop-hover");
+        tab_for_drop.remove_css_class("flowmux-pane-tab-drop-before");
+        tab_for_drop.remove_css_class("flowmux-pane-tab-drop-after");
         let Ok(payload) = value.get::<String>() else {
             tracing::warn!(value = ?value, "tab drop: payload was not String — DropTarget type mismatch");
             return false;
