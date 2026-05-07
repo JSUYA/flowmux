@@ -29,8 +29,8 @@ use vte::prelude::*;
 /// focus-direction shortcuts know where to operate.
 pub type FocusedPane = Rc<Cell<Option<flowmux_core::PaneId>>>;
 
-/// One action can have multiple accelerators (e.g. Ctrl+Shift+T and
-/// Ctrl+Shift+N both create a new workspace).
+/// One action can have multiple accelerators (e.g. Ctrl+Shift+Tab and
+/// Ctrl+ISO_Left_Tab both move to the previous workspace).
 pub const BINDINGS: &[(&str, &[&str])] = &[
     // Pane tree
     ("win.split-right", &["<Ctrl><Shift>Page_Up"]),
@@ -40,10 +40,13 @@ pub const BINDINGS: &[(&str, &[&str])] = &[
     ("win.focus-up", &["<Alt>Up"]),
     ("win.focus-down", &["<Alt>Down"]),
     ("win.close-surface", &["<Alt>w"]),
-    // Tab navigation
-    ("win.next-surface", &["<Shift>Tab", "ISO_Left_Tab"]),
-    ("win.next-workspace", &["<Ctrl>Tab"]),
-    ("win.prev-workspace", &["<Ctrl><Shift>Tab"]),
+    // Tab navigation. The bare Tab key is reserved for the terminal
+    // (shell completion etc.) — never bind any Tab+modifier combo
+    // here. Shift+Tab moves to the next workspace, and Ctrl+Page_Up
+    // is the reciprocal for the previous workspace; either side can
+    // be reached directly via Alt+1..8 too.
+    ("win.next-workspace", &["<Shift>Tab", "<Shift>ISO_Left_Tab"]),
+    ("win.prev-workspace", &["<Ctrl>Page_Up"]),
     ("win.workspace-1", &["<Alt>1"]),
     ("win.workspace-2", &["<Alt>2"]),
     ("win.workspace-3", &["<Alt>3"]),
@@ -144,13 +147,6 @@ pub fn install_actions(
 
     let next_workspace = make_ws_nav_action("next-workspace", WsNav::Next, bridge.clone());
     let prev_workspace = make_ws_nav_action("prev-workspace", WsNav::Prev, bridge.clone());
-    let next_surface = make_next_surface_action(
-        "next-surface",
-        focused.clone(),
-        bridge.clone(),
-        registry.clone(),
-    );
-
     // Eight individual one-shot actions for Alt+1..Alt+8 — simpler
     // than a parametrised "jump-to-workspace(uint8)" because GTK
     // accelerators can target any of these by name with no extra
@@ -194,7 +190,6 @@ pub fn install_actions(
         focus_down,
         close_surface,
         new_surface,
-        next_surface,
         new_workspace,
         next_workspace,
         prev_workspace,
@@ -221,37 +216,6 @@ fn make_ws_nav_action(
             let bridge = bridge.clone();
             glib::MainContext::default().spawn_local(async move {
                 let _ = bridge.tx.send(GtkCommand::FocusWorkspaceDir { dir }).await;
-            });
-        })
-        .build()
-}
-
-fn make_next_surface_action(
-    name: &'static str,
-    focused: FocusedPane,
-    bridge: Bridge,
-    registry: TerminalRegistry,
-) -> gtk::gio::ActionEntry<adw::ApplicationWindow> {
-    gtk::gio::ActionEntry::builder(name)
-        .activate(move |_, _, _| {
-            let pane = match focused.get() {
-                Some(pane) => pane,
-                None => {
-                    tracing::info!(action = name, "no pane focused — ignoring");
-                    return;
-                }
-            };
-            let surface = match registry.borrow().next_surface(pane) {
-                Some(surface) => surface,
-                None => return,
-            };
-            tracing::debug!(action = name, %pane, %surface, "key action fired");
-            let bridge = bridge.clone();
-            glib::MainContext::default().spawn_local(async move {
-                let _ = bridge
-                    .tx
-                    .send(GtkCommand::ActivateSurface { pane, surface })
-                    .await;
             });
         })
         .build()

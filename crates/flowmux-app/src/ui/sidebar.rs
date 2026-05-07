@@ -13,7 +13,7 @@
 //! +----------------+
 //! ```
 //!
-//! The toolbar's `+` adds a workspace (Ctrl+Shift+T equivalent) and
+//! The toolbar's `+` adds a workspace (Ctrl+Shift+N equivalent) and
 //! the bell shows an in-process notification transcript. The list
 //! rows expose hover-X close, color bar, right-click menu (rename /
 //! recolor / close).
@@ -21,7 +21,6 @@
 use crate::bridge::{Bridge, GtkCommand};
 use crate::notifications::{NotificationEntry, NotificationLog};
 use flowmux_core::{NotificationLevel, PrState, Workspace, WorkspaceId};
-use gtk::glib::variant::ToVariant;
 use gtk::prelude::*;
 use std::cell::RefCell;
 use std::collections::HashSet;
@@ -53,6 +52,12 @@ impl Sidebar {
     {
         let list = gtk::ListBox::new();
         list.set_selection_mode(gtk::SelectionMode::Single);
+        // A single click activates a row (= switches workspace). With
+        // this on we listen on `row-activated` instead of
+        // `row-selected`; the latter also fires when GTK moves focus
+        // by Tab traversal, which made plain Tab unintentionally
+        // jump between workspaces.
+        list.set_activate_on_single_click(true);
         list.add_css_class("navigation-sidebar");
 
         let scroll = gtk::ScrolledWindow::new();
@@ -66,18 +71,17 @@ impl Sidebar {
         let attentions: Rc<RefCell<HashSet<WorkspaceId>>> = Rc::new(RefCell::new(HashSet::new()));
         let rows_for_cb = rows.clone();
         let attentions_for_cb = attentions.clone();
-        list.connect_row_selected(move |_, selected| {
-            if let Some(row) = selected {
-                if let Some((id, list_row)) =
-                    rows_for_cb.borrow().iter().find(|(_, r)| r == row).cloned()
-                {
-                    // Selecting a row clears any attention indicator
-                    // it had been carrying.
-                    if attentions_for_cb.borrow_mut().remove(&id) {
-                        list_row.remove_css_class("flowmux-attention");
-                    }
-                    on_select(id);
+        // `row-activated` fires only on click / Enter, never on Tab
+        // focus traversal. That keeps Tab usable inside the terminal
+        // and stops focus from silently flipping workspaces.
+        list.connect_row_activated(move |_, row| {
+            if let Some((id, list_row)) =
+                rows_for_cb.borrow().iter().find(|(_, r)| r == row).cloned()
+            {
+                if attentions_for_cb.borrow_mut().remove(&id) {
+                    list_row.remove_css_class("flowmux-attention");
                 }
+                on_select(id);
             }
         });
 
@@ -92,7 +96,7 @@ impl Sidebar {
 
         let new_btn = gtk::Button::from_icon_name("list-add-symbolic");
         new_btn.add_css_class("flat");
-        new_btn.set_tooltip_text(Some("New tab (Ctrl+Shift+T)"));
+        new_btn.set_tooltip_text(Some("New workspace (Ctrl+Shift+N)"));
         let bridge_for_new = bridge.clone();
         new_btn.connect_clicked(move |_| {
             let bridge = bridge_for_new.clone();
@@ -172,6 +176,20 @@ impl Sidebar {
             self.list.remove(&rows[idx].1);
             rows.swap_remove(idx);
         }
+    }
+
+    pub fn select_workspace(&self, id: WorkspaceId) {
+        if let Some((_, row)) = self.rows.borrow().iter().find(|(wid, _)| *wid == id) {
+            self.list.select_row(Some(row));
+        }
+    }
+
+    pub fn selected_workspace(&self) -> Option<WorkspaceId> {
+        let selected = self.list.selected_row()?;
+        self.rows
+            .borrow()
+            .iter()
+            .find_map(|(id, row)| (row == &selected).then_some(*id))
     }
 
     /// Tint a workspace row to flag that an agent finished there.
