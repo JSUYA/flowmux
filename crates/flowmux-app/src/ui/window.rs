@@ -100,8 +100,12 @@ impl WindowController {
             "options loaded"
         );
         let options = Rc::new(RefCell::new(initial_options));
-        let callbacks =
-            make_callbacks(focused_pane.clone(), bridge.clone(), options.clone());
+        let callbacks = make_callbacks(
+            focused_pane.clone(),
+            bridge.clone(),
+            options.clone(),
+            pane_registry.clone(),
+        );
 
         // gtk::Paned lets the user drag the divider between the
         // sidebar and the content stack — replaces the fixed-width
@@ -1017,6 +1021,7 @@ fn make_callbacks(
     focused: FocusedPane,
     bridge: Bridge,
     options: Rc<RefCell<flowmux_config::options::Options>>,
+    pane_registry: Rc<RefCell<PaneRegistry>>,
 ) -> PaneCallbacks {
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -1224,6 +1229,16 @@ fn make_callbacks(
         read_options: {
             let options = options.clone();
             Rc::new(move || options.borrow().clone())
+        },
+        position_of_surface_in_pane: {
+            let registry = pane_registry.clone();
+            Rc::new(move |pane, surface| {
+                let r = registry.borrow();
+                r.surface_tabs
+                    .get(&pane)?
+                    .iter()
+                    .position(|(id, _)| *id == surface)
+            })
         },
     }
 }

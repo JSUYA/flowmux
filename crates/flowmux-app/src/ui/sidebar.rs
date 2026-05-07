@@ -347,11 +347,6 @@ fn format_time(ts: &chrono::DateTime<chrono::Utc>) -> String {
     local.format("%H:%M:%S").to_string()
 }
 
-/// 드래그 앤 드랍 데이터에 사용하는 mime-type. WorkspaceId의 UUID
-/// 문자열을 바이트로 담는다. 같은 mime을 받는 DropTarget만 매칭되어
-/// 외부 앱과의 충돌이 없다.
-const DND_MIME: &str = "application/x-flowmux-workspace-id";
-
 /// 사이드 패널의 한 워크스페이스 행에 드래그 앤 드랍 컨트롤러를 연결한다.
 ///
 /// - `DragSource`: 행을 잡으면 워크스페이스 ID(UUID 문자열)를 ContentProvider에
@@ -364,9 +359,12 @@ fn attach_dnd_handlers(row: &gtk::ListBoxRow, id: WorkspaceId, bridge: Bridge, r
     let id_for_prepare = id;
     drag_source.connect_prepare(move |_, _, _| {
         tracing::debug!(workspace = %id_for_prepare, "sidebar drag prepare");
+        // ContentProvider::for_value + DropTarget::new(String) 조합으로 type 매칭이
+        // 가장 확실하다. for_bytes(mime, bytes)는 mime-specific 컨텐츠가 되는데
+        // DropTarget::new(Bytes::static_type())로는 motion / drop 시그널이 매칭
+        // 되지 않아 DnD 자체가 작동하지 않았다.
         let payload = id_for_prepare.to_string();
-        let bytes = gtk::glib::Bytes::from_owned(payload.into_bytes());
-        Some(gtk::gdk::ContentProvider::for_bytes(DND_MIME, &bytes))
+        Some(gtk::gdk::ContentProvider::for_value(&payload.to_value()))
     });
     let row_for_begin = row.clone();
     drag_source.connect_drag_begin(move |_, _| {
@@ -387,9 +385,11 @@ fn attach_dnd_handlers(row: &gtk::ListBoxRow, id: WorkspaceId, bridge: Bridge, r
     row.add_controller(drag_source);
 
     let drop_target =
-        gtk::DropTarget::new(gtk::glib::Bytes::static_type(), gtk::gdk::DragAction::MOVE);
+        gtk::DropTarget::new(gtk::glib::types::Type::STRING, gtk::gdk::DragAction::MOVE);
+    let target_id_for_motion = id;
     let row_for_motion = row.clone();
     drop_target.connect_motion(move |_, _, _| {
+        tracing::trace!(target = %target_id_for_motion, "sidebar drop motion");
         row_for_motion.add_css_class("flowmux-drop-hover");
         gtk::gdk::DragAction::MOVE
     });
@@ -400,13 +400,10 @@ fn attach_dnd_handlers(row: &gtk::ListBoxRow, id: WorkspaceId, bridge: Bridge, r
     let row_for_drop = row.clone();
     let target_id = id;
     drop_target.connect_drop(move |_, value, _x, y| {
+        tracing::debug!(target = %target_id, "sidebar drop fired");
         row_for_drop.remove_css_class("flowmux-drop-hover");
-        let Ok(bytes) = value.get::<gtk::glib::Bytes>() else {
-            tracing::warn!("sidebar drop: payload was not Bytes — DropTarget type mismatch");
-            return false;
-        };
-        let Ok(payload) = std::str::from_utf8(&bytes) else {
-            tracing::warn!("sidebar drop: payload not UTF-8");
+        let Ok(payload) = value.get::<String>() else {
+            tracing::warn!(value = ?value, "sidebar drop: payload was not String — DropTarget type mismatch");
             return false;
         };
         let Ok(source_id) = payload.parse::<WorkspaceId>() else {

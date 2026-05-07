@@ -138,6 +138,11 @@ pub struct PaneCallbacks {
     /// 함수. 다이얼로그가 옵션을 갱신하면 다음 호출부터 새 값이
     /// 보인다.
     pub read_options: Rc<dyn Fn() -> flowmux_config::options::Options>,
+    /// 같은 pane 내부에서 surface의 현재 인덱스(0-based)를 돌려준다.
+    /// 탭 DnD reorder가 source / target 상대 위치를 정확히 알고 final_index를
+    /// 계산하기 위해 PaneRegistry::surface_tabs의 위치를 빌려 본다.
+    pub position_of_surface_in_pane:
+        Rc<dyn Fn(PaneId, SurfaceId) -> Option<usize>>,
 }
 
 impl TerminalPane {

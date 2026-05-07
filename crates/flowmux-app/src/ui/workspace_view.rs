@@ -29,7 +29,7 @@ pub struct PaneRegistry {
     active_browser_by_pane: HashMap<PaneId, SurfaceId>,
     pane_frames: HashMap<PaneId, gtk::Widget>,
     surface_stacks: HashMap<PaneId, gtk::Stack>,
-    surface_tabs: HashMap<PaneId, Vec<(SurfaceId, gtk::Widget)>>,
+    pub surface_tabs: HashMap<PaneId, Vec<(SurfaceId, gtk::Widget)>>,
     /// Tab-bar `gtk::Box` so incremental tab additions can `append`
     /// into the same row instead of rebuilding the whole pane.
     pane_tab_containers: HashMap<PaneId, gtk::Box>,
@@ -497,10 +497,13 @@ fn attach_tab_dnd_handlers(
     let drag_source = gtk::DragSource::new();
     drag_source.set_actions(gtk::gdk::DragAction::MOVE);
     drag_source.connect_prepare(move |_, _, _| {
+        tracing::debug!(%pane_id, %surface_id, "tab drag prepare");
+        // ContentProvider::for_value(String) + DropTarget::new(STRING) 조합으로
+        // 매칭한다. for_bytes(mime, bytes)는 mime-specific이라 generic
+        // Bytes type filter와 매칭되지 않아 motion/drop 시그널이 호출되지
+        // 않았다. PaneId와 SurfaceId를 '|' 구분자로 묶어 한 String에 담는다.
         let payload = format!("{pane_id}|{surface_id}");
-        let bytes = gtk::glib::Bytes::from_owned(payload.into_bytes());
-        let provider = gtk::gdk::ContentProvider::for_bytes(TAB_DND_MIME, &bytes);
-        Some(provider)
+        Some(gtk::gdk::ContentProvider::for_value(&payload.to_value()))
     });
     let tab_for_begin = tab.clone();
     drag_source.connect_drag_begin(move |_, _| {
@@ -520,10 +523,11 @@ fn attach_tab_dnd_handlers(
     });
     tab.add_controller(drag_source);
 
-    let drop_target = gtk::DropTarget::new(gtk::glib::Type::INVALID, gtk::gdk::DragAction::MOVE);
-    drop_target.set_types(&[gtk::glib::Bytes::static_type()]);
+    let drop_target =
+        gtk::DropTarget::new(gtk::glib::types::Type::STRING, gtk::gdk::DragAction::MOVE);
     let tab_for_motion = tab.clone();
     drop_target.connect_motion(move |_, _, _| {
+        tracing::trace!(%pane_id, %surface_id, "tab drop motion");
         tab_for_motion.add_css_class("flowmux-pane-tab-drop-hover");
         gtk::gdk::DragAction::MOVE
     });
@@ -535,14 +539,12 @@ fn attach_tab_dnd_handlers(
     let target_surface = surface_id;
     let tab_for_drop = tab.clone();
     let reorder_cb = callbacks.on_reorder_surface.clone();
+    let position_of_surface_cb = callbacks.position_of_surface_in_pane.clone();
     drop_target.connect_drop(move |_, value, x, _y| {
+        tracing::debug!(%target_pane, %target_surface, "tab drop fired");
         tab_for_drop.remove_css_class("flowmux-pane-tab-drop-hover");
-        let Ok(bytes) = value.get::<gtk::glib::Bytes>() else {
-            tracing::warn!("tab drop: payload was not Bytes — DropTarget type mismatch");
-            return false;
-        };
-        let Ok(payload) = std::str::from_utf8(&bytes) else {
-            tracing::warn!("tab drop: payload not UTF-8");
+        let Ok(payload) = value.get::<String>() else {
+            tracing::warn!(value = ?value, "tab drop: payload was not String — DropTarget type mismatch");
             return false;
         };
         let Some((src_pane_str, src_surface_str)) = payload.split_once('|') else {
@@ -598,10 +600,15 @@ fn attach_tab_dnd_handlers(
         // 소스 인덱스를 모르기 때문에 +1 보정은 daemon의 클램프(min(len-1))
         // 에 맡긴다. 결과가 자기 자리면 reorder_surface_in_pane이 None을
         // 반환하므로 GTK 위젯 이동도 건너뛴다.
-        let final_index = if after {
-            target_index.saturating_add(1)
-        } else {
-            target_index
+        // 정확한 final_index 계산 — source remove 후 target 옆에 insert.
+        // PaneRegistry의 surface_tabs에서 src_surface 위치를 직접 빌려 본다
+        // (callback으로 노출).
+        let src_index = (position_of_surface_cb)(target_pane, src_surface);
+        let final_index = match (after, src_index) {
+            (false, Some(s)) if s < target_index => target_index.saturating_sub(1),
+            (false, _) => target_index,
+            (true, Some(s)) if s < target_index => target_index,
+            (true, _) => target_index.saturating_add(1),
         };
 
         tracing::info!(
@@ -609,6 +616,7 @@ fn attach_tab_dnd_handlers(
             %src_surface,
             %target_surface,
             target_index,
+            src_index = ?src_index,
             final_index,
             after,
             "tab drop: dispatching reorder callback"
@@ -618,11 +626,6 @@ fn attach_tab_dnd_handlers(
     });
     tab.add_controller(drop_target);
 }
-
-/// pane-local 탭 드래그 페이로드 mime-type. 값은 "{PaneId}|{SurfaceId}"
-/// 형식의 UTF-8 문자열. 사이드 패널의 워크스페이스 reorder mime과 분리해서 두
-/// 영역의 드롭 매칭이 섞이지 않게 한다.
-const TAB_DND_MIME: &str = "application/x-flowmux-pane-tab";
 
 /// Attach a single new surface to an already-rendered pane: appends a
 /// tab to its tab bar, mounts the panel widget into the pane's stack,
