@@ -47,16 +47,10 @@ pub fn import_from(src: &std::path::Path) -> std::io::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
-
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
 
     #[test]
     fn user_theme_path_uses_flowmux_config_dir() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = crate::test_env::env_lock().lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         std::env::set_var("XDG_CONFIG_HOME", dir.path());
 
@@ -65,7 +59,7 @@ mod tests {
 
     #[test]
     fn missing_theme_returns_none() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = crate::test_env::env_lock().lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         std::env::set_var("XDG_CONFIG_HOME", dir.path());
 
@@ -74,7 +68,7 @@ mod tests {
 
     #[test]
     fn import_creates_parent_and_loads_theme() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = crate::test_env::env_lock().lock().unwrap();
         let config_dir = tempfile::tempdir().unwrap();
         let source_dir = tempfile::tempdir().unwrap();
         let src = source_dir.path().join("theme");

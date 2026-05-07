@@ -151,15 +151,9 @@ pub fn save(opts: &Options) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
-
-    fn xdg_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
 
     fn with_xdg<R>(f: impl FnOnce(&std::path::Path) -> R) -> R {
-        let _g = xdg_lock().lock().unwrap();
+        let _g = crate::test_env::env_lock().lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         let prev = std::env::var_os("XDG_CONFIG_HOME");
         std::env::set_var("XDG_CONFIG_HOME", tmp.path());
