@@ -74,6 +74,12 @@ pub enum GtkCommand {
         id: WorkspaceId,
         ack: oneshot::Sender<()>,
     },
+    /// Rename a workspace and refresh its sidebar row.
+    RenameWorkspace {
+        id: WorkspaceId,
+        name: String,
+        ack: oneshot::Sender<()>,
+    },
     /// A notification was raised on a pane (from VTE OSC signal). Update
     /// the pane border / sidebar badge.
     #[allow(dead_code)]

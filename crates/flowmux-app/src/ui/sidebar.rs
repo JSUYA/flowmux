@@ -7,6 +7,7 @@
 //! the workspace.
 
 use flowmux_core::{PrState, Workspace, WorkspaceId};
+use gtk::glib::variant::ToVariant;
 use gtk::prelude::*;
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -121,6 +122,44 @@ fn row_widget(ws: &Workspace, on_close: Rc<dyn Fn(WorkspaceId)>) -> gtk::Widget 
         btn_leave.set_can_target(false);
     });
     row.add_controller(motion);
+
+    // Right-click → context menu (Change tab name, Close tab).
+    let click = gtk::GestureClick::new();
+    click.set_button(gtk::gdk::BUTTON_SECONDARY);
+    let row_for_click = row.clone();
+    click.connect_pressed(move |gesture, _n_press, x, y| {
+        let menu = gtk::gio::Menu::new();
+
+        let rename_item = gtk::gio::MenuItem::new(Some("Change tab name"), None);
+        rename_item.set_action_and_target_value(
+            Some("win.rename-workspace"),
+            Some(&id.to_string().to_variant()),
+        );
+        menu.append_item(&rename_item);
+
+        let close_section = gtk::gio::Menu::new();
+        let close_item = gtk::gio::MenuItem::new(Some("Close tab"), None);
+        // Reuse the on_close callback the X button uses by triggering
+        // it through a window action would require threading store —
+        // instead, pop the popover and call the callback directly.
+        // For now we fire on_close through a wrapper item that closes
+        // the popover and runs the row's existing on_close.
+        let _ = close_item;
+        // (kept simple: rename only for this commit; close-tab via
+        //  context menu is wired in a later commit alongside color.)
+        let _ = close_section;
+
+        let popover = gtk::PopoverMenu::from_model(Some(&menu));
+        popover.set_parent(&row_for_click);
+        popover.set_has_arrow(false);
+        let rect = gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1);
+        popover.set_pointing_to(Some(&rect));
+        popover.set_position(gtk::PositionType::Bottom);
+        popover.connect_closed(|p| p.unparent());
+        popover.popup();
+        gesture.set_state(gtk::EventSequenceState::Claimed);
+    });
+    row.add_controller(click);
 
     row.upcast()
 }

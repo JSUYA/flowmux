@@ -237,6 +237,21 @@ impl StateStore {
         None
     }
 
+    /// Rename a workspace. Returns true on success.
+    pub async fn rename_workspace(&self, id: WorkspaceId, name: String) -> bool {
+        let mut s = self.inner.lock().await;
+        let mut renamed = false;
+        if let Some(w) = s.workspaces.iter_mut().find(|w| w.id == id) {
+            w.name = name;
+            renamed = true;
+        }
+        drop(s);
+        if renamed {
+            self.mark_dirty();
+        }
+        renamed
+    }
+
     /// Remove an entire workspace. Used by the sidebar's X close
     /// button. Returns true if a workspace with that id existed.
     pub async fn remove_workspace(&self, id: WorkspaceId) -> bool {

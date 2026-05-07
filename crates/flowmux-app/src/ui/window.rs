@@ -92,6 +92,8 @@ impl WindowController {
             .build();
         window.set_content(Some(&toolbar));
 
+        register_workspace_actions(&window, &store, &bridge);
+
         Self {
             window,
             focused_pane,
@@ -280,6 +282,13 @@ impl WindowController {
                 self.drop_workspace(id);
                 let _ = ack.send(());
             }
+            GtkCommand::RenameWorkspace { id, name, ack } => {
+                self.store.rename_workspace(id, name).await;
+                if let Some(ws) = self.store.get_workspace(id).await {
+                    self.sidebar.upsert(&ws);
+                }
+                let _ = ack.send(());
+            }
             GtkCommand::PaneSendKeys { pane, keys, ack } => {
                 let registry = self.pane_registry.borrow();
                 let res = match registry.terminals.get(&pane) {
@@ -427,6 +436,79 @@ fn inject_cookies_into_webkit(
         count += 1;
     }
     Ok(count)
+}
+
+/// Per-workspace context-menu actions. These accept a workspace UUID
+/// string as their target value so a single action handler serves
+/// every sidebar row's context menu.
+fn register_workspace_actions(
+    window: &adw::ApplicationWindow,
+    store: &StateStore,
+    bridge: &Bridge,
+) {
+    use gtk::gio;
+    use gtk::glib::variant::ToVariant;
+
+    // win.rename-workspace(<uuid>) — opens an adw::AlertDialog with an
+    // Entry for the new name and OK/Cancel responses.
+    let store_for_rename = store.clone();
+    let bridge_for_rename = bridge.clone();
+    let window_weak = window.downgrade();
+    let rename = gio::ActionEntry::builder("rename-workspace")
+        .parameter_type(Some(gtk::glib::VariantTy::STRING))
+        .activate(move |_, _, param| {
+            let Some(id_str) = param.and_then(|p| p.str().map(String::from)) else { return };
+            let Ok(id) = id_str.parse::<WorkspaceId>() else { return };
+            let store = store_for_rename.clone();
+            let bridge = bridge_for_rename.clone();
+            let window_weak = window_weak.clone();
+            glib::MainContext::default().spawn_local(async move {
+                let Some(ws) = store.get_workspace(id).await else { return };
+                let Some(window) = window_weak.upgrade() else { return };
+                show_rename_dialog(&window, id, &ws.name, bridge);
+            });
+        })
+        .build();
+
+    window.add_action_entries([rename]);
+}
+
+fn show_rename_dialog(
+    window: &adw::ApplicationWindow,
+    id: WorkspaceId,
+    current_name: &str,
+    bridge: Bridge,
+) {
+    let dialog = adw::AlertDialog::new(Some("Rename Tab"), None);
+    let entry = gtk::Entry::new();
+    entry.set_text(current_name);
+    entry.set_activates_default(true);
+    entry.set_hexpand(true);
+    dialog.set_extra_child(Some(&entry));
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("ok", "OK");
+    dialog.set_default_response(Some("ok"));
+    dialog.set_close_response("cancel");
+    dialog.set_response_appearance("ok", adw::ResponseAppearance::Suggested);
+
+    let entry_for_resp = entry.clone();
+    dialog.connect_response(None, move |dialog, response| {
+        if response == "ok" {
+            let new_name = entry_for_resp.text().to_string();
+            if !new_name.trim().is_empty() {
+                let bridge = bridge.clone();
+                glib::MainContext::default().spawn_local(async move {
+                    let (tx, _rx) = oneshot::channel();
+                    let _ = bridge
+                        .tx
+                        .send(GtkCommand::RenameWorkspace { id, name: new_name, ack: tx })
+                        .await;
+                });
+            }
+        }
+        dialog.close();
+    });
+    dialog.present(Some(window));
 }
 
 /// Spawn the GTK-side dispatch loop. Lives on the main context.
