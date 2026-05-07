@@ -1,0 +1,39 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+name: Test
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+jobs:
+  cargo-test:
+    name: cargo test
+    runs-on: ubuntu-latest
+    env:
+      GDK_BACKEND: x11
+      GTK_A11Y: none
+      RUST_BACKTRACE: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config \
+            libgtk-4-dev libadwaita-1-dev libvte-2.91-gtk4-dev \
+            libwebkitgtk-6.0-dev libssl-dev \
+            libssh2-1-dev libdbus-1-dev \
+            dbus-x11 xvfb
+
+      - name: Run tests
+        run: xvfb-run -a dbus-run-session -- cargo test --workspace --locked -- --nocapture
