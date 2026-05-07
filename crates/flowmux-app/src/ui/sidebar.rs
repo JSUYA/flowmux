@@ -26,6 +26,8 @@ use std::cell::RefCell;
 use std::collections::HashSet;
 use std::rc::Rc;
 
+type RowsCell = Rc<RefCell<Vec<(WorkspaceId, gtk::ListBoxRow)>>>;
+
 #[derive(Clone)]
 pub struct Sidebar {
     pub root: gtk::Box,
@@ -166,8 +168,35 @@ impl Sidebar {
             self.on_close.clone(),
             self.bridge.clone(),
         )));
+        attach_dnd_handlers(&row, ws.id, self.bridge.clone(), self.rows.clone());
         self.list.append(&row);
         rows.push((ws.id, row));
+    }
+
+    /// 드래그 앤 드랍 결과를 사이드 패널에 반영해 채널 행의 시각적
+    /// 위치를 새 인덱스로 옮긴다. `id`가 없으면 no-op이며,
+    /// `target_index`가 길이를 넘으면 마지막 슬롯으로 클램프된다.
+    pub fn reorder(&self, id: WorkspaceId, target_index: usize) {
+        let mut rows = self.rows.borrow_mut();
+        let Some(current) = rows.iter().position(|(rid, _)| *rid == id) else {
+            return;
+        };
+        let len = rows.len();
+        if len == 0 {
+            return;
+        }
+        let target = target_index.min(len - 1);
+        if current == target {
+            return;
+        }
+
+        let (rid, row) = rows.remove(current);
+        // ListBox에서 위젯을 떼고 같은 위젯을 새 위치에 끼워 넣는다.
+        // `gtk::ListBox::insert(_, position)`는 position이 -1이거나
+        // 길이를 넘으면 끝에 추가한다.
+        self.list.remove(&row);
+        self.list.insert(&row, target as i32);
+        rows.insert(target, (rid, row));
     }
 
     pub fn remove(&self, id: WorkspaceId) {
@@ -290,6 +319,118 @@ fn notification_row(entry: &NotificationEntry) -> gtk::Widget {
 fn format_time(ts: &chrono::DateTime<chrono::Utc>) -> String {
     let local: chrono::DateTime<chrono::Local> = (*ts).into();
     local.format("%H:%M:%S").to_string()
+}
+
+/// 드래그 앤 드랍 데이터에 사용하는 mime-type. WorkspaceId의 UUID
+/// 문자열을 바이트로 담는다. 같은 mime을 받는 DropTarget만 매칭되어
+/// 외부 앱과의 충돌이 없다.
+const DND_MIME: &str = "application/x-flowmux-workspace-id";
+
+/// 사이드 패널의 한 채널 행에 드래그 앤 드랍 컨트롤러를 연결한다.
+///
+/// - `DragSource`: 행을 잡으면 채널 ID(UUID 문자열)를 ContentProvider에
+///   담아 드래그를 시작한다. 드래그 동안 원본 행은 살짝 흐려진다.
+/// - `DropTarget`: 다른 행 위에 드랍되면 드랍 위치 y로 행의 위/아래를
+///   결정해 [`GtkCommand::ReorderWorkspace`]를 보낸다.
+fn attach_dnd_handlers(row: &gtk::ListBoxRow, id: WorkspaceId, bridge: Bridge, rows: RowsCell) {
+    let drag_source = gtk::DragSource::new();
+    drag_source.set_actions(gtk::gdk::DragAction::MOVE);
+    drag_source.connect_prepare(move |_, _, _| {
+        let payload = id.to_string();
+        let bytes = gtk::glib::Bytes::from_owned(payload.into_bytes());
+        Some(gtk::gdk::ContentProvider::for_bytes(DND_MIME, &bytes))
+    });
+    let row_for_begin = row.clone();
+    drag_source.connect_drag_begin(move |_, _| {
+        row_for_begin.set_opacity(0.4);
+        row_for_begin.add_css_class("flowmux-dragging");
+    });
+    let row_for_end = row.clone();
+    drag_source.connect_drag_end(move |_, _, _| {
+        row_for_end.set_opacity(1.0);
+        row_for_end.remove_css_class("flowmux-dragging");
+    });
+    let row_for_cancel = row.clone();
+    drag_source.connect_drag_cancel(move |_, _, _| {
+        row_for_cancel.set_opacity(1.0);
+        row_for_cancel.remove_css_class("flowmux-dragging");
+        false
+    });
+    row.add_controller(drag_source);
+
+    let drop_target =
+        gtk::DropTarget::new(gtk::glib::Bytes::static_type(), gtk::gdk::DragAction::MOVE);
+    let row_for_motion = row.clone();
+    drop_target.connect_motion(move |_, _, _| {
+        row_for_motion.add_css_class("flowmux-drop-hover");
+        gtk::gdk::DragAction::MOVE
+    });
+    let row_for_leave = row.clone();
+    drop_target.connect_leave(move |_| {
+        row_for_leave.remove_css_class("flowmux-drop-hover");
+    });
+    let row_for_drop = row.clone();
+    let target_id = id;
+    drop_target.connect_drop(move |_, value, _x, y| {
+        row_for_drop.remove_css_class("flowmux-drop-hover");
+        let Ok(bytes) = value.get::<gtk::glib::Bytes>() else {
+            return false;
+        };
+        let Ok(payload) = std::str::from_utf8(&bytes) else {
+            return false;
+        };
+        let Ok(source_id) = payload.parse::<WorkspaceId>() else {
+            return false;
+        };
+        if source_id == target_id {
+            return false;
+        }
+
+        let rows_snapshot: Vec<WorkspaceId> = rows
+            .borrow()
+            .iter()
+            .map(|(rid, _)| *rid)
+            .collect();
+        let Some(source_idx) = rows_snapshot.iter().position(|rid| *rid == source_id) else {
+            return false;
+        };
+        let Some(target_idx) = rows_snapshot.iter().position(|rid| *rid == target_id) else {
+            return false;
+        };
+
+        // 드랍 y가 행의 절반보다 위면 target 앞, 아래면 뒤에 둔다.
+        let row_height = row_for_drop.height();
+        let above = if row_height > 0 {
+            y < (row_height as f64) / 2.0
+        } else {
+            true
+        };
+
+        // 최종 인덱스 계산. reorder_workspace는 "remove 후 insert(target)"
+        // 의미이므로, source가 target보다 앞에 있을 때 target index가 1 줄어든다.
+        let new_index = match (above, source_idx < target_idx) {
+            (true, true) => target_idx.saturating_sub(1),
+            (true, false) => target_idx,
+            (false, true) => target_idx,
+            (false, false) => target_idx + 1,
+        };
+
+        if new_index == source_idx {
+            return false;
+        }
+
+        let tx = bridge.tx.clone();
+        gtk::glib::MainContext::default().spawn_local(async move {
+            let _ = tx
+                .send(GtkCommand::ReorderWorkspace {
+                    id: source_id,
+                    target_index: new_index,
+                })
+                .await;
+        });
+        true
+    });
+    row.add_controller(drop_target);
 }
 
 fn row_widget(ws: &Workspace, on_close: Rc<dyn Fn(WorkspaceId)>, bridge: Bridge) -> gtk::Widget {

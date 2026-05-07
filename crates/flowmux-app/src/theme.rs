@@ -231,6 +231,12 @@ paned > separator {{
     background-color: rgba(245, 158, 11, 0.18);
     box-shadow: inset 3px 0 0 rgba(245, 158, 11, 0.85);
 }}
+.navigation-sidebar row.flowmux-dragging {{
+    opacity: 0.4;
+}}
+.navigation-sidebar row.flowmux-drop-hover {{
+    box-shadow: inset 0 -2px 0 rgba(96, 165, 250, 0.95);
+}}
 "#,
             bg = bg_css,
             fg = rgba_css(&self.fg),

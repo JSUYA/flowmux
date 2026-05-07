@@ -564,6 +564,11 @@ impl WindowController {
                 }
                 let _ = ack.send(());
             }
+            GtkCommand::ReorderWorkspace { id, target_index } => {
+                if self.store.reorder_workspace(id, target_index).await {
+                    self.sidebar.reorder(id, target_index);
+                }
+            }
             GtkCommand::ShowRenameDialog { id } => {
                 if let Some(ws) = self.store.get_workspace(id).await {
                     show_rename_dialog(&self.window, id, &ws.name, self.bridge.clone());

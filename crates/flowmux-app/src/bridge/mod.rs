@@ -169,6 +169,13 @@ pub enum GtkCommand {
         color: String,
         ack: oneshot::Sender<()>,
     },
+    /// 사이드 패널 안에서 채널을 드래그 앤 드랍해 순서를 재배치할 때
+    /// 발행한다. `target_index`는 이동 후의 최종 위치이며, 길이를 넘으면
+    /// 데몬에서 마지막 슬롯으로 클램프된다.
+    ReorderWorkspace {
+        id: WorkspaceId,
+        target_index: usize,
+    },
     /// Open the 'Change tab name' dialog for `id`. Bridge-driven so
     /// the dialog runs in the window dispatch loop where the parent
     /// window reference is in scope.
