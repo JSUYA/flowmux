@@ -495,6 +495,28 @@ impl WindowController {
                     );
                 }
             }
+            GtkCommand::ReorderSurface {
+                pane,
+                surface,
+                target_index,
+                ack,
+            } => {
+                // store 측 reorder가 변화 없음(None)을 반환하면 GTK 위젯도
+                // 그대로 둔다. 위젯 reorder는 메인 스레드의 PaneRegistry가
+                // 갖고 있는 탭바 gtk::Box와 surface_tabs 인덱스를 모두
+                // 동시에 업데이트해야 일관성이 깨지지 않는다.
+                if self
+                    .store
+                    .reorder_surface_in_pane(pane, surface, target_index)
+                    .await
+                    .is_some()
+                {
+                    self.pane_registry
+                        .borrow_mut()
+                        .reorder_surface_widget(pane, surface, target_index);
+                }
+                let _ = ack.send(Ok(()));
+            }
             GtkCommand::TerminalCwdChanged { pane, surface, cwd } => {
                 self.update_terminal_cwd(pane, surface, cwd).await;
                 self.refresh_window_title().await;
@@ -1004,6 +1026,24 @@ fn make_callbacks(focused: FocusedPane, bridge: Bridge) -> PaneCallbacks {
                     let _ = bridge
                         .tx
                         .send(GtkCommand::ShowRenameSurfaceDialog { pane, surface })
+                        .await;
+                });
+            }))
+        },
+        on_reorder_surface: {
+            let bridge = bridge.clone();
+            Rc::new(RefCell::new(move |pane, surface, target_index| {
+                let bridge = bridge.clone();
+                glib::MainContext::default().spawn_local(async move {
+                    let (tx, _rx) = oneshot::channel();
+                    let _ = bridge
+                        .tx
+                        .send(GtkCommand::ReorderSurface {
+                            pane,
+                            surface,
+                            target_index,
+                            ack: tx,
+                        })
                         .await;
                 });
             }))
@@ -1743,6 +1783,138 @@ mod tests {
             controller.window.title().map(|s| s.to_string()).as_deref(),
             Some("flowmux - Browser")
         );
+    }
+
+    /// ReorderSurface 디스패치가 store와 PaneRegistry를 모두 갱신하고
+    /// 활성 탭이 보존되는지, 같은 자리로 보내면 no-op인지, 다른 pane의
+    /// 탭은 영향이 없는지 한 번에 검증한다.
+    #[gtk::test]
+    async fn reorder_surface_dispatch_updates_store_and_widget_order() {
+        adw::init().expect("libadwaita should initialize in GTK test");
+        let root = std::env::temp_dir().join("flowmux-ui-reorder-surface");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = StateStore::new_lazy(State::default());
+        let ws_id = store
+            .create_workspace(Some("ui".into()), root.clone())
+            .await;
+        let ws = store.get_workspace(ws_id).await.unwrap();
+        let pane = ws.surfaces[0].root_pane.first_leaf_id().unwrap();
+        let first = ws.surfaces[0].root_pane.active_surface_id(pane).unwrap();
+        let (_, second) = store
+            .add_terminal_surface_to_pane(pane, None)
+            .await
+            .unwrap();
+        let (_, browser) = store
+            .add_browser_surface_to_pane(pane, "https://three.test".into())
+            .await
+            .unwrap();
+        // 활성 탭을 첫 번째로 되돌려 둔다 — browser가 마지막에 추가돼서 active.
+        store.set_active_surface(pane, first).await;
+
+        let (bridge, _rx) = Bridge::new();
+        let app = adw::Application::builder()
+            .application_id("com.flowmux.App.UiTest.ReorderSurface")
+            .build();
+        app.register(None::<&gtk::gio::Cancellable>).unwrap();
+        let controller = WindowController::new(
+            &app,
+            store.clone(),
+            Arc::new(ResolvedTheme::load()),
+            bridge,
+        );
+        let ws = store.get_workspace(ws_id).await.unwrap();
+        controller.render_workspace(&ws);
+
+        // first(인덱스 0) → 마지막(인덱스 2)
+        let (ack_tx, ack_rx) = oneshot::channel();
+        controller
+            .dispatch(GtkCommand::ReorderSurface {
+                pane,
+                surface: first,
+                target_index: 2,
+                ack: ack_tx,
+            })
+            .await;
+        ack_rx.await.unwrap().unwrap();
+
+        // store 측 순서 확인.
+        let snap = store.get_workspace(ws_id).await.unwrap();
+        let flowmux_core::Pane::Leaf {
+            content: flowmux_core::PaneContent::Tabs { active, surfaces },
+            ..
+        } = &snap.surfaces[0].root_pane
+        else {
+            panic!("expected tabs")
+        };
+        assert_eq!(
+            surfaces.iter().map(|s| s.id).collect::<Vec<_>>(),
+            vec![second, browser, first],
+            "store reorder failed"
+        );
+        // 활성 탭은 first로 그대로.
+        assert_eq!(*active, first);
+
+        // 같은 자리로 다시 디스패치 → store가 None을 돌려주므로 위젯도 그대로.
+        let (ack_tx, ack_rx) = oneshot::channel();
+        controller
+            .dispatch(GtkCommand::ReorderSurface {
+                pane,
+                surface: first,
+                target_index: 2,
+                ack: ack_tx,
+            })
+            .await;
+        ack_rx.await.unwrap().unwrap();
+        let snap = store.get_workspace(ws_id).await.unwrap();
+        let flowmux_core::Pane::Leaf {
+            content: flowmux_core::PaneContent::Tabs { surfaces, .. },
+            ..
+        } = &snap.surfaces[0].root_pane
+        else {
+            panic!("expected tabs")
+        };
+        assert_eq!(
+            surfaces.iter().map(|s| s.id).collect::<Vec<_>>(),
+            vec![second, browser, first]
+        );
+
+        // 길이를 넘는 인덱스 → 끝으로 클램프되어 자기 자리이므로 no-op.
+        let (ack_tx, ack_rx) = oneshot::channel();
+        controller
+            .dispatch(GtkCommand::ReorderSurface {
+                pane,
+                surface: first,
+                target_index: 999,
+                ack: ack_tx,
+            })
+            .await;
+        ack_rx.await.unwrap().unwrap();
+
+        // browser(가운데)를 처음으로.
+        let (ack_tx, ack_rx) = oneshot::channel();
+        controller
+            .dispatch(GtkCommand::ReorderSurface {
+                pane,
+                surface: browser,
+                target_index: 0,
+                ack: ack_tx,
+            })
+            .await;
+        ack_rx.await.unwrap().unwrap();
+        let snap = store.get_workspace(ws_id).await.unwrap();
+        let flowmux_core::Pane::Leaf {
+            content: flowmux_core::PaneContent::Tabs { active, surfaces },
+            ..
+        } = &snap.surfaces[0].root_pane
+        else {
+            panic!("expected tabs")
+        };
+        assert_eq!(
+            surfaces.iter().map(|s| s.id).collect::<Vec<_>>(),
+            vec![browser, second, first]
+        );
+        // 활성은 여전히 first.
+        assert_eq!(*active, first);
     }
 
     #[test]

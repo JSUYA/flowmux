@@ -126,6 +126,15 @@ pub enum GtkCommand {
     },
     /// Open the rename dialog for a pane-local surface tab.
     ShowRenameSurfaceDialog { pane: PaneId, surface: SurfaceId },
+    /// 같은 pane 안에서 탭(터미널/탭브라우저)을 드래그 앤 드랍으로 좌우
+    /// reorder. `target_index`는 이동 후의 최종 위치이며 길이를 넘으면
+    /// 끝으로 클램프된다.
+    ReorderSurface {
+        pane: PaneId,
+        surface: SurfaceId,
+        target_index: usize,
+        ack: oneshot::Sender<Result<(), String>>,
+    },
     /// VTE reported a cwd change for a terminal surface.
     TerminalCwdChanged {
         pane: PaneId,

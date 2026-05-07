@@ -237,6 +237,12 @@ paned > separator {{
 .navigation-sidebar row.flowmux-drop-hover {{
     box-shadow: inset 0 -2px 0 rgba(96, 165, 250, 0.95);
 }}
+.flowmux-pane-tab.flowmux-pane-tab-dragging {{
+    opacity: 0.4;
+}}
+.flowmux-pane-tab.flowmux-pane-tab-drop-hover {{
+    box-shadow: inset -2px 0 0 rgba(96, 165, 250, 0.95);
+}}
 "#,
             bg = bg_css,
             fg = rgba_css(&self.fg),

@@ -141,6 +141,49 @@ impl PaneRegistry {
         }
     }
 
+    /// 같은 pane 안에서 `surface`로 식별되는 탭을 `target_index` 위치로
+    /// 옮긴다. store 쪽 reorder가 성공한 후에만 호출되며, 탭바의
+    /// `gtk::Box`와 `surface_tabs` 벡터를 한 번에 동기화한다. `target_index`
+    /// 가 길이를 넘거나 자기 자리이면 no-op.
+    pub fn reorder_surface_widget(
+        &mut self,
+        pane: PaneId,
+        surface: SurfaceId,
+        target_index: usize,
+    ) {
+        let Some(tabs) = self.surface_tabs.get_mut(&pane) else {
+            return;
+        };
+        let Some(current) = tabs.iter().position(|(id, _)| *id == surface) else {
+            return;
+        };
+        let len = tabs.len();
+        if len == 0 {
+            return;
+        }
+        let new_index = target_index.min(len - 1);
+        if current == new_index {
+            return;
+        }
+        let entry = tabs.remove(current);
+        tabs.insert(new_index, entry);
+        let order: Vec<gtk::Widget> = tabs.iter().map(|(_, w)| w.clone()).collect();
+        if let Some(container) = self.pane_tab_containers.get(&pane).cloned() {
+            // GtkBox는 직접적인 reorder API가 없으므로, 새 순서 기준으로
+            // 모든 자식을 떼었다가 다시 append 하는 게 가장 안전하다.
+            // 위젯 자체는 유지되므로 핸들러/상태가 보존된다.
+            let mut child = container.first_child();
+            while let Some(c) = child {
+                let next = c.next_sibling();
+                container.remove(&c);
+                child = next;
+            }
+            for w in &order {
+                container.append(w);
+            }
+        }
+    }
+
     pub fn activate_surface(&mut self, pane: PaneId, surface: SurfaceId) {
         if let Some(stack) = self.surface_stacks.get(&pane) {
             stack.set_visible_child_name(&surface.to_string());
@@ -432,8 +475,137 @@ fn build_surface_tab_widget(
         let surface_id = surface.id;
         close.connect_clicked(move |_| (cb.borrow_mut())(pane_id, surface_id));
     }
+    attach_tab_dnd_handlers(&tab, pane_id, surface.id, callbacks);
     (tab, label)
 }
+
+/// 같은 pane 안에서 탭(터미널/탭브라우저)을 좌우로 드래그 앤 드랍 reorder
+/// 하기 위한 컨트롤러를 탭 위젯에 붙인다.
+///
+/// - `DragSource`: 탭을 잡으면 (PaneId, SurfaceId) 페어를 UTF-8로 직렬화한
+///   바이트를 ContentProvider에 담는다. 다른 pane 사이의 이동은 의도적으로
+///   막기 위해 PaneId를 함께 실어 DropTarget이 비교할 수 있도록 한다.
+/// - `DropTarget`: 같은 pane의 다른 탭 위에 드롭하면 드롭 위치 x로 좌/우를
+///   결정해 reorder 콜백을 호출한다. 다른 pane으로의 드롭은 거부한다.
+fn attach_tab_dnd_handlers(
+    tab: &gtk::Box,
+    pane_id: PaneId,
+    surface_id: SurfaceId,
+    callbacks: &PaneCallbacks,
+) {
+    let drag_source = gtk::DragSource::new();
+    drag_source.set_actions(gtk::gdk::DragAction::MOVE);
+    drag_source.connect_prepare(move |_, _, _| {
+        let payload = format!("{pane_id}|{surface_id}");
+        let bytes = gtk::glib::Bytes::from_owned(payload.into_bytes());
+        let provider = gtk::gdk::ContentProvider::for_bytes(TAB_DND_MIME, &bytes);
+        Some(provider)
+    });
+    let tab_for_begin = tab.clone();
+    drag_source.connect_drag_begin(move |_, _| {
+        tab_for_begin.set_opacity(0.4);
+        tab_for_begin.add_css_class("flowmux-pane-tab-dragging");
+    });
+    let tab_for_end = tab.clone();
+    drag_source.connect_drag_end(move |_, _, _| {
+        tab_for_end.set_opacity(1.0);
+        tab_for_end.remove_css_class("flowmux-pane-tab-dragging");
+    });
+    let tab_for_cancel = tab.clone();
+    drag_source.connect_drag_cancel(move |_, _, _| {
+        tab_for_cancel.set_opacity(1.0);
+        tab_for_cancel.remove_css_class("flowmux-pane-tab-dragging");
+        false
+    });
+    tab.add_controller(drag_source);
+
+    let drop_target = gtk::DropTarget::new(gtk::glib::Type::INVALID, gtk::gdk::DragAction::MOVE);
+    drop_target.set_types(&[gtk::glib::Bytes::static_type()]);
+    let tab_for_motion = tab.clone();
+    drop_target.connect_motion(move |_, _, _| {
+        tab_for_motion.add_css_class("flowmux-pane-tab-drop-hover");
+        gtk::gdk::DragAction::MOVE
+    });
+    let tab_for_leave = tab.clone();
+    drop_target.connect_leave(move |_| {
+        tab_for_leave.remove_css_class("flowmux-pane-tab-drop-hover");
+    });
+    let target_pane = pane_id;
+    let target_surface = surface_id;
+    let tab_for_drop = tab.clone();
+    let reorder_cb = callbacks.on_reorder_surface.clone();
+    drop_target.connect_drop(move |_, value, x, _y| {
+        tab_for_drop.remove_css_class("flowmux-pane-tab-drop-hover");
+        let Ok(bytes) = value.get::<gtk::glib::Bytes>() else {
+            return false;
+        };
+        let Ok(payload) = std::str::from_utf8(&bytes) else {
+            return false;
+        };
+        let Some((src_pane_str, src_surface_str)) = payload.split_once('|') else {
+            return false;
+        };
+        let Ok(src_pane) = src_pane_str.parse::<PaneId>() else {
+            return false;
+        };
+        let Ok(src_surface) = src_surface_str.parse::<SurfaceId>() else {
+            return false;
+        };
+        // pane 간 이동은 지원하지 않는다 — 같은 pane의 다른 탭 위에서만 reorder.
+        if src_pane != target_pane {
+            return false;
+        }
+        if src_surface == target_surface {
+            return false;
+        }
+
+        // 드롭 x가 탭 폭의 절반보다 왼쪽이면 target 앞, 오른쪽이면 뒤로.
+        // target_index는 *최종* 인덱스이므로, 탭바 내부에서 target tab의
+        // 현재 인덱스를 알아야 한다. 부모 GtkBox에서 형제 위치를 센다.
+        let Some(parent) = tab_for_drop.parent() else {
+            return false;
+        };
+        let mut target_index: usize = 0;
+        let mut child = parent.first_child();
+        while let Some(c) = child {
+            if c == tab_for_drop.clone().upcast::<gtk::Widget>() {
+                break;
+            }
+            target_index += 1;
+            child = c.next_sibling();
+        }
+
+        let tab_width = tab_for_drop.width();
+        let after = if tab_width > 0 {
+            x > (tab_width as f64) / 2.0
+        } else {
+            false
+        };
+
+        // 같은 박스 안에서:
+        // - 소스가 타깃 *왼쪽*에 있을 때 (src_idx < target_index)
+        //     "타깃 앞"이면 target_index-1, "타깃 뒤"면 target_index.
+        // - 소스가 타깃 *오른쪽*에 있을 때 (src_idx > target_index)
+        //     "타깃 앞"이면 target_index, "타깃 뒤"면 target_index+1.
+        // 소스 인덱스를 모르기 때문에 +1 보정은 daemon의 클램프(min(len-1))
+        // 에 맡긴다. 결과가 자기 자리면 reorder_surface_in_pane이 None을
+        // 반환하므로 GTK 위젯 이동도 건너뛴다.
+        let final_index = if after {
+            target_index.saturating_add(1)
+        } else {
+            target_index
+        };
+
+        (reorder_cb.borrow_mut())(target_pane, src_surface, final_index);
+        true
+    });
+    tab.add_controller(drop_target);
+}
+
+/// pane-local 탭 드래그 페이로드 mime-type. 값은 "{PaneId}|{SurfaceId}"
+/// 형식의 UTF-8 문자열. 사이드 패널의 채널 reorder mime과 분리해서 두
+/// 영역의 드롭 매칭이 섞이지 않게 한다.
+const TAB_DND_MIME: &str = "application/x-flowmux-pane-tab";
 
 /// Attach a single new surface to an already-rendered pane: appends a
 /// tab to its tab bar, mounts the panel widget into the pane's stack,

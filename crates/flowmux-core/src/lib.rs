@@ -521,6 +521,46 @@ impl Pane {
         }
     }
 
+    /// 같은 pane 안에서 `surface_id`로 식별되는 탭(터미널 또는 탭브라우저)을
+    /// `target_index` 위치로 옮긴다. `target_index`는 이동 후의 최종
+    /// 인덱스이며 탭 수를 넘으면 마지막으로 클램프된다. 활성 탭의
+    /// `SurfaceId`는 그대로 유지되므로 옮긴 뒤에도 같은 탭이 활성으로
+    /// 남는다. 매칭되는 surface가 없거나 같은 자리이면 `false`를 반환해
+    /// 호출자가 dirty mark / GTK 위젯 이동을 건너뛸 수 있도록 한다.
+    pub fn reorder_surface_in_leaf(
+        &mut self,
+        target: PaneId,
+        surface_id: SurfaceId,
+        target_index: usize,
+    ) -> bool {
+        match self {
+            Pane::Leaf { id, content } if *id == target => match content {
+                PaneContent::Tabs { surfaces, .. } => {
+                    let Some(current) = surfaces.iter().position(|s| s.id == surface_id) else {
+                        return false;
+                    };
+                    let len = surfaces.len();
+                    if len == 0 {
+                        return false;
+                    }
+                    let new_index = target_index.min(len - 1);
+                    if current == new_index {
+                        return false;
+                    }
+                    let removed = surfaces.remove(current);
+                    surfaces.insert(new_index, removed);
+                    true
+                }
+                PaneContent::Terminal { .. } | PaneContent::Browser { .. } => false,
+            },
+            Pane::Leaf { .. } => false,
+            Pane::Split { first, second, .. } => {
+                first.reorder_surface_in_leaf(target, surface_id, target_index)
+                    || second.reorder_surface_in_leaf(target, surface_id, target_index)
+            }
+        }
+    }
+
     pub fn close_surface_in_leaf(
         &mut self,
         target: PaneId,
@@ -1219,6 +1259,244 @@ mod tests {
         let found = tree.find_surface(right_id, added_id).unwrap();
         assert_eq!(found.id, added_id);
         assert_eq!(found.title, "RBrowser");
+    }
+
+    /// pane 내부 탭 reorder 시나리오 모음. surface_id 기반으로
+    /// active 탭이 보존되는지, terminal과 탭브라우저가 섞여 있어도
+    /// 정상 이동하는지, 인덱스 클램프와 no-op 분기가 모두 동작하는지를
+    /// 한 번에 본다.
+    #[test]
+    fn reorder_surface_moves_first_to_last_and_preserves_active() {
+        let pane_id = PaneId::new();
+        let mut pane = Pane::Leaf {
+            id: pane_id,
+            content: PaneContent::tabbed_terminal("a", None),
+        };
+        let a_id = pane.active_surface_id(pane_id).unwrap();
+        let b = PaneSurface::terminal("b", None);
+        let b_id = b.id;
+        let c = PaneSurface::browser("c", "https://c.test".into());
+        let c_id = c.id;
+        pane.add_surface_to_leaf(pane_id, b).unwrap();
+        pane.add_surface_to_leaf(pane_id, c).unwrap();
+        // a를 활성으로 되돌려 둔다 — c가 마지막으로 추가돼서 active.
+        assert!(pane.set_active_surface(pane_id, a_id));
+
+        assert!(pane.reorder_surface_in_leaf(pane_id, a_id, 2));
+
+        let Pane::Leaf {
+            content: PaneContent::Tabs { active, surfaces },
+            ..
+        } = &pane
+        else {
+            panic!("expected tabbed leaf")
+        };
+        let order: Vec<SurfaceId> = surfaces.iter().map(|s| s.id).collect();
+        assert_eq!(order, vec![b_id, c_id, a_id]);
+        // a를 옮겼지만 active는 여전히 a여야 한다.
+        assert_eq!(*active, a_id);
+    }
+
+    #[test]
+    fn reorder_surface_moves_last_to_first() {
+        let pane_id = PaneId::new();
+        let mut pane = Pane::Leaf {
+            id: pane_id,
+            content: PaneContent::tabbed_terminal("a", None),
+        };
+        let a_id = pane.active_surface_id(pane_id).unwrap();
+        let b = PaneSurface::terminal("b", None);
+        let b_id = b.id;
+        let c = PaneSurface::terminal("c", None);
+        let c_id = c.id;
+        pane.add_surface_to_leaf(pane_id, b).unwrap();
+        pane.add_surface_to_leaf(pane_id, c).unwrap();
+
+        assert!(pane.reorder_surface_in_leaf(pane_id, c_id, 0));
+
+        let Pane::Leaf {
+            content: PaneContent::Tabs { surfaces, .. },
+            ..
+        } = &pane
+        else {
+            panic!("expected tabbed leaf")
+        };
+        assert_eq!(
+            surfaces.iter().map(|s| s.id).collect::<Vec<_>>(),
+            vec![c_id, a_id, b_id]
+        );
+    }
+
+    #[test]
+    fn reorder_surface_clamps_target_beyond_len() {
+        let pane_id = PaneId::new();
+        let mut pane = Pane::Leaf {
+            id: pane_id,
+            content: PaneContent::tabbed_terminal("a", None),
+        };
+        let a_id = pane.active_surface_id(pane_id).unwrap();
+        let b = PaneSurface::terminal("b", None);
+        let b_id = b.id;
+        pane.add_surface_to_leaf(pane_id, b).unwrap();
+
+        // target_index=999 → 끝으로 클램프 → b, a
+        assert!(pane.reorder_surface_in_leaf(pane_id, a_id, 999));
+
+        let Pane::Leaf {
+            content: PaneContent::Tabs { surfaces, .. },
+            ..
+        } = &pane
+        else {
+            panic!("expected tabbed leaf")
+        };
+        assert_eq!(
+            surfaces.iter().map(|s| s.id).collect::<Vec<_>>(),
+            vec![b_id, a_id]
+        );
+    }
+
+    #[test]
+    fn reorder_surface_same_position_returns_false() {
+        let pane_id = PaneId::new();
+        let mut pane = Pane::Leaf {
+            id: pane_id,
+            content: PaneContent::tabbed_terminal("a", None),
+        };
+        let a_id = pane.active_surface_id(pane_id).unwrap();
+        let b = PaneSurface::terminal("b", None);
+        pane.add_surface_to_leaf(pane_id, b).unwrap();
+
+        // a가 이미 인덱스 0이므로 0으로 옮겨도 no-op.
+        assert!(!pane.reorder_surface_in_leaf(pane_id, a_id, 0));
+        // 길이를 넘어도 자기 자리(끝)로 클램프되면 마찬가지로 no-op.
+        let last = pane
+            .find_surface(
+                pane_id,
+                match &pane {
+                    Pane::Leaf {
+                        content: PaneContent::Tabs { surfaces, .. },
+                        ..
+                    } => surfaces.last().unwrap().id,
+                    _ => unreachable!(),
+                },
+            )
+            .unwrap()
+            .id;
+        assert!(!pane.reorder_surface_in_leaf(pane_id, last, 100));
+    }
+
+    #[test]
+    fn reorder_surface_unknown_surface_returns_false() {
+        let pane_id = PaneId::new();
+        let mut pane = Pane::Leaf {
+            id: pane_id,
+            content: PaneContent::tabbed_terminal("a", None),
+        };
+        let missing = SurfaceId::new();
+        assert!(!pane.reorder_surface_in_leaf(pane_id, missing, 0));
+    }
+
+    #[test]
+    fn reorder_surface_single_tab_is_noop() {
+        let pane_id = PaneId::new();
+        let mut pane = Pane::Leaf {
+            id: pane_id,
+            content: PaneContent::tabbed_terminal("only", None),
+        };
+        let only = pane.active_surface_id(pane_id).unwrap();
+        assert!(!pane.reorder_surface_in_leaf(pane_id, only, 0));
+        assert!(!pane.reorder_surface_in_leaf(pane_id, only, 5));
+    }
+
+    /// terminal 두 개 + 탭브라우저 한 개를 만들고 가운데 탭브라우저를
+    /// 양 끝으로 보내며 순서 + active 보존을 확인한다.
+    #[test]
+    fn reorder_surface_mixed_terminal_and_browser() {
+        let pane_id = PaneId::new();
+        let mut pane = Pane::Leaf {
+            id: pane_id,
+            content: PaneContent::tabbed_terminal("term", None),
+        };
+        let term_id = pane.active_surface_id(pane_id).unwrap();
+        let browser = PaneSurface::browser("docs", "https://docs.test".into());
+        let browser_id = browser.id;
+        let term2 = PaneSurface::terminal("term2", None);
+        let term2_id = term2.id;
+        pane.add_surface_to_leaf(pane_id, browser).unwrap();
+        pane.add_surface_to_leaf(pane_id, term2).unwrap();
+        // 탭브라우저(중간)를 active로.
+        assert!(pane.set_active_surface(pane_id, browser_id));
+
+        // 가운데 → 처음
+        assert!(pane.reorder_surface_in_leaf(pane_id, browser_id, 0));
+        assert_active_order(&pane, pane_id, browser_id, &[browser_id, term_id, term2_id]);
+
+        // 처음 → 마지막
+        assert!(pane.reorder_surface_in_leaf(pane_id, browser_id, 2));
+        assert_active_order(&pane, pane_id, browser_id, &[term_id, term2_id, browser_id]);
+    }
+
+    /// split 트리 안 깊숙한 leaf의 탭을 reorder. 다른 leaf는 영향 없어야.
+    #[test]
+    fn reorder_surface_walks_into_split_branches() {
+        let left_id = PaneId::new();
+        let right_id = PaneId::new();
+        let mut tree = Pane::Split {
+            id: PaneId::new(),
+            direction: SplitDirection::Vertical,
+            ratio: 0.5,
+            first: Box::new(Pane::Leaf {
+                id: left_id,
+                content: PaneContent::tabbed_terminal("L0", None),
+            }),
+            second: Box::new(Pane::Leaf {
+                id: right_id,
+                content: PaneContent::tabbed_terminal("R0", None),
+            }),
+        };
+        let r0 = tree.active_surface_id(right_id).unwrap();
+        let r1 = PaneSurface::terminal("R1", None);
+        let r1_id = r1.id;
+        let r2 = PaneSurface::browser("R2", "https://r2.test".into());
+        let r2_id = r2.id;
+        tree.add_surface_to_leaf(right_id, r1).unwrap();
+        tree.add_surface_to_leaf(right_id, r2).unwrap();
+        let l0 = tree.active_surface_id(left_id).unwrap();
+
+        // right pane의 R2(마지막)를 첫 번째로.
+        assert!(tree.reorder_surface_in_leaf(right_id, r2_id, 0));
+        assert_active_order(&tree, right_id, r2_id, &[r2_id, r0, r1_id]);
+
+        // left pane은 그대로여야 한다.
+        assert_active_order(&tree, left_id, l0, &[l0]);
+
+        // 잘못된 (pane, surface) 매칭은 false.
+        assert!(!tree.reorder_surface_in_leaf(left_id, r2_id, 0));
+    }
+
+    fn assert_active_order(
+        pane: &Pane,
+        target: PaneId,
+        expected_active: SurfaceId,
+        expected_order: &[SurfaceId],
+    ) {
+        fn find_tabs<'a>(p: &'a Pane, target: PaneId) -> Option<&'a PaneContent> {
+            match p {
+                Pane::Leaf { id, content } if *id == target => Some(content),
+                Pane::Leaf { .. } => None,
+                Pane::Split { first, second, .. } => {
+                    find_tabs(first, target).or_else(|| find_tabs(second, target))
+                }
+            }
+        }
+        let Some(PaneContent::Tabs { active, surfaces }) = find_tabs(pane, target) else {
+            panic!("target leaf {target} not found or not tabbed");
+        };
+        assert_eq!(*active, expected_active);
+        assert_eq!(
+            surfaces.iter().map(|s| s.id).collect::<Vec<_>>(),
+            expected_order
+        );
     }
 
     #[test]

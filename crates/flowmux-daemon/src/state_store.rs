@@ -457,6 +457,36 @@ impl StateStore {
         updated
     }
 
+    /// pane 안에서 탭(터미널/탭브라우저)을 드래그 앤 드랍으로 재배치할
+    /// 때 호출된다. 같은 pane 내부의 `surface_id` 탭을 `target_index`
+    /// 위치로 옮긴다. `target_index`는 이동을 적용한 뒤의 최종 위치이며
+    /// 길이를 넘어가면 끝으로 클램프된다. 변화가 없거나 매칭되는
+    /// surface가 없으면 `None`을 반환해 호출자가 GTK 위젯을 건드리지
+    /// 않도록 한다. 활성 탭의 SurfaceId는 reorder의 영향을 받지 않으므로
+    /// 옮긴 후에도 같은 탭이 활성으로 남는다.
+    pub async fn reorder_surface_in_pane(
+        &self,
+        pane: PaneId,
+        surface_id: SurfaceId,
+        target_index: usize,
+    ) -> Option<WorkspaceId> {
+        let mut s = self.inner.lock().await;
+        for ws in s.workspaces.iter_mut() {
+            for surface in ws.surfaces.iter_mut() {
+                if surface
+                    .root_pane
+                    .reorder_surface_in_leaf(pane, surface_id, target_index)
+                {
+                    let ws_id = ws.id;
+                    drop(s);
+                    self.mark_dirty();
+                    return Some(ws_id);
+                }
+            }
+        }
+        None
+    }
+
     /// 사이드 패널에서 채널을 드래그 앤 드랍으로 재배치할 때 호출된다.
     /// `id`로 식별되는 채널을 `workspace_order` 안의 `target_index` 위치로
     /// 옮긴다. `target_index`는 이동을 적용한 뒤의 최종 위치이며, 길이를
@@ -2128,8 +2158,172 @@ mod tests {
         assert!(store.reorder_workspace(a, 2).await);
         assert_eq!(store.snapshot().await.active_workspace, Some(a));
 
-        // b를 처음으로 옮겨도 active는 a 그대로.
-        assert!(store.reorder_workspace(b, 0).await);
+        // 이제 순서는 [b, c, a]. b를 끝으로 옮겨도 active는 a 그대로.
+        assert!(store.reorder_workspace(b, 2).await);
         assert_eq!(store.snapshot().await.active_workspace, Some(a));
+    }
+
+    /// pane 내부의 탭(터미널/탭브라우저) reorder가
+    /// 1) 정상 케이스에서 해당 workspace_id를 반환하고
+    /// 2) 자기 자리/없는 surface일 때 None을 반환하며
+    /// 3) 활성 탭이 옮긴 후에도 같은 SurfaceId로 유지되는지
+    /// 통합적으로 본다.
+    #[tokio::test]
+    async fn reorder_surface_in_pane_moves_tab_and_keeps_active() {
+        let store = StateStore::new_lazy(State::default());
+        let ws_id = store
+            .create_workspace(Some("ws".into()), std::path::PathBuf::from("/tmp"))
+            .await;
+        let ws = store.get_workspace(ws_id).await.unwrap();
+        let pane = ws.surfaces[0].root_pane.first_leaf_id().unwrap();
+        let first = ws.surfaces[0].root_pane.active_surface_id(pane).unwrap();
+
+        // 두 번째 (terminal) 와 세 번째 (탭브라우저) 추가.
+        let (_, second) = store
+            .add_terminal_surface_to_pane(pane, Some("/tmp/two".into()))
+            .await
+            .unwrap();
+        let (_, third) = store
+            .add_browser_surface_to_pane(pane, "https://three.test".into())
+            .await
+            .unwrap();
+        // 활성 탭을 first(첫 번째)로 되돌려 둔다.
+        store.set_active_surface(pane, first).await;
+
+        // first를 마지막 자리로.
+        assert_eq!(
+            store.reorder_surface_in_pane(pane, first, 2).await,
+            Some(ws_id)
+        );
+        let snap = store.get_workspace(ws_id).await.unwrap();
+        let flowmux_core::Pane::Leaf {
+            content: flowmux_core::PaneContent::Tabs { active, surfaces },
+            ..
+        } = &snap.surfaces[0].root_pane
+        else {
+            panic!("expected tabs")
+        };
+        assert_eq!(
+            surfaces.iter().map(|s| s.id).collect::<Vec<_>>(),
+            vec![second, third, first]
+        );
+        // first를 옮겼지만 여전히 first가 active.
+        assert_eq!(*active, first);
+
+        // 같은 자리(끝)로 다시 옮기면 None.
+        assert!(store
+            .reorder_surface_in_pane(pane, first, 2)
+            .await
+            .is_none());
+
+        // 없는 SurfaceId면 None.
+        assert!(store
+            .reorder_surface_in_pane(pane, SurfaceId::new(), 0)
+            .await
+            .is_none());
+    }
+
+    /// 길이를 넘어가는 target_index는 끝으로 클램프된다 — 호출자가
+    /// 드랍 위치를 +1 한 인덱스를 넘겨도 안전히 처리.
+    #[tokio::test]
+    async fn reorder_surface_in_pane_clamps_target_index_beyond_len() {
+        let store = StateStore::new_lazy(State::default());
+        let ws_id = store
+            .create_workspace(Some("ws".into()), std::path::PathBuf::from("/tmp"))
+            .await;
+        let ws = store.get_workspace(ws_id).await.unwrap();
+        let pane = ws.surfaces[0].root_pane.first_leaf_id().unwrap();
+        let first = ws.surfaces[0].root_pane.active_surface_id(pane).unwrap();
+        let (_, second) = store
+            .add_terminal_surface_to_pane(pane, None)
+            .await
+            .unwrap();
+
+        // first 를 999번째로 → 끝(인덱스 1)로 클램프.
+        assert_eq!(
+            store.reorder_surface_in_pane(pane, first, 999).await,
+            Some(ws_id)
+        );
+        let snap = store.get_workspace(ws_id).await.unwrap();
+        let flowmux_core::Pane::Leaf {
+            content: flowmux_core::PaneContent::Tabs { surfaces, .. },
+            ..
+        } = &snap.surfaces[0].root_pane
+        else {
+            panic!("expected tabs")
+        };
+        assert_eq!(
+            surfaces.iter().map(|s| s.id).collect::<Vec<_>>(),
+            vec![second, first]
+        );
+    }
+
+    /// 한 channel(workspace) 안의 reorder가 다른 channel에 영향이 없어야 한다.
+    #[tokio::test]
+    async fn reorder_surface_in_pane_does_not_touch_other_workspaces() {
+        let store = StateStore::new_lazy(State::default());
+        let alpha = store
+            .create_workspace(Some("alpha".into()), std::path::PathBuf::from("/tmp/alpha"))
+            .await;
+        let beta = store
+            .create_workspace(Some("beta".into()), std::path::PathBuf::from("/tmp/beta"))
+            .await;
+
+        let ws_alpha = store.get_workspace(alpha).await.unwrap();
+        let alpha_pane = ws_alpha.surfaces[0].root_pane.first_leaf_id().unwrap();
+        let alpha_first = ws_alpha.surfaces[0]
+            .root_pane
+            .active_surface_id(alpha_pane)
+            .unwrap();
+        let (_, alpha_second) = store
+            .add_terminal_surface_to_pane(alpha_pane, None)
+            .await
+            .unwrap();
+
+        let ws_beta = store.get_workspace(beta).await.unwrap();
+        let beta_pane = ws_beta.surfaces[0].root_pane.first_leaf_id().unwrap();
+        let beta_first = ws_beta.surfaces[0]
+            .root_pane
+            .active_surface_id(beta_pane)
+            .unwrap();
+        let (_, beta_second) = store
+            .add_terminal_surface_to_pane(beta_pane, None)
+            .await
+            .unwrap();
+
+        // alpha pane의 첫 탭을 끝으로.
+        assert_eq!(
+            store
+                .reorder_surface_in_pane(alpha_pane, alpha_first, 1)
+                .await,
+            Some(alpha)
+        );
+
+        // beta는 그대로.
+        let snap_beta = store.get_workspace(beta).await.unwrap();
+        let flowmux_core::Pane::Leaf {
+            content: flowmux_core::PaneContent::Tabs { surfaces, .. },
+            ..
+        } = &snap_beta.surfaces[0].root_pane
+        else {
+            panic!("expected tabs")
+        };
+        assert_eq!(
+            surfaces.iter().map(|s| s.id).collect::<Vec<_>>(),
+            vec![beta_first, beta_second]
+        );
+        // alpha는 swap 됐다.
+        let snap_alpha = store.get_workspace(alpha).await.unwrap();
+        let flowmux_core::Pane::Leaf {
+            content: flowmux_core::PaneContent::Tabs { surfaces, .. },
+            ..
+        } = &snap_alpha.surfaces[0].root_pane
+        else {
+            panic!("expected tabs")
+        };
+        assert_eq!(
+            surfaces.iter().map(|s| s.id).collect::<Vec<_>>(),
+            vec![alpha_second, alpha_first]
+        );
     }
 }

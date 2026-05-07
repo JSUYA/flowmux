@@ -119,6 +119,9 @@ pub struct PaneCallbacks {
     pub on_close_surface: Rc<RefCell<dyn FnMut(PaneId, SurfaceId)>>,
     /// Pane-local rename tab.
     pub on_rename_surface: Rc<RefCell<dyn FnMut(PaneId, SurfaceId)>>,
+    /// 같은 pane 내부에서 탭을 드래그 앤 드랍으로 reorder. 세 번째
+    /// 인자는 이동 후의 최종 인덱스(0-based, 길이 초과 시 클램프).
+    pub on_reorder_surface: Rc<RefCell<dyn FnMut(PaneId, SurfaceId, usize)>>,
     /// VTE reported that a terminal surface changed its cwd.
     pub on_terminal_cwd_changed: Rc<RefCell<dyn FnMut(PaneId, SurfaceId, PathBuf)>>,
     /// WebKit reported that a browser pane navigated to a new URL.
