@@ -98,6 +98,12 @@ pub enum GtkCommand {
         body: String,
         level: NotificationLevel,
     },
+    /// An AI agent (claude / codex / opencode) just exited inside
+    /// `pane`. agent_watch::install fires this once per disappearance.
+    AgentCompleted {
+        pane: PaneId,
+        name: String,
+    },
     /// Cycle to the previous / next workspace in sidebar order.
     FocusWorkspaceDir {
         dir: WsNav,

@@ -24,6 +24,7 @@ use flowmux_core::{NotificationLevel, PrState, Workspace, WorkspaceId};
 use gtk::glib::variant::ToVariant;
 use gtk::prelude::*;
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::rc::Rc;
 
 #[derive(Clone)]
@@ -35,6 +36,7 @@ pub struct Sidebar {
     bell_button: gtk::MenuButton,
     bell_popover: gtk::Popover,
     notification_log: NotificationLog,
+    attentions: Rc<RefCell<HashSet<WorkspaceId>>>,
 }
 
 impl Sidebar {
@@ -60,15 +62,22 @@ impl Sidebar {
         let rows: Rc<RefCell<Vec<(WorkspaceId, gtk::ListBoxRow)>>> =
             Rc::new(RefCell::new(Vec::new()));
 
+        let attentions: Rc<RefCell<HashSet<WorkspaceId>>> = Rc::new(RefCell::new(HashSet::new()));
         let rows_for_cb = rows.clone();
+        let attentions_for_cb = attentions.clone();
         list.connect_row_selected(move |_, selected| {
             if let Some(row) = selected {
-                if let Some((id, _)) = rows_for_cb
+                if let Some((id, list_row)) = rows_for_cb
                     .borrow()
                     .iter()
                     .find(|(_, r)| r == row)
                     .cloned()
                 {
+                    // Selecting a row clears any attention indicator
+                    // it had been carrying.
+                    if attentions_for_cb.borrow_mut().remove(&id) {
+                        list_row.remove_css_class("flowmux-attention");
+                    }
                     on_select(id);
                 }
             }
@@ -134,6 +143,7 @@ impl Sidebar {
             bell_button,
             bell_popover,
             notification_log,
+            attentions,
         }
     }
 
@@ -154,6 +164,16 @@ impl Sidebar {
         if let Some(idx) = rows.iter().position(|(wid, _)| *wid == id) {
             self.list.remove(&rows[idx].1);
             rows.swap_remove(idx);
+        }
+    }
+
+    /// Tint a workspace row to flag that an agent finished there.
+    /// Cleared automatically when the user selects the row.
+    pub fn mark_attention(&self, id: WorkspaceId) {
+        if self.attentions.borrow_mut().insert(id) {
+            if let Some((_, row)) = self.rows.borrow().iter().find(|(wid, _)| *wid == id).cloned() {
+                row.add_css_class("flowmux-attention");
+            }
         }
     }
 

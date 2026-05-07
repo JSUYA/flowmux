@@ -166,6 +166,10 @@ impl ResolvedTheme {
     margin: 2px 6px;
     padding: 8px 10px;
 }}
+.navigation-sidebar row.flowmux-attention {{
+    background-color: rgba(245, 158, 11, 0.18);
+    box-shadow: inset 3px 0 0 rgba(245, 158, 11, 0.85);
+}}
 "#,
             bg = bg_css,
             border = pane_border_css,

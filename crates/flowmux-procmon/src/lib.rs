@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! Watch a process tree under a workspace's root PID and report which
 //! TCP ports it has bound in LISTEN state. Mirrors cmux's sidebar
 //! "listening ports" pill on Linux by parsing `/proc/<pid>/net/tcp[6]`
@@ -51,6 +52,13 @@ pub fn descendants(root: u32) -> Result<HashSet<u32>, ProcError> {
         }
     }
     Ok(out)
+}
+
+/// Read the comm (executable basename) of a process, trimmed.
+pub fn comm_of(pid: u32) -> Option<String> {
+    std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .ok()
+        .map(|s| s.trim().to_string())
 }
 
 fn read_ppid(pid: u32) -> Option<u32> {

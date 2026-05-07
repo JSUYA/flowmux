@@ -5,6 +5,7 @@
 //! tokio runtime, and wires GTK-affecting verbs to the GTK main loop
 //! through an [`async_channel`] bridge.
 
+mod agent_watch;
 mod bridge;
 mod ipc_handler;
 mod keybindings;
@@ -105,6 +106,8 @@ fn main() -> anyhow::Result<()> {
             controller.focused_pane.clone(),
             controller.pane_registry(),
         );
+        // Watch shell descendants so we know when an agent finishes.
+        agent_watch::install(controller.pane_registry(), bridge_for_activate.clone());
         spawn_dispatch_loop(rx_for_activate.clone(), controller.clone());
         let controller_for_init = controller.clone();
         gtk::glib::MainContext::default().spawn_local(async move {

@@ -349,6 +349,38 @@ impl WindowController {
                 });
                 self.sidebar.bump_notification_badge();
             }
+            GtkCommand::AgentCompleted { pane, name } => {
+                let title = format!("{name} finished");
+                let body = format!("agent '{name}' just exited");
+                // Add to in-process bell log.
+                self.notification_log.borrow_mut().push(NotificationEntry {
+                    title: title.clone(),
+                    body: body.clone(),
+                    level: flowmux_core::NotificationLevel::AttentionNeeded,
+                    created_at: chrono::Utc::now(),
+                    seen: false,
+                });
+                self.sidebar.bump_notification_badge();
+                // Tint the workspace's sidebar row until the user clicks it.
+                if let Some(ws_id) = self.store.workspace_for_pane(pane).await {
+                    self.sidebar.mark_attention(ws_id);
+                }
+                // Fire the FDO desktop notification too.
+                glib::MainContext::default().spawn_local(async move {
+                    let n = flowmux_core::Notification {
+                        id: flowmux_core::NotificationId::new(),
+                        title,
+                        body,
+                        level: flowmux_core::NotificationLevel::AttentionNeeded,
+                        source_pane: Some(pane),
+                        created_at: chrono::Utc::now(),
+                        read: false,
+                    };
+                    if let Ok(notifier) = flowmux_notify::DesktopNotifier::connect().await {
+                        let _ = notifier.send(&n).await;
+                    }
+                });
+            }
             GtkCommand::FocusWorkspaceAt { idx } => {
                 let snap = self.store.snapshot().await;
                 let target_idx = (idx as usize).saturating_sub(1);
