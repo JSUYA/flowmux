@@ -473,6 +473,23 @@ impl WindowController {
                     .borrow_mut()
                     .activate_surface(pane, surface);
                 self.refresh_window_title().await;
+                // 탭(클릭 / Shift+Tab 사이클 / IPC 등 모든 경로)으로
+                // surface가 활성화된 직후, 키보드 포커스를 새로 활성된
+                // 위젯(터미널의 vte::Terminal 또는 브라우저의 WebView)
+                // 으로 옮긴다. 이렇게 해야 사용자가 그대로 타이핑하면
+                // 새 탭의 셸/페이지로 키 입력이 들어가고, Tab 키도 셸의
+                // 자동완성으로 처리된다 (탭바로 포커스 traversal 되지
+                // 않음). 위젯이 stack에 추가된 직후라 idle_add로 한
+                // 프레임 미룬다.
+                let registry = self.pane_registry.clone();
+                glib::idle_add_local_once(move || {
+                    let r = registry.borrow();
+                    if let Some(term) = r.terminals.get(&surface) {
+                        term.widget.grab_focus();
+                    } else if let Some(browser) = r.browsers.get(&surface) {
+                        browser.web_view.grab_focus();
+                    }
+                });
             }
             GtkCommand::CloseSurface { pane, surface, ack } => {
                 match self.store.close_surface(pane, surface).await {
