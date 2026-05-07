@@ -41,12 +41,19 @@ pub const BINDINGS: &[(&str, &[&str])] = &[
     ("win.focus-down", &["<Alt>Down"]),
     ("win.close-surface", &["<Alt>w"]),
     // Tab navigation. The bare Tab key is reserved for the terminal
-    // (shell completion etc.) — never bind any Tab+modifier combo
-    // here. Shift+Tab moves to the next workspace, and Ctrl+Page_Up
-    // is the reciprocal for the previous workspace; either side can
-    // be reached directly via Alt+1..8 too.
-    ("win.next-workspace", &["<Shift>Tab", "<Shift>ISO_Left_Tab"]),
-    ("win.prev-workspace", &["<Ctrl>Page_Up"]),
+    // (shell completion etc.). Shift+Tab cycles pane-local terminal /
+    // browser tabs; Ctrl+Tab cycles the left workspace list.
+    ("win.next-surface", &["<Shift>Tab", "<Shift>ISO_Left_Tab"]),
+    ("win.prev-surface", &[]),
+    ("win.next-workspace", &["<Ctrl>Tab"]),
+    (
+        "win.prev-workspace",
+        &[
+            "<Ctrl><Shift>Tab",
+            "<Ctrl><Shift>ISO_Left_Tab",
+            "<Ctrl>ISO_Left_Tab",
+        ],
+    ),
     ("win.workspace-1", &["<Alt>1"]),
     ("win.workspace-2", &["<Alt>2"]),
     ("win.workspace-3", &["<Alt>3"]),
@@ -144,6 +151,20 @@ pub fn install_actions(
             }
         }),
     );
+    let next_surface = make_surface_nav_action(
+        "next-surface",
+        focused.clone(),
+        bridge.clone(),
+        registry.clone(),
+        SurfaceNav::Next,
+    );
+    let prev_surface = make_surface_nav_action(
+        "prev-surface",
+        focused.clone(),
+        bridge.clone(),
+        registry.clone(),
+        SurfaceNav::Prev,
+    );
 
     let next_workspace = make_ws_nav_action("next-workspace", WsNav::Next, bridge.clone());
     let prev_workspace = make_ws_nav_action("prev-workspace", WsNav::Prev, bridge.clone());
@@ -190,6 +211,8 @@ pub fn install_actions(
         focus_down,
         close_surface,
         new_surface,
+        next_surface,
+        prev_surface,
         new_workspace,
         next_workspace,
         prev_workspace,
@@ -204,6 +227,50 @@ pub fn install_actions(
         copy,
         paste,
     ]);
+}
+
+#[derive(Clone, Copy)]
+enum SurfaceNav {
+    Next,
+    Prev,
+}
+
+fn make_surface_nav_action(
+    name: &'static str,
+    focused: FocusedPane,
+    bridge: Bridge,
+    registry: TerminalRegistry,
+    dir: SurfaceNav,
+) -> gtk::gio::ActionEntry<adw::ApplicationWindow> {
+    gtk::gio::ActionEntry::builder(name)
+        .activate(move |_, _, _| {
+            let pane = match focused.get() {
+                Some(pane) => pane,
+                None => {
+                    tracing::info!(action = name, "no pane focused — ignoring");
+                    return;
+                }
+            };
+            let surface = {
+                let registry = registry.borrow();
+                match dir {
+                    SurfaceNav::Next => registry.next_surface(pane),
+                    SurfaceNav::Prev => registry.previous_surface(pane),
+                }
+            };
+            let Some(surface) = surface else {
+                tracing::info!(action = name, %pane, "no pane-local surface — ignoring");
+                return;
+            };
+            let bridge = bridge.clone();
+            glib::MainContext::default().spawn_local(async move {
+                let _ = bridge
+                    .tx
+                    .send(GtkCommand::ActivateSurface { pane, surface })
+                    .await;
+            });
+        })
+        .build()
 }
 
 fn make_ws_nav_action(
@@ -344,4 +411,35 @@ fn make_clipboard_action(
             }
         })
         .build()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn accels(action: &str) -> &'static [&'static str] {
+        BINDINGS
+            .iter()
+            .find_map(|(name, accels)| (*name == action).then_some(*accels))
+            .expect("binding should exist")
+    }
+
+    #[test]
+    fn shift_tab_cycles_pane_local_surface_not_workspace() {
+        assert_eq!(
+            accels("win.next-surface"),
+            &["<Shift>Tab", "<Shift>ISO_Left_Tab"]
+        );
+        assert!(!accels("win.next-workspace")
+            .iter()
+            .any(|accel| accel.contains("<Shift>Tab") || accel.contains("<Shift>ISO_Left_Tab")));
+    }
+
+    #[test]
+    fn ctrl_tab_cycles_workspace_list() {
+        assert_eq!(accels("win.next-workspace"), &["<Ctrl>Tab"]);
+        assert!(accels("win.prev-workspace")
+            .iter()
+            .any(|accel| accel.contains("<Ctrl><Shift>Tab")));
+    }
 }

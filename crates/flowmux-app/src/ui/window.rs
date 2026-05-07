@@ -18,7 +18,6 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::oneshot;
 use webkit6::prelude::*;
 
@@ -35,11 +34,6 @@ pub struct WindowController {
     bridge: Bridge,
     theme: Arc<ResolvedTheme>,
     notification_log: NotificationLog,
-    /// Tokio runtime handle. The FDO Notifications client (zbus +
-    /// tokio feature) and any other future-needs-tokio work has to
-    /// run on a tokio executor — we can't drive `Connection::session`
-    /// from the glib main loop alone.
-    tokio_handle: tokio::runtime::Handle,
 }
 
 impl WindowController {
@@ -48,7 +42,6 @@ impl WindowController {
         store: StateStore,
         theme: Arc<ResolvedTheme>,
         bridge: Bridge,
-        tokio_handle: tokio::runtime::Handle,
     ) -> Self {
         let focused_pane: FocusedPane = Rc::new(Cell::new(None));
         let notification_log = crate::notifications::new_log();
@@ -137,9 +130,8 @@ impl WindowController {
             bridge,
             theme,
             notification_log,
-            tokio_handle,
         };
-        controller.install_cwd_persistence();
+        controller.install_state_flush_on_close();
         controller
     }
 
@@ -206,19 +198,10 @@ impl WindowController {
         self.pane_registry.clone()
     }
 
-    fn install_cwd_persistence(&self) {
-        let controller = self.clone();
-        glib::timeout_add_local(Duration::from_secs(2), move || {
-            let controller = controller.clone();
-            glib::MainContext::default().spawn_local(async move {
-                controller.persist_terminal_cwds().await;
-            });
-            glib::ControlFlow::Continue
-        });
-
+    fn install_state_flush_on_close(&self) {
         let controller = self.clone();
         self.window.connect_close_request(move |_| {
-            controller.persist_terminal_cwds_blocking();
+            controller.flush_terminal_cwds_blocking();
             if let Err(e) = controller.store.save_now_blocking() {
                 tracing::warn!(error = %e, "state save on close failed");
             }
@@ -226,25 +209,22 @@ impl WindowController {
         });
     }
 
-    async fn persist_terminal_cwds(&self) {
-        let cwd_entries = self.pane_registry.borrow().terminal_cwds();
-        for (pane, surface, cwd) in cwd_entries {
-            if self
-                .store
-                .update_surface_cwd(pane, surface, cwd)
-                .await
-                .is_some()
-            {
-                if let Some(title) = self.store.surface_title(pane, surface).await {
-                    self.pane_registry
-                        .borrow()
-                        .set_surface_title(surface, &title);
-                }
+    async fn update_terminal_cwd(&self, pane: PaneId, surface: SurfaceId, cwd: std::path::PathBuf) {
+        if self
+            .store
+            .update_surface_cwd(pane, surface, cwd)
+            .await
+            .is_some()
+        {
+            if let Some(title) = self.store.surface_title(pane, surface).await {
+                self.pane_registry
+                    .borrow()
+                    .set_surface_title(surface, &title);
             }
         }
     }
 
-    fn persist_terminal_cwds_blocking(&self) {
+    fn flush_terminal_cwds_blocking(&self) {
         let cwd_entries = self.pane_registry.borrow().terminal_cwds();
         for (pane, surface, cwd) in cwd_entries {
             let _ = self.store.update_surface_cwd_blocking(pane, surface, cwd);
@@ -449,6 +429,9 @@ impl WindowController {
                     );
                 }
             }
+            GtkCommand::TerminalCwdChanged { pane, surface, cwd } => {
+                self.update_terminal_cwd(pane, surface, cwd).await;
+            }
             GtkCommand::NewWorkspace { root } => {
                 // Prefer the focused pane's cwd so a new tab opens
                 // where the user was working, falling back to the
@@ -520,7 +503,12 @@ impl WindowController {
                 let target = snap.workspace_order[next];
                 self.activate_workspace(target).await;
             }
-            GtkCommand::AddNotification { title, body, level } => {
+            GtkCommand::AddNotification {
+                pane,
+                title,
+                body,
+                level,
+            } => {
                 self.notification_log.borrow_mut().push(NotificationEntry {
                     title,
                     body,
@@ -529,46 +517,13 @@ impl WindowController {
                     seen: false,
                 });
                 self.sidebar.bump_notification_badge();
-            }
-            GtkCommand::AgentCompleted { pane, name } => {
-                let title = format!("{name} finished");
-                let body = format!("agent '{name}' just exited");
-                // Add to in-process bell log.
-                self.notification_log.borrow_mut().push(NotificationEntry {
-                    title: title.clone(),
-                    body: body.clone(),
-                    level: flowmux_core::NotificationLevel::AttentionNeeded,
-                    created_at: chrono::Utc::now(),
-                    seen: false,
-                });
-                self.sidebar.bump_notification_badge();
-                // Tint the workspace's sidebar row until the user clicks it.
-                if let Some(ws_id) = self.store.workspace_for_pane(pane).await {
-                    self.sidebar.mark_attention(ws_id);
-                }
-                // Fire the FDO desktop notification through the tokio
-                // runtime — DesktopNotifier wraps zbus which needs a
-                // tokio executor; calling .await on it from glib's
-                // main loop alone silently no-ops.
-                self.tokio_handle.spawn(async move {
-                    let n = flowmux_core::Notification {
-                        id: flowmux_core::NotificationId::new(),
-                        title,
-                        body,
-                        level: flowmux_core::NotificationLevel::AttentionNeeded,
-                        source_pane: Some(pane),
-                        created_at: chrono::Utc::now(),
-                        read: false,
-                    };
-                    match flowmux_notify::DesktopNotifier::connect().await {
-                        Ok(notifier) => {
-                            if let Err(e) = notifier.send(&n).await {
-                                tracing::warn!(error = %e, "desktop notify send failed");
-                            }
+                if matches!(level, flowmux_core::NotificationLevel::AttentionNeeded) {
+                    if let Some(pane) = pane {
+                        if let Some(ws_id) = self.store.workspace_for_pane(pane).await {
+                            self.sidebar.mark_attention(ws_id);
                         }
-                        Err(e) => tracing::warn!(error = %e, "desktop notifier connect failed"),
                     }
-                });
+                }
             }
             GtkCommand::FocusWorkspaceAt { idx } => {
                 let snap = self.store.snapshot().await;
@@ -940,6 +895,18 @@ fn make_callbacks(focused: FocusedPane, bridge: Bridge) -> PaneCallbacks {
                 });
             }))
         },
+        on_terminal_cwd_changed: {
+            let bridge = bridge.clone();
+            Rc::new(RefCell::new(move |pane, surface, cwd| {
+                let bridge = bridge.clone();
+                glib::MainContext::default().spawn_local(async move {
+                    let _ = bridge
+                        .tx
+                        .send(GtkCommand::TerminalCwdChanged { pane, surface, cwd })
+                        .await;
+                });
+            }))
+        },
     }
 }
 
@@ -1227,4 +1194,138 @@ pub fn spawn_dispatch_loop(rx: async_channel::Receiver<GtkCommand>, controller: 
             controller.dispatch(cmd).await;
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flowmux_core::PaneContent;
+    use flowmux_state::State;
+
+    #[gtk::test]
+    async fn terminal_cwd_event_updates_rendered_tab_label_and_respects_manual_rename() {
+        adw::init().expect("libadwaita should initialize in GTK test");
+        let root = std::env::temp_dir().join("flowmux-ui-cwd-one");
+        let next = std::env::temp_dir().join("flowmux-ui-cwd-two");
+        let fixed_next = std::env::temp_dir().join("flowmux-ui-cwd-three");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&next).unwrap();
+        std::fs::create_dir_all(&fixed_next).unwrap();
+
+        let store = StateStore::new_lazy(State::default());
+        let ws_id = store
+            .create_workspace(Some("ui".into()), root.clone())
+            .await;
+        let ws = store.get_workspace(ws_id).await.unwrap();
+        let pane = ws.surfaces[0].root_pane.first_leaf_id().unwrap();
+        let surface = ws.surfaces[0].root_pane.active_surface_id(pane).unwrap();
+        let (bridge, _rx) = Bridge::new();
+        let app = adw::Application::builder()
+            .application_id("com.flowmux.App.UiTest")
+            .build();
+        app.register(None::<&gtk::gio::Cancellable>).unwrap();
+        let controller =
+            WindowController::new(&app, store.clone(), Arc::new(ResolvedTheme::load()), bridge);
+
+        controller.render_workspace(&ws);
+        assert_eq!(
+            controller
+                .pane_registry
+                .borrow()
+                .surface_title_text(surface)
+                .as_deref(),
+            Some("flowmux-ui-cwd-on...")
+        );
+
+        controller
+            .dispatch(GtkCommand::TerminalCwdChanged {
+                pane,
+                surface,
+                cwd: next.clone(),
+            })
+            .await;
+
+        assert_eq!(
+            store.surface_title(pane, surface).await.as_deref(),
+            Some("flowmux-ui-cwd-tw...")
+        );
+        assert_eq!(
+            controller
+                .pane_registry
+                .borrow()
+                .surface_title_text(surface)
+                .as_deref(),
+            Some("flowmux-ui-cwd-tw...")
+        );
+
+        assert_eq!(
+            store.rename_surface(pane, surface, "fixed".into()).await,
+            Some(ws_id)
+        );
+        controller
+            .pane_registry
+            .borrow()
+            .set_surface_title(surface, "fixed");
+
+        controller
+            .dispatch(GtkCommand::TerminalCwdChanged {
+                pane,
+                surface,
+                cwd: fixed_next.clone(),
+            })
+            .await;
+
+        assert_eq!(
+            store.surface_title(pane, surface).await.as_deref(),
+            Some("fixed")
+        );
+        assert_eq!(
+            controller
+                .pane_registry
+                .borrow()
+                .surface_title_text(surface)
+                .as_deref(),
+            Some("fixed")
+        );
+
+        let refreshed = store.get_workspace(ws_id).await.unwrap();
+        let PaneContent::Tabs { surfaces, .. } = (match &refreshed.surfaces[0].root_pane {
+            flowmux_core::Pane::Leaf { content, .. } => content,
+            flowmux_core::Pane::Split { .. } => panic!("expected single leaf"),
+        }) else {
+            panic!("expected tabs")
+        };
+        assert!(matches!(
+            &surfaces[0].kind,
+            flowmux_core::SurfaceKind::Terminal { cwd: Some(cwd), .. } if cwd == &fixed_next
+        ));
+        assert!(surfaces[0].title_locked);
+    }
+
+    #[test]
+    fn app_source_does_not_reintroduce_glib_polling_timers() {
+        fn visit(path: &std::path::Path, files: &mut Vec<std::path::PathBuf>) {
+            if path.is_dir() {
+                for entry in std::fs::read_dir(path).unwrap() {
+                    visit(&entry.unwrap().path(), files);
+                }
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                files.push(path.to_path_buf());
+            }
+        }
+
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let needle_one = ["timeout", "_add_local"].concat();
+        let needle_two = ["glib", "::", "timeout"].concat();
+        let mut files = Vec::new();
+        visit(&src, &mut files);
+        for file in files {
+            let text = std::fs::read_to_string(&file).unwrap();
+            assert!(
+                !text.contains(&needle_one) && !text.contains(&needle_two),
+                "polling timer found in {}",
+                file.display()
+            );
+        }
+    }
 }

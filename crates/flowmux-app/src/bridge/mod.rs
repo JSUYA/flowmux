@@ -124,6 +124,12 @@ pub enum GtkCommand {
     },
     /// Open the rename dialog for a pane-local surface tab.
     ShowRenameSurfaceDialog { pane: PaneId, surface: SurfaceId },
+    /// VTE reported a cwd change for a terminal surface.
+    TerminalCwdChanged {
+        pane: PaneId,
+        surface: SurfaceId,
+        cwd: PathBuf,
+    },
     /// Create a brand-new workspace and add it to the sidebar.
     NewWorkspace { root: std::path::PathBuf },
     /// Remove a workspace entirely (sidebar row + stack page + state).
@@ -154,13 +160,11 @@ pub enum GtkCommand {
     /// sidebar's bell popover. flowmux-notify still delivers the real
     /// desktop notification through D-Bus; this is the GUI tee.
     AddNotification {
+        pane: Option<PaneId>,
         title: String,
         body: String,
         level: NotificationLevel,
     },
-    /// An AI agent (claude / codex / opencode) just exited inside
-    /// `pane`. agent_watch::install fires this once per disappearance.
-    AgentCompleted { pane: PaneId, name: String },
     /// Cycle to the previous / next workspace in sidebar order.
     FocusWorkspaceDir { dir: WsNav },
     /// Jump straight to the N-th workspace (1-indexed; clamped to

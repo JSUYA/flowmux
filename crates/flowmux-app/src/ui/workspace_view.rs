@@ -18,6 +18,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use vte::prelude::*;
 
 #[derive(Default)]
 pub struct PaneRegistry {
@@ -61,6 +62,28 @@ impl PaneRegistry {
             .copied()
     }
 
+    pub fn next_surface(&self, pane: PaneId) -> Option<SurfaceId> {
+        self.adjacent_surface(pane, 1)
+    }
+
+    pub fn previous_surface(&self, pane: PaneId) -> Option<SurfaceId> {
+        self.adjacent_surface(pane, -1)
+    }
+
+    fn adjacent_surface(&self, pane: PaneId, offset: isize) -> Option<SurfaceId> {
+        let tabs = self.surface_tabs.get(&pane)?;
+        if tabs.len() < 2 {
+            return None;
+        }
+        let active = self.active_surface(pane);
+        let active_idx = active
+            .and_then(|active| tabs.iter().position(|(id, _)| *id == active))
+            .unwrap_or(0);
+        let len = tabs.len() as isize;
+        let next_idx = (active_idx as isize + offset).rem_euclid(len) as usize;
+        Some(tabs[next_idx].0)
+    }
+
     pub fn terminal_cwds(&self) -> Vec<(PaneId, SurfaceId, std::path::PathBuf)> {
         self.terminals
             .iter()
@@ -77,6 +100,13 @@ impl PaneRegistry {
             label.set_text(title);
             label.set_tooltip_text(Some(title));
         }
+    }
+
+    #[cfg(test)]
+    pub fn surface_title_text(&self, surface: SurfaceId) -> Option<String> {
+        self.surface_tab_labels
+            .get(&surface)
+            .map(|label| label.text().to_string())
     }
 
     pub fn clear_workspace(&mut self, workspace: WorkspaceId) {
@@ -438,6 +468,17 @@ fn build_panel(
             let argv = shell.clone().map(|s| vec![s]).unwrap_or(argv);
             let pane = TerminalPane::spawn(pane_id, argv, cwd.clone(), callbacks.clone());
             theme.apply_to_vte(&pane.widget);
+
+            {
+                let cb = callbacks.on_terminal_cwd_changed.clone();
+                let pane_for_cwd = pane.clone();
+                let surface_id = surface.id;
+                pane.widget.connect_current_directory_uri_notify(move |_| {
+                    if let Some(cwd) = pane_for_cwd.current_dir() {
+                        (cb.borrow_mut())(pane_id, surface_id, cwd);
+                    }
+                });
+            }
 
             let frame_in = frame.clone();
             let frame_out = frame.clone();

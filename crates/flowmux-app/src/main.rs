@@ -5,7 +5,6 @@
 //! tokio runtime, and wires GTK-affecting verbs to the GTK main loop
 //! through an [`async_channel`] bridge.
 
-mod agent_watch;
 mod bridge;
 mod ipc_handler;
 mod keybindings;
@@ -70,7 +69,6 @@ fn main() -> anyhow::Result<()> {
     let store_for_activate = store.clone();
     let rx_for_activate = rx.clone();
     let bridge_for_activate = bridge.clone();
-    let handle_for_activate = rt.handle().clone();
     app.connect_activate(move |app| {
         // Resolve the visual theme once per activation so a config edit
         // picks up after the user re-launches.
@@ -100,7 +98,6 @@ fn main() -> anyhow::Result<()> {
             store_for_activate.clone(),
             theme,
             bridge_for_activate.clone(),
-            handle_for_activate.clone(),
         );
         keybindings::install_actions(
             &controller.window,
@@ -108,8 +105,6 @@ fn main() -> anyhow::Result<()> {
             controller.focused_pane.clone(),
             controller.pane_registry(),
         );
-        // Watch shell descendants so we know when an agent finishes.
-        agent_watch::install(controller.pane_registry(), bridge_for_activate.clone());
         spawn_dispatch_loop(rx_for_activate.clone(), controller.clone());
         let controller_for_init = controller.clone();
         gtk::glib::MainContext::default().spawn_local(async move {

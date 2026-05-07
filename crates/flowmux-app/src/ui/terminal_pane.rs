@@ -117,6 +117,8 @@ pub struct PaneCallbacks {
     pub on_close_surface: Rc<RefCell<dyn FnMut(PaneId, SurfaceId)>>,
     /// Pane-local rename tab.
     pub on_rename_surface: Rc<RefCell<dyn FnMut(PaneId, SurfaceId)>>,
+    /// VTE reported that a terminal surface changed its cwd.
+    pub on_terminal_cwd_changed: Rc<RefCell<dyn FnMut(PaneId, SurfaceId, PathBuf)>>,
 }
 
 impl TerminalPane {

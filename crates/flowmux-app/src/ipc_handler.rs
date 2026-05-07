@@ -330,6 +330,7 @@ impl Handler for GuiHandler {
                         .bridge
                         .tx
                         .send(GtkCommand::AddNotification {
+                            pane,
                             title: title.clone(),
                             body: body.clone(),
                             level,

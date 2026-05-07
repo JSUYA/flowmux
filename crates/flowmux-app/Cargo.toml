@@ -36,7 +36,6 @@ flowmux-notify = { workspace = true }
 flowmux-terminal = { workspace = true }
 flowmux-state = { workspace = true }
 flowmux-vcs = { workspace = true }
-flowmux-procmon = { workspace = true }
 flowmux-daemon = { workspace = true }
 flowmux-cookies = { workspace = true }
 flowmux-browser = { workspace = true }
