@@ -386,22 +386,40 @@ fn attach_dnd_handlers(row: &gtk::ListBoxRow, id: WorkspaceId, bridge: Bridge, r
 
     let drop_target =
         gtk::DropTarget::new(gtk::glib::types::Type::STRING, gtk::gdk::DragAction::MOVE);
+    // motion 시그널의 y로 행 위/아래 절반을 판정해 인디케이터 위치를 정한다.
+    // 드롭 로직도 같은 y 기준으로 new_index를 계산하므로, 사용자가 보는 파란
+    // 라인이 곧 드롭이 일어나는 위치다. 첫 행 위쪽 절반에 호버하면 인디케이터가
+    // 첫 행 위에 떠서 "맨 위로 이동" 시그널이 된다.
     let target_id_for_motion = id;
     let row_for_motion = row.clone();
-    drop_target.connect_motion(move |_, _, _| {
-        tracing::trace!(target = %target_id_for_motion, "sidebar drop motion");
-        row_for_motion.add_css_class("flowmux-drop-hover");
+    drop_target.connect_motion(move |_, _x, y| {
+        tracing::trace!(target = %target_id_for_motion, y, "sidebar drop motion");
+        let height = row_for_motion.height();
+        let above = if height > 0 {
+            y < (height as f64) / 2.0
+        } else {
+            true
+        };
+        if above {
+            row_for_motion.remove_css_class("flowmux-drop-below");
+            row_for_motion.add_css_class("flowmux-drop-above");
+        } else {
+            row_for_motion.remove_css_class("flowmux-drop-above");
+            row_for_motion.add_css_class("flowmux-drop-below");
+        }
         gtk::gdk::DragAction::MOVE
     });
     let row_for_leave = row.clone();
     drop_target.connect_leave(move |_| {
-        row_for_leave.remove_css_class("flowmux-drop-hover");
+        row_for_leave.remove_css_class("flowmux-drop-above");
+        row_for_leave.remove_css_class("flowmux-drop-below");
     });
     let row_for_drop = row.clone();
     let target_id = id;
     drop_target.connect_drop(move |_, value, _x, y| {
         tracing::debug!(target = %target_id, "sidebar drop fired");
-        row_for_drop.remove_css_class("flowmux-drop-hover");
+        row_for_drop.remove_css_class("flowmux-drop-above");
+        row_for_drop.remove_css_class("flowmux-drop-below");
         let Ok(payload) = value.get::<String>() else {
             tracing::warn!(value = ?value, "sidebar drop: payload was not String — DropTarget type mismatch");
             return false;

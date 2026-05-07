@@ -240,7 +240,10 @@ paned > separator {{
 .navigation-sidebar row.flowmux-dragging {{
     opacity: 0.4;
 }}
-.navigation-sidebar row.flowmux-drop-hover {{
+.navigation-sidebar row.flowmux-drop-above {{
+    box-shadow: inset 0 2px 0 rgba(96, 165, 250, 0.95);
+}}
+.navigation-sidebar row.flowmux-drop-below {{
     box-shadow: inset 0 -2px 0 rgba(96, 165, 250, 0.95);
 }}
 .flowmux-pane-tab.flowmux-pane-tab-dragging {{
