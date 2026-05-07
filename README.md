@@ -66,6 +66,26 @@ sudo apt install \
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
 
+### Recommended (optional) — full media playback in tab browser
+
+WebKitGTK delegates media decoding to GStreamer. Without these
+plugins the tab browser still loads pages, but YouTube / Twitch /
+HTML5 `<video>` may stall, miss subtitles, or fail on
+encrypted/DRM content. Install them if you plan to play video:
+
+```bash
+sudo apt install \
+    gstreamer1.0-plugins-good \
+    gstreamer1.0-plugins-bad \
+    gstreamer1.0-plugins-ugly \
+    gstreamer1.0-libav
+```
+
+The exact symptoms when missing: log lines like
+`GStreamer element fakevideosink not found` or
+`WebKit wasn't able to find a WebVTT encoder. Subtitles handling
+will be degraded unless gst-plugins-bad is installed.`
+
 Then:
 
 ```bash
