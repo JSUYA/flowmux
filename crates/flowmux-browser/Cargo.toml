@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+[package]
+name = "flowmux-browser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Browser controller trait + DOM snapshot types + JS scripts shared by flowmux-app's WebKit impl and headless test mocks."
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+dirs = { workspace = true }
+async-trait = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true, features = ["macros", "rt"] }
