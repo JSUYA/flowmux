@@ -140,45 +140,90 @@ impl ResolvedTheme {
         let bg_css = rgba_css(&self.bg);
         let pane_border_css = rgba_css(&blend_with_alpha(&self.fg, 0.10));
         let pane_focus_css = rgba_css(&blend_with_alpha(&self.fg, 0.45));
+        let tabbar_bg_css = rgba_css(&shift_lightness(
+            &self.bg,
+            if self.is_dark() { 0.025 } else { -0.025 },
+        ));
+        let tab_active_bg_css = rgba_css(&shift_lightness(
+            &self.bg,
+            if self.is_dark() { 0.055 } else { -0.055 },
+        ));
+        let control_hover_css = rgba_css(&blend_with_alpha(&self.fg, 0.09));
+        let subdued_fg_css = rgba_css(&blend_with_alpha(&self.fg, 0.72));
         let sidebar_bg = rgba_css(&shift_lightness(&self.bg, -0.04));
         format!(
             r#"
 .flowmux-pane {{
     background-color: {bg};
     border: 1px solid {border};
-    border-radius: 8px;
-    margin: 6px;
+    border-radius: 4px;
+    margin: 1px;
     padding: 0;
     transition: border-color 80ms ease;
 }}
 .flowmux-pane.focused {{
     border-color: {focus};
+    box-shadow: inset 0 0 0 1px {focus};
 }}
 .flowmux-pane vte-terminal {{
-    padding: 8px;
-    border-radius: 7px;
+    padding: 7px;
+    border-radius: 0 0 3px 3px;
 }}
 .flowmux-pane-tabbar {{
-    background-color: rgba(255,255,255,0.025);
+    min-height: 26px;
+    background-color: {tabbar};
     border-bottom: 1px solid {border};
-    padding: 2px;
+    padding: 0 2px;
 }}
-.flowmux-pane-tab-wrap {{
-    border-radius: 6px;
+.flowmux-pane-tabs {{
+    margin: 0;
 }}
 .flowmux-pane-tab {{
-    min-height: 24px;
-    padding: 2px 8px;
-    border-radius: 6px 0 0 6px;
+    margin: 2px 1px 0 0;
+    border: 1px solid transparent;
+    border-bottom: 0;
+    border-radius: 4px 4px 0 0;
 }}
 .flowmux-pane-tab.active {{
-    background-color: rgba(255,255,255,0.10);
+    background-color: {tab_active};
+    border-color: {border};
+}}
+.flowmux-pane-tab-main {{
+    min-height: 22px;
+    padding: 0 7px;
+    border-radius: 3px 0 0 0;
+    color: {subdued_fg};
+}}
+.flowmux-pane-tab.active .flowmux-pane-tab-main {{
+    color: {fg};
 }}
 .flowmux-pane-tab-close {{
-    min-height: 24px;
-    min-width: 24px;
-    padding: 2px;
-    border-radius: 0 6px 6px 0;
+    min-height: 22px;
+    min-width: 20px;
+    padding: 0 4px;
+    border-radius: 0 3px 0 0;
+    opacity: 0.66;
+}}
+.flowmux-pane-tab-close:hover,
+.flowmux-pane-tool:hover {{
+    background-color: {control_hover};
+    opacity: 1.0;
+}}
+.flowmux-pane-tools {{
+    margin: 0 2px 0 4px;
+}}
+.flowmux-pane-tool {{
+    min-height: 22px;
+    min-width: 22px;
+    margin-top: 2px;
+    padding: 0;
+    border-radius: 4px;
+    opacity: 0.72;
+}}
+paned > separator {{
+    background-color: {border};
+    min-width: 1px;
+    min-height: 1px;
 }}
 .navigation-sidebar {{
     background-color: {sidebar};
@@ -194,8 +239,13 @@ impl ResolvedTheme {
 }}
 "#,
             bg = bg_css,
+            fg = rgba_css(&self.fg),
             border = pane_border_css,
             focus = pane_focus_css,
+            tabbar = tabbar_bg_css,
+            tab_active = tab_active_bg_css,
+            control_hover = control_hover_css,
+            subdued_fg = subdued_fg_css,
             sidebar = sidebar_bg,
         )
     }

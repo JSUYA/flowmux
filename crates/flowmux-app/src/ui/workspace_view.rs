@@ -26,7 +26,7 @@ pub struct PaneRegistry {
     active_browser_by_pane: HashMap<PaneId, SurfaceId>,
     pane_frames: HashMap<PaneId, gtk::Widget>,
     surface_stacks: HashMap<PaneId, gtk::Stack>,
-    surface_buttons: HashMap<PaneId, Vec<(SurfaceId, gtk::Button)>>,
+    surface_tabs: HashMap<PaneId, Vec<(SurfaceId, gtk::Widget)>>,
     pane_workspace: HashMap<PaneId, WorkspaceId>,
     surface_workspace: HashMap<SurfaceId, WorkspaceId>,
 }
@@ -59,6 +59,18 @@ impl PaneRegistry {
             .copied()
     }
 
+    pub fn next_surface(&self, pane: PaneId) -> Option<SurfaceId> {
+        let tabs = self.surface_tabs.get(&pane)?;
+        if tabs.len() < 2 {
+            return None;
+        }
+        let active = self.active_surface(pane);
+        let idx = active
+            .and_then(|surface| tabs.iter().position(|(id, _)| *id == surface))
+            .unwrap_or(0);
+        Some(tabs[(idx + 1) % tabs.len()].0)
+    }
+
     pub fn clear_workspace(&mut self, workspace: WorkspaceId) {
         let panes: Vec<PaneId> = self
             .pane_workspace
@@ -70,7 +82,7 @@ impl PaneRegistry {
             self.active_browser_by_pane.remove(&pane);
             self.pane_frames.remove(&pane);
             self.surface_stacks.remove(&pane);
-            self.surface_buttons.remove(&pane);
+            self.surface_tabs.remove(&pane);
             self.pane_workspace.remove(&pane);
         }
 
@@ -97,12 +109,12 @@ impl PaneRegistry {
             self.active_browser_by_pane.insert(pane, surface);
             self.active_terminal_by_pane.remove(&pane);
         }
-        if let Some(buttons) = self.surface_buttons.get(&pane) {
-            for (id, button) in buttons {
+        if let Some(tabs) = self.surface_tabs.get(&pane) {
+            for (id, tab) in tabs {
                 if *id == surface {
-                    button.add_css_class("active");
+                    tab.add_css_class("active");
                 } else {
-                    button.remove_css_class("active");
+                    tab.remove_css_class("active");
                 }
             }
         }
@@ -221,42 +233,49 @@ fn build_leaf_pane(
     root.set_hexpand(true);
     root.set_vexpand(true);
 
-    let tabbar = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    let tabbar = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     tabbar.add_css_class("flowmux-pane-tabbar");
-    tabbar.set_margin_top(4);
-    tabbar.set_margin_start(6);
-    tabbar.set_margin_end(6);
+
+    let tabs = gtk::Box::new(gtk::Orientation::Horizontal, 2);
+    tabs.add_css_class("flowmux-pane-tabs");
+    tabs.set_hexpand(false);
+
+    let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    spacer.set_hexpand(true);
+
+    let tools = gtk::Box::new(gtk::Orientation::Horizontal, 1);
+    tools.add_css_class("flowmux-pane-tools");
 
     let stack = gtk::Stack::new();
     stack.set_hexpand(true);
     stack.set_vexpand(true);
     stack.set_transition_type(gtk::StackTransitionType::Crossfade);
 
-    let mut tab_buttons = Vec::new();
+    let mut tab_widgets = Vec::new();
     for surface in &surfaces {
-        let tab = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        tab.add_css_class("flowmux-pane-tab-wrap");
-        let button = surface_tab_button(surface, surface.id == active);
+        let tab = surface_tab(surface, surface.id == active);
+        let button = tab
+            .first_child()
+            .and_downcast::<gtk::Button>()
+            .expect("surface tab starts with button");
         {
             let cb = callbacks.on_activate_surface.clone();
             let pane_id = pane_id;
             let surface_id = surface.id;
             button.connect_clicked(move |_| (cb.borrow_mut())(pane_id, surface_id));
         }
-        tab.append(&button);
-        let close = gtk::Button::from_icon_name("window-close-symbolic");
-        close.add_css_class("flat");
-        close.add_css_class("flowmux-pane-tab-close");
-        close.set_tooltip_text(Some("Close tab"));
+        let close = tab
+            .last_child()
+            .and_downcast::<gtk::Button>()
+            .expect("surface tab ends with close button");
         {
             let cb = callbacks.on_close_surface.clone();
             let pane_id = pane_id;
             let surface_id = surface.id;
             close.connect_clicked(move |_| (cb.borrow_mut())(pane_id, surface_id));
         }
-        tab.append(&close);
-        tabbar.append(&tab);
-        tab_buttons.push((surface.id, button));
+        tabs.append(&tab);
+        tab_widgets.push((surface.id, tab.clone().upcast::<gtk::Widget>()));
 
         let widget = build_panel(
             pane_id,
@@ -271,17 +290,34 @@ fn build_leaf_pane(
         stack.add_named(&widget, Some(&surface.id.to_string()));
     }
 
-    let add = gtk::Button::from_icon_name("tab-new-symbolic");
-    add.add_css_class("flat");
-    add.set_tooltip_text(Some("New terminal tab"));
+    let split_right = pane_tool_button("go-next-symbolic", "Split right");
+    {
+        let cb = callbacks.on_split_right.clone();
+        let pane_id = pane_id;
+        split_right.connect_clicked(move |_| (cb.borrow_mut())(pane_id));
+    }
+    tools.append(&split_right);
+
+    let split_down = pane_tool_button("go-down-symbolic", "Split down");
+    {
+        let cb = callbacks.on_split_down.clone();
+        let pane_id = pane_id;
+        split_down.connect_clicked(move |_| (cb.borrow_mut())(pane_id));
+    }
+    tools.append(&split_down);
+
+    let add = pane_tool_button("tab-new-symbolic", "New terminal tab");
     {
         let cb = callbacks.on_new_surface.clone();
         let pane_id = pane_id;
         add.connect_clicked(move |_| (cb.borrow_mut())(pane_id));
     }
-    tabbar.append(&add);
+    tools.append(&add);
 
     stack.set_visible_child_name(&active.to_string());
+    tabbar.append(&tabs);
+    tabbar.append(&spacer);
+    tabbar.append(&tools);
     root.append(&tabbar);
     root.append(&stack);
     frame.set_child(Some(&root));
@@ -291,7 +327,7 @@ fn build_leaf_pane(
         let mut r = registry.borrow_mut();
         r.pane_frames.insert(pane_id, frame_widget);
         r.surface_stacks.insert(pane_id, stack);
-        r.surface_buttons.insert(pane_id, tab_buttons);
+        r.surface_tabs.insert(pane_id, tab_widgets);
         r.pane_workspace.insert(pane_id, workspace);
         r.activate_surface(pane_id, active);
     }
@@ -313,13 +349,16 @@ fn materialize_surfaces(
     }
 }
 
-fn surface_tab_button(surface: &PaneSurface, active: bool) -> gtk::Button {
+fn surface_tab(surface: &PaneSurface, active: bool) -> gtk::Box {
+    let tab = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    tab.add_css_class("flowmux-pane-tab");
+    if active {
+        tab.add_css_class("active");
+    }
+
     let button = gtk::Button::new();
     button.add_css_class("flat");
-    button.add_css_class("flowmux-pane-tab");
-    if active {
-        button.add_css_class("active");
-    }
+    button.add_css_class("flowmux-pane-tab-main");
     button.set_tooltip_text(Some(&surface.title));
 
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
@@ -333,6 +372,22 @@ fn surface_tab_button(surface: &PaneSurface, active: bool) -> gtk::Button {
     label.set_max_width_chars(18);
     row.append(&label);
     button.set_child(Some(&row));
+    tab.append(&button);
+
+    let close = gtk::Button::from_icon_name("window-close-symbolic");
+    close.add_css_class("flat");
+    close.add_css_class("flowmux-pane-tab-close");
+    close.set_tooltip_text(Some("Close tab"));
+    tab.append(&close);
+
+    tab
+}
+
+fn pane_tool_button(icon_name: &str, tooltip: &str) -> gtk::Button {
+    let button = gtk::Button::from_icon_name(icon_name);
+    button.add_css_class("flat");
+    button.add_css_class("flowmux-pane-tool");
+    button.set_tooltip_text(Some(tooltip));
     button
 }
 
