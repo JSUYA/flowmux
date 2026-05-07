@@ -29,6 +29,9 @@ pub struct PaneRegistry {
     pane_frames: HashMap<PaneId, gtk::Widget>,
     surface_stacks: HashMap<PaneId, gtk::Stack>,
     surface_tabs: HashMap<PaneId, Vec<(SurfaceId, gtk::Widget)>>,
+    /// Tab-bar `gtk::Box` so incremental tab additions can `append`
+    /// into the same row instead of rebuilding the whole pane.
+    pane_tab_containers: HashMap<PaneId, gtk::Box>,
     surface_tab_labels: HashMap<SurfaceId, gtk::Label>,
     pane_workspace: HashMap<PaneId, WorkspaceId>,
     surface_workspace: HashMap<SurfaceId, WorkspaceId>,
@@ -121,6 +124,7 @@ impl PaneRegistry {
             self.pane_frames.remove(&pane);
             self.surface_stacks.remove(&pane);
             self.surface_tabs.remove(&pane);
+            self.pane_tab_containers.remove(&pane);
             self.pane_workspace.remove(&pane);
         }
 
@@ -292,41 +296,7 @@ fn build_leaf_pane(
 
     let mut tab_widgets = Vec::new();
     for surface in &surfaces {
-        let (tab, label) = surface_tab(surface, surface.id == active);
-        let button = tab
-            .first_child()
-            .and_downcast::<gtk::Button>()
-            .expect("surface tab starts with button");
-        {
-            let activate_cb = callbacks.on_activate_surface.clone();
-            let rename_cb = callbacks.on_rename_surface.clone();
-            let last_click = Rc::new(Cell::new(None::<Instant>));
-            let pane_id = pane_id;
-            let surface_id = surface.id;
-            button.connect_clicked(move |_| {
-                let now = Instant::now();
-                let double_clicked = last_click
-                    .get()
-                    .is_some_and(|last| now.duration_since(last) <= Duration::from_millis(500));
-                if double_clicked {
-                    last_click.set(None);
-                    (rename_cb.borrow_mut())(pane_id, surface_id);
-                } else {
-                    last_click.set(Some(now));
-                    (activate_cb.borrow_mut())(pane_id, surface_id);
-                }
-            });
-        }
-        let close = tab
-            .last_child()
-            .and_downcast::<gtk::Button>()
-            .expect("surface tab ends with close button");
-        {
-            let cb = callbacks.on_close_surface.clone();
-            let pane_id = pane_id;
-            let surface_id = surface.id;
-            close.connect_clicked(move |_| (cb.borrow_mut())(pane_id, surface_id));
-        }
+        let (tab, label) = build_surface_tab_widget(pane_id, surface, surface.id == active, callbacks);
         tabs.append(&tab);
         tab_widgets.push((surface.id, tab.clone().upcast::<gtk::Widget>()));
         registry
@@ -393,6 +363,7 @@ fn build_leaf_pane(
         r.pane_frames.insert(pane_id, frame_widget);
         r.surface_stacks.insert(pane_id, stack);
         r.surface_tabs.insert(pane_id, tab_widgets);
+        r.pane_tab_containers.insert(pane_id, tabs);
         r.pane_workspace.insert(pane_id, workspace);
         r.activate_surface(pane_id, active);
     }
@@ -416,6 +387,114 @@ fn materialize_surfaces(
             fallback_cwd,
         )],
     }
+}
+
+/// Build a single surface tab + wire its click / double-click (rename)
+/// / close handlers. Shared between the initial pane render and the
+/// incremental [`attach_surface_to_pane`] path so a click on either
+/// behaves identically.
+fn build_surface_tab_widget(
+    pane_id: PaneId,
+    surface: &PaneSurface,
+    active: bool,
+    callbacks: &PaneCallbacks,
+) -> (gtk::Box, gtk::Label) {
+    let (tab, label) = surface_tab(surface, active);
+    let button = tab
+        .first_child()
+        .and_downcast::<gtk::Button>()
+        .expect("surface tab starts with button");
+    {
+        let activate_cb = callbacks.on_activate_surface.clone();
+        let rename_cb = callbacks.on_rename_surface.clone();
+        let last_click = Rc::new(Cell::new(None::<Instant>));
+        let surface_id = surface.id;
+        button.connect_clicked(move |_| {
+            let now = Instant::now();
+            let double_clicked = last_click
+                .get()
+                .is_some_and(|last| now.duration_since(last) <= Duration::from_millis(500));
+            if double_clicked {
+                last_click.set(None);
+                (rename_cb.borrow_mut())(pane_id, surface_id);
+            } else {
+                last_click.set(Some(now));
+                (activate_cb.borrow_mut())(pane_id, surface_id);
+            }
+        });
+    }
+    let close = tab
+        .last_child()
+        .and_downcast::<gtk::Button>()
+        .expect("surface tab ends with close button");
+    {
+        let cb = callbacks.on_close_surface.clone();
+        let surface_id = surface.id;
+        close.connect_clicked(move |_| (cb.borrow_mut())(pane_id, surface_id));
+    }
+    (tab, label)
+}
+
+/// Attach a single new surface to an already-rendered pane: appends a
+/// tab to its tab bar, mounts the panel widget into the pane's stack,
+/// records it in `registry`, and activates it. Returns `false` if the
+/// pane has not been rendered yet (e.g. workspace not visible) — the
+/// caller can fall back to a full re-render.
+///
+/// 이 경로는 기존 탭/탭브라우저의 GTK 위젯을 손대지 않으므로 다른
+/// pane에 띄워둔 탭브라우저의 navigate 상태와 터미널 셸 세션이
+/// 사라지지 않는다는 점이 핵심이다.
+pub fn attach_surface_to_pane(
+    pane_id: PaneId,
+    workspace: WorkspaceId,
+    surface: &PaneSurface,
+    callbacks: &PaneCallbacks,
+    registry: Rc<RefCell<PaneRegistry>>,
+    theme: Arc<ResolvedTheme>,
+) -> bool {
+    let (tabs, stack, frame) = {
+        let r = registry.borrow();
+        let Some(tabs) = r.pane_tab_containers.get(&pane_id).cloned() else {
+            return false;
+        };
+        let Some(stack) = r.surface_stacks.get(&pane_id).cloned() else {
+            return false;
+        };
+        let Some(frame) = r
+            .pane_frames
+            .get(&pane_id)
+            .and_then(|w| w.downcast_ref::<gtk::Frame>().cloned())
+        else {
+            return false;
+        };
+        (tabs, stack, frame)
+    };
+
+    let (tab, label) = build_surface_tab_widget(pane_id, surface, true, callbacks);
+    tabs.append(&tab);
+
+    let widget = build_panel(
+        pane_id,
+        workspace,
+        surface,
+        Vec::new(),
+        callbacks,
+        registry.clone(),
+        theme,
+        frame,
+    );
+    stack.add_named(&widget, Some(&surface.id.to_string()));
+
+    {
+        let mut r = registry.borrow_mut();
+        r.surface_tab_labels.insert(surface.id, label);
+        r.surface_tabs
+            .entry(pane_id)
+            .or_default()
+            .push((surface.id, tab.upcast::<gtk::Widget>()));
+        r.activate_surface(pane_id, surface.id);
+    }
+    true
 }
 
 fn surface_tab(surface: &PaneSurface, active: bool) -> (gtk::Box, gtk::Label) {
@@ -498,7 +577,12 @@ fn build_panel(
             widget
         }
         SurfaceKind::Browser { initial_url } => {
-            let pane = BrowserPane::new(pane_id, initial_url.as_deref());
+            let pane = BrowserPane::new(
+                pane_id,
+                surface.id,
+                initial_url.as_deref(),
+                callbacks.clone(),
+            );
             let widget = pane.root.clone().upcast::<gtk::Widget>();
             let mut r = registry.borrow_mut();
             r.browsers.insert(surface.id, pane);

@@ -121,6 +121,10 @@ pub struct PaneCallbacks {
     pub on_rename_surface: Rc<RefCell<dyn FnMut(PaneId, SurfaceId)>>,
     /// VTE reported that a terminal surface changed its cwd.
     pub on_terminal_cwd_changed: Rc<RefCell<dyn FnMut(PaneId, SurfaceId, PathBuf)>>,
+    /// WebKit reported that a browser pane navigated to a new URL.
+    pub on_browser_uri_changed: Rc<RefCell<dyn FnMut(PaneId, SurfaceId, String)>>,
+    /// WebKit reported that a browser pane's page title changed.
+    pub on_browser_title_changed: Rc<RefCell<dyn FnMut(PaneId, SurfaceId, String)>>,
 }
 
 impl TerminalPane {

@@ -9,7 +9,8 @@
 //!   already exposed by webkit6, so the Task 15 work mostly involves
 //!   wrapping it in a stable IPC verb shape, not new widgets.
 
-use flowmux_core::PaneId;
+use crate::ui::terminal_pane::PaneCallbacks;
+use flowmux_core::{PaneId, SurfaceId};
 use gtk::prelude::*;
 use webkit6::prelude::*;
 
@@ -22,7 +23,20 @@ pub struct BrowserPane {
 }
 
 impl BrowserPane {
-    pub fn new(id: PaneId, initial_url: Option<&str>) -> Self {
+    pub fn new(
+        id: PaneId,
+        surface_id: SurfaceId,
+        initial_url: Option<&str>,
+        callbacks: PaneCallbacks,
+    ) -> Self {
+        // Idempotent webkit sandbox bypass — main.rs entry에서도 같은
+        // env를 설정하지만, 단위 테스트(bin이 아닌 lib 경로)에서는
+        // main.rs를 거치지 않으므로 BrowserPane을 만드는 시점에 한
+        // 번 더 설정해 두 경로 모두에서 일관되게 동작하게 한다.
+        // 자세한 배경은 main.rs의 동일 set_var 주석 참조.
+        if std::env::var_os("WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS").is_none() {
+            std::env::set_var("WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS", "1");
+        }
         let web_view = webkit6::WebView::new();
         web_view.set_hexpand(true);
         web_view.set_vexpand(true);
@@ -81,12 +95,30 @@ impl BrowserPane {
             });
         }
 
-        // Reflect navigation in the address bar.
+        // Reflect navigation in the address bar AND mirror the new URL
+        // back to the daemon — 앱이 종료되어도 다음 실행 때 마지막
+        // 페이지로 복원되도록 state에 반영한다.
         {
             let a = address.clone();
+            let uri_cb = callbacks.on_browser_uri_changed.clone();
             web_view.connect_uri_notify(move |w| {
                 if let Some(uri) = w.uri() {
-                    a.set_text(uri.as_str());
+                    let uri_str = uri.to_string();
+                    a.set_text(&uri_str);
+                    (uri_cb.borrow_mut())(id, surface_id, uri_str);
+                }
+            });
+        }
+
+        // 브라우저 페이지 title이 바뀌면 surface 탭 이름도 함께 갱신.
+        // 사용자가 직접 rename 한 경우(title_locked)는 daemon 쪽에서
+        // 무시하므로 여기서는 항상 통보만 한다.
+        {
+            let title_cb = callbacks.on_browser_title_changed.clone();
+            web_view.connect_title_notify(move |w| {
+                let title = w.title().map(|t| t.to_string()).unwrap_or_default();
+                if !title.trim().is_empty() {
+                    (title_cb.borrow_mut())(id, surface_id, title);
                 }
             });
         }

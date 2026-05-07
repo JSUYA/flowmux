@@ -132,6 +132,23 @@ pub enum GtkCommand {
         surface: SurfaceId,
         cwd: PathBuf,
     },
+    /// WebKit reported that a browser pane navigated to a new URL.
+    /// 다음 실행 시 같은 페이지로 복원되도록 state에 반영한다.
+    BrowserUriChanged {
+        pane: PaneId,
+        surface: SurfaceId,
+        url: String,
+    },
+    /// WebKit reported a page title change. surface의 title_locked가
+    /// false인 경우에 한해 탭 라벨과 윈도우 제목을 갱신한다.
+    BrowserTitleChanged {
+        pane: PaneId,
+        surface: SurfaceId,
+        title: String,
+    },
+    /// 윈도우 타이틀을 "flowmux - {focused tab name}"으로 다시 계산.
+    /// 포커스 변경 / 탭 활성화 / 탭 라벨 변경 직후에 보낸다.
+    RefreshWindowTitle,
     /// Create a brand-new workspace and add it to the sidebar.
     NewWorkspace { root: std::path::PathBuf },
     /// Remove a workspace entirely (sidebar row + stack page + state).

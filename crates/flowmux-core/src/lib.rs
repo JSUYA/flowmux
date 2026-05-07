@@ -407,6 +407,78 @@ impl Pane {
         }
     }
 
+    /// Update a browser surface's stored URL — webview navigate 시
+    /// 호출되어 다음 실행 때 같은 페이지로 복원되도록 한다. 매칭되는
+    /// surface가 browser kind일 때만 적용. URL이 그대로면 false 반환
+    /// (호출자는 dirty mark을 생략 가능).
+    pub fn set_surface_browser_url(
+        &mut self,
+        target: PaneId,
+        surface_id: SurfaceId,
+        new_url: String,
+    ) -> bool {
+        match self {
+            Pane::Leaf { id, content } if *id == target => match content {
+                PaneContent::Tabs { surfaces, .. } => {
+                    if let Some(surface) =
+                        surfaces.iter_mut().find(|surface| surface.id == surface_id)
+                    {
+                        if let SurfaceKind::Browser { initial_url } = &mut surface.kind {
+                            if initial_url.as_deref() == Some(new_url.as_str()) {
+                                return false;
+                            }
+                            *initial_url = Some(new_url);
+                            return true;
+                        }
+                    }
+                    false
+                }
+                PaneContent::Terminal { .. } | PaneContent::Browser { .. } => false,
+            },
+            Pane::Leaf { .. } => false,
+            Pane::Split { first, second, .. } => {
+                first.set_surface_browser_url(target, surface_id, new_url.clone())
+                    || second.set_surface_browser_url(target, surface_id, new_url)
+            }
+        }
+    }
+
+    /// Auto-rename a surface from an external signal (browser page title,
+    /// terminal OSC, …) — title_locked = true 인 surface는 사용자가 직접
+    /// rename한 것이므로 건너뛴다. 빈 문자열이거나 동일 타이틀이면 false.
+    pub fn set_surface_title_auto(
+        &mut self,
+        target: PaneId,
+        surface_id: SurfaceId,
+        new_title: String,
+    ) -> bool {
+        if new_title.trim().is_empty() {
+            return false;
+        }
+        match self {
+            Pane::Leaf { id, content } if *id == target => match content {
+                PaneContent::Tabs { surfaces, .. } => {
+                    if let Some(surface) =
+                        surfaces.iter_mut().find(|surface| surface.id == surface_id)
+                    {
+                        if surface.title_locked || surface.title == new_title {
+                            return false;
+                        }
+                        surface.title = new_title;
+                        return true;
+                    }
+                    false
+                }
+                PaneContent::Terminal { .. } | PaneContent::Browser { .. } => false,
+            },
+            Pane::Leaf { .. } => false,
+            Pane::Split { first, second, .. } => {
+                first.set_surface_title_auto(target, surface_id, new_title.clone())
+                    || second.set_surface_title_auto(target, surface_id, new_title)
+            }
+        }
+    }
+
     pub fn set_surface_cwd(
         &mut self,
         target: PaneId,
@@ -506,6 +578,24 @@ impl Pane {
             Pane::Split { first, second, .. } => first
                 .surface_count(target)
                 .or_else(|| second.surface_count(target)),
+        }
+    }
+
+    /// Look up `(target_pane, target_surface)` and return a clone of the
+    /// matching `PaneSurface`. Returns `None` if the pane or surface is
+    /// not found.
+    pub fn find_surface(&self, target_pane: PaneId, target: SurfaceId) -> Option<PaneSurface> {
+        match self {
+            Pane::Leaf { id, content } if *id == target_pane => match content {
+                PaneContent::Tabs { surfaces, .. } => {
+                    surfaces.iter().find(|s| s.id == target).cloned()
+                }
+                PaneContent::Terminal { .. } | PaneContent::Browser { .. } => None,
+            },
+            Pane::Leaf { .. } => None,
+            Pane::Split { first, second, .. } => first
+                .find_surface(target_pane, target)
+                .or_else(|| second.find_surface(target_pane, target)),
         }
     }
 
@@ -1018,6 +1108,117 @@ mod tests {
             &surfaces[0].kind,
             SurfaceKind::Terminal { cwd: Some(cwd), .. } if cwd == &PathBuf::from("/tmp/another")
         ));
+    }
+
+    #[test]
+    fn set_surface_browser_url_replaces_initial_url_only_for_browser_kind() {
+        let pane_id = PaneId::new();
+        let mut pane = Pane::Leaf {
+            id: pane_id,
+            content: PaneContent::tabbed_browser("Docs", "https://one.test".into()),
+        };
+        let browser_id = pane.active_surface_id(pane_id).unwrap();
+        assert!(pane.set_surface_browser_url(pane_id, browser_id, "https://two.test".into()));
+        assert!(matches!(
+            pane.find_surface(pane_id, browser_id).unwrap().kind,
+            SurfaceKind::Browser { initial_url: Some(ref u) } if u == "https://two.test"
+        ));
+        // 같은 URL을 다시 set하면 false (no-op).
+        assert!(!pane.set_surface_browser_url(pane_id, browser_id, "https://two.test".into()));
+
+        // Terminal surface는 영향을 받지 않아야 한다.
+        let term = PaneSurface::terminal("term", None);
+        let term_id = term.id;
+        pane.add_surface_to_leaf(pane_id, term).unwrap();
+        assert!(!pane.set_surface_browser_url(pane_id, term_id, "https://x.test".into()));
+    }
+
+    #[test]
+    fn set_surface_title_auto_skips_locked_titles() {
+        let pane_id = PaneId::new();
+        let mut pane = Pane::Leaf {
+            id: pane_id,
+            content: PaneContent::tabbed_browser("Browser", "https://one.test".into()),
+        };
+        let surface_id = pane.active_surface_id(pane_id).unwrap();
+
+        // 잠겨 있지 않은 surface는 자동 갱신.
+        assert!(pane.set_surface_title_auto(pane_id, surface_id, "Page Title".into()));
+        assert_eq!(pane.surface_title(pane_id, surface_id), Some("Page Title"));
+
+        // 동일 title은 no-op.
+        assert!(!pane.set_surface_title_auto(pane_id, surface_id, "Page Title".into()));
+
+        // 빈 / whitespace title은 no-op.
+        assert!(!pane.set_surface_title_auto(pane_id, surface_id, "".into()));
+        assert!(!pane.set_surface_title_auto(pane_id, surface_id, "   ".into()));
+
+        // 사용자가 직접 rename → title_locked = true.
+        assert!(pane.rename_surface(pane_id, surface_id, "MyName".into()));
+        assert!(!pane.set_surface_title_auto(pane_id, surface_id, "Other Page".into()));
+        assert_eq!(pane.surface_title(pane_id, surface_id), Some("MyName"));
+    }
+
+    #[test]
+    fn find_surface_returns_clone_of_matching_surface() {
+        let pane_id = PaneId::new();
+        let mut pane = Pane::Leaf {
+            id: pane_id,
+            content: PaneContent::tabbed_terminal("one", None),
+        };
+        let added = PaneSurface::browser("Docs", "https://docs.example.org".into());
+        let added_id = added.id;
+        assert_eq!(
+            pane.add_surface_to_leaf(pane_id, added.clone()),
+            Some(added_id)
+        );
+
+        let found = pane.find_surface(pane_id, added_id).expect("must find");
+        assert_eq!(found.id, added_id);
+        assert_eq!(found.title, "Docs");
+        assert!(matches!(
+            found.kind,
+            SurfaceKind::Browser { initial_url: Some(ref u) } if u == "https://docs.example.org"
+        ));
+    }
+
+    #[test]
+    fn find_surface_returns_none_for_unknown_pane_or_surface() {
+        let pane_id = PaneId::new();
+        let pane = Pane::Leaf {
+            id: pane_id,
+            content: PaneContent::tabbed_terminal("one", None),
+        };
+        assert!(pane.find_surface(PaneId::new(), SurfaceId::new()).is_none());
+        assert!(pane.find_surface(pane_id, SurfaceId::new()).is_none());
+    }
+
+    #[test]
+    fn find_surface_walks_into_split_branches() {
+        let left_id = PaneId::new();
+        let right_id = PaneId::new();
+        let mut tree = Pane::Split {
+            id: PaneId::new(),
+            direction: SplitDirection::Vertical,
+            ratio: 0.5,
+            first: Box::new(Pane::Leaf {
+                id: left_id,
+                content: PaneContent::tabbed_terminal("L", None),
+            }),
+            second: Box::new(Pane::Leaf {
+                id: right_id,
+                content: PaneContent::tabbed_terminal("R", None),
+            }),
+        };
+        let added = PaneSurface::browser("RBrowser", "https://r.test".into());
+        let added_id = added.id;
+        assert_eq!(tree.add_surface_to_leaf(right_id, added), Some(added_id));
+
+        // 잘못된 (pane, surface) 매칭은 None — surface는 right pane에만 존재.
+        assert!(tree.find_surface(left_id, added_id).is_none());
+        let found = tree.find_surface(right_id, added_id).unwrap();
+        assert_eq!(found.id, added_id);
+        assert_eq!(found.title, "RBrowser");
     }
 
     #[test]

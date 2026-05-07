@@ -378,6 +378,70 @@ impl StateStore {
         updated
     }
 
+    /// 브라우저 surface의 마지막 URL을 state에 반영한다. webview의
+    /// uri_notify 신호에 응답해 호출되며, 앱 종료/재실행 시 마지막에
+    /// 보고 있던 페이지로 복원되도록 한다.
+    pub async fn update_browser_url(
+        &self,
+        pane: PaneId,
+        surface_id: SurfaceId,
+        url: String,
+    ) -> Option<WorkspaceId> {
+        let mut s = self.inner.lock().await;
+        let mut updated = None;
+        for ws in s.workspaces.iter_mut() {
+            for surface in ws.surfaces.iter_mut() {
+                if surface
+                    .root_pane
+                    .set_surface_browser_url(pane, surface_id, url.clone())
+                {
+                    updated = Some(ws.id);
+                    break;
+                }
+            }
+            if updated.is_some() {
+                break;
+            }
+        }
+        drop(s);
+        if updated.is_some() {
+            self.mark_dirty();
+        }
+        updated
+    }
+
+    /// 외부 신호로부터 받은 자동 타이틀(브라우저 페이지 제목 등)을
+    /// surface에 반영한다. 사용자가 직접 rename 한 surface(title_locked)는
+    /// 건드리지 않는다.
+    pub async fn update_surface_auto_title(
+        &self,
+        pane: PaneId,
+        surface_id: SurfaceId,
+        title: String,
+    ) -> Option<WorkspaceId> {
+        let mut s = self.inner.lock().await;
+        let mut updated = None;
+        for ws in s.workspaces.iter_mut() {
+            for surface in ws.surfaces.iter_mut() {
+                if surface
+                    .root_pane
+                    .set_surface_title_auto(pane, surface_id, title.clone())
+                {
+                    updated = Some(ws.id);
+                    break;
+                }
+            }
+            if updated.is_some() {
+                break;
+            }
+        }
+        drop(s);
+        if updated.is_some() {
+            self.mark_dirty();
+        }
+        updated
+    }
+
     pub fn update_surface_cwd_blocking(
         &self,
         pane: PaneId,
@@ -391,6 +455,31 @@ impl StateStore {
             self.mark_dirty();
         }
         updated
+    }
+
+    /// 사이드 패널에서 채널을 드래그 앤 드랍으로 재배치할 때 호출된다.
+    /// `id`로 식별되는 채널을 `workspace_order` 안의 `target_index` 위치로
+    /// 옮긴다. `target_index`는 이동을 적용한 뒤의 최종 위치이며, 길이를
+    /// 넘어가면 끝으로 클램프된다. 같은 위치이거나 채널이 존재하지 않으면
+    /// `false`를 반환한다.
+    pub async fn reorder_workspace(&self, id: WorkspaceId, target_index: usize) -> bool {
+        let mut s = self.inner.lock().await;
+        let Some(current) = s.workspace_order.iter().position(|x| *x == id) else {
+            return false;
+        };
+        let len = s.workspace_order.len();
+        if len == 0 {
+            return false;
+        }
+        let target = target_index.min(len - 1);
+        if current == target {
+            return false;
+        }
+        let removed = s.workspace_order.remove(current);
+        s.workspace_order.insert(target, removed);
+        drop(s);
+        self.mark_dirty();
+        true
     }
 
     /// Remove an entire workspace. Used by the sidebar's X close
@@ -1534,5 +1623,513 @@ mod tests {
             panic!("original pane should be tabbed leaf")
         };
         assert_eq!(orig_surfaces.len(), 1, "original pane untouched");
+    }
+
+    /// 케이스: pane A에 탭브라우저 추가 → pane B에 탭브라우저 추가
+    /// → A의 기존 탭브라우저 surface는 (id, title, initial_url) 모두
+    /// 변경 없이 보존되어야 한다. 이전에는 GTK 측 rerender 가
+    /// BrowserPane을 새로 만들어 about:blank로 돌아갔지만, state
+    /// 자체는 처음부터 변하지 않으므로 daemon 레벨에서 그 invariant
+    /// 를 잠가둔다 — 만약 add_browser_surface_to_pane 구현이 다른
+    /// pane을 손상시키게 회귀하면 여기서 잡힌다.
+    #[tokio::test]
+    async fn add_browser_to_one_pane_keeps_other_pane_browser_intact() {
+        let store = StateStore::new_lazy(State::default());
+        let ws_id = store
+            .create_workspace(Some("demo".into()), std::path::PathBuf::from("/tmp/demo"))
+            .await;
+        let pane_a = first_pane(&store.get_workspace(ws_id).await.unwrap());
+        let (_, pane_b) = store
+            .split_pane(pane_a, SplitDirection::Vertical)
+            .await
+            .unwrap();
+
+        // pane A에 https 탭브라우저 추가 (사용자가 navigate한 가상의 결과
+        // URL은 GTK 측 webview에 있고 state는 initial_url만 가지므로,
+        // 여기서는 새로 추가된 surface의 메타데이터 보존을 검증한다).
+        let (_, browser_a) = store
+            .add_browser_surface_to_pane(pane_a, "https://docs.a.test".into())
+            .await
+            .unwrap();
+        let snap_before = store.get_workspace(ws_id).await.unwrap();
+        let surfaces_a_before = pane_surfaces(&snap_before, pane_a);
+        let surfaces_b_before = pane_surfaces(&snap_before, pane_b);
+
+        // pane B에 about:blank 탭브라우저 추가.
+        let (_, browser_b) = store
+            .add_browser_surface_to_pane(pane_b, "about:blank".into())
+            .await
+            .unwrap();
+        assert_ne!(browser_a, browser_b);
+
+        let snap_after = store.get_workspace(ws_id).await.unwrap();
+        let surfaces_a_after = pane_surfaces(&snap_after, pane_a);
+        let surfaces_b_after = pane_surfaces(&snap_after, pane_b);
+
+        // pane A의 surface 목록은 idx, id, title, kind 모두 동일하게 유지.
+        assert_eq!(
+            fingerprints(&surfaces_a_before),
+            fingerprints(&surfaces_a_after),
+            "pane A surfaces must not change when pane B gets a new browser tab"
+        );
+        // pane B는 정확히 한 개의 새 surface가 늘어났어야 한다.
+        assert_eq!(surfaces_b_before.len() + 1, surfaces_b_after.len());
+        assert!(surfaces_b_after
+            .iter()
+            .any(|s| s.id == browser_b
+                && matches!(&s.kind, SurfaceKind::Browser { initial_url: Some(u) } if u == "about:blank")));
+    }
+
+    /// 케이스: 같은 pane에 탭브라우저를 여러 개 연속해서 추가해도
+    /// 먼저 추가한 surface들의 메타데이터가 그대로이고, 새로 추가된
+    /// 탭이 active로 전환된다.
+    #[tokio::test]
+    async fn appending_browser_tabs_preserves_earlier_tabs_in_same_pane() {
+        let store = StateStore::new_lazy(State::default());
+        let ws_id = store
+            .create_workspace(Some("demo".into()), std::path::PathBuf::from("/tmp/demo"))
+            .await;
+        let pane = first_pane(&store.get_workspace(ws_id).await.unwrap());
+
+        let (_, first_browser) = store
+            .add_browser_surface_to_pane(pane, "https://one.test".into())
+            .await
+            .unwrap();
+        let (_, second_browser) = store
+            .add_browser_surface_to_pane(pane, "https://two.test".into())
+            .await
+            .unwrap();
+        let (_, third_browser) = store
+            .add_browser_surface_to_pane(pane, "https://three.test".into())
+            .await
+            .unwrap();
+
+        let ws = store.get_workspace(ws_id).await.unwrap();
+        let surfaces = pane_surfaces(&ws, pane);
+        assert_eq!(surfaces.len(), 4); // 초기 terminal + 3 browsers
+        let by_id: std::collections::HashMap<_, _> =
+            surfaces.iter().map(|s| (s.id, s.clone())).collect();
+        for (id, expected_url) in [
+            (first_browser, "https://one.test"),
+            (second_browser, "https://two.test"),
+            (third_browser, "https://three.test"),
+        ] {
+            let s = by_id.get(&id).expect("browser surface must still exist");
+            assert!(matches!(
+                &s.kind,
+                SurfaceKind::Browser { initial_url: Some(u) } if u == expected_url
+            ));
+        }
+        // 가장 최근에 추가된 탭이 활성 surface여야 한다.
+        assert_eq!(first_pane_active_surface(&ws), third_browser);
+    }
+
+    /// 케이스: 탭브라우저 추가가 다른 채널(workspace)의 surface를
+    /// 건드리지 않아야 한다.
+    #[tokio::test]
+    async fn adding_browser_in_one_workspace_does_not_touch_other_workspaces() {
+        let store = StateStore::new_lazy(State::default());
+        let alpha = store
+            .create_workspace(Some("alpha".into()), std::path::PathBuf::from("/tmp/alpha"))
+            .await;
+        let beta = store
+            .create_workspace(Some("beta".into()), std::path::PathBuf::from("/tmp/beta"))
+            .await;
+        let pane_alpha = first_pane(&store.get_workspace(alpha).await.unwrap());
+        let pane_beta = first_pane(&store.get_workspace(beta).await.unwrap());
+
+        let beta_before = pane_surfaces(&store.get_workspace(beta).await.unwrap(), pane_beta);
+        let _ = store
+            .add_browser_surface_to_pane(pane_alpha, "https://alpha-only.test".into())
+            .await
+            .unwrap();
+        let beta_after = pane_surfaces(&store.get_workspace(beta).await.unwrap(), pane_beta);
+        assert_eq!(fingerprints(&beta_before), fingerprints(&beta_after));
+    }
+
+    /// 케이스: 새 탭(터미널)을 다른 pane에 추가해도 기존 pane의
+    /// terminal surface 메타데이터(특히 cwd)가 보존된다.
+    #[tokio::test]
+    async fn adding_terminal_tab_to_other_pane_keeps_existing_terminal_cwd() {
+        let store = StateStore::new_lazy(State::default());
+        let ws_id = store
+            .create_workspace(Some("demo".into()), std::path::PathBuf::from("/tmp/demo"))
+            .await;
+        let pane_a = first_pane(&store.get_workspace(ws_id).await.unwrap());
+        let (_, pane_b) = store
+            .split_pane(pane_a, SplitDirection::Vertical)
+            .await
+            .unwrap();
+
+        let surface_a_id = first_pane_active_surface(&store.get_workspace(ws_id).await.unwrap());
+        // 사용자가 셸에서 cd 한 결과를 모사: pane A의 terminal surface에 cwd 갱신.
+        assert_eq!(
+            store
+                .update_surface_cwd(pane_a, surface_a_id, "/tmp/work/inner".into())
+                .await,
+            Some(ws_id)
+        );
+
+        // 이제 pane B에 새 탭(terminal)을 추가한다.
+        let (_, _new_term) = store
+            .add_terminal_surface_to_pane(pane_b, Some("/tmp/other".into()))
+            .await
+            .unwrap();
+
+        // pane A의 surface는 그대로 cwd /tmp/work/inner로 남아 있어야 한다.
+        let ws = store.get_workspace(ws_id).await.unwrap();
+        let surfaces_a = pane_surfaces(&ws, pane_a);
+        let s_a = surfaces_a
+            .iter()
+            .find(|s| s.id == surface_a_id)
+            .expect("pane A's terminal surface must still exist");
+        assert!(matches!(
+            &s_a.kind,
+            SurfaceKind::Terminal { cwd: Some(cwd), .. }
+                if cwd == &std::path::PathBuf::from("/tmp/work/inner")
+        ));
+    }
+
+    fn pane_surfaces(ws: &Workspace, pane: PaneId) -> Vec<PaneSurface> {
+        fn walk(p: &Pane, target: PaneId) -> Option<Vec<PaneSurface>> {
+            match p {
+                Pane::Leaf { id, content } if *id == target => match content {
+                    PaneContent::Tabs { surfaces, .. } => Some(surfaces.clone()),
+                    PaneContent::Terminal { .. } | PaneContent::Browser { .. } => Some(vec![]),
+                },
+                Pane::Leaf { .. } => None,
+                Pane::Split { first, second, .. } => {
+                    walk(first, target).or_else(|| walk(second, target))
+                }
+            }
+        }
+        ws.surfaces
+            .iter()
+            .find_map(|s| walk(&s.root_pane, pane))
+            .unwrap_or_default()
+    }
+
+    /// 브라우저 navigate가 발생하면 update_browser_url 호출로 surface
+    /// 의 initial_url이 갱신되어, 다음 실행 시 같은 페이지로 복원된다.
+    /// terminal surface나 잘못된 (pane, surface) 조합에는 영향 없음을
+    /// 함께 검증한다.
+    #[tokio::test]
+    async fn update_browser_url_persists_last_navigation_only_for_browser() {
+        let store = StateStore::new_lazy(State::default());
+        let ws_id = store
+            .create_workspace(Some("demo".into()), std::path::PathBuf::from("/tmp/demo"))
+            .await;
+        let pane = first_pane(&store.get_workspace(ws_id).await.unwrap());
+        let (_, browser) = store
+            .add_browser_surface_to_pane(pane, "https://one.test".into())
+            .await
+            .unwrap();
+
+        // navigate → state에 반영.
+        assert_eq!(
+            store
+                .update_browser_url(pane, browser, "https://two.test/page?x=1".into())
+                .await,
+            Some(ws_id)
+        );
+        let ws = store.get_workspace(ws_id).await.unwrap();
+        let updated = ws.surfaces[0]
+            .root_pane
+            .find_surface(pane, browser)
+            .unwrap();
+        assert!(matches!(
+            &updated.kind,
+            SurfaceKind::Browser { initial_url: Some(u) } if u == "https://two.test/page?x=1"
+        ));
+
+        // 같은 URL은 no-op으로 None.
+        assert_eq!(
+            store
+                .update_browser_url(pane, browser, "https://two.test/page?x=1".into())
+                .await,
+            None
+        );
+
+        // terminal surface(첫 active surface)는 영향 X.
+        let terminal_id = first_pane_active_surface(&store.get_workspace(ws_id).await.unwrap());
+        // active 가 browser 였을 수 있으니 terminal id를 명시적으로 찾는다.
+        let ws = store.get_workspace(ws_id).await.unwrap();
+        let terminal_id = match &ws.surfaces[0].root_pane {
+            Pane::Leaf {
+                content: PaneContent::Tabs { surfaces, .. },
+                ..
+            } => surfaces
+                .iter()
+                .find(|s| matches!(s.kind, SurfaceKind::Terminal { .. }))
+                .map(|s| s.id)
+                .unwrap(),
+            _ => terminal_id,
+        };
+        assert_eq!(
+            store
+                .update_browser_url(pane, terminal_id, "https://nope.test".into())
+                .await,
+            None
+        );
+    }
+
+    /// 브라우저 페이지 title 신호가 surface.title을 자동 갱신.
+    /// 사용자가 rename으로 잠근 surface는 자동 갱신되지 않는다.
+    #[tokio::test]
+    async fn update_surface_auto_title_respects_user_rename() {
+        let store = StateStore::new_lazy(State::default());
+        let ws_id = store
+            .create_workspace(Some("demo".into()), std::path::PathBuf::from("/tmp/demo"))
+            .await;
+        let pane = first_pane(&store.get_workspace(ws_id).await.unwrap());
+        let (_, browser_a) = store
+            .add_browser_surface_to_pane(pane, "https://a.test".into())
+            .await
+            .unwrap();
+        let (_, browser_b) = store
+            .add_browser_surface_to_pane(pane, "https://b.test".into())
+            .await
+            .unwrap();
+
+        // A의 page title이 도착 → 갱신됨.
+        assert_eq!(
+            store
+                .update_surface_auto_title(pane, browser_a, "Example A — Home".into())
+                .await,
+            Some(ws_id)
+        );
+        assert_eq!(
+            store.surface_title(pane, browser_a).await.as_deref(),
+            Some("Example A — Home")
+        );
+
+        // B를 사용자가 직접 이름 짓고 → 자동 갱신은 무시.
+        store
+            .rename_surface(pane, browser_b, "Pinned".into())
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .update_surface_auto_title(pane, browser_b, "B Page".into())
+                .await,
+            None
+        );
+        assert_eq!(
+            store.surface_title(pane, browser_b).await.as_deref(),
+            Some("Pinned")
+        );
+
+        // 빈 title은 무시.
+        assert_eq!(
+            store
+                .update_surface_auto_title(pane, browser_a, "   ".into())
+                .await,
+            None
+        );
+    }
+
+    /// 다른 채널의 다른 pane에 있는 browser url을 갱신해도, 첫 채널
+    /// surface 데이터는 변하지 않는다.
+    #[tokio::test]
+    async fn update_browser_url_in_one_workspace_does_not_touch_others() {
+        let store = StateStore::new_lazy(State::default());
+        let alpha = store
+            .create_workspace(Some("alpha".into()), std::path::PathBuf::from("/tmp/alpha"))
+            .await;
+        let beta = store
+            .create_workspace(Some("beta".into()), std::path::PathBuf::from("/tmp/beta"))
+            .await;
+        let pane_alpha = first_pane(&store.get_workspace(alpha).await.unwrap());
+        let pane_beta = first_pane(&store.get_workspace(beta).await.unwrap());
+
+        let (_, alpha_browser) = store
+            .add_browser_surface_to_pane(pane_alpha, "https://alpha.test".into())
+            .await
+            .unwrap();
+        let (_, beta_browser) = store
+            .add_browser_surface_to_pane(pane_beta, "https://beta.test".into())
+            .await
+            .unwrap();
+
+        let _ = store
+            .update_browser_url(pane_alpha, alpha_browser, "https://alpha.test/2".into())
+            .await;
+
+        let beta_surfaces = pane_surfaces(&store.get_workspace(beta).await.unwrap(), pane_beta);
+        let beta_b = beta_surfaces.iter().find(|s| s.id == beta_browser).unwrap();
+        assert!(matches!(
+            &beta_b.kind,
+            SurfaceKind::Browser { initial_url: Some(u) } if u == "https://beta.test"
+        ));
+    }
+
+    /// `PaneSurface`는 외부 crate라 `PartialEq` 미구현 — 단위 테스트용으로
+    /// 보존성 검증에 필요한 핵심 필드(id, title, title_locked, kind)만
+    /// 추출한다.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct SurfaceFingerprint {
+        id: SurfaceId,
+        title: String,
+        title_locked: bool,
+        kind: SurfaceKindFingerprint,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum SurfaceKindFingerprint {
+        Terminal {
+            shell: Option<String>,
+            cwd: Option<std::path::PathBuf>,
+        },
+        Browser {
+            initial_url: Option<String>,
+        },
+    }
+
+    fn fingerprint(s: &PaneSurface) -> SurfaceFingerprint {
+        let kind = match &s.kind {
+            SurfaceKind::Terminal { shell, cwd } => SurfaceKindFingerprint::Terminal {
+                shell: shell.clone(),
+                cwd: cwd.clone(),
+            },
+            SurfaceKind::Browser { initial_url } => SurfaceKindFingerprint::Browser {
+                initial_url: initial_url.clone(),
+            },
+        };
+        SurfaceFingerprint {
+            id: s.id,
+            title: s.title.clone(),
+            title_locked: s.title_locked,
+            kind,
+        }
+    }
+
+    fn fingerprints(surfaces: &[PaneSurface]) -> Vec<SurfaceFingerprint> {
+        surfaces.iter().map(fingerprint).collect()
+    }
+
+    async fn create_named_workspace(store: &StateStore, name: &str) -> WorkspaceId {
+        store
+            .create_workspace(Some(name.into()), std::path::PathBuf::from("/tmp").join(name))
+            .await
+    }
+
+    #[tokio::test]
+    async fn reorder_workspace_moves_first_to_last() {
+        let store = StateStore::new_lazy(State::default());
+        let a = create_named_workspace(&store, "a").await;
+        let b = create_named_workspace(&store, "b").await;
+        let c = create_named_workspace(&store, "c").await;
+
+        assert!(store.reorder_workspace(a, 2).await);
+
+        let order = store.snapshot().await.workspace_order;
+        assert_eq!(order, vec![b, c, a]);
+    }
+
+    #[tokio::test]
+    async fn reorder_workspace_moves_last_to_first() {
+        let store = StateStore::new_lazy(State::default());
+        let a = create_named_workspace(&store, "a").await;
+        let b = create_named_workspace(&store, "b").await;
+        let c = create_named_workspace(&store, "c").await;
+
+        assert!(store.reorder_workspace(c, 0).await);
+
+        let order = store.snapshot().await.workspace_order;
+        assert_eq!(order, vec![c, a, b]);
+    }
+
+    #[tokio::test]
+    async fn reorder_workspace_moves_middle_within_range() {
+        let store = StateStore::new_lazy(State::default());
+        let a = create_named_workspace(&store, "a").await;
+        let b = create_named_workspace(&store, "b").await;
+        let c = create_named_workspace(&store, "c").await;
+        let d = create_named_workspace(&store, "d").await;
+
+        // b를 끝으로 옮긴다 (a, c, d, b)
+        assert!(store.reorder_workspace(b, 3).await);
+        assert_eq!(store.snapshot().await.workspace_order, vec![a, c, d, b]);
+
+        // d를 처음으로 옮긴다 (d, a, c, b)
+        assert!(store.reorder_workspace(d, 0).await);
+        assert_eq!(store.snapshot().await.workspace_order, vec![d, a, c, b]);
+    }
+
+    #[tokio::test]
+    async fn reorder_workspace_target_beyond_len_clamps_to_end() {
+        let store = StateStore::new_lazy(State::default());
+        let a = create_named_workspace(&store, "a").await;
+        let b = create_named_workspace(&store, "b").await;
+        let c = create_named_workspace(&store, "c").await;
+
+        // 100을 줘도 끝으로만 이동해야 한다.
+        assert!(store.reorder_workspace(a, 100).await);
+
+        let order = store.snapshot().await.workspace_order;
+        assert_eq!(order, vec![b, c, a]);
+    }
+
+    #[tokio::test]
+    async fn reorder_workspace_no_change_returns_false() {
+        let store = StateStore::new_lazy(State::default());
+        let a = create_named_workspace(&store, "a").await;
+        let b = create_named_workspace(&store, "b").await;
+        let c = create_named_workspace(&store, "c").await;
+
+        // 자기 자리로 이동.
+        assert!(!store.reorder_workspace(b, 1).await);
+        assert_eq!(store.snapshot().await.workspace_order, vec![a, b, c]);
+
+        // 길이를 초과한 인덱스도 자기 자리(끝)이면 false.
+        assert!(!store.reorder_workspace(c, 100).await);
+        assert_eq!(store.snapshot().await.workspace_order, vec![a, b, c]);
+    }
+
+    #[tokio::test]
+    async fn reorder_workspace_unknown_id_returns_false() {
+        let store = StateStore::new_lazy(State::default());
+        let a = create_named_workspace(&store, "a").await;
+        let b = create_named_workspace(&store, "b").await;
+
+        let missing = WorkspaceId::new();
+        assert!(!store.reorder_workspace(missing, 0).await);
+        assert_eq!(store.snapshot().await.workspace_order, vec![a, b]);
+    }
+
+    #[tokio::test]
+    async fn reorder_workspace_single_channel_is_noop() {
+        let store = StateStore::new_lazy(State::default());
+        let a = create_named_workspace(&store, "a").await;
+
+        assert!(!store.reorder_workspace(a, 0).await);
+        assert!(!store.reorder_workspace(a, 5).await);
+        assert_eq!(store.snapshot().await.workspace_order, vec![a]);
+    }
+
+    #[tokio::test]
+    async fn reorder_workspace_empty_state_returns_false() {
+        let store = StateStore::new_lazy(State::default());
+        let any = WorkspaceId::new();
+        assert!(!store.reorder_workspace(any, 0).await);
+    }
+
+    #[tokio::test]
+    async fn reorder_workspace_does_not_change_active_workspace() {
+        let store = StateStore::new_lazy(State::default());
+        let a = create_named_workspace(&store, "a").await;
+        let b = create_named_workspace(&store, "b").await;
+        let _c = create_named_workspace(&store, "c").await;
+
+        // active는 처음 만들어진 a로 시작한다.
+        assert_eq!(store.snapshot().await.active_workspace, Some(a));
+
+        // a를 끝으로 옮겨도 active는 그대로 a여야 한다.
+        assert!(store.reorder_workspace(a, 2).await);
+        assert_eq!(store.snapshot().await.active_workspace, Some(a));
+
+        // b를 처음으로 옮겨도 active는 a 그대로.
+        assert!(store.reorder_workspace(b, 0).await);
+        assert_eq!(store.snapshot().await.active_workspace, Some(a));
     }
 }

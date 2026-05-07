@@ -9,7 +9,7 @@ use crate::notifications::{NotificationEntry, NotificationLog};
 use crate::theme::ResolvedTheme;
 use crate::ui::sidebar::Sidebar;
 use crate::ui::terminal_pane::PaneCallbacks;
-use crate::ui::workspace_view::{build_surface, PaneRegistry};
+use crate::ui::workspace_view::{attach_surface_to_pane, build_surface, PaneRegistry};
 use adw::prelude::*;
 use flowmux_core::{PaneId, SurfaceId, Workspace, WorkspaceId};
 use flowmux_daemon::StateStore;
@@ -191,6 +191,47 @@ impl WindowController {
         self.focus_first_leaf_of(ws);
     }
 
+    /// 새로 만들어진 surface를 가능한 한 incremental하게 붙인다.
+    ///
+    /// 기존 동작: rerender_workspace 호출 → 채널 전체 위젯 재생성 →
+    /// 다른 pane의 탭브라우저 navigate 상태와 터미널 셸 세션이 모두
+    /// 사라짐.
+    ///
+    /// 새 동작: 해당 pane의 tab bar / stack에만 위젯을 append한다.
+    /// pane이 아직 화면에 렌더되지 않았거나 (예: 다른 채널이 보이고
+    /// 있을 때) registry에서 핸들을 못 찾은 경우엔 안전하게 전체
+    /// rerender로 폴백한다.
+    async fn attach_or_rerender_surface(
+        &self,
+        ws_id: WorkspaceId,
+        pane: PaneId,
+        surface_id: SurfaceId,
+    ) {
+        let Some(ws) = self.store.get_workspace(ws_id).await else {
+            return;
+        };
+        let surface = ws
+            .surfaces
+            .iter()
+            .find_map(|s| s.root_pane.find_surface(pane, surface_id));
+        if let Some(surface) = surface {
+            let attached = attach_surface_to_pane(
+                pane,
+                ws.id,
+                &surface,
+                &self.callbacks,
+                self.pane_registry.clone(),
+                self.theme.clone(),
+            );
+            if attached {
+                self.refresh_window_title().await;
+                return;
+            }
+        }
+        self.rerender_workspace(&ws);
+        self.refresh_window_title().await;
+    }
+
     /// Shared pane registry — exposed so the keybindings module can
     /// reach into VTE widgets for copy/paste actions on the GTK
     /// main thread without going through the bridge.
@@ -207,6 +248,27 @@ impl WindowController {
             }
             glib::Propagation::Proceed
         });
+    }
+
+    /// 윈도우 제목을 "flowmux - {focused tab name}"으로 다시 계산한다.
+    /// 포커스된 pane이 없거나 그 pane에 active surface가 없으면
+    /// "flowmux"로 폴백한다.
+    async fn refresh_window_title(&self) {
+        let title = match self.focused_pane.get() {
+            None => None,
+            Some(pane) => {
+                let active = self.pane_registry.borrow().active_surface(pane);
+                match active {
+                    Some(surface) => self.store.surface_title(pane, surface).await,
+                    None => None,
+                }
+            }
+        };
+        let next = match title.as_deref().map(str::trim) {
+            Some(t) if !t.is_empty() => format!("flowmux - {t}"),
+            _ => "flowmux".to_string(),
+        };
+        self.window.set_title(Some(&next));
     }
 
     async fn update_terminal_cwd(&self, pane: PaneId, surface: SurfaceId, cwd: std::path::PathBuf) {
@@ -358,23 +420,21 @@ impl WindowController {
                     r.active_terminal(pane).and_then(|term| term.current_dir())
                 }
                 .or_else(|| std::env::current_dir().ok());
-                if let Some((ws_id, _surface)) =
+                if let Some((ws_id, surface_id)) =
                     self.store.add_terminal_surface_to_pane(pane, cwd).await
                 {
-                    if let Some(ws) = self.store.get_workspace(ws_id).await {
-                        self.rerender_workspace(&ws);
-                    }
+                    self.attach_or_rerender_surface(ws_id, pane, surface_id)
+                        .await;
                 }
             }
             GtkCommand::NewBrowserSurface { pane } => {
-                if let Some((ws_id, _surface)) = self
+                if let Some((ws_id, surface_id)) = self
                     .store
                     .add_browser_surface_to_pane(pane, "about:blank".into())
                     .await
                 {
-                    if let Some(ws) = self.store.get_workspace(ws_id).await {
-                        self.rerender_workspace(&ws);
-                    }
+                    self.attach_or_rerender_surface(ws_id, pane, surface_id)
+                        .await;
                 }
             }
             GtkCommand::ActivateSurface { pane, surface } => {
@@ -382,6 +442,7 @@ impl WindowController {
                 self.pane_registry
                     .borrow_mut()
                     .activate_surface(pane, surface);
+                self.refresh_window_title().await;
             }
             GtkCommand::CloseSurface { pane, surface, ack } => {
                 match self.store.close_surface(pane, surface).await {
@@ -419,6 +480,7 @@ impl WindowController {
                     self.pane_registry
                         .borrow()
                         .set_surface_title(surface, &title);
+                    self.refresh_window_title().await;
                     let _ = ack.send(Ok(()));
                 }
             },
@@ -435,6 +497,32 @@ impl WindowController {
             }
             GtkCommand::TerminalCwdChanged { pane, surface, cwd } => {
                 self.update_terminal_cwd(pane, surface, cwd).await;
+                self.refresh_window_title().await;
+            }
+            GtkCommand::BrowserUriChanged { pane, surface, url } => {
+                let _ = self.store.update_browser_url(pane, surface, url).await;
+            }
+            GtkCommand::BrowserTitleChanged {
+                pane,
+                surface,
+                title,
+            } => {
+                if self
+                    .store
+                    .update_surface_auto_title(pane, surface, title)
+                    .await
+                    .is_some()
+                {
+                    if let Some(latest) = self.store.surface_title(pane, surface).await {
+                        self.pane_registry
+                            .borrow()
+                            .set_surface_title(surface, &latest);
+                    }
+                    self.refresh_window_title().await;
+                }
+            }
+            GtkCommand::RefreshWindowTitle => {
+                self.refresh_window_title().await;
             }
             GtkCommand::NewWorkspace { root } => {
                 // Prefer the focused pane's cwd so a new tab opens
@@ -798,10 +886,17 @@ fn make_callbacks(focused: FocusedPane, bridge: Bridge) -> PaneCallbacks {
         on_child_exited: Rc::new(RefCell::new(|pane, status| {
             tracing::info!(%pane, status, "child exited");
         })),
-        on_focus: Rc::new(RefCell::new(move |pane| {
-            tracing::debug!(%pane, "pane focused");
-            focused.set(Some(pane));
-        })),
+        on_focus: {
+            let bridge = bridge.clone();
+            Rc::new(RefCell::new(move |pane| {
+                tracing::debug!(%pane, "pane focused");
+                focused.set(Some(pane));
+                let bridge = bridge.clone();
+                glib::MainContext::default().spawn_local(async move {
+                    let _ = bridge.tx.send(GtkCommand::RefreshWindowTitle).await;
+                });
+            }))
+        },
         on_close_pane: {
             let bridge = bridge.clone();
             Rc::new(RefCell::new(move |pane| {
@@ -916,6 +1011,34 @@ fn make_callbacks(focused: FocusedPane, bridge: Bridge) -> PaneCallbacks {
                     let _ = bridge
                         .tx
                         .send(GtkCommand::TerminalCwdChanged { pane, surface, cwd })
+                        .await;
+                });
+            }))
+        },
+        on_browser_uri_changed: {
+            let bridge = bridge.clone();
+            Rc::new(RefCell::new(move |pane, surface, url| {
+                let bridge = bridge.clone();
+                glib::MainContext::default().spawn_local(async move {
+                    let _ = bridge
+                        .tx
+                        .send(GtkCommand::BrowserUriChanged { pane, surface, url })
+                        .await;
+                });
+            }))
+        },
+        on_browser_title_changed: {
+            let bridge = bridge.clone();
+            Rc::new(RefCell::new(move |pane, surface, title| {
+                let bridge = bridge.clone();
+                glib::MainContext::default().spawn_local(async move {
+                    let _ = bridge
+                        .tx
+                        .send(GtkCommand::BrowserTitleChanged {
+                            pane,
+                            surface,
+                            title,
+                        })
                         .await;
                 });
             }))
@@ -1313,6 +1436,308 @@ mod tests {
             flowmux_core::SurfaceKind::Terminal { cwd: Some(cwd), .. } if cwd == &fixed_next
         ));
         assert!(surfaces[0].title_locked);
+    }
+
+    /// 포커스 변경 / 탭 활성화 / RefreshWindowTitle 명령에 따라
+    /// adw::ApplicationWindow.title이 "flowmux - {focused tab name}"
+    /// 형식으로 갱신되는지 검증한다. 포커스가 없을 때는 "flowmux"
+    /// 단독.
+    #[gtk::test]
+    async fn refresh_window_title_uses_focused_pane_active_surface() {
+        adw::init().expect("libadwaita should initialize in GTK test");
+        let root = std::env::temp_dir().join("flowmux-ui-window-title");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = StateStore::new_lazy(State::default());
+        let ws_id = store
+            .create_workspace(Some("ui".into()), root.clone())
+            .await;
+        let ws = store.get_workspace(ws_id).await.unwrap();
+        let pane = ws.surfaces[0].root_pane.first_leaf_id().unwrap();
+        let surface = ws.surfaces[0].root_pane.active_surface_id(pane).unwrap();
+
+        let (bridge, _rx) = Bridge::new();
+        let app = adw::Application::builder()
+            .application_id("com.flowmux.App.UiTest.WindowTitle")
+            .build();
+        app.register(None::<&gtk::gio::Cancellable>).unwrap();
+        let controller = WindowController::new(
+            &app,
+            store.clone(),
+            Arc::new(ResolvedTheme::load()),
+            bridge,
+        );
+        controller.render_workspace(&ws);
+
+        // 포커스가 없는 초기 상태에서는 단독 "flowmux"로 폴백.
+        controller.focused_pane.set(None);
+        controller
+            .dispatch(GtkCommand::RefreshWindowTitle)
+            .await;
+        assert_eq!(
+            controller.window.title().map(|s| s.to_string()).as_deref(),
+            Some("flowmux")
+        );
+
+        // 포커스가 잡히면 "flowmux - {tab name}"으로 바뀐다.
+        let expected_tab_name = store.surface_title(pane, surface).await.unwrap();
+        controller.focused_pane.set(Some(pane));
+        controller
+            .dispatch(GtkCommand::RefreshWindowTitle)
+            .await;
+        assert_eq!(
+            controller.window.title().map(|s| s.to_string()),
+            Some(format!("flowmux - {expected_tab_name}"))
+        );
+
+        // RenameSurface 디스패치 후에도 윈도우 제목이 새 이름을 따라간다.
+        let (ack_tx, ack_rx) = oneshot::channel();
+        controller
+            .dispatch(GtkCommand::RenameSurface {
+                pane,
+                surface,
+                title: "Custom".into(),
+                ack: ack_tx,
+            })
+            .await;
+        let _ = ack_rx.await;
+        assert_eq!(
+            controller.window.title().map(|s| s.to_string()).as_deref(),
+            Some("flowmux - Custom")
+        );
+    }
+
+    /// `BrowserUriChanged` 디스패치가 store에 마지막 navigate URL을
+    /// 반영하는지 검증한다. webkit::WebView를 띄우지 않고 store
+    /// 상호작용만 검증하기 위해, 미리 add_browser_surface_to_pane으로
+    /// state에 browser surface를 만들어 두고 dispatch한다.
+    #[gtk::test]
+    async fn browser_uri_changed_dispatch_persists_url_in_state() {
+        adw::init().expect("libadwaita should initialize in GTK test");
+        let root = std::env::temp_dir().join("flowmux-ui-browser-url");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = StateStore::new_lazy(State::default());
+        let ws_id = store
+            .create_workspace(Some("ui".into()), root.clone())
+            .await;
+        let ws = store.get_workspace(ws_id).await.unwrap();
+        let pane = ws.surfaces[0].root_pane.first_leaf_id().unwrap();
+        // browser surface를 직접 추가해서 webkit init 부담을 피한다.
+        let (_, browser) = store
+            .add_browser_surface_to_pane(pane, "https://before.test".into())
+            .await
+            .unwrap();
+
+        let (bridge, _rx) = Bridge::new();
+        let app = adw::Application::builder()
+            .application_id("com.flowmux.App.UiTest.BrowserUri")
+            .build();
+        app.register(None::<&gtk::gio::Cancellable>).unwrap();
+        let controller = WindowController::new(
+            &app,
+            store.clone(),
+            Arc::new(ResolvedTheme::load()),
+            bridge,
+        );
+
+        controller
+            .dispatch(GtkCommand::BrowserUriChanged {
+                pane,
+                surface: browser,
+                url: "https://after.test/page".into(),
+            })
+            .await;
+
+        let updated = store.get_workspace(ws_id).await.unwrap();
+        let s = updated.surfaces[0]
+            .root_pane
+            .find_surface(pane, browser)
+            .unwrap();
+        assert!(matches!(
+            &s.kind,
+            flowmux_core::SurfaceKind::Browser { initial_url: Some(u) } if u == "https://after.test/page"
+        ));
+    }
+
+    /// `BrowserTitleChanged` 디스패치가 store/탭 라벨 모두를 갱신.
+    /// 사용자가 직접 rename한 surface는 자동 갱신되지 않음을 함께
+    /// 검증.
+    #[gtk::test]
+    async fn browser_title_changed_dispatch_updates_state_but_skips_locked() {
+        adw::init().expect("libadwaita should initialize in GTK test");
+        let root = std::env::temp_dir().join("flowmux-ui-browser-title");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = StateStore::new_lazy(State::default());
+        let ws_id = store
+            .create_workspace(Some("ui".into()), root.clone())
+            .await;
+        let ws = store.get_workspace(ws_id).await.unwrap();
+        let pane = ws.surfaces[0].root_pane.first_leaf_id().unwrap();
+        let (_, browser_a) = store
+            .add_browser_surface_to_pane(pane, "https://a.test".into())
+            .await
+            .unwrap();
+        let (_, browser_b) = store
+            .add_browser_surface_to_pane(pane, "https://b.test".into())
+            .await
+            .unwrap();
+        store
+            .rename_surface(pane, browser_b, "Pinned".into())
+            .await
+            .unwrap();
+
+        let (bridge, _rx) = Bridge::new();
+        let app = adw::Application::builder()
+            .application_id("com.flowmux.App.UiTest.BrowserTitle")
+            .build();
+        app.register(None::<&gtk::gio::Cancellable>).unwrap();
+        let controller = WindowController::new(
+            &app,
+            store.clone(),
+            Arc::new(ResolvedTheme::load()),
+            bridge,
+        );
+
+        // A: title_locked=false → 갱신.
+        controller
+            .dispatch(GtkCommand::BrowserTitleChanged {
+                pane,
+                surface: browser_a,
+                title: "Hello — Page A".into(),
+            })
+            .await;
+        assert_eq!(
+            store.surface_title(pane, browser_a).await.as_deref(),
+            Some("Hello — Page A")
+        );
+
+        // B: title_locked=true → 그대로 "Pinned".
+        controller
+            .dispatch(GtkCommand::BrowserTitleChanged {
+                pane,
+                surface: browser_b,
+                title: "Should not stick".into(),
+            })
+            .await;
+        assert_eq!(
+            store.surface_title(pane, browser_b).await.as_deref(),
+            Some("Pinned")
+        );
+    }
+
+    /// 새 탭이 추가(NewSurface)되면 그 탭이 active로 잡혀 윈도우
+    /// 제목도 새 탭 이름으로 갱신된다. 기존 활성 탭 이름을 유지하면
+    /// 안 된다.
+    #[gtk::test]
+    async fn new_surface_dispatch_updates_window_title_to_new_tab() {
+        adw::init().expect("libadwaita should initialize in GTK test");
+        let root = std::env::temp_dir().join("flowmux-ui-window-title-newtab");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = StateStore::new_lazy(State::default());
+        let ws_id = store
+            .create_workspace(Some("ui".into()), root.clone())
+            .await;
+        let ws = store.get_workspace(ws_id).await.unwrap();
+        let pane = ws.surfaces[0].root_pane.first_leaf_id().unwrap();
+
+        let (bridge, _rx) = Bridge::new();
+        let app = adw::Application::builder()
+            .application_id("com.flowmux.App.UiTest.WindowTitleNewTab")
+            .build();
+        app.register(None::<&gtk::gio::Cancellable>).unwrap();
+        let controller = WindowController::new(
+            &app,
+            store.clone(),
+            Arc::new(ResolvedTheme::load()),
+            bridge,
+        );
+        controller.render_workspace(&ws);
+        controller.focused_pane.set(Some(pane));
+        controller.dispatch(GtkCommand::RefreshWindowTitle).await;
+        let initial = controller.window.title().map(|s| s.to_string());
+
+        // dispatch가 자체적으로 새 terminal surface를 만들고, attach 후
+        // refresh_window_title 까지 호출한다.
+        controller
+            .dispatch(GtkCommand::NewSurface { pane })
+            .await;
+
+        let title_now = controller.window.title().map(|s| s.to_string());
+        assert!(title_now.is_some());
+        assert!(
+            title_now.as_deref().unwrap().starts_with("flowmux - "),
+            "title should keep the flowmux prefix, got {title_now:?}"
+        );
+        // 새 탭이 active 라면 store에서 그 surface의 title이 곧 윈도우 제목.
+        let active = controller
+            .pane_registry
+            .borrow()
+            .active_surface(pane)
+            .expect("active surface must be tracked");
+        let expected = store.surface_title(pane, active).await.unwrap();
+        assert_eq!(
+            title_now,
+            Some(format!("flowmux - {expected}")),
+            "window title should follow the newly-active tab — initial was {initial:?}"
+        );
+    }
+
+    /// ActivateSurface 디스패치만으로도 윈도우 제목이 활성 탭 기준
+    /// 으로 다시 계산된다.
+    #[gtk::test]
+    async fn activate_surface_dispatch_refreshes_window_title() {
+        adw::init().expect("libadwaita should initialize in GTK test");
+        let root = std::env::temp_dir().join("flowmux-ui-window-title-activate");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = StateStore::new_lazy(State::default());
+        let ws_id = store
+            .create_workspace(Some("ui".into()), root.clone())
+            .await;
+        let ws = store.get_workspace(ws_id).await.unwrap();
+        let pane = ws.surfaces[0].root_pane.first_leaf_id().unwrap();
+        let original_surface = ws.surfaces[0].root_pane.active_surface_id(pane).unwrap();
+        let (_, browser) = store
+            .add_browser_surface_to_pane(pane, "https://docs.test".into())
+            .await
+            .unwrap();
+
+        let (bridge, _rx) = Bridge::new();
+        let app = adw::Application::builder()
+            .application_id("com.flowmux.App.UiTest.WindowTitleActivate")
+            .build();
+        app.register(None::<&gtk::gio::Cancellable>).unwrap();
+        let controller = WindowController::new(
+            &app,
+            store.clone(),
+            Arc::new(ResolvedTheme::load()),
+            bridge,
+        );
+        let ws = store.get_workspace(ws_id).await.unwrap();
+        controller.render_workspace(&ws);
+        controller.focused_pane.set(Some(pane));
+
+        controller
+            .dispatch(GtkCommand::ActivateSurface {
+                pane,
+                surface: original_surface,
+            })
+            .await;
+        let term_title = store.surface_title(pane, original_surface).await.unwrap();
+        assert_eq!(
+            controller.window.title().map(|s| s.to_string()),
+            Some(format!("flowmux - {term_title}"))
+        );
+
+        controller
+            .dispatch(GtkCommand::ActivateSurface {
+                pane,
+                surface: browser,
+            })
+            .await;
+        // browser surface는 add_browser_surface_to_pane 시 "Browser"로 저장.
+        assert_eq!(
+            controller.window.title().map(|s| s.to_string()).as_deref(),
+            Some("flowmux - Browser")
+        );
     }
 
     #[test]
