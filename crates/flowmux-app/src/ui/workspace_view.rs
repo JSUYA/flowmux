@@ -604,7 +604,7 @@ fn attach_tab_dnd_handlers(
 }
 
 /// pane-local 탭 드래그 페이로드 mime-type. 값은 "{PaneId}|{SurfaceId}"
-/// 형식의 UTF-8 문자열. 사이드 패널의 채널 reorder mime과 분리해서 두
+/// 형식의 UTF-8 문자열. 사이드 패널의 워크스페이스 reorder mime과 분리해서 두
 /// 영역의 드롭 매칭이 섞이지 않게 한다.
 const TAB_DND_MIME: &str = "application/x-flowmux-pane-tab";
 

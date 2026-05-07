@@ -487,11 +487,11 @@ impl StateStore {
         None
     }
 
-    /// 사이드 패널에서 채널을 드래그 앤 드랍으로 재배치할 때 호출된다.
-    /// `id`로 식별되는 채널을 `workspace_order` 안의 `target_index` 위치로
+    /// 사이드 패널에서 워크스페이스를 드래그 앤 드랍으로 재배치할 때 호출된다.
+    /// `id`로 식별되는 워크스페이스를 `workspace_order` 안의 `target_index` 위치로
     /// 옮긴다. `target_index`는 이동을 적용한 뒤의 최종 위치이며, 길이를
-    /// 넘어가면 끝으로 클램프된다. 같은 위치이거나 채널이 존재하지 않으면
-    /// `false`를 반환한다.
+    /// 넘어가면 끝으로 클램프된다. 같은 위치이거나 워크스페이스가 존재하지
+    /// 않으면 `false`를 반환한다.
     pub async fn reorder_workspace(&self, id: WorkspaceId, target_index: usize) -> bool {
         let mut s = self.inner.lock().await;
         let Some(current) = s.workspace_order.iter().position(|x| *x == id) else {
@@ -1536,7 +1536,7 @@ mod tests {
 
     #[tokio::test]
     async fn add_browser_surface_to_pane_appends_browser_tab_and_activates() {
-        // 채널을 만들면 첫 pane에는 탭(terminal) 한 개가 있고, 거기에
+        // 워크스페이스를 만들면 첫 pane에는 탭(terminal) 한 개가 있고, 거기에
         // 탭브라우저 추가 버튼을 누르면 같은 pane 안에 새 탭브라우저가
         // 추가되며 그게 활성 탭이 되어야 한다.
         let store = StateStore::new_lazy(State::default());
@@ -1754,7 +1754,7 @@ mod tests {
         assert_eq!(first_pane_active_surface(&ws), third_browser);
     }
 
-    /// 케이스: 탭브라우저 추가가 다른 채널(workspace)의 surface를
+    /// 케이스: 탭브라우저 추가가 다른 워크스페이스의 surface를
     /// 건드리지 않아야 한다.
     #[tokio::test]
     async fn adding_browser_in_one_workspace_does_not_touch_other_workspaces() {
@@ -1958,7 +1958,7 @@ mod tests {
         );
     }
 
-    /// 다른 채널의 다른 pane에 있는 browser url을 갱신해도, 첫 채널
+    /// 다른 워크스페이스의 다른 pane에 있는 browser url을 갱신해도, 첫 워크스페이스
     /// surface 데이터는 변하지 않는다.
     #[tokio::test]
     async fn update_browser_url_in_one_workspace_does_not_touch_others() {

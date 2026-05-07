@@ -199,7 +199,7 @@ impl Sidebar {
         rows.push((ws.id, row));
     }
 
-    /// 드래그 앤 드랍 결과를 사이드 패널에 반영해 채널 행의 시각적
+    /// 드래그 앤 드랍 결과를 사이드 패널에 반영해 워크스페이스 행의 시각적
     /// 위치를 새 인덱스로 옮긴다. `id`가 없으면 no-op이며,
     /// `target_index`가 길이를 넘으면 마지막 슬롯으로 클램프된다.
     pub fn reorder(&self, id: WorkspaceId, target_index: usize) {
@@ -352,9 +352,9 @@ fn format_time(ts: &chrono::DateTime<chrono::Utc>) -> String {
 /// 외부 앱과의 충돌이 없다.
 const DND_MIME: &str = "application/x-flowmux-workspace-id";
 
-/// 사이드 패널의 한 채널 행에 드래그 앤 드랍 컨트롤러를 연결한다.
+/// 사이드 패널의 한 워크스페이스 행에 드래그 앤 드랍 컨트롤러를 연결한다.
 ///
-/// - `DragSource`: 행을 잡으면 채널 ID(UUID 문자열)를 ContentProvider에
+/// - `DragSource`: 행을 잡으면 워크스페이스 ID(UUID 문자열)를 ContentProvider에
 ///   담아 드래그를 시작한다. 드래그 동안 원본 행은 살짝 흐려진다.
 /// - `DropTarget`: 다른 행 위에 드랍되면 드랍 위치 y로 행의 위/아래를
 ///   결정해 [`GtkCommand::ReorderWorkspace`]를 보낸다.

@@ -204,12 +204,12 @@ impl WindowController {
 
     /// 새로 만들어진 surface를 가능한 한 incremental하게 붙인다.
     ///
-    /// 기존 동작: rerender_workspace 호출 → 채널 전체 위젯 재생성 →
+    /// 기존 동작: rerender_workspace 호출 → 워크스페이스 전체 위젯 재생성 →
     /// 다른 pane의 탭브라우저 navigate 상태와 터미널 셸 세션이 모두
     /// 사라짐.
     ///
     /// 새 동작: 해당 pane의 tab bar / stack에만 위젯을 append한다.
-    /// pane이 아직 화면에 렌더되지 않았거나 (예: 다른 채널이 보이고
+    /// pane이 아직 화면에 렌더되지 않았거나 (예: 다른 워크스페이스가 보이고
     /// 있을 때) registry에서 핸들을 못 찾은 경우엔 안전하게 전체
     /// rerender로 폴백한다.
     async fn attach_or_rerender_surface(
