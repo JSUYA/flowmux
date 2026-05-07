@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! 사이드 패널 좌하단 옵션 버튼이 띄우는 모달 다이얼로그.
 //!
-//! 두 항목만 노출한다:
+//! 세 항목을 노출한다:
 //!
 //! * 전체 줌 배율 (10..=200% SpinButton)
 //! * 새 탭브라우저 기본 웹뷰 엔진 (DropDown: WebKit / Chrome / Firefox)
+//! * 포커스된 pane의 1px 테두리 색 (ColorDialogButton, 기본 연한 노란색)
 //!
 //! [확인] / [취소] 버튼으로 닫는다. [확인] 시에만 `on_apply`가 호출되며,
 //! 다이얼로그는 자기 자신이 닫는다 (호출 측은 콜백만 처리).
@@ -55,6 +56,7 @@ fn build_dialog(
 
     let zoom_spin = build_zoom_spin(current.zoom_percent);
     let engine_drop = build_engine_drop(&current.default_browser_engine);
+    let focus_color_btn = build_focus_color_button(current.focus_border_color_or_default());
 
     let body = gtk::Box::new(gtk::Orientation::Vertical, 12);
     body.set_margin_top(16);
@@ -63,6 +65,7 @@ fn build_dialog(
     body.set_margin_end(20);
     body.append(&row("전체 줌 (%)", &zoom_spin));
     body.append(&row("브라우저 웹뷰", &engine_drop));
+    body.append(&row("포커스 테두리 색", &focus_color_btn));
 
     let hint = gtk::Label::new(Some(
         "이미 열려 있는 탭브라우저는 그대로 유지됩니다.",
@@ -84,9 +87,10 @@ fn build_dialog(
         let dialog = dialog.clone();
         let zoom_spin = zoom_spin.clone();
         let engine_drop = engine_drop.clone();
+        let focus_color_btn = focus_color_btn.clone();
         let on_apply = std::rc::Rc::new(on_apply);
         ok_btn.connect_clicked(move |_| {
-            let opts = collect_options(&zoom_spin, &engine_drop);
+            let opts = collect_options(&zoom_spin, &engine_drop, &focus_color_btn);
             (on_apply)(opts);
             dialog.close();
         });
@@ -141,17 +145,48 @@ fn build_engine_drop(initial: &BrowserEngine) -> gtk::DropDown {
 
 /// 다이얼로그 위젯에서 사용자 의도를 다시 [`Options`]로 모아낸다.
 /// SpinButton 값이 직접 타이핑으로 범위를 살짝 넘었을 가능성이 있어
-/// `clamp_zoom`로 한 번 더 보정한다.
-fn collect_options(spin: &gtk::SpinButton, drop: &gtk::DropDown) -> Options {
+/// `clamp_zoom`으로 한 번 더 보정한다. 포커스 색은 [`color_button_hex`]
+/// 가 GdkRGBA → `#rrggbb` 6-자리 hex로 정규화해 돌려준다.
+fn collect_options(
+    spin: &gtk::SpinButton,
+    drop: &gtk::DropDown,
+    focus_color: &gtk::ColorDialogButton,
+) -> Options {
     let zoom = Options::clamp_zoom(spin.value_as_int().max(0) as u16);
     let engine = engine_options()
         .get(drop.selected() as usize)
         .cloned()
         .unwrap_or(BrowserEngine::Webkit);
+    let color_hex = color_button_hex(focus_color);
     Options {
         zoom_percent: zoom,
         default_browser_engine: engine,
+        focus_border_color: color_hex,
     }
+}
+
+/// gtk::ColorDialogButton의 현재 RGBA를 `#rrggbb` 형식으로 직렬화.
+/// 알파 채널은 무시(테두리에는 투명도가 의미 없음).
+fn color_button_hex(button: &gtk::ColorDialogButton) -> String {
+    let rgba = button.rgba();
+    let r = (rgba.red().clamp(0.0, 1.0) * 255.0).round() as u8;
+    let g = (rgba.green().clamp(0.0, 1.0) * 255.0).round() as u8;
+    let b = (rgba.blue().clamp(0.0, 1.0) * 255.0).round() as u8;
+    format!("#{:02x}{:02x}{:02x}", r, g, b)
+}
+
+/// `#rrggbb` (또는 다른 hex 형식)을 GdkRGBA로 파싱해 ColorDialogButton에
+/// 미리 채운다. 파싱 실패 시 기본 연한 노란색으로 fallback.
+fn build_focus_color_button(initial_hex: &str) -> gtk::ColorDialogButton {
+    let dialog = gtk::ColorDialog::new();
+    dialog.set_with_alpha(false);
+    let button = gtk::ColorDialogButton::new(Some(dialog));
+    let parsed = gtk::gdk::RGBA::parse(initial_hex)
+        .ok()
+        .or_else(|| gtk::gdk::RGBA::parse("#fff4b3").ok())
+        .expect("default focus color must be a valid RGBA literal");
+    button.set_rgba(&parsed);
+    button
 }
 
 /// DropDown에 노출되는 빌트인 엔진 순서. 직렬화에는 [`BrowserEngine`]

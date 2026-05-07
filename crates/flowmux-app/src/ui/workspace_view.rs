@@ -724,7 +724,7 @@ fn build_panel(
     callbacks: &PaneCallbacks,
     registry: Rc<RefCell<PaneRegistry>>,
     theme: Arc<ResolvedTheme>,
-    _frame: gtk::Frame,
+    frame: gtk::Frame,
 ) -> gtk::Widget {
     match &surface.kind {
         SurfaceKind::Terminal { cwd, shell } => {
@@ -746,6 +746,22 @@ fn build_panel(
                 });
             }
 
+            // 포커스 enter/leave에 맞춰 frame에 .focused class를
+            // 토글한다. 포커스된 pane은 옵션의 focus_border_color로
+            // 1px 테두리를 그리도록 theme.rs CSS가 처리한다.
+            let frame_in = frame.clone();
+            let frame_out = frame.clone();
+            let focus = gtk::EventControllerFocus::new();
+            focus.connect_enter(move |_| {
+                if !frame_in.has_css_class("focused") {
+                    frame_in.add_css_class("focused");
+                }
+            });
+            focus.connect_leave(move |_| {
+                frame_out.remove_css_class("focused");
+            });
+            pane.widget.add_controller(focus);
+
             let widget = pane.root.clone();
             let mut r = registry.borrow_mut();
             r.terminals.insert(surface.id, pane);
@@ -765,6 +781,23 @@ fn build_panel(
             // 반영 — apply_zoom 호출 전에 만들어진 위젯도 옵션과
             // 동기화된 상태에서 시작한다.
             pane.web_view.set_zoom_level(opts.zoom_factor());
+
+            // 탭브라우저도 포커스 표시는 동일하게 — WebView가 키보드
+            // 포커스를 받으면 frame에 .focused가 붙어 사용자가 어떤
+            // 탭이 입력 대상인지 한눈에 알 수 있다.
+            let frame_in = frame.clone();
+            let frame_out = frame.clone();
+            let focus = gtk::EventControllerFocus::new();
+            focus.connect_enter(move |_| {
+                if !frame_in.has_css_class("focused") {
+                    frame_in.add_css_class("focused");
+                }
+            });
+            focus.connect_leave(move |_| {
+                frame_out.remove_css_class("focused");
+            });
+            pane.web_view.add_controller(focus);
+
             let widget = pane.root.clone().upcast::<gtk::Widget>();
             let mut r = registry.borrow_mut();
             r.browsers.insert(surface.id, pane);

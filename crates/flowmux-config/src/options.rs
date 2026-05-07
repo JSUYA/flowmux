@@ -19,6 +19,11 @@ pub const ZOOM_MAX: u16 = 200;
 /// 줌 % 기본값.
 pub const ZOOM_DEFAULT: u16 = 100;
 
+/// 포커스된 pane의 1px 테두리 기본 색 — 연한 노란색 (Champagne).
+/// 어두운 / 밝은 테마 양쪽에서 충분히 보이면서도 cmux와 다른 느낌의
+/// "은은한 강조"가 되도록 골랐다.
+pub const FOCUS_BORDER_COLOR_DEFAULT: &str = "#fff4b3";
+
 /// 새 탭브라우저를 만들 때 쓸 웹뷰 엔진. 현 단계에서는 모두
 /// WebKitGTK로 fallback되며, 외부 엔진 spawn 분기는 다음 단계
 /// 작업이다 — 그래도 사용자가 고른 값을 옵션 파일에 기록해 둬
@@ -71,10 +76,20 @@ pub struct Options {
     pub zoom_percent: u16,
     #[serde(default)]
     pub default_browser_engine: BrowserEngine,
+    /// 포커스된 pane의 1px 테두리 색 (CSS 형식, 보통 `#rrggbb`).
+    /// 사용자가 옵션 다이얼로그의 컬러 버튼으로 고른 색이 그대로
+    /// 저장되며, 깨졌거나 비어 있으면 [`FOCUS_BORDER_COLOR_DEFAULT`]
+    /// 로 fallback한다.
+    #[serde(default = "default_focus_color")]
+    pub focus_border_color: String,
 }
 
 fn default_zoom() -> u16 {
     ZOOM_DEFAULT
+}
+
+fn default_focus_color() -> String {
+    FOCUS_BORDER_COLOR_DEFAULT.to_string()
 }
 
 impl Default for Options {
@@ -82,6 +97,7 @@ impl Default for Options {
         Self {
             zoom_percent: ZOOM_DEFAULT,
             default_browser_engine: BrowserEngine::default(),
+            focus_border_color: default_focus_color(),
         }
     }
 }
@@ -109,6 +125,38 @@ impl Options {
         self.default_browser_engine = engine;
         self
     }
+
+    /// 포커스 테두리 색을 새 값으로. 유효하지 않으면(빈 문자열 /
+    /// `#`이 없거나 hex가 아님) 기본 색으로 되돌린다.
+    pub fn with_focus_border_color(mut self, color: impl Into<String>) -> Self {
+        let color = color.into();
+        self.focus_border_color = if is_valid_hex_color(&color) {
+            color
+        } else {
+            FOCUS_BORDER_COLOR_DEFAULT.to_string()
+        };
+        self
+    }
+
+    /// load 시점의 sanitize에 쓰이는 동일 검증.
+    pub fn focus_border_color_or_default(&self) -> &str {
+        if is_valid_hex_color(&self.focus_border_color) {
+            &self.focus_border_color
+        } else {
+            FOCUS_BORDER_COLOR_DEFAULT
+        }
+    }
+}
+
+/// CSS 색 문자열로 사용 가능한 hex 형식인지 검사. 허용:
+///   `#rgb` / `#rgba` / `#rrggbb` / `#rrggbbaa`
+/// 그 외 형식(rgba(), 색 이름)은 옵션 파일에 들어와도 fallback 되도록
+/// 보수적으로 거절한다.
+pub fn is_valid_hex_color(s: &str) -> bool {
+    let Some(body) = s.strip_prefix('#') else {
+        return false;
+    };
+    matches!(body.len(), 3 | 4 | 6 | 8) && body.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 /// `$XDG_CONFIG_HOME/flowmux/options.json` 경로. XDG dir 미해결이면
@@ -130,8 +178,14 @@ pub fn load() -> Options {
         Ok(o) => o,
         Err(_) => return Options::default(),
     };
+    let focus_border_color = if is_valid_hex_color(&opts.focus_border_color) {
+        opts.focus_border_color
+    } else {
+        FOCUS_BORDER_COLOR_DEFAULT.to_string()
+    };
     Options {
         zoom_percent: Options::clamp_zoom(opts.zoom_percent),
+        focus_border_color,
         ..opts
     }
 }
@@ -312,5 +366,71 @@ mod tests {
     fn missing_fields_fall_back_to_defaults() {
         let opts: Options = serde_json::from_str("{}").unwrap();
         assert_eq!(opts, Options::default());
+    }
+
+    #[test]
+    fn default_focus_border_color_is_pale_yellow() {
+        assert_eq!(Options::default().focus_border_color, "#fff4b3");
+    }
+
+    #[test]
+    fn is_valid_hex_color_accepts_known_lengths() {
+        assert!(is_valid_hex_color("#abc"));
+        assert!(is_valid_hex_color("#abcd"));
+        assert!(is_valid_hex_color("#aabbcc"));
+        assert!(is_valid_hex_color("#aabbccdd"));
+        assert!(is_valid_hex_color("#FFF4B3"));
+    }
+
+    #[test]
+    fn is_valid_hex_color_rejects_other_formats() {
+        assert!(!is_valid_hex_color(""));
+        assert!(!is_valid_hex_color("#"));
+        assert!(!is_valid_hex_color("#g00"));
+        assert!(!is_valid_hex_color("#12345"));
+        assert!(!is_valid_hex_color("rgb(255,0,0)"));
+        assert!(!is_valid_hex_color("yellow"));
+    }
+
+    #[test]
+    fn with_focus_border_color_falls_back_for_invalid_input() {
+        let opts = Options::default().with_focus_border_color("not-a-color");
+        assert_eq!(opts.focus_border_color, "#fff4b3");
+
+        let opts = Options::default().with_focus_border_color("#deadbe");
+        assert_eq!(opts.focus_border_color, "#deadbe");
+    }
+
+    #[test]
+    fn focus_border_color_or_default_protects_callers() {
+        let mut opts = Options::default();
+        opts.focus_border_color = "garbage".into();
+        assert_eq!(opts.focus_border_color_or_default(), "#fff4b3");
+    }
+
+    #[test]
+    fn options_load_sanitizes_corrupt_focus_color() {
+        with_xdg(|root| {
+            let path = root.join("flowmux").join("options.json");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(
+                &path,
+                r#"{"zoom_percent": 100, "default_browser_engine": {"kind": "webkit"}, "focus_border_color": "blueish"}"#,
+            )
+            .unwrap();
+            let opts = load();
+            assert_eq!(opts.focus_border_color, "#fff4b3");
+        });
+    }
+
+    #[test]
+    fn options_save_then_load_preserves_focus_color() {
+        with_xdg(|_| {
+            let opts = Options::default()
+                .with_focus_border_color("#0bd968");
+            save(&opts).unwrap();
+            let back = load();
+            assert_eq!(back.focus_border_color, "#0bd968");
+        });
     }
 }

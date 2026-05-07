@@ -135,8 +135,10 @@ impl ResolvedTheme {
     }
 
     /// CSS rules that paint the pane frame and tint the sidebar to
-    /// match the terminal background.
-    pub fn css(&self) -> String {
+    /// match the terminal background. `focus_border_color`는 사용자가
+    /// 옵션에서 고른 hex 색이며, 포커스된 pane의 1px 테두리를 그리는
+    /// 데 사용된다.
+    pub fn css(&self, focus_border_color: &str) -> String {
         let bg_css = rgba_css(&self.bg);
         let pane_border_css = rgba_css(&blend_with_alpha(&self.fg, 0.10));
         let tabbar_bg_css = rgba_css(&shift_lightness(
@@ -158,6 +160,10 @@ impl ResolvedTheme {
     border-radius: 4px;
     margin: 1px;
     padding: 0;
+}}
+.flowmux-pane.focused {{
+    border-color: {focus};
+    box-shadow: inset 0 0 0 1px {focus};
 }}
 .flowmux-pane vte-terminal {{
     padding: 7px;
@@ -247,6 +253,7 @@ paned > separator {{
             bg = bg_css,
             fg = rgba_css(&self.fg),
             border = pane_border_css,
+            focus = focus_border_color,
             tabbar = tabbar_bg_css,
             tab_active = tab_active_bg_css,
             control_hover = control_hover_css,

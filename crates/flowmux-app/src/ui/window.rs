@@ -36,6 +36,10 @@ pub struct WindowController {
     theme: Arc<ResolvedTheme>,
     notification_log: NotificationLog,
     options: Rc<RefCell<flowmux_config::options::Options>>,
+    /// 글로벌 CssProvider — 옵션 다이얼로그에서 포커스 테두리 색이
+    /// 바뀌면 같은 인스턴스의 CSS를 다시 로드해 모든 pane에 즉시
+    /// 반영한다.
+    css_provider: gtk::CssProvider,
 }
 
 impl WindowController {
@@ -44,6 +48,7 @@ impl WindowController {
         store: StateStore,
         theme: Arc<ResolvedTheme>,
         bridge: Bridge,
+        css_provider: gtk::CssProvider,
     ) -> Self {
         let focused_pane: FocusedPane = Rc::new(Cell::new(None));
         let notification_log = crate::notifications::new_log();
@@ -141,6 +146,7 @@ impl WindowController {
             theme,
             notification_log,
             options,
+            css_provider,
         };
         controller.install_state_flush_on_close();
         controller
@@ -362,12 +368,15 @@ impl WindowController {
                 let current = self.options.borrow().clone();
                 let options_cell = self.options.clone();
                 let registry = self.pane_registry.clone();
+                let css_provider = self.css_provider.clone();
+                let theme = self.theme.clone();
                 crate::ui::options_dialog::present(&self.window, current, move |opts| {
                     if let Err(e) = flowmux_config::options::save(&opts) {
                         tracing::warn!(error = %e, "options save failed");
                         return;
                     }
                     *options_cell.borrow_mut() = opts.clone();
+                    // 줌은 모든 기존 위젯에 즉시 반영.
                     let registry = registry.borrow();
                     for terminal in registry.terminals.values() {
                         terminal.widget.set_font_scale(opts.zoom_factor());
@@ -375,6 +384,18 @@ impl WindowController {
                     for browser in registry.browsers.values() {
                         browser.web_view.set_zoom_level(opts.zoom_factor());
                     }
+                    // 포커스 테두리 색은 CSS 한 줄을 다시 로드해 반영 —
+                    // 같은 CssProvider 인스턴스라 새 변경이 모든 위젯에
+                    // 자동으로 다시 적용된다.
+                    css_provider.load_from_string(
+                        &theme.css(opts.focus_border_color_or_default()),
+                    );
+                    tracing::info!(
+                        zoom_percent = opts.zoom_percent,
+                        engine = ?opts.default_browser_engine,
+                        focus_border_color = %opts.focus_border_color,
+                        "options applied"
+                    );
                 });
             }
             GtkCommand::WorkspaceCreated {
@@ -1461,7 +1482,13 @@ mod tests {
             .build();
         app.register(None::<&gtk::gio::Cancellable>).unwrap();
         let controller =
-            WindowController::new(&app, store.clone(), Arc::new(ResolvedTheme::load()), bridge);
+            WindowController::new(
+                &app,
+                store.clone(),
+                Arc::new(ResolvedTheme::load()),
+                bridge,
+                gtk::CssProvider::new(),
+            );
 
         controller.render_workspace(&ws);
         assert_eq!(
@@ -1565,6 +1592,7 @@ mod tests {
             store.clone(),
             Arc::new(ResolvedTheme::load()),
             bridge,
+            gtk::CssProvider::new(),
         );
         controller.render_workspace(&ws);
 
@@ -1637,6 +1665,7 @@ mod tests {
             store.clone(),
             Arc::new(ResolvedTheme::load()),
             bridge,
+            gtk::CssProvider::new(),
         );
 
         controller
@@ -1695,6 +1724,7 @@ mod tests {
             store.clone(),
             Arc::new(ResolvedTheme::load()),
             bridge,
+            gtk::CssProvider::new(),
         );
 
         // A: title_locked=false → 갱신.
@@ -1749,6 +1779,7 @@ mod tests {
             store.clone(),
             Arc::new(ResolvedTheme::load()),
             bridge,
+            gtk::CssProvider::new(),
         );
         controller.render_workspace(&ws);
         controller.focused_pane.set(Some(pane));
@@ -1810,6 +1841,7 @@ mod tests {
             store.clone(),
             Arc::new(ResolvedTheme::load()),
             bridge,
+            gtk::CssProvider::new(),
         );
         let ws = store.get_workspace(ws_id).await.unwrap();
         controller.render_workspace(&ws);
@@ -1876,6 +1908,7 @@ mod tests {
             store.clone(),
             Arc::new(ResolvedTheme::load()),
             bridge,
+            gtk::CssProvider::new(),
         );
         let ws = store.get_workspace(ws_id).await.unwrap();
         controller.render_workspace(&ws);

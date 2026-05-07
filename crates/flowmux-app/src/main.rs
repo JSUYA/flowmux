@@ -93,9 +93,13 @@ fn main() -> anyhow::Result<()> {
             style.set_color_scheme(adw::ColorScheme::ForceLight);
         }
 
-        // Install the global CSS for pane frames + sidebar tint.
+        // Install the global CSS for pane frames + sidebar tint. 옵션의
+        // focus_border_color를 미리 읽어 포커스 테두리 색을 채워 둔다 —
+        // 옵션 다이얼로그에서 변경되면 WindowController가 같은 provider
+        // 인스턴스의 CSS를 다시 로드해 즉시 반영한다.
+        let initial_options = flowmux_config::options::load();
         let provider = gtk::CssProvider::new();
-        provider.load_from_string(&theme.css());
+        provider.load_from_string(&theme.css(initial_options.focus_border_color_or_default()));
         if let Some(display) = gtk::gdk::Display::default() {
             gtk::style_context_add_provider_for_display(
                 &display,
@@ -109,6 +113,7 @@ fn main() -> anyhow::Result<()> {
             store_for_activate.clone(),
             theme,
             bridge_for_activate.clone(),
+            provider,
         );
         keybindings::install_actions(
             &controller.window,
