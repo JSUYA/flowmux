@@ -1025,7 +1025,19 @@ fn build_panel(
     match &surface.kind {
         SurfaceKind::Terminal { cwd, shell } => {
             let argv = shell.clone().map(|s| vec![s]).unwrap_or(argv);
-            let pane = TerminalPane::spawn(pane_id, argv, cwd.clone(), callbacks.clone());
+            let socket = flowmux_config::paths::runtime_socket();
+            let bundled_cli = std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.join("flowmux")))
+                .filter(|p| p.exists());
+            let extra_env = flowmux_terminal::agent_pty_env(
+                pane_id,
+                workspace,
+                &socket,
+                bundled_cli.as_deref(),
+            );
+            let pane =
+                TerminalPane::spawn(pane_id, argv, cwd.clone(), extra_env, callbacks.clone());
             theme.apply_to_vte(&pane.widget);
             // 새 터미널 위젯도 현재 옵션의 줌 배율로 시작한다.
             pane.widget

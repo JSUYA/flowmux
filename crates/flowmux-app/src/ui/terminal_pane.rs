@@ -152,10 +152,17 @@ pub struct PaneCallbacks {
 impl TerminalPane {
     /// Build a fresh terminal widget and spawn `argv` in `cwd`. If
     /// `argv` is empty we fall back to the user's `$SHELL`.
+    ///
+    /// `extra_env` is added to the child's environment as `KEY=VALUE`
+    /// pairs. flowmux uses this to inject `FLOWMUX_PANE_ID`, `FLOWMUX_SURFACE_ID`,
+    /// `FLOWMUX_WORKSPACE_ID`, `FLOWMUX_SOCKET_PATH`, etc., so terminal-side
+    /// agents (claude/codex/opencode) can discover their context without
+    /// explicit flags. Build the vector with `flowmux_terminal::agent_pty_env`.
     pub fn spawn(
         id: PaneId,
         argv: Vec<String>,
         cwd: Option<std::path::PathBuf>,
+        extra_env: Vec<(String, String)>,
         callbacks: PaneCallbacks,
     ) -> Self {
         let term = vte::Terminal::new();
@@ -289,13 +296,21 @@ impl TerminalPane {
         let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
         let cwd_str = cwd.as_ref().and_then(|p| p.to_str());
 
+        // VTE's spawn_async expects an envv array of `KEY=VALUE` strings,
+        // or an empty slice to inherit the parent's environment. We
+        // append flowmux-specific entries so agents inside the PTY can
+        // self-discover their pane and the daemon socket. Inheritance of
+        // the parent env is handled by glib at the spawn-async layer.
+        let envv_strings = flowmux_terminal::env_to_kv_strings(&extra_env);
+        let envv_refs: Vec<&str> = envv_strings.iter().map(String::as_str).collect();
+
         let pid: Rc<Cell<Option<i32>>> = Rc::new(Cell::new(None));
         let pid_for_cb = pid.clone();
         term.spawn_async(
             vte::PtyFlags::DEFAULT,
             cwd_str,
             &argv_refs,
-            &[], // envv: inherit
+            &envv_refs,
             glib::SpawnFlags::DEFAULT,
             || {}, // child setup (runs in child after fork)
             -1,    // no timeout

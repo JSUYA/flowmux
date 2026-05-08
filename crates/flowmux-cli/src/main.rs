@@ -11,6 +11,19 @@ use flowmux_core::{NotificationLevel, PaneId, SplitDirection};
 use flowmux_ipc::{client::Client, protocol::Request, protocol::Response};
 use std::io::Read;
 use std::path::PathBuf;
+use std::str::FromStr;
+
+/// Read `FLOWMUX_PANE_ID` (set by `flowmux-app` at PTY spawn time) and parse
+/// it as a `PaneId`. Returns `None` if the env var is missing or invalid.
+/// Used as a fallback when the user does not pass an explicit `--pane`/
+/// positional pane id, so terminal-side agents can call e.g.
+/// `flowmux browser open https://...` without knowing their own pane.
+fn pane_from_env() -> Option<PaneId> {
+    std::env::var("FLOWMUX_PANE_ID")
+        .ok()
+        .as_deref()
+        .and_then(|s| PaneId::from_str(s).ok())
+}
 
 #[derive(Parser)]
 #[command(
@@ -19,8 +32,10 @@ use std::path::PathBuf;
     about = "Linux/GTK4 terminal for AI coding agents"
 )]
 struct Cli {
-    /// Override the daemon socket path.
-    #[arg(long, env = "FLOWMUX_SOCKET")]
+    /// Override the daemon socket path. Defaults to `FLOWMUX_SOCKET_PATH`
+    /// (injected by `flowmux-app` into every PTY) and falls back to the
+    /// XDG runtime path. `FLOWMUX_SOCKET` is accepted as a legacy alias.
+    #[arg(long, env = "FLOWMUX_SOCKET_PATH")]
     socket: Option<PathBuf>,
 
     #[command(subcommand)]
@@ -223,7 +238,10 @@ async fn main() -> anyhow::Result<()> {
         _ => {}
     }
 
-    let socket = cli.socket.unwrap_or_else(paths::runtime_socket);
+    let socket = cli
+        .socket
+        .or_else(|| std::env::var_os("FLOWMUX_SOCKET").map(PathBuf::from))
+        .unwrap_or_else(paths::runtime_socket);
     let client = Client::connect(&socket)
         .await
         .with_context(|| "is the flowmux daemon running? try: flowmux-app &")?;
@@ -320,9 +338,13 @@ fn build_request(cmd: Cmd) -> anyhow::Result<Request> {
             } else {
                 SplitDirection::Vertical
             };
+            // When invoked from a terminal that flowmux-app spawned, the
+            // PTY's `FLOWMUX_PANE_ID` lets the daemon resolve "next to me"
+            // without the caller passing a pane id explicitly. cmux's
+            // CLI uses the same fallback (`CMUX_SURFACE_ID`).
             Request::BrowserOpen {
                 url,
-                target_pane: None,
+                target_pane: pane_from_env(),
                 direction,
             }
         }
@@ -502,6 +524,13 @@ mod tests {
 
     #[test]
     fn browser_open_no_flags_defaults_to_right_split() {
+        // SAFETY: tests in this module mutate process-global env. Remove
+        // FLOWMUX_PANE_ID so a leak from another test doesn't change the
+        // expected target_pane = None outcome below.
+        unsafe {
+            std::env::remove_var("FLOWMUX_PANE_ID");
+        }
+
         let req = build_request(Cmd::Browser {
             url: "https://example.com".into(),
             right: false,
@@ -515,6 +544,60 @@ mod tests {
                 target_pane: None,
                 direction: SplitDirection::Vertical,
             } if url == "https://example.com"
+        ));
+    }
+
+    #[test]
+    fn browser_open_picks_target_pane_from_flowmux_pane_id_env() {
+        let pane = PaneId::new();
+        let pane_str = pane.to_string();
+        // SAFETY: this test reads/writes a process-global env var. cargo
+        // serializes by default within a binary's test harness, and we
+        // remove the var at the end of the test.
+        unsafe {
+            std::env::set_var("FLOWMUX_PANE_ID", &pane_str);
+        }
+
+        let req = build_request(Cmd::Browser {
+            url: "https://example.com".into(),
+            right: false,
+            down: false,
+        })
+        .unwrap();
+
+        unsafe {
+            std::env::remove_var("FLOWMUX_PANE_ID");
+        }
+
+        assert!(matches!(
+            req,
+            Request::BrowserOpen { target_pane: Some(got), .. } if got == pane
+        ));
+    }
+
+    #[test]
+    fn browser_open_ignores_invalid_flowmux_pane_id_env() {
+        unsafe {
+            std::env::set_var("FLOWMUX_PANE_ID", "not-a-uuid");
+        }
+
+        let req = build_request(Cmd::Browser {
+            url: "https://example.com".into(),
+            right: false,
+            down: false,
+        })
+        .unwrap();
+
+        unsafe {
+            std::env::remove_var("FLOWMUX_PANE_ID");
+        }
+
+        assert!(matches!(
+            req,
+            Request::BrowserOpen {
+                target_pane: None,
+                ..
+            }
         ));
     }
 
