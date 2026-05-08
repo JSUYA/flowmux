@@ -25,6 +25,20 @@ fn pane_from_env() -> Option<PaneId> {
         .and_then(|s| PaneId::from_str(s).ok())
 }
 
+/// Parse a pane reference from the CLI. Accepts cmux-compatible prefix
+/// forms `surface:<uuid>` and `pane:<uuid>` as well as a bare uuid, so
+/// agents that already speak cmux's CLI can keep their existing call
+/// shape. (`surface:<integer>` style numeric refs are out of scope for
+/// this layer — they require a daemon-side index lookup, planned with
+/// the ListPanes IPC verb.)
+fn parse_pane_or_surface(s: &str) -> Result<PaneId, String> {
+    let inner = s
+        .strip_prefix("surface:")
+        .or_else(|| s.strip_prefix("pane:"))
+        .unwrap_or(s);
+    PaneId::from_str(inner).map_err(|e| format!("invalid pane id `{s}`: {e}"))
+}
+
 #[derive(Parser)]
 #[command(
     name = "flowmux",
@@ -37,6 +51,12 @@ struct Cli {
     /// XDG runtime path. `FLOWMUX_SOCKET` is accepted as a legacy alias.
     #[arg(long, env = "FLOWMUX_SOCKET_PATH")]
     socket: Option<PathBuf>,
+
+    /// Print responses as a single-line JSON object instead of the
+    /// default human-readable indented form. Mirrors cmux's `--json`
+    /// flag — easier to parse from agent scripts.
+    #[arg(long, global = true)]
+    json: bool,
 
     #[command(subcommand)]
     cmd: Cmd,
@@ -252,7 +272,7 @@ async fn main() -> anyhow::Result<()> {
 
     let req = build_request(cli.cmd)?;
     let resp = client.call(req).await?;
-    print_response(&resp)?;
+    print_response(&resp, cli.json)?;
     Ok(())
 }
 
@@ -427,14 +447,66 @@ fn parse_level(s: &str) -> NotificationLevel {
     }
 }
 
-fn print_response(r: &Response) -> anyhow::Result<()> {
-    println!("{}", serde_json::to_string_pretty(r)?);
+fn print_response(r: &Response, json_mode: bool) -> anyhow::Result<()> {
+    let s = if json_mode {
+        // Single-line JSON — easier to parse from agent scripts
+        // (`jq -r .pane` etc.). Mirrors cmux's `--json` shape.
+        serde_json::to_string(r)?
+    } else {
+        serde_json::to_string_pretty(r)?
+    };
+    println!("{s}");
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_pane_or_surface_accepts_bare_uuid_and_prefix_forms() {
+        let pane = PaneId::new();
+        let s = pane.to_string();
+
+        assert_eq!(parse_pane_or_surface(&s).unwrap(), pane);
+        assert_eq!(
+            parse_pane_or_surface(&format!("surface:{s}")).unwrap(),
+            pane
+        );
+        assert_eq!(
+            parse_pane_or_surface(&format!("pane:{s}")).unwrap(),
+            pane
+        );
+    }
+
+    #[test]
+    fn parse_pane_or_surface_rejects_garbage() {
+        assert!(parse_pane_or_surface("not-a-uuid").is_err());
+        assert!(parse_pane_or_surface("surface:also-not-a-uuid").is_err());
+    }
+
+    #[test]
+    fn print_response_pretty_default_uses_indented_output() {
+        let resp = Response::Ok;
+        let pretty = serde_json::to_string_pretty(&resp).unwrap();
+        let compact = serde_json::to_string(&resp).unwrap();
+
+        // Sanity-check the format we expect on each side. Pretty output
+        // is multi-line for non-trivial structures — `Response::Ok`
+        // serializes to a single string either way, so use a richer
+        // variant to verify the shape difference.
+        let resp = Response::BrowserPaneOpened {
+            pane: PaneId::new(),
+            placement_strategy: flowmux_core::PlacementStrategy::SplitRight,
+        };
+        let pretty = serde_json::to_string_pretty(&resp).unwrap();
+        let compact = serde_json::to_string(&resp).unwrap();
+        assert!(pretty.contains('\n'), "pretty output should be multi-line");
+        assert!(
+            !compact.contains('\n'),
+            "compact (--json mode) output must be single-line"
+        );
+    }
 
     #[test]
     fn maps_notify_level_strings_to_core_levels() {

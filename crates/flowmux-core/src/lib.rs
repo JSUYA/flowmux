@@ -157,8 +157,19 @@ pub mod id {
 
             impl std::str::FromStr for $name {
                 type Err = uuid::Error;
+                /// Accepts a bare UUID (`<uuid>`) and the cmux-style
+                /// prefixed forms (`surface:<uuid>`, `pane:<uuid>`,
+                /// `workspace:<uuid>`, …). Anything before the first
+                /// `:` is treated as a label and ignored, so an agent
+                /// that learned the cmux CLI shape ports unchanged.
+                ///
+                /// (`surface:<integer>` numeric refs in cmux require a
+                /// daemon-side index lookup; those are not parsed
+                /// here — the CLI surfaces them as a separate IPC
+                /// verb when implemented.)
                 fn from_str(s: &str) -> Result<Self, Self::Err> {
-                    Ok(Self(s.parse()?))
+                    let inner = s.split_once(':').map(|(_, rest)| rest).unwrap_or(s);
+                    Ok(Self(inner.parse()?))
                 }
             }
         };
@@ -1151,6 +1162,7 @@ pub enum CoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::str::FromStr;
 
     #[test]
     fn split_leaf_replaces_target_with_a_split() {
@@ -2511,6 +2523,31 @@ mod tests {
         let other = PaneId::new();
         let pane = vsplit(term_leaf(term_id), term_leaf(other));
         assert!(pane.find_right_sibling_browser_leaf(term_id).is_none());
+    }
+
+    #[test]
+    fn id_from_str_accepts_bare_uuid_and_cmux_prefixes() {
+        let pane = PaneId::new();
+        let s = pane.to_string();
+        // bare UUID
+        assert_eq!(PaneId::from_str(&s).unwrap(), pane);
+        // surface: prefix (cmux-compatible)
+        assert_eq!(PaneId::from_str(&format!("surface:{s}")).unwrap(), pane);
+        // pane: prefix
+        assert_eq!(PaneId::from_str(&format!("pane:{s}")).unwrap(), pane);
+        // arbitrary label is ignored before ':' — keeps the rule simple
+        // and forward-compatible with future label types.
+        assert_eq!(PaneId::from_str(&format!("foo:{s}")).unwrap(), pane);
+
+        let ws = WorkspaceId::new();
+        let s = ws.to_string();
+        assert_eq!(WorkspaceId::from_str(&format!("workspace:{s}")).unwrap(), ws);
+    }
+
+    #[test]
+    fn id_from_str_rejects_non_uuid_after_prefix() {
+        assert!(PaneId::from_str("surface:not-a-uuid").is_err());
+        assert!(PaneId::from_str("not-a-uuid").is_err());
     }
 
     #[test]
