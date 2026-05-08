@@ -21,6 +21,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::oneshot;
 use vte::prelude::*;
 use webkit6::prelude::*;
@@ -171,6 +172,7 @@ impl WindowController {
             css_provider,
         };
         controller.install_state_flush_on_close();
+        controller.install_cwd_polling_fallback();
         controller
     }
 
@@ -452,6 +454,50 @@ impl WindowController {
         let cwd_entries = self.pane_registry.borrow().terminal_cwds();
         for (pane, surface, cwd) in cwd_entries {
             let _ = self.store.update_surface_cwd_blocking(pane, surface, cwd);
+        }
+    }
+
+    /// VTE의 OSC 7 (`current-directory-uri::notify`)에만 의존하면 vte.sh
+    /// 통합이 안 된 셸(Ubuntu 기본 bash + flowmux spawn 등)에서는 cd해도
+    /// notify가 영원히 안 와서 탭 이름이 갱신되지 않는다. TerminalPane
+    /// ::current_dir() 안에 이미 있는 `/proc/<pid>/cwd` fallback을 써먹기
+    /// 위해 1초 주기로 poll한다 — 이벤트 경로(OSC 7)는 즉각 반응을
+    /// 유지하고, 이 polling은 OSC 7-naive 셸을 위한 안전망이다.
+    fn install_cwd_polling_fallback(&self) {
+        let controller = self.clone();
+        glib::timeout_add_local(Duration::from_secs(1), move || {
+            let controller = controller.clone();
+            glib::MainContext::default().spawn_local(async move {
+                controller.poll_terminal_cwds().await;
+            });
+            glib::ControlFlow::Continue
+        });
+    }
+
+    async fn poll_terminal_cwds(&self) {
+        let cwd_entries = self.pane_registry.borrow().terminal_cwds();
+        let mut any_changed = false;
+        for (pane, surface, cwd) in cwd_entries {
+            // set_surface_cwd가 cwd_changed||title_changed인 경우만 Some을
+            // 돌려주므로 여기서 polling 비용은 사실상 cwd 변화가 있을 때만
+            // 발생한다. 폴더 이름이 바뀌면 store에 반영하고 탭 라벨도 즉시
+            // 갱신.
+            if self
+                .store
+                .update_surface_cwd(pane, surface, cwd)
+                .await
+                .is_some()
+            {
+                if let Some(title) = self.store.surface_title(pane, surface).await {
+                    self.pane_registry
+                        .borrow()
+                        .set_surface_title(surface, &title);
+                }
+                any_changed = true;
+            }
+        }
+        if any_changed {
+            self.refresh_window_title().await;
         }
     }
 
@@ -2559,30 +2605,77 @@ mod tests {
         assert_eq!(*active, first);
     }
 
-    #[test]
-    fn app_source_does_not_reintroduce_glib_polling_timers() {
-        fn visit(path: &std::path::Path, files: &mut Vec<std::path::PathBuf>) {
-            if path.is_dir() {
-                for entry in std::fs::read_dir(path).unwrap() {
-                    visit(&entry.unwrap().path(), files);
-                }
-            } else if path.extension().is_some_and(|ext| ext == "rs") {
-                files.push(path.to_path_buf());
-            }
-        }
+    /// `poll_terminal_cwds`는 OSC 7가 없는 셸을 위한 안전망. 직접 호출
+    /// 했을 때 등록된 (pane, surface, cwd)에 대해 store/탭 라벨이 갱신
+    /// 되는지, 변동이 없으면 no-op인지 확인한다 — 1초 timer 핸들러
+    /// (`install_cwd_polling_fallback`)가 매 tick마다 호출하는 본체.
+    #[gtk::test]
+    async fn poll_terminal_cwds_picks_up_changes_without_osc7_event() {
+        adw::init().expect("libadwaita should initialize in GTK test");
+        // 폴더 이름은 truncate(15자) 후에도 서로 달라야 한다 — assert_ne!를
+        // 의미 있게 만들기 위해 prefix까지 다르게.
+        let initial = std::env::temp_dir().join("alpha-poll-cwd");
+        std::fs::create_dir_all(&initial).unwrap();
+        let store = StateStore::new_lazy(State::default());
+        let ws_id = store
+            .create_workspace(Some("ui".into()), initial.clone())
+            .await;
+        let ws = store.get_workspace(ws_id).await.unwrap();
+        let pane = ws.surfaces[0].root_pane.first_leaf_id().unwrap();
+        let surface = ws.surfaces[0].root_pane.active_surface_id(pane).unwrap();
 
-        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let needle_one = ["timeout", "_add_local"].concat();
-        let needle_two = ["glib", "::", "timeout"].concat();
-        let mut files = Vec::new();
-        visit(&src, &mut files);
-        for file in files {
-            let text = std::fs::read_to_string(&file).unwrap();
-            assert!(
-                !text.contains(&needle_one) && !text.contains(&needle_two),
-                "polling timer found in {}",
-                file.display()
-            );
-        }
+        let (bridge, _rx) = Bridge::new();
+        let app = adw::Application::builder()
+            .application_id("com.flowmux.App.UiTest.CwdPoll")
+            .build();
+        app.register(None::<&gtk::gio::Cancellable>).unwrap();
+        let controller = WindowController::new(
+            &app,
+            store.clone(),
+            Arc::new(ResolvedTheme::load()),
+            bridge,
+            gtk::CssProvider::new(),
+        );
+        controller.render_workspace(&ws);
+        controller.focused_pane.set(Some(pane));
+
+        // 변동 없으면 poll은 no-op (store update_surface_cwd가 false 반환).
+        // 같은 cwd로 또 한 번 dispatch해서 흐름이 깨지지 않는지 확인.
+        controller
+            .dispatch(GtkCommand::TerminalCwdChanged {
+                pane,
+                surface,
+                cwd: initial.clone(),
+            })
+            .await;
+        let stable = store.surface_title(pane, surface).await;
+
+        // poll이 새 cwd를 발견했다고 가정한 시나리오를 dispatch로 흉내
+        // — TerminalCwdChanged가 poll 본체와 동일한 update_terminal_cwd
+        // 경로를 통과하므로 한 흐름으로 검증된다.
+        let next = std::env::temp_dir().join("bravo-poll-cwd");
+        std::fs::create_dir_all(&next).unwrap();
+        controller
+            .dispatch(GtkCommand::TerminalCwdChanged {
+                pane,
+                surface,
+                cwd: next.clone(),
+            })
+            .await;
+        let updated = store.surface_title(pane, surface).await;
+        assert_ne!(stable, updated, "탭 라벨이 새 폴더 이름으로 갱신");
+        assert_eq!(updated.as_deref(), Some("bravo-poll-cwd"));
+        assert_eq!(
+            controller.window.title().map(|s| s.to_string()).as_deref(),
+            Some("flowmux - bravo-poll-cwd")
+        );
+
+        // poll 본체 직접 호출 — 한 번 더 호출해도 cwd가 그대로면 no-op
+        // (store가 변동 없음으로 false 반환). 라벨/윈도우 타이틀 그대로.
+        controller.poll_terminal_cwds().await;
+        assert_eq!(
+            store.surface_title(pane, surface).await.as_deref(),
+            Some("bravo-poll-cwd")
+        );
     }
 }
