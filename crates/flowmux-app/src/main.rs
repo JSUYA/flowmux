@@ -31,23 +31,22 @@ fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    // WebKitGTK 6.0의 기본 sandbox는 bwrap + xdg-dbus-proxy를 띄우는데
-    // Ubuntu 24.04의 unprivileged user-namespace AppArmor 제한 환경에서는
-    // bwrap이 'setting up uid map: Permission denied'로 실패해 dbus-proxy
-    // 가 종료 코드 1로 죽고, 곧이어 첫 탭브라우저 생성 시 앱이 강제 종료된다.
-    // 사용자가 별도 AppArmor 프로파일을 설치하지 않아도 동작하도록, 첫
-    // WebView가 만들어지기 전에 sandbox 비활성화 플래그를 세팅한다.
-    // 이미 사용자가 명시적으로 값을 지정한 경우(0/1 무관)는 존중한다.
+    // WebKitGTK 6.0's default sandbox starts bwrap + xdg-dbus-proxy. On
+    // Ubuntu 24.04 with unprivileged user namespaces restricted by AppArmor,
+    // bwrap fails with "setting up uid map: Permission denied", the proxy
+    // exits with code 1, and the first browser tab creation aborts the app.
+    // Set the sandbox bypass before the first WebView unless the user has
+    // already set an explicit value.
     if std::env::var_os("WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS").is_none() {
         std::env::set_var("WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS", "1");
     }
 
-    // WebKitGTK 6.0의 새 DMA-BUF renderer는 Mesa Wayland 환경에서 종료
-    // 시 `eglDestroySync` 부재 + 후속 `corrupted size vs. prev_size`
-    // glibc abort를 일으키는 race가 알려져 있다 (libepoxy가 EGL 1.5
-    // 또는 EGL_KHR_fence_sync를 못 찾을 때 NULL deref). 사용자가 별도로
-    // 값을 지정하지 않은 경우 DMA-BUF renderer를 끄는 게 가장 안전한
-    // 기본값이다 — 그래픽 품질 손실 없이 종료 cleanup만 단순해진다.
+    // WebKitGTK 6.0's DMA-BUF renderer has a known shutdown race on some
+    // Mesa Wayland setups: missing `eglDestroySync` can lead to a later
+    // `corrupted size vs. prev_size` glibc abort when libepoxy cannot find
+    // EGL 1.5 or EGL_KHR_fence_sync. Unless the user has chosen otherwise,
+    // disabling the DMA-BUF renderer is the safest default and only
+    // simplifies shutdown cleanup.
     if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
         std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
     }
@@ -103,13 +102,15 @@ fn main() -> anyhow::Result<()> {
             style.set_color_scheme(adw::ColorScheme::ForceLight);
         }
 
-        // Install the global CSS for pane frames + sidebar tint. 옵션의
-        // focus_border_color를 미리 읽어 포커스 테두리 색을 채워 둔다 —
-        // 옵션 다이얼로그에서 변경되면 WindowController가 같은 provider
-        // 인스턴스의 CSS를 다시 로드해 즉시 반영한다.
+        // Install the global CSS for pane frames + sidebar tint. Seed it with
+        // the current focus border options; the options dialog later reloads
+        // this same provider so changes apply immediately.
         let initial_options = flowmux_config::options::load();
         let provider = gtk::CssProvider::new();
-        provider.load_from_string(&theme.css(initial_options.focus_border_color_or_default()));
+        provider.load_from_string(&theme.css(
+            initial_options.focus_border_color_or_default(),
+            initial_options.focus_border_alpha(),
+        ));
         if let Some(display) = gtk::gdk::Display::default() {
             gtk::style_context_add_provider_for_display(
                 &display,

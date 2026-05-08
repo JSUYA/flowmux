@@ -91,9 +91,9 @@ pub enum WsNav {
 /// `oneshot::Sender` for replies if the caller needs the result.
 #[derive(Debug)]
 pub enum GtkCommand {
-    /// 사이드 패널 좌하단 옵션 버튼이 눌리면 GTK 측에서 모달
-    /// 옵션 다이얼로그를 띄운다. 다이얼로그 자체가 OK / 취소
-    /// 결과를 보유 — bridge에는 결과를 돌려주지 않는다.
+    /// Show the modal options dialog from the GTK side.
+    /// The dialog owns OK / cancel handling and returns nothing through
+    /// the bridge.
     ShowOptionsDialog,
     /// Render a freshly-created workspace in the sidebar + open its first pane.
     WorkspaceCreated {
@@ -129,9 +129,9 @@ pub enum GtkCommand {
         ack: oneshot::Sender<Result<(), String>>,
     },
     /// Move keyboard focus to the nearest pane in `dir`.
-    /// `from = None` (현재 포커스된 pane이 없을 때) 인 경우 활성 워크스페이스의
-    /// 첫 leaf pane에 포커스를 잡아 — 사이드 패널에서 워크스페이스만 클릭한 직후
-    /// Alt+화살표를 처음 누른 케이스를 자연스럽게 처리한다.
+    /// If `from = None`, focus the active workspace's first leaf pane.
+    /// This handles pressing Alt+arrow immediately after selecting only
+    /// a workspace row in the side panel.
     FocusDirection {
         from: Option<PaneId>,
         dir: FocusDir,
@@ -140,11 +140,11 @@ pub enum GtkCommand {
     /// (Reserved for the planned horizontal surface-tab bar; currently
     /// unused since the sidebar shows workspaces, not surfaces.)
     NewSurface { pane: PaneId },
-    /// 같은 pane에 빈(about:blank) 탭브라우저를 새 탭으로 추가한다.
+    /// Add an empty about:blank browser tab to the same pane.
     NewBrowserSurface { pane: PaneId },
-    /// 터미널 안의 URL을 Ctrl-클릭했을 때 같은 pane에 새 탭브라우저로
-    /// URL을 로드해 연다. `pane`은 클릭이 발생한 터미널의 pane id이고
-    /// `url`은 trailing punctuation을 정리한 후의 URL 문자열이다.
+    /// Open a Ctrl-clicked terminal URL in a new browser tab in the same
+    /// pane. `pane` is the source terminal pane and `url` has already had
+    /// trailing punctuation trimmed.
     OpenUrlInBrowserTab { pane: PaneId, url: String },
     /// Switch the active pane-local surface tab.
     ActivateSurface { pane: PaneId, surface: SurfaceId },
@@ -163,9 +163,9 @@ pub enum GtkCommand {
     },
     /// Open the rename dialog for a pane-local surface tab.
     ShowRenameSurfaceDialog { pane: PaneId, surface: SurfaceId },
-    /// 같은 pane 안에서 탭(터미널/탭브라우저)을 드래그 앤 드랍으로 좌우
-    /// reorder. `target_index`는 이동 후의 최종 위치이며 길이를 넘으면
-    /// 끝으로 클램프된다.
+    /// Reorder a terminal or browser tab within the same pane by drag and
+    /// drop. `target_index` is the final position after the move and is
+    /// clamped to the end if it exceeds the length.
     ReorderSurface {
         pane: PaneId,
         surface: SurfaceId,
@@ -179,31 +179,34 @@ pub enum GtkCommand {
         cwd: PathBuf,
     },
     /// WebKit reported that a browser pane navigated to a new URL.
-    /// 다음 실행 시 같은 페이지로 복원되도록 state에 반영한다.
+    /// Store it in state so the next launch can restore the same page.
     BrowserUriChanged {
         pane: PaneId,
         surface: SurfaceId,
         url: String,
     },
-    /// WebKit reported a page title change. surface의 title_locked가
-    /// false인 경우에 한해 탭 라벨과 윈도우 제목을 갱신한다.
+    /// WebKit reported a page title change. Update the tab label and
+    /// window title only when the surface is not title-locked.
     BrowserTitleChanged {
         pane: PaneId,
         surface: SurfaceId,
         title: String,
     },
-    /// VTE가 OSC 0/2 (window title)로 받은 타이틀 변화를 알린다.
-    /// vi/claude/codex/tmux 같은 프로그램이 셸 안에서 실행되면
-    /// 보내며, 사용자가 직접 rename한 surface는 daemon 쪽에서
-    /// 무시한다. 빈 문자열은 무시 (셸이 종료되면서 OSC를 비울 때).
+    /// VTE reported an OSC 0/2 window-title change. Programs such as
+    /// vi, claude, codex, or tmux can emit these from inside the shell.
+    /// The daemon ignores user-renamed surfaces and empty reset titles.
     TerminalTitleChanged {
         pane: PaneId,
         surface: SurfaceId,
         title: String,
     },
-    /// 윈도우 타이틀을 "flowmux - {focused tab name}"으로 다시 계산.
-    /// 포커스 변경 / 탭 활성화 / 탭 라벨 변경 직후에 보낸다.
+    /// Recompute the window title as "flowmux - {focused tab name}".
+    /// Sent after focus changes, tab activation, or tab label changes.
     RefreshWindowTitle,
+    /// Emitted when a pane receives keyboard focus. The workspace side-panel
+    /// label and subtitles are based on the MRU focused pane's active
+    /// surface, so they need recomputation on focus moves.
+    PaneFocused { pane: PaneId },
     /// Create a brand-new workspace and add it to the sidebar.
     NewWorkspace { root: std::path::PathBuf },
     /// Remove a workspace entirely (sidebar row + stack page + state).
@@ -224,9 +227,9 @@ pub enum GtkCommand {
         color: String,
         ack: oneshot::Sender<()>,
     },
-    /// 사이드 패널 안에서 워크스페이스를 드래그 앤 드랍해 순서를 재배치할 때
-    /// 발행한다. `target_index`는 이동 후의 최종 위치이며, 길이를 넘으면
-    /// 데몬에서 마지막 슬롯으로 클램프된다.
+    /// Emitted when a workspace row is reordered by drag and drop in the
+    /// side panel. `target_index` is the final position after the move and
+    /// is clamped to the last slot by the daemon if it exceeds the length.
     ReorderWorkspace {
         id: WorkspaceId,
         target_index: usize,
@@ -251,10 +254,10 @@ pub enum GtkCommand {
     /// Jump straight to the N-th workspace (1-indexed; clamped to
     /// what currently exists).
     FocusWorkspaceAt { idx: u8 },
-    /// 사이드 패널에서 특정 워크스페이스 행을 클릭(=row-activated)했을 때.
-    /// dispatcher가 activate_workspace로 라우팅해 GtkStack 가시성 + store
-    /// active_workspace + 첫 leaf grab_focus까지 한 흐름으로 처리한다 —
-    /// click과 Alt+숫자/Ctrl+Tab의 워크스페이스 전환 경로를 통일.
+    /// A side-panel workspace row was clicked or row-activated. The
+    /// dispatcher routes it through activate_workspace so GtkStack
+    /// visibility, store active_workspace, and first-leaf grab_focus happen
+    /// in one flow shared by clicks, Alt+number, and Ctrl+Tab.
     ActivateWorkspace { id: WorkspaceId },
     /// A notification was raised on a pane (from VTE OSC signal). Update
     /// the pane border / sidebar badge.

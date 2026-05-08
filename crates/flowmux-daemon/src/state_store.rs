@@ -104,9 +104,9 @@ impl StateStore {
         let surface_id = SurfaceId::new();
         let pane_id = PaneId::new();
         let tab_title = terminal_tab_title_for_cwd(Some(&root));
-        // 호출자가 명시한 name이 있어도 그것은 자동 결정값(name)으로 둔다.
-        // cmux 시맨틱: customTitle은 사용자가 직접 rename 했을 때만 채워지고,
-        // 새로 만들 때는 항상 None으로 시작해 자동 모드를 유지한다.
+        // Even if caller supplies a name, treat it as the automatic value (`name`).
+        // cmux semantics: customTitle is filled only after an explicit user
+        // rename, and new workspaces always start with None in automatic mode.
         let auto_name = name.unwrap_or_else(|| {
             root.file_name()
                 .and_then(|n| n.to_str())
@@ -318,16 +318,14 @@ impl StateStore {
         updated
     }
 
-    /// 사용자가 우클릭 메뉴 → "Change tab name" 다이얼로그에서 입력한
-    /// 값을 워크스페이스에 적용한다. cmux의 `setCustomTitle`과 동일하게
-    /// 동작한다:
-    ///   * 입력을 양 끝 공백 기준 trim 한 결과가 비어 있으면
-    ///     `custom_title = None`으로 되돌려 자동 모드 (= `name`을 표시)
-    ///     로 복귀한다.
-    ///   * 비어 있지 않으면 `custom_title = Some(trimmed)`로 저장한다.
-    /// 자동 결정값인 `name`은 어떤 경우에도 직접 건드리지 않는다 — 자동
-    /// 갱신 신호(folder rename, OSC, …)가 따로 갱신할 수 있도록.
-    /// 매칭되는 워크스페이스가 없거나 변경이 없으면 `false` 반환.
+    /// Apply the value the user entered in the right-click "Change tab name"
+    /// dialog to a workspace. Behavior matches cmux `setCustomTitle`:
+    ///   * If trimming both ends yields an empty value, reset to
+    ///     `custom_title = None` and return to automatic mode, showing `name`.
+    ///   * Otherwise store `custom_title = Some(trimmed)`.
+    /// The automatic value `name` is never modified here, so separate automatic
+    /// signals such as folder rename or OSC can update it. Returns `false` when
+    /// no workspace matches or nothing changes.
     pub async fn rename_workspace(&self, id: WorkspaceId, raw_input: String) -> bool {
         let trimmed = raw_input.trim();
         let new_custom = if trimmed.is_empty() {
@@ -398,9 +396,8 @@ impl StateStore {
         updated
     }
 
-    /// 브라우저 surface의 마지막 URL을 state에 반영한다. webview의
-    /// uri_notify 신호에 응답해 호출되며, 앱 종료/재실행 시 마지막에
-    /// 보고 있던 페이지로 복원되도록 한다.
+    /// Store the last URL of a browser surface in state. Called in response to
+    /// webview uri_notify so app exit/relaunch can restore the last viewed page.
     pub async fn update_browser_url(
         &self,
         pane: PaneId,
@@ -430,18 +427,17 @@ impl StateStore {
         updated
     }
 
-    /// 외부 신호로부터 받은 자동 타이틀(브라우저 페이지 제목 / 터미널
-    /// OSC 0/2 등)을 surface에 반영한다. 사용자가 직접 rename 한 surface
-    /// (title_locked)는 건드리지 않는다.
+    /// Apply an automatic title from external signals, such as browser page title
+    /// or terminal OSC 0/2, to a surface. User-renamed surfaces (title_locked)
+    /// are left untouched.
     ///
-    /// cmux의 single-panel auto-sync 룰을 같은 호출 안에서 함께 적용한다 —
-    /// 워크스페이스에 split이 전혀 없고 (단일 Leaf), 갱신된 surface가 그
-    /// 레이프의 활성 탭이며, 사용자가 직접 지정한 `custom_title`이 없는
-    /// 경우, 워크스페이스의 자동 결정값(`name`)도 같은 타이틀로 따라간다.
-    /// 이렇게 해서 사이드 패널의 [`Workspace::display_title`]이 활성 탭의
-    /// OSC 타이틀(예: "Claude Code")을 자연스럽게 비춘다. split이 있거나
-    /// 사용자가 rename으로 custom_title을 잠가 둔 경우엔 어떤 자동 갱신도
-    /// 워크스페이스 라벨에 영향을 주지 않는다.
+    /// Applies cmux's single-panel auto-sync rule in the same call: if the
+    /// workspace has no split (single Leaf), the updated surface is that leaf's
+    /// active tab, and there is no user-provided `custom_title`, the workspace's
+    /// automatic value (`name`) follows the same title. This lets
+    /// [`Workspace::display_title`] naturally reflect active tab OSC titles such
+    /// as "Claude Code". Splits or locked custom titles block automatic workspace
+    /// label changes.
     pub async fn update_surface_auto_title(
         &self,
         pane: PaneId,
@@ -451,26 +447,16 @@ impl StateStore {
         let mut s = self.inner.lock().await;
         let mut updated = None;
         for ws in s.workspaces.iter_mut() {
-            let mut hit = false;
             for surface in ws.surfaces.iter_mut() {
                 if surface
                     .root_pane
                     .set_surface_title_auto(pane, surface_id, title.clone())
                 {
-                    hit = true;
+                    updated = Some(ws.id);
                     break;
                 }
             }
-            if hit {
-                // OSC 0/2 등 외부 신호로 들어온 title은 truncate 되지
-                // 않은 원본이므로 그대로 ws.name에 복사한다 (탭 라벨에
-                // 쓰이는 surface.title은 15자에서 잘리지만 사이드 패널
-                // 라벨은 ellipsize로 동적 잘림이 가능해 원본을 보존하는
-                // 게 맞다).
-                if workspace_should_sync_to_surface(ws, surface_id) && ws.name != title {
-                    ws.name = title.clone();
-                }
-                updated = Some(ws.id);
+            if updated.is_some() {
                 break;
             }
         }
@@ -479,6 +465,25 @@ impl StateStore {
             self.mark_dirty();
         }
         updated
+    }
+
+    /// Set the workspace's automatic value (`name`) directly. The GTK side knows
+    /// the focused pane's active surface title, so the new design explicitly
+    /// updates "current focused tab = workspace name" through this setter.
+    /// `custom_title` is left untouched so user-locked labels remain. Returns
+    /// `false` for no changes or missing workspaces.
+    pub async fn set_workspace_name(&self, id: WorkspaceId, name: String) -> bool {
+        let mut s = self.inner.lock().await;
+        let Some(w) = s.workspaces.iter_mut().find(|w| w.id == id) else {
+            return false;
+        };
+        if w.name == name {
+            return false;
+        }
+        w.name = name;
+        drop(s);
+        self.mark_dirty();
+        true
     }
 
     pub fn update_surface_cwd_blocking(
@@ -496,13 +501,12 @@ impl StateStore {
         updated
     }
 
-    /// pane 안에서 탭(터미널/탭브라우저)을 드래그 앤 드랍으로 재배치할
-    /// 때 호출된다. 같은 pane 내부의 `surface_id` 탭을 `target_index`
-    /// 위치로 옮긴다. `target_index`는 이동을 적용한 뒤의 최종 위치이며
-    /// 길이를 넘어가면 끝으로 클램프된다. 변화가 없거나 매칭되는
-    /// surface가 없으면 `None`을 반환해 호출자가 GTK 위젯을 건드리지
-    /// 않도록 한다. 활성 탭의 SurfaceId는 reorder의 영향을 받지 않으므로
-    /// 옮긴 후에도 같은 탭이 활성으로 남는다.
+    /// Called when reordering terminal/browser tabs inside a pane by drag and
+    /// drop. Moves `surface_id` within the same pane to `target_index`. The index
+    /// is the final position after applying the move and clamps to the end when
+    /// too large. Returns `None` for no changes or missing surfaces so callers
+    /// leave GTK widgets untouched. Active SurfaceId is unaffected by reorder,
+    /// so the same tab remains active after moving.
     pub async fn reorder_surface_in_pane(
         &self,
         pane: PaneId,
@@ -526,11 +530,11 @@ impl StateStore {
         None
     }
 
-    /// 사이드 패널에서 워크스페이스를 드래그 앤 드랍으로 재배치할 때 호출된다.
-    /// `id`로 식별되는 워크스페이스를 `workspace_order` 안의 `target_index` 위치로
-    /// 옮긴다. `target_index`는 이동을 적용한 뒤의 최종 위치이며, 길이를
-    /// 넘어가면 끝으로 클램프된다. 같은 위치이거나 워크스페이스가 존재하지
-    /// 않으면 `false`를 반환한다.
+    /// Called when reordering workspaces in the side panel by drag and drop.
+    /// Moves the workspace identified by `id` to `target_index` inside
+    /// `workspace_order`. The index is the final position after applying the
+    /// move and clamps to the end when too large. Same-position moves or missing
+    /// workspaces return `false`.
     pub async fn reorder_workspace(&self, id: WorkspaceId, target_index: usize) -> bool {
         let mut s = self.inner.lock().await;
         let Some(current) = s.workspace_order.iter().position(|x| *x == id) else {
@@ -551,19 +555,19 @@ impl StateStore {
         true
     }
 
-    /// 저장된 윈도우 사이즈/maximize. 첫 실행에는 None.
+    /// Saved window size/maximized state. `None` on first launch.
     pub fn window_layout_blocking(&self) -> Option<WindowLayout> {
         self.inner.blocking_lock().window.clone()
     }
 
-    /// 저장된 사이드 패널 divider 픽셀 위치. 첫 실행에는 None.
+    /// Saved side-panel divider pixel position. `None` on first launch.
     pub fn sidebar_position_blocking(&self) -> Option<i32> {
         self.inner.blocking_lock().sidebar_position
     }
 
-    /// 윈도우 사이즈/maximize 상태를 state에 기록한다. close 시 GTK 메인
-    /// 스레드에서 동기적으로 호출되므로 blocking 변형으로 둔다 — async
-    /// runtime이 종료 핸들러 안에서 살아 있다는 보장이 없다.
+    /// Record window size/maximized state in state. This blocking variant is
+    /// used because close handling calls it synchronously on the GTK main thread,
+    /// where the async runtime is not guaranteed to still be alive.
     pub fn set_window_layout_blocking(&self, layout: WindowLayout) {
         let mut s = self.inner.blocking_lock();
         if s.window.as_ref() == Some(&layout) {
@@ -574,7 +578,7 @@ impl StateStore {
         self.mark_dirty();
     }
 
-    /// 사이드 패널 / 콘텐츠 영역 사이 divider 픽셀 위치를 기록.
+    /// Record the divider pixel position between side panel and content area.
     pub fn set_sidebar_position_blocking(&self, position: i32) {
         let mut s = self.inner.blocking_lock();
         if s.sidebar_position == Some(position) {
@@ -585,9 +589,9 @@ impl StateStore {
         self.mark_dirty();
     }
 
-    /// pane split divider의 ratio를 모델에 반영. `split_id`는 트리 안의
-    /// `Pane::Split` 노드 PaneId. 매칭되는 split이 없거나 ratio가 같으면
-    /// `false` (호출자가 dirty mark을 건너뛸 수 있도록).
+    /// Apply a pane split divider ratio to the model. `split_id` is the PaneId
+    /// of a `Pane::Split` node in the tree. Returns `false` if no matching split
+    /// exists or the ratio is unchanged so callers can skip dirty marking.
     pub fn set_pane_split_ratio_blocking(&self, split_id: PaneId, ratio: f32) -> bool {
         let mut s = self.inner.blocking_lock();
         let mut updated = false;
@@ -772,21 +776,6 @@ impl StateStore {
                 }
             }
             if hit {
-                // 활성 탭이 바뀌면 single-pane 워크스페이스의 자동
-                // 결정값(`name`)도 새 활성 탭 라벨로 따라간다 — cmux의
-                // single-panel auto-sync 룰을 탭 전환에도 적용. surface.title
-                // 이 truncated일 수 있어 workspace_name_from_surface로
-                // 원본 길이 라벨을 추출해 사용한다.
-                if workspace_should_sync_to_surface(ws, surface_id) {
-                    if let Some(surface) = ws.surfaces[0].root_pane.find_surface(pane, surface_id)
-                    {
-                        if let Some(new_name) = workspace_name_from_surface(&surface) {
-                            if ws.name != new_name {
-                                ws.name = new_name;
-                            }
-                        }
-                    }
-                }
                 let ws_id = ws.id;
                 drop(s);
                 self.mark_dirty();
@@ -849,53 +838,6 @@ impl StateStore {
     }
 }
 
-/// 워크스페이스 자동 결정값(`name`)으로 쓸 수 있는 surface의 "원본"
-/// 라벨을 돌려준다. surface.title은 탭 표시용으로 15자에서 잘리는
-/// 경우가 있어 그대로 ws.name에 복사하면 사이드 패널 라벨에 잘린
-/// 텍스트가 남는다 (DynamicGenerati... 같은 회귀). 그래서:
-///   * 사용자가 명시적으로 rename 해서 `title_locked == true`거나 OSC
-///     0/2로 들어와 있는 라벨이라면 surface.title 자체가 원본이라
-///     그대로 사용.
-///   * 그렇지 않은 터미널 surface는 cwd 폴더명을 풀(full) 길이로 다시
-///     계산해 사용. cwd가 없으면 None.
-///   * 브라우저 surface는 surface.title이 페이지 제목이라 그대로 사용.
-fn workspace_name_from_surface(surface: &PaneSurface) -> Option<String> {
-    if surface.title_locked {
-        return Some(surface.title.clone());
-    }
-    match &surface.kind {
-        SurfaceKind::Terminal { cwd, .. } => {
-            // cwd가 있으면 원본 폴더명, 없으면 surface.title fallback.
-            if let Some(cwd) = cwd.as_ref() {
-                if let Some(folder) = cwd.file_name().and_then(|n| n.to_str()) {
-                    if !folder.is_empty() {
-                        return Some(folder.to_string());
-                    }
-                }
-            }
-            Some(surface.title.clone())
-        }
-        SurfaceKind::Browser { .. } => Some(surface.title.clone()),
-    }
-}
-
-/// 워크스페이스에 split이 없고(단일 Leaf), `surface_id`가 그 leaf의
-/// 활성 탭이라면 `true`. 이 조건이 맞을 때만 surface auto-title이
-/// 워크스페이스의 자동 결정값(`name`)으로 함께 동기화된다 — cmux의
-/// "single panel only" 룰과 동일.
-fn workspace_should_sync_to_surface(ws: &Workspace, surface_id: SurfaceId) -> bool {
-    if ws.surfaces.len() != 1 {
-        return false;
-    }
-    let Pane::Leaf { content, .. } = &ws.surfaces[0].root_pane else {
-        return false;
-    };
-    let PaneContent::Tabs { active, .. } = content else {
-        return false;
-    };
-    *active == surface_id
-}
-
 fn update_surface_cwd_in_state(
     state: &mut State,
     pane: PaneId,
@@ -903,36 +845,13 @@ fn update_surface_cwd_in_state(
     cwd: std::path::PathBuf,
 ) -> Option<WorkspaceId> {
     for ws in state.workspaces.iter_mut() {
-        let mut hit = false;
         for surface in ws.surfaces.iter_mut() {
             if surface
                 .root_pane
                 .set_surface_cwd(pane, surface_id, cwd.clone())
             {
-                hit = true;
-                break;
+                return Some(ws.id);
             }
-        }
-        if hit {
-            // cwd 변경으로 surface 라벨이 폴더명으로 갱신됐을 수 있다.
-            // single-pane 워크스페이스라면 워크스페이스의 자동 결정값
-            // (`name`)도 같이 따라간다 — 이때 surface.title을 그대로
-            // 복사하면 안 된다(탭 라벨용으로 15자에서 truncate되어
-            // "DynamicGenerati..." 같은 잘린 값이 ws.name에 박히는 회귀).
-            // cwd 자체에서 폴더명을 직접 뽑아 사이드 패널이 ellipsize로
-            // 동적으로 잘릴 수 있도록 원본 길이로 저장한다.
-            if workspace_should_sync_to_surface(ws, surface_id) {
-                if let Some(folder) = cwd
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .filter(|s| !s.is_empty())
-                {
-                    if ws.name != folder {
-                        ws.name = folder.to_string();
-                    }
-                }
-            }
-            return Some(ws.id);
         }
     }
     None
@@ -1093,7 +1012,8 @@ mod tests {
             .await;
         let missing = WorkspaceId::new();
 
-        // rename은 cmux 시맨틱 — name은 자동값으로 그대로 두고 custom_title만 갱신.
+        // Rename follows cmux semantics: keep `name` as the automatic value and
+        // update only custom_title.
         assert!(store.rename_workspace(ws_id, "new".into()).await);
         assert!(store.set_workspace_color(ws_id, "#112233".into()).await);
         assert!(!store.rename_workspace(missing, "missing".into()).await);
@@ -1115,20 +1035,20 @@ mod tests {
             .create_workspace(Some("auto".into()), std::path::PathBuf::from("/tmp/auto"))
             .await;
 
-        // 사용자 rename → custom_title 채워짐.
+        // User rename -> custom_title is filled.
         assert!(store.rename_workspace(ws_id, "MyName".into()).await);
         let ws = store.get_workspace(ws_id).await.unwrap();
         assert_eq!(ws.custom_title.as_deref(), Some("MyName"));
         assert_eq!(ws.display_title(), "MyName");
 
-        // 빈 입력 → 자동 모드 복귀 (custom_title = None).
+        // Empty input -> return to automatic mode (custom_title = None).
         assert!(store.rename_workspace(ws_id, "".into()).await);
         let ws = store.get_workspace(ws_id).await.unwrap();
         assert_eq!(ws.custom_title, None);
         assert_eq!(ws.display_title(), "auto");
         assert_eq!(ws.name, "auto");
 
-        // 공백만 있는 입력도 같은 의미.
+        // Whitespace-only input has the same meaning.
         assert!(store.rename_workspace(ws_id, "Custom Again".into()).await);
         assert!(store.rename_workspace(ws_id, "   \t\n".into()).await);
         let ws = store.get_workspace(ws_id).await.unwrap();
@@ -1155,11 +1075,11 @@ mod tests {
             .create_workspace(Some("auto".into()), std::path::PathBuf::from("/tmp/auto"))
             .await;
         assert!(store.rename_workspace(ws_id, "Same".into()).await);
-        // 같은 값 재입력 → false (변경 없음).
+        // Re-entering the same value -> false (no change).
         assert!(!store.rename_workspace(ws_id, "Same".into()).await);
-        // trim 결과가 같으면 false.
+        // Same trimmed result returns false.
         assert!(!store.rename_workspace(ws_id, "  Same  ".into()).await);
-        // 빈 입력 두 번도 두 번째는 false.
+        // Empty input twice returns false on the second call.
         assert!(store.rename_workspace(ws_id, "".into()).await);
         assert!(!store.rename_workspace(ws_id, "".into()).await);
     }
@@ -1803,9 +1723,9 @@ mod tests {
 
     #[tokio::test]
     async fn add_browser_surface_to_pane_appends_browser_tab_and_activates() {
-        // 워크스페이스를 만들면 첫 pane에는 탭(terminal) 한 개가 있고, 거기에
-        // 탭브라우저 추가 버튼을 누르면 같은 pane 안에 새 탭브라우저가
-        // 추가되며 그게 활성 탭이 되어야 한다.
+        // Creating a workspace creates one terminal tab in the first pane. Pressing
+        // the browser-tab add button should add a new browser tab to the same
+        // pane and make it active.
         let store = StateStore::new_lazy(State::default());
         let ws_id = store
             .create_workspace(Some("demo".into()), std::path::PathBuf::from("/tmp/demo"))
@@ -1859,9 +1779,8 @@ mod tests {
 
     #[tokio::test]
     async fn add_browser_surface_to_pane_targets_correct_pane_after_split() {
-        // split을 통해 만들어진 새 pane(원래 pane이 아닌 sibling)에도
-        // 탭브라우저를 추가할 수 있어야 하고, 다른 pane의 탭 개수에는
-        // 영향이 없어야 한다.
+        // A newly split sibling pane, not the original pane, should also accept
+        // browser tabs without affecting tab counts in other panes.
         let store = StateStore::new_lazy(State::default());
         let ws_id = store
             .create_workspace(Some("demo".into()), std::path::PathBuf::from("/tmp/demo"))
@@ -1922,13 +1841,12 @@ mod tests {
         assert_eq!(orig_surfaces.len(), 1, "original pane untouched");
     }
 
-    /// 케이스: pane A에 탭브라우저 추가 → pane B에 탭브라우저 추가
-    /// → A의 기존 탭브라우저 surface는 (id, title, initial_url) 모두
-    /// 변경 없이 보존되어야 한다. 이전에는 GTK 측 rerender 가
-    /// BrowserPane을 새로 만들어 about:blank로 돌아갔지만, state
-    /// 자체는 처음부터 변하지 않으므로 daemon 레벨에서 그 invariant
-    /// 를 잠가둔다 — 만약 add_browser_surface_to_pane 구현이 다른
-    /// pane을 손상시키게 회귀하면 여기서 잡힌다.
+    /// Case: add a browser tab to pane A, then add a browser tab to pane B. A's
+    /// existing browser surface must preserve id, title, and initial_url. GTK
+    /// rerender previously recreated BrowserPane and returned to about:blank,
+    /// but daemon state itself should never change, so lock that invariant here.
+    /// If add_browser_surface_to_pane regresses and damages another pane, this
+    /// catches it.
     #[tokio::test]
     async fn add_browser_to_one_pane_keeps_other_pane_browser_intact() {
         let store = StateStore::new_lazy(State::default());
@@ -1941,9 +1859,9 @@ mod tests {
             .await
             .unwrap();
 
-        // pane A에 https 탭브라우저 추가 (사용자가 navigate한 가상의 결과
-        // URL은 GTK 측 webview에 있고 state는 initial_url만 가지므로,
-        // 여기서는 새로 추가된 surface의 메타데이터 보존을 검증한다).
+        // Add an https browser tab to pane A. A hypothetical user-navigated URL
+        // lives in the GTK webview while state keeps only initial_url, so verify
+        // the newly added surface metadata is preserved.
         let (_, browser_a) = store
             .add_browser_surface_to_pane(pane_a, "https://docs.a.test".into())
             .await
@@ -1952,7 +1870,7 @@ mod tests {
         let surfaces_a_before = pane_surfaces(&snap_before, pane_a);
         let surfaces_b_before = pane_surfaces(&snap_before, pane_b);
 
-        // pane B에 about:blank 탭브라우저 추가.
+        // Add an about:blank browser tab to pane B.
         let (_, browser_b) = store
             .add_browser_surface_to_pane(pane_b, "about:blank".into())
             .await
@@ -1963,13 +1881,13 @@ mod tests {
         let surfaces_a_after = pane_surfaces(&snap_after, pane_a);
         let surfaces_b_after = pane_surfaces(&snap_after, pane_b);
 
-        // pane A의 surface 목록은 idx, id, title, kind 모두 동일하게 유지.
+        // Pane A's surface list keeps the same idx, id, title, and kind.
         assert_eq!(
             fingerprints(&surfaces_a_before),
             fingerprints(&surfaces_a_after),
             "pane A surfaces must not change when pane B gets a new browser tab"
         );
-        // pane B는 정확히 한 개의 새 surface가 늘어났어야 한다.
+        // Pane B should have exactly one new surface.
         assert_eq!(surfaces_b_before.len() + 1, surfaces_b_after.len());
         assert!(surfaces_b_after
             .iter()
@@ -1977,9 +1895,8 @@ mod tests {
                 && matches!(&s.kind, SurfaceKind::Browser { initial_url: Some(u) } if u == "about:blank")));
     }
 
-    /// 케이스: 같은 pane에 탭브라우저를 여러 개 연속해서 추가해도
-    /// 먼저 추가한 surface들의 메타데이터가 그대로이고, 새로 추가된
-    /// 탭이 active로 전환된다.
+    /// Case: adding multiple browser tabs to the same pane preserves metadata
+    /// for earlier surfaces and activates the newly added tab.
     #[tokio::test]
     async fn appending_browser_tabs_preserves_earlier_tabs_in_same_pane() {
         let store = StateStore::new_lazy(State::default());
@@ -2003,7 +1920,7 @@ mod tests {
 
         let ws = store.get_workspace(ws_id).await.unwrap();
         let surfaces = pane_surfaces(&ws, pane);
-        assert_eq!(surfaces.len(), 4); // 초기 terminal + 3 browsers
+        assert_eq!(surfaces.len(), 4); // initial terminal + 3 browsers
         let by_id: std::collections::HashMap<_, _> =
             surfaces.iter().map(|s| (s.id, s.clone())).collect();
         for (id, expected_url) in [
@@ -2017,12 +1934,11 @@ mod tests {
                 SurfaceKind::Browser { initial_url: Some(u) } if u == expected_url
             ));
         }
-        // 가장 최근에 추가된 탭이 활성 surface여야 한다.
+        // The most recently added tab should be the active surface.
         assert_eq!(first_pane_active_surface(&ws), third_browser);
     }
 
-    /// 케이스: 탭브라우저 추가가 다른 워크스페이스의 surface를
-    /// 건드리지 않아야 한다.
+    /// Case: adding a browser tab must not touch surfaces in another workspace.
     #[tokio::test]
     async fn adding_browser_in_one_workspace_does_not_touch_other_workspaces() {
         let store = StateStore::new_lazy(State::default());
@@ -2044,8 +1960,8 @@ mod tests {
         assert_eq!(fingerprints(&beta_before), fingerprints(&beta_after));
     }
 
-    /// 케이스: 새 탭(터미널)을 다른 pane에 추가해도 기존 pane의
-    /// terminal surface 메타데이터(특히 cwd)가 보존된다.
+    /// Case: adding a new terminal tab to another pane preserves terminal surface
+    /// metadata, especially cwd, in the existing pane.
     #[tokio::test]
     async fn adding_terminal_tab_to_other_pane_keeps_existing_terminal_cwd() {
         let store = StateStore::new_lazy(State::default());
@@ -2059,7 +1975,7 @@ mod tests {
             .unwrap();
 
         let surface_a_id = first_pane_active_surface(&store.get_workspace(ws_id).await.unwrap());
-        // 사용자가 셸에서 cd 한 결과를 모사: pane A의 terminal surface에 cwd 갱신.
+        // Simulate the user running cd in the shell by updating pane A terminal cwd.
         assert_eq!(
             store
                 .update_surface_cwd(pane_a, surface_a_id, "/tmp/work/inner".into())
@@ -2067,13 +1983,13 @@ mod tests {
             Some(ws_id)
         );
 
-        // 이제 pane B에 새 탭(terminal)을 추가한다.
+        // Now add a new terminal tab to pane B.
         let (_, _new_term) = store
             .add_terminal_surface_to_pane(pane_b, Some("/tmp/other".into()))
             .await
             .unwrap();
 
-        // pane A의 surface는 그대로 cwd /tmp/work/inner로 남아 있어야 한다.
+        // Pane A's surface should keep cwd /tmp/work/inner.
         let ws = store.get_workspace(ws_id).await.unwrap();
         let surfaces_a = pane_surfaces(&ws, pane_a);
         let s_a = surfaces_a
@@ -2106,10 +2022,9 @@ mod tests {
             .unwrap_or_default()
     }
 
-    /// 브라우저 navigate가 발생하면 update_browser_url 호출로 surface
-    /// 의 initial_url이 갱신되어, 다음 실행 시 같은 페이지로 복원된다.
-    /// terminal surface나 잘못된 (pane, surface) 조합에는 영향 없음을
-    /// 함께 검증한다.
+    /// Browser navigation updates a surface's initial_url via update_browser_url,
+    /// allowing the next launch to restore the same page. Also verify terminal
+    /// surfaces and wrong (pane, surface) pairs are unaffected.
     #[tokio::test]
     async fn update_browser_url_persists_last_navigation_only_for_browser() {
         let store = StateStore::new_lazy(State::default());
@@ -2122,7 +2037,7 @@ mod tests {
             .await
             .unwrap();
 
-        // navigate → state에 반영.
+        // navigate -> reflected in state.
         assert_eq!(
             store
                 .update_browser_url(pane, browser, "https://two.test/page?x=1".into())
@@ -2139,7 +2054,7 @@ mod tests {
             SurfaceKind::Browser { initial_url: Some(u) } if u == "https://two.test/page?x=1"
         ));
 
-        // 같은 URL은 no-op으로 None.
+        // Same URL returns None as a no-op.
         assert_eq!(
             store
                 .update_browser_url(pane, browser, "https://two.test/page?x=1".into())
@@ -2147,9 +2062,9 @@ mod tests {
             None
         );
 
-        // terminal surface(첫 active surface)는 영향 X.
+        // Terminal surface, the first active surface, is unaffected.
         let terminal_id = first_pane_active_surface(&store.get_workspace(ws_id).await.unwrap());
-        // active 가 browser 였을 수 있으니 terminal id를 명시적으로 찾는다.
+        // Active may be browser, so find the terminal id explicitly.
         let ws = store.get_workspace(ws_id).await.unwrap();
         let terminal_id = match &ws.surfaces[0].root_pane {
             Pane::Leaf {
@@ -2170,8 +2085,8 @@ mod tests {
         );
     }
 
-    /// 브라우저 페이지 title 신호가 surface.title을 자동 갱신.
-    /// 사용자가 rename으로 잠근 surface는 자동 갱신되지 않는다.
+    /// Browser page title signals automatically update surface.title. Surfaces
+    /// locked by user rename do not update automatically.
     #[tokio::test]
     async fn update_surface_auto_title_respects_user_rename() {
         let store = StateStore::new_lazy(State::default());
@@ -2188,7 +2103,7 @@ mod tests {
             .await
             .unwrap();
 
-        // A의 page title이 도착 → 갱신됨.
+        // A's page title arrives -> updated.
         assert_eq!(
             store
                 .update_surface_auto_title(pane, browser_a, "Example A — Home".into())
@@ -2200,7 +2115,7 @@ mod tests {
             Some("Example A — Home")
         );
 
-        // B를 사용자가 직접 이름 짓고 → 자동 갱신은 무시.
+        // User names B directly -> automatic updates are ignored.
         store
             .rename_surface(pane, browser_b, "Pinned".into())
             .await
@@ -2216,7 +2131,7 @@ mod tests {
             Some("Pinned")
         );
 
-        // 빈 title은 무시.
+        // Empty title is ignored.
         assert_eq!(
             store
                 .update_surface_auto_title(pane, browser_a, "   ".into())
@@ -2225,8 +2140,8 @@ mod tests {
         );
     }
 
-    /// 다른 워크스페이스의 다른 pane에 있는 browser url을 갱신해도, 첫 워크스페이스
-    /// surface 데이터는 변하지 않는다.
+    /// Updating a browser URL in another pane of another workspace must not
+    /// change the first workspace's surface data.
     #[tokio::test]
     async fn update_browser_url_in_one_workspace_does_not_touch_others() {
         let store = StateStore::new_lazy(State::default());
@@ -2260,9 +2175,8 @@ mod tests {
         ));
     }
 
-    /// `PaneSurface`는 외부 crate라 `PartialEq` 미구현 — 단위 테스트용으로
-    /// 보존성 검증에 필요한 핵심 필드(id, title, title_locked, kind)만
-    /// 추출한다.
+    /// `PaneSurface` comes from another crate and does not implement PartialEq.
+    /// Extract only the key fields needed for unit-test preservation checks.
     #[derive(Clone, Debug, PartialEq, Eq)]
     struct SurfaceFingerprint {
         id: SurfaceId,
@@ -2344,11 +2258,11 @@ mod tests {
         let c = create_named_workspace(&store, "c").await;
         let d = create_named_workspace(&store, "d").await;
 
-        // b를 끝으로 옮긴다 (a, c, d, b)
+        // Move b to the end (a, c, d, b).
         assert!(store.reorder_workspace(b, 3).await);
         assert_eq!(store.snapshot().await.workspace_order, vec![a, c, d, b]);
 
-        // d를 처음으로 옮긴다 (d, a, c, b)
+        // Move d to the front (d, a, c, b).
         assert!(store.reorder_workspace(d, 0).await);
         assert_eq!(store.snapshot().await.workspace_order, vec![d, a, c, b]);
     }
@@ -2360,7 +2274,7 @@ mod tests {
         let b = create_named_workspace(&store, "b").await;
         let c = create_named_workspace(&store, "c").await;
 
-        // 100을 줘도 끝으로만 이동해야 한다.
+        // Even 100 should only move to the end.
         assert!(store.reorder_workspace(a, 100).await);
 
         let order = store.snapshot().await.workspace_order;
@@ -2374,11 +2288,11 @@ mod tests {
         let b = create_named_workspace(&store, "b").await;
         let c = create_named_workspace(&store, "c").await;
 
-        // 자기 자리로 이동.
+        // Move to its own position.
         assert!(!store.reorder_workspace(b, 1).await);
         assert_eq!(store.snapshot().await.workspace_order, vec![a, b, c]);
 
-        // 길이를 초과한 인덱스도 자기 자리(끝)이면 false.
+        // An out-of-range index that clamps to its own end position returns false.
         assert!(!store.reorder_workspace(c, 100).await);
         assert_eq!(store.snapshot().await.workspace_order, vec![a, b, c]);
     }
@@ -2418,23 +2332,22 @@ mod tests {
         let b = create_named_workspace(&store, "b").await;
         let _c = create_named_workspace(&store, "c").await;
 
-        // active는 처음 만들어진 a로 시작한다.
+        // Active starts as the first-created a.
         assert_eq!(store.snapshot().await.active_workspace, Some(a));
 
-        // a를 끝으로 옮겨도 active는 그대로 a여야 한다.
+        // Moving a to the end should leave active as a.
         assert!(store.reorder_workspace(a, 2).await);
         assert_eq!(store.snapshot().await.active_workspace, Some(a));
 
-        // 이제 순서는 [b, c, a]. b를 끝으로 옮겨도 active는 a 그대로.
+        // Order is now [b, c, a]. Moving b to the end still leaves active as a.
         assert!(store.reorder_workspace(b, 2).await);
         assert_eq!(store.snapshot().await.active_workspace, Some(a));
     }
 
-    /// pane 내부의 탭(터미널/탭브라우저) reorder가
-    /// 1) 정상 케이스에서 해당 workspace_id를 반환하고
-    /// 2) 자기 자리/없는 surface일 때 None을 반환하며
-    /// 3) 활성 탭이 옮긴 후에도 같은 SurfaceId로 유지되는지
-    /// 통합적으로 본다.
+    /// Integrated test for pane-internal terminal/browser tab reorder:
+    /// 1. returns the workspace_id in the normal case,
+    /// 2. returns None for same-position or missing surfaces,
+    /// 3. keeps the active tab on the same SurfaceId after moving.
     #[tokio::test]
     async fn reorder_surface_in_pane_moves_tab_and_keeps_active() {
         let store = StateStore::new_lazy(State::default());
@@ -2445,7 +2358,7 @@ mod tests {
         let pane = ws.surfaces[0].root_pane.first_leaf_id().unwrap();
         let first = ws.surfaces[0].root_pane.active_surface_id(pane).unwrap();
 
-        // 두 번째 (terminal) 와 세 번째 (탭브라우저) 추가.
+        // Add the second terminal and third browser tab.
         let (_, second) = store
             .add_terminal_surface_to_pane(pane, Some("/tmp/two".into()))
             .await
@@ -2454,10 +2367,10 @@ mod tests {
             .add_browser_surface_to_pane(pane, "https://three.test".into())
             .await
             .unwrap();
-        // 활성 탭을 first(첫 번째)로 되돌려 둔다.
+        // Restore the active tab to first.
         store.set_active_surface(pane, first).await;
 
-        // first를 마지막 자리로.
+        // Move first to the last position.
         assert_eq!(
             store.reorder_surface_in_pane(pane, first, 2).await,
             Some(ws_id)
@@ -2474,24 +2387,24 @@ mod tests {
             surfaces.iter().map(|s| s.id).collect::<Vec<_>>(),
             vec![second, third, first]
         );
-        // first를 옮겼지만 여전히 first가 active.
+        // first moved but remains active.
         assert_eq!(*active, first);
 
-        // 같은 자리(끝)로 다시 옮기면 None.
+        // Moving to the same end position again returns None.
         assert!(store
             .reorder_surface_in_pane(pane, first, 2)
             .await
             .is_none());
 
-        // 없는 SurfaceId면 None.
+        // Missing SurfaceId returns None.
         assert!(store
             .reorder_surface_in_pane(pane, SurfaceId::new(), 0)
             .await
             .is_none());
     }
 
-    /// 길이를 넘어가는 target_index는 끝으로 클램프된다 — 호출자가
-    /// 드랍 위치를 +1 한 인덱스를 넘겨도 안전히 처리.
+    /// target_index beyond length clamps to the end, safely handling callers
+    /// that pass drop-position + 1 indexes.
     #[tokio::test]
     async fn reorder_surface_in_pane_clamps_target_index_beyond_len() {
         let store = StateStore::new_lazy(State::default());
@@ -2506,7 +2419,7 @@ mod tests {
             .await
             .unwrap();
 
-        // first 를 999번째로 → 끝(인덱스 1)로 클램프.
+        // Move first to 999 -> clamp to the end, index 1.
         assert_eq!(
             store.reorder_surface_in_pane(pane, first, 999).await,
             Some(ws_id)
@@ -2525,7 +2438,7 @@ mod tests {
         );
     }
 
-    /// 한 channel(workspace) 안의 reorder가 다른 channel에 영향이 없어야 한다.
+    /// Reorder inside one channel/workspace must not affect another channel.
     #[tokio::test]
     async fn reorder_surface_in_pane_does_not_touch_other_workspaces() {
         let store = StateStore::new_lazy(State::default());
@@ -2558,7 +2471,7 @@ mod tests {
             .await
             .unwrap();
 
-        // alpha pane의 첫 탭을 끝으로.
+        // Move alpha pane's first tab to the end.
         assert_eq!(
             store
                 .reorder_surface_in_pane(alpha_pane, alpha_first, 1)
@@ -2566,7 +2479,7 @@ mod tests {
             Some(alpha)
         );
 
-        // beta는 그대로.
+        // beta stays unchanged.
         let snap_beta = store.get_workspace(beta).await.unwrap();
         let flowmux_core::Pane::Leaf {
             content: flowmux_core::PaneContent::Tabs { surfaces, .. },
@@ -2579,7 +2492,7 @@ mod tests {
             surfaces.iter().map(|s| s.id).collect::<Vec<_>>(),
             vec![beta_first, beta_second]
         );
-        // alpha는 swap 됐다.
+        // alpha was swapped.
         let snap_alpha = store.get_workspace(alpha).await.unwrap();
         let flowmux_core::Pane::Leaf {
             content: flowmux_core::PaneContent::Tabs { surfaces, .. },
@@ -2594,10 +2507,10 @@ mod tests {
         );
     }
 
-    /// 윈도우 사이즈와 사이드바 위치 setter는 blocking이므로 별도 tokio
-    /// 런타임 안에서 spawn_blocking으로 호출해 인메모리 mutex 충돌이 없는
-    /// 지 본다. 동일 값으로 다시 호출하면 mark_dirty가 트리거되지 않는
-    /// 의미상 idempotent도 함께 검증.
+    /// Window size and sidebar position setters are blocking, so call them with
+    /// spawn_blocking inside a separate tokio runtime and verify there is no
+    /// in-memory mutex conflict. Also verify semantic idempotence: repeating the
+    /// same value does not trigger mark_dirty.
     #[tokio::test]
     async fn window_layout_setter_persists_value() {
         let store = StateStore::new_lazy(State::default());
@@ -2635,8 +2548,8 @@ mod tests {
         assert_eq!(store.snapshot().await.sidebar_position, Some(280));
     }
 
-    /// pane split ratio setter — 정상 케이스, 트리 안에 없는 split id,
-    /// 같은 ratio (no-op)를 한 시나리오로 본다.
+    /// Pane split ratio setter scenario: normal case, split id missing from the
+    /// tree, and same-ratio no-op.
     #[tokio::test]
     async fn pane_split_ratio_setter_updates_only_matching_split() {
         let store = StateStore::new_lazy(State::default());
@@ -2644,8 +2557,8 @@ mod tests {
             .create_workspace(Some("demo".into()), std::path::PathBuf::from("/tmp/demo"))
             .await;
         let original = first_pane(&store.get_workspace(ws_id).await.unwrap());
-        // split_pane이 새 Split 노드를 만들고, 그 PaneId는
-        // workspace 트리 안의 첫 surface의 root_pane이다.
+        // split_pane creates a new Split node whose PaneId is the root_pane of
+        // the first surface in the workspace tree.
         let _ = store
             .split_pane(original, SplitDirection::Vertical)
             .await
@@ -2670,7 +2583,7 @@ mod tests {
         };
         assert!((ratio - 0.7).abs() < 0.001);
 
-        // 동일 ratio 다시 호출 → false.
+        // Calling the same ratio again -> false.
         let store_for_blocking = store.clone();
         let again = tokio::task::spawn_blocking(move || {
             store_for_blocking.set_pane_split_ratio_blocking(split_id, 0.7)
@@ -2679,7 +2592,7 @@ mod tests {
         .unwrap();
         assert!(!again);
 
-        // 모르는 split id → false, 트리 변경 없음.
+        // Unknown split id -> false, tree unchanged.
         let store_for_blocking = store.clone();
         let unknown = tokio::task::spawn_blocking(move || {
             store_for_blocking.set_pane_split_ratio_blocking(PaneId::new(), 0.3)
@@ -2689,44 +2602,53 @@ mod tests {
         assert!(!unknown);
     }
 
-    /// 단일 pane 워크스페이스에서 활성 surface의 OSC 타이틀이 도착하면
-    /// `Workspace::name`도 같은 값으로 따라가야 한다 — cmux의 single-panel
-    /// auto-sync 룰. custom_title이 None이면 display_title도 자연스럽게
-    /// 새 타이틀을 비춘다.
+    /// set_workspace_name is the setter the GTK side uses to write the focused
+    /// pane's active surface title explicitly into ws.name. Repeating the same
+    /// value returns false (no-op).
+    /// false (no-op).
     #[tokio::test]
-    async fn update_surface_auto_title_syncs_workspace_name_for_single_pane() {
+    async fn set_workspace_name_updates_only_on_change() {
         let store = StateStore::new_lazy(State::default());
         let ws_id = store
             .create_workspace(Some("auto".into()), std::path::PathBuf::from("/tmp/auto"))
             .await;
-        let ws = store.get_workspace(ws_id).await.unwrap();
-        let pane = first_pane(&ws);
-        let active = first_pane_active_surface(&ws);
 
-        // 외부 프로그램이 OSC 0/2로 "Claude Code"를 보냄.
-        let updated = store
-            .update_surface_auto_title(pane, active, "Claude Code".into())
-            .await;
-        assert_eq!(updated, Some(ws_id));
+        // Different value returns true.
+        assert!(store.set_workspace_name(ws_id, "Claude Code".into()).await);
+        assert_eq!(
+            store.get_workspace(ws_id).await.unwrap().name,
+            "Claude Code"
+        );
 
-        let ws = store.get_workspace(ws_id).await.unwrap();
-        assert_eq!(ws.name, "Claude Code");
-        assert_eq!(ws.custom_title, None);
-        assert_eq!(ws.display_title(), "Claude Code");
-    }
+        // Same value returns false.
+        assert!(!store.set_workspace_name(ws_id, "Claude Code".into()).await);
 
-    /// custom_title이 설정돼 있어도 자동값(name)은 OSC를 따라가지만,
-    /// display_title은 custom이 우선이라 사용자가 잠근 라벨이 흔들리지
-    /// 않는다.
-    #[tokio::test]
-    async fn auto_title_sync_does_not_override_custom_title() {
-        let store = StateStore::new_lazy(State::default());
-        let ws_id = store
-            .create_workspace(Some("auto".into()), std::path::PathBuf::from("/tmp/auto"))
-            .await;
-        // 사용자가 rename → custom_title 잠금.
+        // Unknown workspace returns false.
+        assert!(
+            !store
+                .set_workspace_name(WorkspaceId::new(), "ignored".into())
+                .await
+        );
+
+        // Even with custom_title locked, set_workspace_name updates only ws.name.
+        // custom_title stays as-is, and display_title gives custom priority.
         store.rename_workspace(ws_id, "MyName".into()).await;
+        store.set_workspace_name(ws_id, "Updated Auto".into()).await;
+        let ws = store.get_workspace(ws_id).await.unwrap();
+        assert_eq!(ws.name, "Updated Auto");
+        assert_eq!(ws.custom_title.as_deref(), Some("MyName"));
+        assert_eq!(ws.display_title(), "MyName");
+    }
 
+    /// Automatic synchronization is not the daemon's responsibility: surface
+    /// updates touch only the surface, and ws.name changes only when GTK knows
+    /// focus information and calls set_workspace_name. Regression guard.
+    #[tokio::test]
+    async fn surface_auto_title_does_not_touch_workspace_name() {
+        let store = StateStore::new_lazy(State::default());
+        let ws_id = store
+            .create_workspace(Some("auto".into()), std::path::PathBuf::from("/tmp/auto"))
+            .await;
         let ws = store.get_workspace(ws_id).await.unwrap();
         let pane = first_pane(&ws);
         let active = first_pane_active_surface(&ws);
@@ -2736,175 +2658,14 @@ mod tests {
             .await;
 
         let ws = store.get_workspace(ws_id).await.unwrap();
-        assert_eq!(ws.name, "Claude Code"); // 자동값은 따라감
-        assert_eq!(ws.custom_title.as_deref(), Some("MyName"));
-        assert_eq!(ws.display_title(), "MyName"); // 표시는 custom 그대로
-    }
-
-    /// split이 있는 워크스페이스(multi-pane)에서는 surface OSC가 와도
-    /// 워크스페이스 name은 건드리지 않는다 — cmux의 single-panel-only 룰.
-    #[tokio::test]
-    async fn auto_title_sync_skips_when_workspace_is_split() {
-        let store = StateStore::new_lazy(State::default());
-        let ws_id = store
-            .create_workspace(Some("auto".into()), std::path::PathBuf::from("/tmp/auto"))
-            .await;
-        let original = first_pane(&store.get_workspace(ws_id).await.unwrap());
-        // split → 더 이상 single-pane 아님.
-        store
-            .split_pane(original, SplitDirection::Vertical)
-            .await
-            .unwrap();
-
-        let ws = store.get_workspace(ws_id).await.unwrap();
-        // 첫 번째 leaf의 active surface로 OSC를 보낸다.
-        let active_in_first = match &ws.surfaces[0].root_pane {
-            Pane::Split { first, .. } => match first.as_ref() {
-                Pane::Leaf { id, content } => match content {
-                    PaneContent::Tabs { active, .. } => (*id, *active),
-                    _ => panic!("expected tabs"),
-                },
-                _ => panic!("expected leaf"),
-            },
-            _ => panic!("expected split"),
-        };
-        let (pane, surface) = active_in_first;
-
-        store
-            .update_surface_auto_title(pane, surface, "Claude Code".into())
-            .await;
-
-        let ws = store.get_workspace(ws_id).await.unwrap();
-        // surface의 라벨은 갱신되지만 워크스페이스 name은 그대로.
+        // Surface label updates, but ws.name stays unchanged until GTK calls
+        // set_workspace_name.
         assert_eq!(ws.name, "auto");
     }
 
-    /// 비활성 탭의 OSC가 와도 single-pane 워크스페이스의 name은 건드리지
-    /// 않는다 — 활성 탭만 동기화 대상이다.
+    /// Likewise, cwd changes do not let the daemon mutate ws.name by itself.
     #[tokio::test]
-    async fn auto_title_sync_skips_inactive_surface() {
-        let store = StateStore::new_lazy(State::default());
-        let ws_id = store
-            .create_workspace(Some("auto".into()), std::path::PathBuf::from("/tmp/auto"))
-            .await;
-        let ws = store.get_workspace(ws_id).await.unwrap();
-        let pane = first_pane(&ws);
-        let first = first_pane_active_surface(&ws);
-        // 두 번째 탭을 추가하면 active가 두 번째로 옮겨가므로, 첫 번째로
-        // 다시 전환해 첫 번째를 active 상태로 둔다.
-        let second = store
-            .add_terminal_surface_to_pane(pane, Some(std::path::PathBuf::from("/tmp/auto")))
-            .await
-            .unwrap()
-            .1;
-        store.set_active_surface(pane, first).await;
-
-        // 두 번째(비활성)의 OSC가 와도 ws.name은 안 바뀐다.
-        store
-            .update_surface_auto_title(pane, second, "Background".into())
-            .await;
-        let ws = store.get_workspace(ws_id).await.unwrap();
-        assert_eq!(ws.name, "auto");
-    }
-
-    /// 탭 전환만으로도 single-pane 워크스페이스의 name이 새 활성 탭의
-    /// 라벨로 바뀐다. 사용자가 한 leaf 안에서 OSC가 다른 두 탭 사이를
-    /// 오갈 때 사이드바가 자연스럽게 따라간다.
-    #[tokio::test]
-    async fn set_active_surface_syncs_workspace_name_to_new_active() {
-        let store = StateStore::new_lazy(State::default());
-        let ws_id = store
-            .create_workspace(Some("auto".into()), std::path::PathBuf::from("/tmp/auto"))
-            .await;
-        let ws = store.get_workspace(ws_id).await.unwrap();
-        let pane = first_pane(&ws);
-        let first_surface = first_pane_active_surface(&ws);
-
-        // 첫 번째 탭 라벨을 명시적으로 다른 값으로 바꿔둔다 (rename으로
-        // surface title_locked 됨).
-        store
-            .rename_surface(pane, first_surface, "First Title".into())
-            .await
-            .unwrap();
-        // 그 사이 활성 surface OSC가 들어왔다고 가정 — single-pane이고
-        // 활성이 first_surface → ws.name 동기화.
-        store
-            .update_surface_auto_title(pane, first_surface, "ignored".into())
-            .await;
-        // title_locked라 surface 라벨은 그대로지만 workspace.name은
-        // 어떨까? set_surface_title_auto가 false 반환 → hit=false →
-        // ws.name 갱신 안 됨. 즉 잠긴 surface로는 sync 트리거 안 됨.
-        let ws = store.get_workspace(ws_id).await.unwrap();
-        assert_eq!(ws.name, "auto");
-
-        // 두 번째 탭을 추가하고 활성 전환 → name이 그 탭 라벨로 sync.
-        let (_, second) = store
-            .add_terminal_surface_to_pane(pane, Some(std::path::PathBuf::from("/tmp/auto/sub")))
-            .await
-            .unwrap();
-        store.set_active_surface(pane, second).await;
-
-        let ws = store.get_workspace(ws_id).await.unwrap();
-        // active 전환 시점의 두 번째 surface 라벨은 cwd 폴더명("sub")이라
-        // ws.name도 "sub"로 따라가야 한다.
-        assert_eq!(ws.name, "sub");
-    }
-
-    /// 회귀 방지: cwd 폴더명이 15자를 넘는 경우에도 워크스페이스
-    /// `name`은 truncated 라벨("Long...") 대신 원본 길이 그대로
-    /// 저장되어야 한다 — 사이드 패널 라벨은 자체 ellipsize로 동적
-    /// 잘림이 가능해 원본을 보존하는 게 옳다.
-    #[tokio::test]
-    async fn cwd_sync_preserves_full_folder_name_without_truncation() {
-        // 처음에는 짧은 폴더에서 시작 — create_workspace가 같은 cwd로
-        // surface를 만들기 때문에 set_surface_cwd가 no-op이 되지 않게
-        // 시작점은 짧은 cwd로 잡고 긴 폴더로 cd한 시나리오를 본다.
-        let store = StateStore::new_lazy(State::default());
-        let ws_id = store
-            .create_workspace(Some("auto".into()), std::path::PathBuf::from("/tmp/auto"))
-            .await;
-        let ws = store.get_workspace(ws_id).await.unwrap();
-        let pane = first_pane(&ws);
-        let active = first_pane_active_surface(&ws);
-
-        let long_dir = std::path::PathBuf::from("/tmp/DynamicGenerativeUI");
-        store.update_surface_cwd(pane, active, long_dir).await;
-        let ws = store.get_workspace(ws_id).await.unwrap();
-        // surface.title은 탭 표시용으로 truncated 될 수 있지만,
-        // ws.name은 원본 폴더명 19자 그대로.
-        assert_eq!(ws.name, "DynamicGenerativeUI");
-
-        // 더 긴 이름으로 다시 cd → 같은 룰.
-        let dir2 = std::path::PathBuf::from("/tmp/AnotherLongFolderNameForTest");
-        store.update_surface_cwd(pane, active, dir2).await;
-        let ws = store.get_workspace(ws_id).await.unwrap();
-        assert_eq!(ws.name, "AnotherLongFolderNameForTest");
-    }
-
-    /// 회귀 방지: OSC 0/2로 들어온 긴 타이틀도 ws.name에는 truncate
-    /// 없이 그대로 저장된다.
-    #[tokio::test]
-    async fn auto_title_sync_preserves_full_osc_title_without_truncation() {
-        let store = StateStore::new_lazy(State::default());
-        let ws_id = store
-            .create_workspace(Some("auto".into()), std::path::PathBuf::from("/tmp/auto"))
-            .await;
-        let ws = store.get_workspace(ws_id).await.unwrap();
-        let pane = first_pane(&ws);
-        let active = first_pane_active_surface(&ws);
-
-        let long = "Claude Code — long descriptive program title".to_string();
-        store
-            .update_surface_auto_title(pane, active, long.clone())
-            .await;
-        let ws = store.get_workspace(ws_id).await.unwrap();
-        assert_eq!(ws.name, long);
-    }
-
-    /// cwd 변경(폴더 이동)도 single-pane 워크스페이스의 name 동기화 대상.
-    /// 사용자가 cd로 폴더를 옮기면 사이드바 라벨도 새 폴더명으로 따라간다.
-    #[tokio::test]
-    async fn cwd_change_syncs_workspace_name_for_single_pane() {
+    async fn surface_cwd_does_not_touch_workspace_name() {
         let store = StateStore::new_lazy(State::default());
         let ws_id = store
             .create_workspace(Some("origin".into()), std::path::PathBuf::from("/tmp/origin"))
@@ -2913,14 +2674,11 @@ mod tests {
         let pane = first_pane(&ws);
         let active = first_pane_active_surface(&ws);
 
-        // cwd가 다른 폴더로 바뀌면 surface 라벨이 새 폴더명으로 갱신되고
-        // ws.name도 같이 따라간다.
         store
             .update_surface_cwd(pane, active, std::path::PathBuf::from("/tmp/elsewhere"))
             .await;
         let ws = store.get_workspace(ws_id).await.unwrap();
-        assert_eq!(ws.name, "elsewhere");
-        assert_eq!(ws.display_title(), "elsewhere");
+        assert_eq!(ws.name, "origin");
     }
 
     // ----- right-sibling browser reuse (Phase 2) ----------------------

@@ -134,12 +134,14 @@ impl ResolvedTheme {
         relative_luminance(&self.bg) < 0.5
     }
 
-    /// CSS rules that paint the pane frame and tint the sidebar to
-    /// match the terminal background. `focus_border_color`는 사용자가
-    /// 옵션에서 고른 hex 색이며, 포커스된 pane의 1px 테두리를 그리는
-    /// 데 사용된다.
-    pub fn css(&self, focus_border_color: &str) -> String {
+    /// CSS rules that paint the pane frame and tint the sidebar to match
+    /// the terminal background. `focus_border_color` is the hex color chosen
+    /// in options, and `focus_border_alpha` is the 0.0..=1.0 opacity from
+    /// the same options. The focused pane's 1px border is rendered as
+    /// `rgba(r,g,b,alpha)` so slider changes apply immediately.
+    pub fn css(&self, focus_border_color: &str, focus_border_alpha: f32) -> String {
         let bg_css = rgba_css(&self.bg);
+        let focus_css = focus_border_rgba_css(focus_border_color, focus_border_alpha);
         let pane_border_css = rgba_css(&blend_with_alpha(&self.fg, 0.10));
         let tabbar_bg_css = rgba_css(&shift_lightness(
             &self.bg,
@@ -259,7 +261,7 @@ paned > separator {{
             bg = bg_css,
             fg = rgba_css(&self.fg),
             border = pane_border_css,
-            focus = focus_border_color,
+            focus = focus_css,
             tabbar = tabbar_bg_css,
             tab_active = tab_active_bg_css,
             control_hover = control_hover_css,
@@ -285,6 +287,25 @@ fn rgba_css(c: &gdk::RGBA) -> String {
         (c.blue() * 255.0) as u8,
         c.alpha(),
     )
+}
+
+/// Convert `#rrggbb` or another GTK-accepted hex/rgba color into an
+/// `rgba(...)` CSS token with the provided alpha. `alpha` is clamped to
+/// 0.0..=1.0. If parsing fails, return the input color unchanged so the
+/// fallback remains visually usable.
+pub(crate) fn focus_border_rgba_css(color_hex: &str, alpha: f32) -> String {
+    let alpha = alpha.clamp(0.0, 1.0);
+    if let Some(c) = parse(color_hex) {
+        format!(
+            "rgba({},{},{},{:.3})",
+            (c.red() * 255.0) as u8,
+            (c.green() * 255.0) as u8,
+            (c.blue() * 255.0) as u8,
+            alpha,
+        )
+    } else {
+        color_hex.to_string()
+    }
 }
 
 fn relative_luminance(c: &gdk::RGBA) -> f32 {

@@ -66,9 +66,9 @@ pub const BINDINGS: &[(&str, &[&str])] = &[
     ("win.copy", &["<Ctrl><Shift>c"]),
     ("win.paste", &["<Ctrl><Shift>v"]),
     ("win.new-surface", &["<Ctrl><Shift>t"]),
-    // Ctrl+Shift+B는 같은 pane에 새 탭브라우저를 추가한다 — 탭바
-    // 우측의 탭브라우저 추가 버튼과 동일 동작이며, Ctrl+Shift+T(새 탭)와
-    // 짝을 이룬다.
+    // Ctrl+Shift+B adds a new browser tab to the same pane. It mirrors the
+    // browser-tab add button on the right side of the tab bar and pairs with
+    // Ctrl+Shift+T for terminal tabs.
     ("win.new-browser-surface", &["<Ctrl><Shift>b"]),
     ("win.new-workspace", &["<Ctrl><Shift>n"]),
 ];
@@ -350,12 +350,12 @@ fn move_split(bridge: Bridge, direction: SplitDirection) -> PaneAction {
     })
 }
 
-/// focus-{left,right,up,down} 전용 액션 빌더.
+/// Action builder for focus-{left,right,up,down}.
 ///
-/// `make_pane_action`과 달리 현재 focused pane이 없어도 액션을 무시하지
-/// 않는다 — `from = None` 으로 디스패치해서 dispatcher가 활성 워크스페이스의
-/// 첫 leaf pane에 포커스를 잡도록 한다 (사이드 패널에서 워크스페이스만 클릭한
-/// 직후 Alt+화살표를 누른 케이스).
+/// Unlike `make_pane_action`, this does not ignore the action when no pane
+/// is currently focused. It dispatches `from = None` so the dispatcher can
+/// focus the active workspace's first leaf pane after a side-panel-only
+/// workspace click.
 fn make_focus_direction_action(
     name: &'static str,
     focused: FocusedPane,

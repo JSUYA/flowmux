@@ -24,19 +24,19 @@ pub fn terminal_tab_title_for_cwd(cwd: Option<&Path>) -> String {
     truncate_tab_title(&folder)
 }
 
-/// 터미널 surface가 받은 OSC 0/2 타이틀이 셸의 PS1 윈도우 타이틀
-/// (cwd를 그대로 에코한 형태)인지 판별한다. true이면 호출자는
-/// 그 타이틀을 무시하고 cwd 기반 폴더 이름을 유지해야 한다.
+/// Determine whether an OSC 0/2 title from a terminal surface is the shell's
+/// PS1 window title, effectively an echo of cwd. If true, callers should ignore
+/// the title and keep the cwd-based folder name.
 ///
-/// 인식 패턴:
-/// * 타이틀이 cwd 절대경로 자체와 동일 (`/tmp/foo`)
-/// * 타이틀이 `<prefix>:[ ]<cwd>` 로 끝나고 prefix 끝이 `:`
-///   (bash 기본 `\u@\h: \w`, debian_chroot 변형 등) — `<cwd>`는
-///   절대경로 또는 `$HOME`을 `~`로 축약한 형태.
+/// Recognized patterns:
+/// * Title equals the cwd absolute path itself (`/tmp/foo`).
+/// * Title ends with `<prefix>:[ ]<cwd>`, with prefix ending in `:`, as in
+///   default bash `\u@\h: \w` or debian_chroot variants. `<cwd>` may be an
+///   absolute path or `$HOME` abbreviated to `~`.
 ///
-/// vi/codex/claude/tmux 같이 셸 외부 프로그램이 보내는 타이틀
-/// (`vi src/main.rs`, `tmux: 0:bash*` 등)은 위 구조에 맞지 않으므로
-/// 통과한다. 호출자는 PS1 에코는 버리고 프로그램 타이틀은 받는다.
+/// Titles from external programs such as vi, codex, claude, or tmux, for
+/// example `vi src/main.rs` or `tmux: 0:bash*`, do not match this structure and
+/// pass through. Callers drop PS1 echoes but accept program titles.
 pub fn title_is_shell_cwd_echo(title: &str, cwd: &Path, home: Option<&Path>) -> bool {
     let title = title.trim_end();
     if title.is_empty() {
@@ -71,8 +71,8 @@ fn matches_trailing_path_after_colon(title: &str, path: &str) -> bool {
     let Some(prefix) = title.strip_suffix(path) else {
         return false;
     };
-    // bash 기본 PS1은 `:`와 path 사이에 공백을 넣는다(`\u@\h: \w`).
-    // 옛날식이나 zsh 일부 테마는 공백 없이 붙이기도 한다(`\u@\h:\w`).
+    // Default bash PS1 puts a space between `:` and path (`\u@\h: \w`).
+    // Older prompts or some zsh themes may omit the space (`\u@\h:\w`).
     let prefix = prefix.trim_end_matches(' ');
     prefix.ends_with(':')
 }
@@ -186,16 +186,16 @@ pub use id::{NotificationId, PaneId, SurfaceId, WorkspaceId};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Workspace {
     pub id: WorkspaceId,
-    /// 자동 결정되는 워크스페이스 네임. 워크스페이스 생성 시 root_dir의
-    /// 마지막 폴더 이름으로 시작하고, daemon 측 자동 갱신 신호
-    /// (예: PTY OSC, cwd 변경)로 갱신될 수 있다. cmux의 `processTitle`에
-    /// 대응 — 사용자 의도가 아니라 시스템이 마지막으로 관찰한 값이다.
+    /// Automatically determined workspace name. It starts as the last folder of
+    /// root_dir when the workspace is created and may update from daemon-side
+    /// automatic signals such as PTY OSC or cwd changes. This corresponds to
+    /// cmux's `processTitle`: the latest system-observed value, not user intent.
     pub name: String,
-    /// 사용자가 우클릭 메뉴 → "Change tab name"으로 직접 입력한 이름.
-    /// `None`이면 자동 모드(즉, `name`을 표시)이고, 빈 문자열로 다시 저장
-    /// 요청하면 `None`으로 되돌아가 자동 모드로 복귀한다 (cmux의
-    /// `customTitle: String?`과 동일 시맨틱). 사이드 패널에 표시되는 최종
-    /// 이름은 [`Workspace::display_title`]가 계산.
+    /// Name entered by the user through the right-click "Change tab name" menu.
+    /// `None` means automatic mode, showing `name`. Saving an empty string resets
+    /// to `None` and returns to automatic mode, matching cmux
+    /// `customTitle: String?` semantics. [`Workspace::display_title`] computes
+    /// the final name shown in the side panel.
     #[serde(default)]
     pub custom_title: Option<String>,
     pub root_dir: PathBuf,
@@ -214,9 +214,9 @@ pub struct Workspace {
 }
 
 impl Workspace {
-    /// 사이드 패널 / 윈도우 타이틀에 표시할 최종 이름. 사용자가 직접
-    /// 지정한 [`Workspace::custom_title`]이 있으면 그 값, 없으면 자동
-    /// 결정된 [`Workspace::name`]을 그대로 돌려준다.
+    /// Final name shown in the side panel / window title. Returns user-provided
+    /// [`Workspace::custom_title`] when present; otherwise the automatically
+    /// determined [`Workspace::name`].
     pub fn display_title(&self) -> &str {
         self.custom_title
             .as_deref()
@@ -508,10 +508,10 @@ impl Pane {
         }
     }
 
-    /// Update a browser surface's stored URL — webview navigate 시
-    /// 호출되어 다음 실행 때 같은 페이지로 복원되도록 한다. 매칭되는
-    /// surface가 browser kind일 때만 적용. URL이 그대로면 false 반환
-    /// (호출자는 dirty mark을 생략 가능).
+    /// Update a browser surface's stored URL. Called on webview navigation so
+    /// the next launch can restore the same page. Applies only to matching
+    /// browser surfaces. Returns false when the URL is unchanged so callers can
+    /// skip dirty marking.
     pub fn set_surface_browser_url(
         &mut self,
         target: PaneId,
@@ -545,8 +545,8 @@ impl Pane {
     }
 
     /// Auto-rename a surface from an external signal (browser page title,
-    /// terminal OSC, …) — title_locked = true 인 surface는 사용자가 직접
-    /// rename한 것이므로 건너뛴다. 빈 문자열이거나 동일 타이틀이면 false.
+    /// terminal OSC, etc. Surfaces with title_locked = true were user-renamed and
+    /// are skipped. Empty or identical titles return false.
     pub fn set_surface_title_auto(
         &mut self,
         target: PaneId,
@@ -565,15 +565,14 @@ impl Pane {
                         if surface.title_locked || surface.title == new_title {
                             return false;
                         }
-                        // OSC 0/2가 사실은 셸 PS1의 cwd 에코이면 버린다.
-                        // 그렇지 않으면 cwd가 바뀔 때마다 셸이 매 프롬프트
-                        // 마다 보내는 `user@host: /path` 가 폴더 이름을
-                        // 덮어써 탭 라벨/윈도우 타이틀이 PS1 형태로 굳어
-                        // 버린다. flowmux-app 측 터미널 cwd-notify가 별도로
-                        // `terminal_tab_title_for_cwd`를 통해 폴더 이름을
-                        // 다시 set_surface_cwd로 반영하므로 그 흐름만 살리면
-                        // 충분하다. vi/codex/claude/tmux 같은 외부 프로그램
-                        // 타이틀은 PS1 패턴에 안 걸리므로 그대로 통과.
+                        // Drop OSC 0/2 when it is really a shell PS1 cwd echo.
+                        // Otherwise every prompt's `user@host: /path` would
+                        // overwrite folder labels and freeze tab/window titles
+                        // in PS1 form. flowmux-app separately applies cwd folder
+                        // names through terminal_tab_title_for_cwd via
+                        // set_surface_cwd, while external program titles such
+                        // as vi/codex/claude/tmux do not match the PS1 pattern
+                        // and pass through.
                         if let SurfaceKind::Terminal { cwd: Some(cwd), .. } = &surface.kind {
                             let home = std::env::var_os("HOME").map(PathBuf::from);
                             if title_is_shell_cwd_echo(&new_title, cwd, home.as_deref()) {
@@ -608,11 +607,10 @@ impl Pane {
                         surfaces.iter_mut().find(|surface| surface.id == surface_id)
                     {
                         if let SurfaceKind::Terminal { cwd, .. } = &mut surface.kind {
-                            // cwd가 실제로 바뀔 때만 폴더-기반 라벨로 갱신.
-                            // cwd가 같다면 OSC 0/2로 들어와 있는 외부 프로그램
-                            // 타이틀(예: "Claude Code", "vi …")을 polling이
-                            // 매 tick마다 덮어 쓰지 않도록 surface.title을
-                            // 건드리지 않는다.
+                            // Update folder-based labels only when cwd actually
+                            // changes. If cwd is the same, do not let polling
+                            // overwrite external program titles from OSC 0/2 on
+                            // each tick.
                             if cwd.as_ref() == Some(&new_cwd) {
                                 return false;
                             }
@@ -639,12 +637,12 @@ impl Pane {
         }
     }
 
-    /// 같은 pane 안에서 `surface_id`로 식별되는 탭(터미널 또는 탭브라우저)을
-    /// `target_index` 위치로 옮긴다. `target_index`는 이동 후의 최종
-    /// 인덱스이며 탭 수를 넘으면 마지막으로 클램프된다. 활성 탭의
-    /// `SurfaceId`는 그대로 유지되므로 옮긴 뒤에도 같은 탭이 활성으로
-    /// 남는다. 매칭되는 surface가 없거나 같은 자리이면 `false`를 반환해
-    /// 호출자가 dirty mark / GTK 위젯 이동을 건너뛸 수 있도록 한다.
+    /// Move the terminal or browser tab identified by `surface_id` within the
+    /// same pane to `target_index`. `target_index` is the final index after the
+    /// move and clamps to the last tab when too large. The active tab SurfaceId
+    /// is preserved, so the same tab remains active after moving. Missing
+    /// surfaces or same-position moves return `false` so callers can skip dirty
+    /// marking and GTK widget moves.
     pub fn reorder_surface_in_leaf(
         &mut self,
         target: PaneId,
@@ -757,12 +755,12 @@ impl Pane {
         }
     }
 
-    /// `child`(leaf 또는 split)를 직접 자식으로 갖고 있는 Split 노드의
-    /// `PaneId`를 반환. 인접 split이 아니면 더 깊이 재귀해서 찾는다.
-    /// `child`가 트리의 루트이거나 트리 안에 없으면 `None`.
+    /// Return the `PaneId` of the Split node that directly owns `child`, whether
+    /// a leaf or split. Recurses deeper when the adjacent split is not the owner.
+    /// Returns `None` when `child` is the tree root or not in the tree.
     ///
-    /// incremental split이 끝난 직후 새 sibling을 통해 방금 만들어진
-    /// Split 노드의 PaneId를 GTK 측에서 조회할 때 쓴다.
+    /// Used by the GTK side immediately after incremental split to find the
+    /// newly created Split node through the new sibling.
     pub fn parent_split_id(&self, child: PaneId) -> Option<PaneId> {
         if let Pane::Split {
             id, first, second, ..
@@ -786,10 +784,9 @@ impl Pane {
         None
     }
 
-    /// `target` 으로 식별되는 Split 노드의 ratio를 갱신. ratio가 0/1
-    /// 양 끝으로 가는 걸 막기 위해 [0.05, 0.95]로 클램프하고, 의미
-    /// 있는 변화가 있을 때만 `true` 반환 — 호출자가 dirty mark를
-    /// 건너뛸 수 있도록.
+    /// Update the ratio for the Split node identified by `target`. Clamp to
+    /// [0.05, 0.95] to avoid exact 0/1 extremes and return `true` only for
+    /// meaningful changes so callers can skip dirty marking.
     pub fn set_split_ratio(&mut self, target: PaneId, new_ratio: f32) -> bool {
         let clamped = new_ratio.clamp(0.05, 0.95);
         match self {
@@ -813,10 +810,10 @@ impl Pane {
         }
     }
 
-    /// `target` 으로 식별되는 leaf의 [`PaneContent`] 클론을 반환한다.
-    /// 같은 트리 안에 매칭되는 leaf가 없거나 target가 split 노드면
-    /// `None`. incremental split 경로가 새로 생긴 sibling pane의 초기
-    /// 컨텐츠(터미널 / 탭브라우저)를 GTK 위젯으로 빌드할 때 쓴다.
+    /// Return a clone of the [`PaneContent`] for the leaf identified by `target`.
+    /// Returns `None` if no matching leaf exists in the tree or target is a split
+    /// node. Used by the incremental split path to build GTK widgets for the new
+    /// sibling pane's initial terminal or browser content.
     pub fn find_leaf_content(&self, target: PaneId) -> Option<PaneContent> {
         match self {
             Pane::Leaf { id, content } if *id == target => Some(content.clone()),
@@ -1435,10 +1432,10 @@ mod tests {
 
     #[test]
     fn set_surface_cwd_preserves_program_title_when_cwd_unchanged() {
-        // 회귀 방지: vi/claude 같은 외부 프로그램이 OSC 0/2로 set한 타이틀이
-        // 1초 cwd polling에 의해 폴더명으로 되돌아가지 않아야 한다.
-        // poll_terminal_cwds는 cwd가 그대로면 같은 cwd로 set_surface_cwd를
-        // 호출하므로, 이 케이스에서 surface.title은 절대 건드리지 않아야 한다.
+        // Regression guard: titles set by external programs such as vi/claude
+        // through OSC 0/2 must not be reverted to folder names by one-second cwd
+        // polling. If cwd is unchanged, polling calls set_surface_cwd with the
+        // same cwd, and surface.title must stay untouched.
         let pane_id = PaneId::new();
         let mut pane = Pane::Leaf {
             id: pane_id,
@@ -1446,7 +1443,7 @@ mod tests {
         };
         let surface_id = pane.active_surface_id(pane_id).unwrap();
 
-        // 외부 프로그램 진입: set_surface_title_auto로 "Claude Code" 진입.
+        // Enter an external program: set_surface_title_auto applies "Claude Code".
         assert!(pane.set_surface_title_auto(
             pane_id,
             surface_id,
@@ -1454,13 +1451,13 @@ mod tests {
         ));
         assert_eq!(pane.surface_title(pane_id, surface_id), Some("Claude Code"));
 
-        // polling이 같은 cwd를 또 보고 — no-op이어야 하고, 타이틀은
-        // "Claude Code" 그대로.
+        // Polling sees the same cwd again; it should be a no-op and keep the
+        // title at "Claude Code".
         assert!(!pane.set_surface_cwd(pane_id, surface_id, "/tmp/work".into()));
         assert_eq!(pane.surface_title(pane_id, surface_id), Some("Claude Code"));
 
-        // 사용자가 cd로 cwd를 실제로 바꾸면 그제서야 폴더명 라벨로 복귀.
-        // (외부 프로그램에서 빠져나온 자연스러운 흐름과 동치.)
+        // When the user actually changes cwd, then it returns to a folder label.
+        // This matches the natural flow after leaving the external program.
         assert!(pane.set_surface_cwd(pane_id, surface_id, "/tmp/another".into()));
         assert_eq!(pane.surface_title(pane_id, surface_id), Some("another"));
 
@@ -1490,10 +1487,10 @@ mod tests {
             pane.find_surface(pane_id, browser_id).unwrap().kind,
             SurfaceKind::Browser { initial_url: Some(ref u) } if u == "https://two.test"
         ));
-        // 같은 URL을 다시 set하면 false (no-op).
+        // Setting the same URL again returns false (no-op).
         assert!(!pane.set_surface_browser_url(pane_id, browser_id, "https://two.test".into()));
 
-        // Terminal surface는 영향을 받지 않아야 한다.
+        // Terminal surfaces should not be affected.
         let term = PaneSurface::terminal("term", None);
         let term_id = term.id;
         pane.add_surface_to_leaf(pane_id, term).unwrap();
@@ -1509,18 +1506,18 @@ mod tests {
         };
         let surface_id = pane.active_surface_id(pane_id).unwrap();
 
-        // 잠겨 있지 않은 surface는 자동 갱신.
+        // Unlocked surfaces update automatically.
         assert!(pane.set_surface_title_auto(pane_id, surface_id, "Page Title".into()));
         assert_eq!(pane.surface_title(pane_id, surface_id), Some("Page Title"));
 
-        // 동일 title은 no-op.
+        // Identical title is a no-op.
         assert!(!pane.set_surface_title_auto(pane_id, surface_id, "Page Title".into()));
 
-        // 빈 / whitespace title은 no-op.
+        // Empty / whitespace title is a no-op.
         assert!(!pane.set_surface_title_auto(pane_id, surface_id, "".into()));
         assert!(!pane.set_surface_title_auto(pane_id, surface_id, "   ".into()));
 
-        // 사용자가 직접 rename → title_locked = true.
+        // User rename -> title_locked = true.
         assert!(pane.rename_surface(pane_id, surface_id, "MyName".into()));
         assert!(!pane.set_surface_title_auto(pane_id, surface_id, "Other Page".into()));
         assert_eq!(pane.surface_title(pane_id, surface_id), Some("MyName"));
@@ -1529,31 +1526,31 @@ mod tests {
     #[test]
     fn title_is_shell_cwd_echo_recognizes_bash_default_ps1() {
         let cwd = Path::new("/tmp/flowmux-shell-echo-test");
-        // bash 기본 `\u@\h: \w` (절대경로 표시).
+        // Default bash `\u@\h: \w` with an absolute path.
         assert!(title_is_shell_cwd_echo(
             "junsu@host: /tmp/flowmux-shell-echo-test",
             cwd,
             None,
         ));
-        // 공백 없이 `\u@\h:\w`.
+        // `\u@\h:\w` without a space.
         assert!(title_is_shell_cwd_echo(
             "junsu@host:/tmp/flowmux-shell-echo-test",
             cwd,
             None,
         ));
-        // debian_chroot prefix 변형.
+        // debian_chroot prefix variant.
         assert!(title_is_shell_cwd_echo(
             "(jammy)junsu@host: /tmp/flowmux-shell-echo-test",
             cwd,
             None,
         ));
-        // 호스트만 prefix.
+        // Host-only prefix.
         assert!(title_is_shell_cwd_echo(
             "host: /tmp/flowmux-shell-echo-test",
             cwd,
             None,
         ));
-        // path 자체만 (PROMPT가 path만 emit하는 테마).
+        // Path only, for prompt themes that emit only the path.
         assert!(title_is_shell_cwd_echo(
             "/tmp/flowmux-shell-echo-test",
             cwd,
@@ -1565,19 +1562,20 @@ mod tests {
     fn title_is_shell_cwd_echo_recognizes_tilde_form() {
         let home = Path::new("/home/junsu");
         let cwd = Path::new("/home/junsu/dev/os");
-        // bash `\w`는 $HOME을 `~`로 축약.
+        // bash `\w` abbreviates $HOME to `~`.
         assert!(title_is_shell_cwd_echo(
             "junsu@host: ~/dev/os",
             cwd,
             Some(home),
         ));
-        // home 자체 (cwd == $HOME → ~).
+        // Home itself, cwd == $HOME -> ~.
         assert!(title_is_shell_cwd_echo(
             "junsu@host: ~",
             Path::new("/home/junsu"),
             Some(home),
         ));
-        // home 정보가 없으면 tilde 매칭은 안 되지만 절대경로 매칭은 여전.
+        // Without home information, tilde matching is unavailable but absolute
+        // path matching still works.
         assert!(!title_is_shell_cwd_echo(
             "junsu@host: ~/dev/os",
             cwd,
@@ -1588,8 +1586,8 @@ mod tests {
     #[test]
     fn title_is_shell_cwd_echo_passes_program_titles() {
         let cwd = Path::new("/tmp/flowmux-shell-echo-test");
-        // vi/codex/claude/tmux 같은 외부 프로그램이 보내는 타이틀은 PS1
-        // 패턴(`prefix:[ ]<cwd>`)에 안 걸린다.
+        // Titles from external programs such as vi/codex/claude/tmux do not
+        // match the PS1 pattern (`prefix:[ ]<cwd>`).
         assert!(!title_is_shell_cwd_echo(
             "vim src/main.rs",
             cwd,
@@ -1605,26 +1603,25 @@ mod tests {
             cwd,
             None,
         ));
-        // cwd 안의 파일을 여는 vim도 통과해야 한다 — prefix가 `:`로
-        // 끝나지 않으므로.
+        // vim opening a file inside cwd should also pass through because its
+        // prefix does not end with `:`.
         assert!(!title_is_shell_cwd_echo(
             "vim /tmp/flowmux-shell-echo-test",
             cwd,
             None,
         ));
-        // 빈 / whitespace는 echo로 오인하지 않는다 (호출자가 이미 검사
-        // 하지만 helper 단독 호출 안전성 유지).
+        // Empty / whitespace values are not mistaken for echoes, even though
+        // callers already check them, keeping the helper safe in isolation.
         assert!(!title_is_shell_cwd_echo("", cwd, None));
         assert!(!title_is_shell_cwd_echo("   ", cwd, None));
     }
 
     #[test]
     fn set_surface_title_auto_drops_shell_ps1_echo_on_terminal() {
-        // 회귀 방지: 셸이 매 프롬프트마다 OSC 0/2로 보내는 PS1
-        // 형태(`user@host: /path`)가 cwd 기반 폴더 이름 라벨을
-        // 덮어 쓰지 않도록 한다. flowmux-app 측 cwd-notify 플로우가
-        // set_surface_cwd로 폴더 이름을 별도로 반영하므로 OSC 0/2
-        // 에코는 무시하는 것이 정답.
+        // Regression guard: shell PS1-shaped OSC 0/2 titles (`user@host: /path`)
+        // emitted on every prompt must not overwrite cwd-based folder labels.
+        // flowmux-app's cwd-notify flow applies folder names through
+        // set_surface_cwd, so OSC 0/2 echoes should be ignored.
         let pane_id = PaneId::new();
         let cwd = PathBuf::from("/tmp/flowmux-shell-echo-test");
         let mut pane = Pane::Leaf {
@@ -1633,7 +1630,7 @@ mod tests {
         };
         let surface_id = pane.active_surface_id(pane_id).unwrap();
 
-        // PS1 echo 들 — 모두 무시되어야 한다 (반환 false, title 그대로).
+        // PS1 echoes: all should be ignored, returning false and keeping title.
         assert!(!pane.set_surface_title_auto(
             pane_id,
             surface_id,
@@ -1649,7 +1646,7 @@ mod tests {
             Some("flowmux-shell-...")
         );
 
-        // 외부 프로그램 타이틀(vi 등)은 정상적으로 반영된다.
+        // External program titles, such as vi, still apply normally.
         assert!(pane.set_surface_title_auto(
             pane_id,
             surface_id,
@@ -1715,7 +1712,7 @@ mod tests {
         };
         assert_eq!(tree.parent_split_id(l), Some(split_id));
         assert_eq!(tree.parent_split_id(r), Some(split_id));
-        // Split 자신은 누구의 자식도 아니므로 None — 루트 시점.
+        // A Split is not its own child, so root lookup returns None.
         assert_eq!(tree.parent_split_id(split_id), None);
         assert_eq!(tree.parent_split_id(PaneId::new()), None);
     }
@@ -1865,7 +1862,7 @@ mod tests {
         };
         assert_eq!(surfaces[0].title, "solo");
 
-        // 다른 PaneId는 None.
+        // Other PaneIds return None.
         assert!(tree.find_leaf_content(PaneId::new()).is_none());
     }
 
@@ -1895,7 +1892,7 @@ mod tests {
         };
         assert_eq!(surfaces[0].title, "Docs");
 
-        // split 자체의 PaneId는 leaf가 아니므로 None.
+        // A split PaneId is not a leaf, so return None.
         let split_id = match &tree {
             Pane::Split { id, .. } => *id,
             _ => unreachable!(),
@@ -1905,10 +1902,10 @@ mod tests {
 
     #[test]
     fn split_leaf_preserves_target_pane_id_and_creates_fresh_sibling() {
-        // incremental split의 핵심 가정 — 분할 후 target의 PaneId는
-        // 그대로 유지되고, sibling은 새 PaneId를 받는다. 이 시나리오가
-        // 깨지면 GTK 측 PaneRegistry::pane_frame(target_pane) 조회가
-        // 빗나가 다른 pane을 통째로 rebuild하는 회귀가 발생한다.
+        // Core assumption for incremental split: target keeps its PaneId after
+        // splitting, and the sibling receives a new PaneId. If this breaks, GTK
+        // PaneRegistry::pane_frame(target_pane) lookup misses and can rebuild
+        // the wrong pane.
         let target = PaneId::new();
         let mut tree = Pane::Leaf {
             id: target,
@@ -1929,7 +1926,7 @@ mod tests {
         assert!(leaves.contains(&target));
         assert!(leaves.contains(&new_pane));
 
-        // target의 컨텐츠는 원래대로, new_pane는 fresh 컨텐츠.
+        // Target content remains original; new_pane has fresh content.
         let target_content = tree.find_leaf_content(target).unwrap();
         let new_content = tree.find_leaf_content(new_pane).unwrap();
         let (PaneContent::Tabs { surfaces: t_surfs, .. }, PaneContent::Tabs { surfaces: n_surfs, .. }) =
@@ -1943,9 +1940,8 @@ mod tests {
 
     #[test]
     fn split_leaf_inside_existing_split_preserves_neighbor_pane_id() {
-        // 이미 split 트리 안에 있는 한 pane을 다시 split해도, 같은 split
-        // 안의 다른 sibling pane의 PaneId는 그대로다. GTK 측에서 sibling의
-        // gtk::Frame을 그대로 이어 갈 수 있음을 보장.
+        // Splitting a pane already inside a split tree preserves the other
+        // sibling pane's PaneId, so GTK can keep reusing that sibling's gtk::Frame.
         let l = PaneId::new();
         let r = PaneId::new();
         let mut tree = Pane::Split {
@@ -1971,17 +1967,17 @@ mod tests {
             )
             .unwrap();
 
-        // r 은 그대로 leaf 로 유지.
+        // r remains a leaf.
         assert!(matches!(
             tree.find_leaf_content(r),
             Some(PaneContent::Tabs { .. })
         ));
-        // l 도 새 split의 일원으로 살아남고, l 자체의 PaneId는 보존.
+        // l survives as part of the new split and keeps its PaneId.
         assert!(matches!(
             tree.find_leaf_content(l),
             Some(PaneContent::Tabs { .. })
         ));
-        // 새 sibling 등록.
+        // New sibling is registered.
         assert!(tree.find_leaf_content(new_under_l).is_some());
         assert_ne!(new_under_l, l);
         assert_ne!(new_under_l, r);
@@ -2008,17 +2004,17 @@ mod tests {
         let added_id = added.id;
         assert_eq!(tree.add_surface_to_leaf(right_id, added), Some(added_id));
 
-        // 잘못된 (pane, surface) 매칭은 None — surface는 right pane에만 존재.
+        // Wrong (pane, surface) pairing returns None because the surface exists
+        // only in the right pane.
         assert!(tree.find_surface(left_id, added_id).is_none());
         let found = tree.find_surface(right_id, added_id).unwrap();
         assert_eq!(found.id, added_id);
         assert_eq!(found.title, "RBrowser");
     }
 
-    /// pane 내부 탭 reorder 시나리오 모음. surface_id 기반으로
-    /// active 탭이 보존되는지, terminal과 탭브라우저가 섞여 있어도
-    /// 정상 이동하는지, 인덱스 클램프와 no-op 분기가 모두 동작하는지를
-    /// 한 번에 본다.
+    /// Pane-internal tab reorder scenarios. Covers preserving the active tab by
+    /// surface_id, moving mixed terminal/browser tabs, index clamping, and no-op
+    /// branches.
     #[test]
     fn reorder_surface_moves_first_to_last_and_preserves_active() {
         let pane_id = PaneId::new();
@@ -2033,7 +2029,7 @@ mod tests {
         let c_id = c.id;
         pane.add_surface_to_leaf(pane_id, b).unwrap();
         pane.add_surface_to_leaf(pane_id, c).unwrap();
-        // a를 활성으로 되돌려 둔다 — c가 마지막으로 추가돼서 active.
+        // Restore active to a; c was added last and became active.
         assert!(pane.set_active_surface(pane_id, a_id));
 
         assert!(pane.reorder_surface_in_leaf(pane_id, a_id, 2));
@@ -2047,7 +2043,7 @@ mod tests {
         };
         let order: Vec<SurfaceId> = surfaces.iter().map(|s| s.id).collect();
         assert_eq!(order, vec![b_id, c_id, a_id]);
-        // a를 옮겼지만 active는 여전히 a여야 한다.
+        // a moved, but active should still be a.
         assert_eq!(*active, a_id);
     }
 
@@ -2093,7 +2089,7 @@ mod tests {
         let b_id = b.id;
         pane.add_surface_to_leaf(pane_id, b).unwrap();
 
-        // target_index=999 → 끝으로 클램프 → b, a
+        // target_index=999 -> clamp to end -> b, a.
         assert!(pane.reorder_surface_in_leaf(pane_id, a_id, 999));
 
         let Pane::Leaf {
@@ -2120,9 +2116,9 @@ mod tests {
         let b = PaneSurface::terminal("b", None);
         pane.add_surface_to_leaf(pane_id, b).unwrap();
 
-        // a가 이미 인덱스 0이므로 0으로 옮겨도 no-op.
+        // a is already at index 0, so moving to 0 is a no-op.
         assert!(!pane.reorder_surface_in_leaf(pane_id, a_id, 0));
-        // 길이를 넘어도 자기 자리(끝)로 클램프되면 마찬가지로 no-op.
+        // Even out-of-range clamps to its current end position, so no-op.
         let last = pane
             .find_surface(
                 pane_id,
@@ -2162,8 +2158,8 @@ mod tests {
         assert!(!pane.reorder_surface_in_leaf(pane_id, only, 5));
     }
 
-    /// terminal 두 개 + 탭브라우저 한 개를 만들고 가운데 탭브라우저를
-    /// 양 끝으로 보내며 순서 + active 보존을 확인한다.
+    /// Create two terminals and one browser tab, move the middle browser tab to
+    /// both ends, and verify order plus active preservation.
     #[test]
     fn reorder_surface_mixed_terminal_and_browser() {
         let pane_id = PaneId::new();
@@ -2178,19 +2174,19 @@ mod tests {
         let term2_id = term2.id;
         pane.add_surface_to_leaf(pane_id, browser).unwrap();
         pane.add_surface_to_leaf(pane_id, term2).unwrap();
-        // 탭브라우저(중간)를 active로.
+        // Make the middle browser tab active.
         assert!(pane.set_active_surface(pane_id, browser_id));
 
-        // 가운데 → 처음
+        // Middle -> first.
         assert!(pane.reorder_surface_in_leaf(pane_id, browser_id, 0));
         assert_active_order(&pane, pane_id, browser_id, &[browser_id, term_id, term2_id]);
 
-        // 처음 → 마지막
+        // First -> last.
         assert!(pane.reorder_surface_in_leaf(pane_id, browser_id, 2));
         assert_active_order(&pane, pane_id, browser_id, &[term_id, term2_id, browser_id]);
     }
 
-    /// split 트리 안 깊숙한 leaf의 탭을 reorder. 다른 leaf는 영향 없어야.
+    /// Reorder a tab in a deep leaf of a split tree. Other leaves must be unaffected.
     #[test]
     fn reorder_surface_walks_into_split_branches() {
         let left_id = PaneId::new();
@@ -2217,14 +2213,14 @@ mod tests {
         tree.add_surface_to_leaf(right_id, r2).unwrap();
         let l0 = tree.active_surface_id(left_id).unwrap();
 
-        // right pane의 R2(마지막)를 첫 번째로.
+        // Move R2, the last tab in the right pane, to first.
         assert!(tree.reorder_surface_in_leaf(right_id, r2_id, 0));
         assert_active_order(&tree, right_id, r2_id, &[r2_id, r0, r1_id]);
 
-        // left pane은 그대로여야 한다.
+        // Left pane should stay unchanged.
         assert_active_order(&tree, left_id, l0, &[l0]);
 
-        // 잘못된 (pane, surface) 매칭은 false.
+        // Wrong (pane, surface) pairing returns false.
         assert!(!tree.reorder_surface_in_leaf(left_id, r2_id, 0));
     }
 
@@ -2311,14 +2307,14 @@ mod tests {
         };
         assert_eq!(ws.display_title(), "My Project");
 
-        // 자동 갱신으로 name이 바뀌어도 custom_title이 우선.
+        // custom_title wins even when automatic updates change name.
         ws.name = "updated-auto".into();
         assert_eq!(ws.display_title(), "My Project");
     }
 
     #[test]
     fn display_title_treats_empty_custom_as_unset() {
-        // 방어: 어떤 경로로 빈 문자열이 저장되더라도 표시는 자동 모드.
+        // Defensive: if any path stores an empty string, display returns to automatic mode.
         let ws = Workspace {
             id: WorkspaceId::new(),
             name: "auto".into(),
@@ -2334,8 +2330,8 @@ mod tests {
 
     #[test]
     fn workspace_loads_legacy_state_without_custom_title() {
-        // 이전 버전 state.json은 custom_title 필드가 없다.
-        // #[serde(default)] 덕에 None으로 로드되어야 한다.
+        // Older state.json files lack custom_title.
+        // #[serde(default)] should load it as None.
         let json = r#"{
             "id": "00000000-0000-0000-0000-000000000001",
             "name": "old-project",

@@ -130,6 +130,7 @@ mod tests {
             collect(&env, "FLOWMUX_SOCKET_PATH"),
             Some("/run/user/1000/flowmux.sock")
         );
+        // bundled_cli omitted when not provided.
         assert!(collect(&env, "FLOWMUX_BUNDLED_CLI_PATH").is_none());
     }
 
@@ -191,6 +192,8 @@ mod tests {
 
         assert_eq!(kv.len(), 6);
         for entry in &kv {
+            // Each entry must contain a single '=' delimiter so VTE/glib
+            // accepts it as a `KEY=VALUE` pair.
             let eq = entry.find('=').expect("envv entry must have '='");
             let key = &entry[..eq];
             let val = &entry[eq + 1..];

@@ -615,7 +615,7 @@ mod tests {
     #[test]
     fn browser_type_preserves_unicode_text() {
         let pane = PaneId::new();
-        let text = "hello\nworld 안녕\t↩️";
+        let text = "hello\nworld hi\t↩️";
         match roundtrip_request(Request::BrowserType {
             pane,
             text: text.into(),

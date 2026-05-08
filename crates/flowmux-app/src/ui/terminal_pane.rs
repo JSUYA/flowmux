@@ -113,14 +113,14 @@ pub struct PaneCallbacks {
     pub on_activate_surface: Rc<RefCell<dyn FnMut(PaneId, SurfaceId)>>,
     /// Pane-local new terminal tab.
     pub on_new_surface: Rc<RefCell<dyn FnMut(PaneId)>>,
-    /// Pane-local new browser tab (탭브라우저 추가).
+    /// Pane-local new browser tab.
     pub on_new_browser_surface: Rc<RefCell<dyn FnMut(PaneId)>>,
     /// Pane-local close tab.
     pub on_close_surface: Rc<RefCell<dyn FnMut(PaneId, SurfaceId)>>,
     /// Pane-local rename tab.
     pub on_rename_surface: Rc<RefCell<dyn FnMut(PaneId, SurfaceId)>>,
-    /// 같은 pane 내부에서 탭을 드래그 앤 드랍으로 reorder. 세 번째
-    /// 인자는 이동 후의 최종 인덱스(0-based, 길이 초과 시 클램프).
+    /// Reorder a tab within the same pane by drag and drop. The third argument
+    /// is the final 0-based index after the move, clamped if it exceeds length.
     pub on_reorder_surface: Rc<RefCell<dyn FnMut(PaneId, SurfaceId, usize)>>,
     /// VTE reported that a terminal surface changed its cwd.
     pub on_terminal_cwd_changed: Rc<RefCell<dyn FnMut(PaneId, SurfaceId, PathBuf)>>,
@@ -128,24 +128,24 @@ pub struct PaneCallbacks {
     pub on_browser_uri_changed: Rc<RefCell<dyn FnMut(PaneId, SurfaceId, String)>>,
     /// WebKit reported that a browser pane's page title changed.
     pub on_browser_title_changed: Rc<RefCell<dyn FnMut(PaneId, SurfaceId, String)>>,
-    /// VTE가 OSC 0/2 window-title을 알렸다 (vi/claude/codex/tmux
-    /// 같은 프로그램이 셸 안에서 보낼 때). 빈 문자열은 호출 측에서
-    /// 무시한다.
+    /// VTE reported an OSC 0/2 window title, often emitted by programs such as
+    /// vi, claude, codex, or tmux inside the shell. Empty titles are ignored by
+    /// the caller.
     pub on_terminal_title_changed: Rc<RefCell<dyn FnMut(PaneId, SurfaceId, String)>>,
-    /// 현재 시점의 사용자 옵션을 가져온다 (새 BrowserPane 생성 시
-    /// 엔진 선택 + 위젯 생성 직후 줌 적용에 사용). WindowController가
-    /// 보유한 `Rc<RefCell<Options>>`에서 clone해 돌려주는 가벼운
-    /// 함수. 다이얼로그가 옵션을 갱신하면 다음 호출부터 새 값이
-    /// 보인다.
+    /// Return the current user options. Used when creating a new BrowserPane to
+    /// choose the engine and apply zoom immediately after widget creation. This
+    /// cheaply clones the `Rc<RefCell<Options>>` held by WindowController, so
+    /// dialog updates are visible on the next call.
     pub read_options: Rc<dyn Fn() -> flowmux_config::options::Options>,
-    /// 같은 pane 내부에서 surface의 현재 인덱스(0-based)를 돌려준다.
-    /// 탭 DnD reorder가 source / target 상대 위치를 정확히 알고 final_index를
-    /// 계산하기 위해 PaneRegistry::surface_tabs의 위치를 빌려 본다.
+    /// Return the surface's current 0-based index within the same pane. Tab DnD
+    /// uses PaneRegistry::surface_tabs to compute final_index from the source
+    /// and target relative positions.
     pub position_of_surface_in_pane:
         Rc<dyn Fn(PaneId, SurfaceId) -> Option<usize>>,
-    /// 터미널 안에서 Ctrl+클릭으로 URL이 선택되면 호출된다. 호출 측은
-    /// 같은 pane에 새 탭브라우저를 url과 함께 연다(GtkCommand::OpenUrlInBrowserTab).
-    /// url은 trailing punctuation이 정리된 상태로 전달된다.
+    /// Called when Ctrl+click selects a URL inside the terminal. The caller
+    /// opens that URL in a new browser tab in the same pane
+    /// (GtkCommand::OpenUrlInBrowserTab). The URL arrives with trailing
+    /// punctuation already trimmed.
     pub on_open_url: Rc<RefCell<dyn FnMut(PaneId, String)>>,
 }
 
@@ -188,11 +188,10 @@ impl TerminalPane {
             });
         }
 
-        // URL 인식 (Ctrl+클릭으로 내부 탭브라우저에서 열기).
-        // 터미널에 출력된 URL을 PCRE2 regex로 매치 등록 → hover 시
-        // pointer 커서로 바뀌고, 사용자가 Ctrl을 누른 채 좌클릭하면
-        // 같은 pane에 새 탭브라우저를 그 URL로 띄운다. 일반 클릭은
-        // 평소처럼 VTE의 텍스트 선택으로 흘러간다.
+        // URL recognition for opening terminal URLs in an internal browser tab
+        // via Ctrl+click. A PCRE2 regex match changes hover to the pointer
+        // cursor; Ctrl+left-click opens the URL in a new browser tab in the
+        // same pane. Plain clicks continue into VTE text selection.
         install_url_link_handling(&term, id, callbacks.on_open_url.clone());
 
         // Process exit.
@@ -297,10 +296,10 @@ impl TerminalPane {
         let cwd_str = cwd.as_ref().and_then(|p| p.to_str());
 
         // VTE's spawn_async expects an envv array of `KEY=VALUE` strings,
-        // or an empty slice to inherit the parent's environment. We
-        // append flowmux-specific entries so agents inside the PTY can
-        // self-discover their pane and the daemon socket. Inheritance of
-        // the parent env is handled by glib at the spawn-async layer.
+        // or an empty slice to inherit the parent's environment. We build
+        // a minimal extension on top of inheritance: parent env is
+        // implicit, and we append flowmux-specific entries so agents can
+        // self-discover their pane.
         let envv_strings = flowmux_terminal::env_to_kv_strings(&extra_env);
         let envv_refs: Vec<&str> = envv_strings.iter().map(String::as_str).collect();
 
@@ -341,26 +340,24 @@ impl TerminalPane {
 
 // ---- URL link handling --------------------------------------------------
 
-/// PCRE2 패턴: http(s) / ftp / file URL을 공백/꺽쇠/따옴표/백틱 전까지
-/// 매치한다. (?i)로 schema는 대소문자 무관. 매치된 문자열에 끝쪽
-/// 구두점이 붙을 수 있어 dispatch 직전에 trim_url_trailing()로 정리한다.
+/// PCRE2 pattern: match http(s), ftp, and file URLs until whitespace, angle
+/// brackets, quotes, or backticks. `(?i)` makes the scheme case-insensitive.
+/// A match may include trailing sentence punctuation, so trim it immediately
+/// before dispatch.
 const URL_REGEX_PATTERN: &str = r#"(?i)(?:https?|ftp|file)://[^\s<>"'`]+"#;
 
-/// PCRE2 컴파일 플래그.
-///   * PCRE2_MULTILINE (0x400): 줄을 넘기는 wrap된 터미널 출력에서도
-///     매치가 깨지지 않도록 한다.
-///   * PCRE2_UTF (0x80000): VTE는 매치 엔진에 UTF-8 텍스트를 넘기므로
-///     이 플래그가 빠지면 PCRE2가 입력을 raw byte로 다뤄 hover 감지 /
-///     커서 변경이 동작하지 않는다 (gnome-terminal과 동일 조합).
-///   * PCRE2_NO_UTF_CHECK (0x4000_0000): VTE 내부에서 이미 UTF-8을
-///     검증하므로 PCRE2의 추가 검증을 끄고 매치마다의 오버헤드를 줄인다.
+/// PCRE2 compile flags.
+///   * PCRE2_MULTILINE (0x400): keep matches working across wrapped terminal output.
+///   * PCRE2_UTF (0x80000): VTE passes UTF-8 text to the match engine; without
+///     this flag PCRE2 treats input as raw bytes and hover / cursor changes fail.
+///   * PCRE2_NO_UTF_CHECK (0x4000_0000): VTE has already validated UTF-8, so skip
+///     PCRE2's extra validation cost on each match.
 const URL_REGEX_COMPILE_FLAGS: u32 = 0x0000_0400 | 0x0008_0000 | 0x4000_0000;
 
-/// Trailing punctuation을 잘라낸 URL을 돌려준다. `.`, `,`, `;`, `:`,
-/// `!`, `?`, 닫는 괄호류, 따옴표 — 문장 끝에 자연스럽게 붙기 쉬운
-/// 문자들. URL path/query에 의도적으로 들어 있을 수도 있지만, 사용자
-/// 시나리오에서 "마지막에 `.`이 붙은 URL을 그대로 열어 404"보다는
-/// "마지막 `.`을 떼서 정상 URL을 여는" 쪽이 거의 항상 옳다.
+/// Return a URL with trailing punctuation removed: `.`, `,`, `;`, `:`, `!`,
+/// `?`, closing brackets, and quotes. These characters can be intentional in a
+/// URL path/query, but in the common user scenario it is better to drop the
+/// sentence-ending punctuation than to open a 404 with the final `.` included.
 fn trim_url_trailing(s: &str) -> String {
     s.trim_end_matches(|c: char| {
         matches!(
@@ -386,9 +383,9 @@ fn install_url_link_handling(
     pane_id: PaneId,
     on_open_url: Rc<RefCell<dyn FnMut(PaneId, String)>>,
 ) {
-    // 1) Regex 컴파일 + 등록. 실패하면(매우 드묾 — 보통 PCRE2 빌드
-    //    이슈) 조용히 fall through — 링크 인식만 비활성화되고 터미널
-    //    자체는 정상 동작한다.
+    // 1) Compile and register the regex. If this fails, usually due to a PCRE2
+    //    build issue, link recognition is disabled while the terminal itself
+    //    keeps working.
     let regex = match vte::Regex::for_match(URL_REGEX_PATTERN, URL_REGEX_COMPILE_FLAGS) {
         Ok(r) => r,
         Err(e) => {
@@ -397,25 +394,22 @@ fn install_url_link_handling(
         }
     };
     let tag = term.match_add_regex(&regex, 0);
-    // hover 시 pointer 커서로 바뀌게 함. Ctrl 없이도 pointer가 보이지만
-    // 실제 클릭은 Ctrl이 눌린 경우에만 동작 — gnome-terminal과 동일한
-    // UX 패턴이다 (시각적 hint는 항상, action은 modifier로 제한).
+    // Show a pointer cursor on hover. The pointer appears even without Ctrl,
+    // but activation requires Ctrl, matching the gnome-terminal UX pattern:
+    // always show the hint, gate the action behind the modifier.
     term.match_set_cursor_name(tag, "pointer");
     tracing::debug!(%pane_id, tag, "URL match registered on terminal");
 
-    // 2) 좌클릭 gesture. Capture phase에서 button-press를 먼저 보고
-    //    Ctrl 여부를 판단한다.
+    // 2) Left-click gesture. Inspect button-press in capture phase first to
+    //    determine whether Ctrl is held.
     //
-    //    여기서 핵심 함정: GtkGestureSingle은 button-press 시점에
-    //    자기 sequence를 자동으로 Claimed로 가져가 버린다. 즉 우리가
-    //    아무 것도 안 해도 같은 button-press 이벤트는 다른 controller
-    //    (VTE의 selection drag)로 전달되지 않아 텍스트 선택이 막힌다.
-    //    "선택도 안 된다"의 직접 원인이 이거다.
+    //    The key trap: GtkGestureSingle automatically claims its sequence on
+    //    button-press. If we do nothing, that event never reaches other
+    //    controllers such as VTE selection drag, so text selection breaks.
     //
-    //    해결: Ctrl이 안 눌렸으면 명시적으로 set_state(Denied)로
-    //    sequence를 우리 손에서 풀어 준다 — VTE의 selection gesture가
-    //    그 sequence를 잡을 수 있다. Ctrl이 눌린 경우에만 Claimed로
-    //    유지해 selection이 시작되지 않게 한다.
+    //    Fix: when Ctrl is not held, explicitly set the sequence to Denied so
+    //    VTE's selection gesture can claim it. Keep it Claimed only for
+    //    Ctrl-clicks so selection does not start.
     let click = gtk::GestureClick::new();
     click.set_button(gtk::gdk::BUTTON_PRIMARY);
     click.set_propagation_phase(gtk::PropagationPhase::Capture);
@@ -427,16 +421,16 @@ fn install_url_link_handling(
             .map(|e| e.modifier_state())
             .unwrap_or_else(gtk::gdk::ModifierType::empty);
         if !modifiers.contains(gtk::gdk::ModifierType::CONTROL_MASK) {
-            // VTE의 selection drag가 같은 button-press를 처리할 수 있도록
-            // 우리 sequence를 풀어 준다. 이거 없으면 GestureSingle의 자동
-            // Claim 때문에 selection이 영구히 막힌다.
+            // Release our sequence so VTE selection drag can handle the same
+            // button-press. Otherwise GestureSingle's auto-claim blocks
+            // selection permanently.
             gesture.set_state(gtk::EventSequenceState::Denied);
             return;
         }
 
-        // 우선 OSC 8 hyperlink (escape sequence로 URL 첨부된 텍스트)부터
-        // 보고, 없으면 regex 매치로 폴백한다. OSC 8을 지원하는 ls / git
-        // / 일부 빌드 도구가 만드는 링크가 우선순위가 높다.
+        // Prefer OSC 8 hyperlinks, where the URL is attached by escape
+        // sequence, then fall back to regex matches. Links produced by ls,
+        // git, or build tools that support OSC 8 should win.
         let url_raw: Option<String> = term_widget
             .check_hyperlink_at(x, y)
             .map(|g| g.to_string())
@@ -446,9 +440,9 @@ fn install_url_link_handling(
             });
 
         let Some(raw) = url_raw else {
-            // Ctrl을 누른 채로 클릭했지만 URL 위가 아니다. selection 시도로
-            // 보고 sequence를 풀어 준다 — Ctrl+드래그로 block selection
-            // 같은 VTE 자체 기능을 막지 않기 위해.
+            // Ctrl was held, but the click was not on a URL. Treat it as a
+            // selection attempt and release the sequence so VTE features such
+            // as Ctrl+drag block selection still work.
             gesture.set_state(gtk::EventSequenceState::Denied);
             return;
         };
@@ -459,8 +453,7 @@ fn install_url_link_handling(
         }
         tracing::info!(%pane_id, %url, "Ctrl+click on terminal URL → open in browser tab");
         (on_open_url.borrow_mut())(pane_id, url);
-        // URL을 처리했으니 sequence를 가져가서 VTE의 selection이
-        // 시작되지 않게 한다.
+        // We handled the URL, so claim the sequence to prevent VTE selection.
         gesture.set_state(gtk::EventSequenceState::Claimed);
     });
     term.add_controller(click);
@@ -492,7 +485,7 @@ mod tests {
 
     #[test]
     fn trim_url_trailing_preserves_internal_punctuation() {
-        // path 내부의 `.`이나 `,`은 보존해야 한다 — trim은 끝부터만 한다.
+        // Preserve `.` or `,` inside the path; trim only from the end.
         assert_eq!(
             trim_url_trailing("https://example.com/a.b/c"),
             "https://example.com/a.b/c"

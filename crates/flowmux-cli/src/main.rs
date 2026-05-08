@@ -25,20 +25,6 @@ fn pane_from_env() -> Option<PaneId> {
         .and_then(|s| PaneId::from_str(s).ok())
 }
 
-/// Parse a pane reference from the CLI. Accepts cmux-compatible prefix
-/// forms `surface:<uuid>` and `pane:<uuid>` as well as a bare uuid, so
-/// agents that already speak cmux's CLI can keep their existing call
-/// shape. (`surface:<integer>` style numeric refs are out of scope for
-/// this layer — they require a daemon-side index lookup, planned with
-/// the ListPanes IPC verb.)
-fn parse_pane_or_surface(s: &str) -> Result<PaneId, String> {
-    let inner = s
-        .strip_prefix("surface:")
-        .or_else(|| s.strip_prefix("pane:"))
-        .unwrap_or(s);
-    PaneId::from_str(inner).map_err(|e| format!("invalid pane id `{s}`: {e}"))
-}
-
 #[derive(Parser)]
 #[command(
     name = "flowmux",
@@ -51,12 +37,6 @@ struct Cli {
     /// XDG runtime path. `FLOWMUX_SOCKET` is accepted as a legacy alias.
     #[arg(long, env = "FLOWMUX_SOCKET_PATH")]
     socket: Option<PathBuf>,
-
-    /// Print responses as a single-line JSON object instead of the
-    /// default human-readable indented form. Mirrors cmux's `--json`
-    /// flag — easier to parse from agent scripts.
-    #[arg(long, global = true)]
-    json: bool,
 
     #[command(subcommand)]
     cmd: Cmd,
@@ -187,56 +167,6 @@ enum Cmd {
         name: String,
     },
 
-    // ---- Phase 5 P0 action gap ------------------------
-    /// Double-click an element by its ref id.
-    BrowserDblClick { pane: PaneId, target: String },
-    /// Hover over an element (mouseenter + mouseover).
-    BrowserHover { pane: PaneId, target: String },
-    /// Focus an element (`HTMLElement.focus()`).
-    BrowserFocus { pane: PaneId, target: String },
-    /// Blur an element (`HTMLElement.blur()`).
-    BrowserBlur { pane: PaneId, target: String },
-    /// Check a checkbox or radio (no-op when already checked).
-    BrowserCheck { pane: PaneId, target: String },
-    /// Uncheck a checkbox (radios cannot be unchecked individually).
-    BrowserUncheck { pane: PaneId, target: String },
-    /// Print `true` / `false` for whether an element is currently
-    /// rendered (size > 0, not display:none, opacity > 0).
-    BrowserIsVisible { pane: PaneId, target: String },
-    /// Print `true` / `false` for whether `el.disabled === false`.
-    BrowserIsEnabled { pane: PaneId, target: String },
-    /// Print `true` / `false` for `el.checked` of a checkbox/radio.
-    BrowserIsChecked { pane: PaneId, target: String },
-    /// Print the number of elements matching a CSS selector.
-    BrowserCount { pane: PaneId, selector: String },
-
-    // ---- Phase 7: agent session resume mapping ----
-    /// Record a `(agent, surface) → session_id` mapping so the next
-    /// app launch can `--resume <session_id>` in the same surface.
-    /// Mirrors cmux's hook-side `cmux agent-session update`.
-    AgentSessionUpdate {
-        #[arg(long)]
-        agent: String,
-        #[arg(long)]
-        surface: flowmux_core::SurfaceId,
-        #[arg(long)]
-        session_id: String,
-    },
-    /// Look up the session id previously recorded for `(agent, surface)`.
-    AgentSessionGet {
-        #[arg(long)]
-        agent: String,
-        #[arg(long)]
-        surface: flowmux_core::SurfaceId,
-    },
-    /// Forget the session previously recorded for `(agent, surface)`.
-    AgentSessionForget {
-        #[arg(long)]
-        agent: String,
-        #[arg(long)]
-        surface: flowmux_core::SurfaceId,
-    },
-
     /// Import cookies from a host browser into the in-app browser jar.
     ImportCookies {
         /// Browser slug: firefox, chrome, chromium, brave, edge, arc.
@@ -322,7 +252,7 @@ async fn main() -> anyhow::Result<()> {
 
     let req = build_request(cli.cmd)?;
     let resp = client.call(req).await?;
-    print_response(&resp, cli.json)?;
+    print_response(&resp)?;
     Ok(())
 }
 
@@ -458,32 +388,6 @@ fn build_request(cmd: Cmd) -> anyhow::Result<Request> {
         Cmd::BrowserText { pane, target } => Request::BrowserText { pane, target },
         Cmd::BrowserValue { pane, target } => Request::BrowserValue { pane, target },
         Cmd::BrowserAttr { pane, target, name } => Request::BrowserAttr { pane, target, name },
-
-        Cmd::BrowserDblClick { pane, target } => Request::BrowserDblClick { pane, target },
-        Cmd::BrowserHover { pane, target } => Request::BrowserHover { pane, target },
-        Cmd::BrowserFocus { pane, target } => Request::BrowserFocus { pane, target },
-        Cmd::BrowserBlur { pane, target } => Request::BrowserBlur { pane, target },
-        Cmd::BrowserCheck { pane, target } => Request::BrowserCheck { pane, target },
-        Cmd::BrowserUncheck { pane, target } => Request::BrowserUncheck { pane, target },
-        Cmd::BrowserIsVisible { pane, target } => Request::BrowserIsVisible { pane, target },
-        Cmd::BrowserIsEnabled { pane, target } => Request::BrowserIsEnabled { pane, target },
-        Cmd::BrowserIsChecked { pane, target } => Request::BrowserIsChecked { pane, target },
-        Cmd::BrowserCount { pane, selector } => Request::BrowserCount { pane, selector },
-
-        Cmd::AgentSessionUpdate {
-            agent,
-            surface,
-            session_id,
-        } => Request::AgentSessionUpdate {
-            agent,
-            surface,
-            session_id,
-        },
-        Cmd::AgentSessionGet { agent, surface } => Request::AgentSessionGet { agent, surface },
-        Cmd::AgentSessionForget { agent, surface } => {
-            Request::AgentSessionForget { agent, surface }
-        }
-
         Cmd::ImportCookies { from, domain } => Request::ImportCookies {
             source: from,
             domain,
@@ -523,66 +427,14 @@ fn parse_level(s: &str) -> NotificationLevel {
     }
 }
 
-fn print_response(r: &Response, json_mode: bool) -> anyhow::Result<()> {
-    let s = if json_mode {
-        // Single-line JSON — easier to parse from agent scripts
-        // (`jq -r .pane` etc.). Mirrors cmux's `--json` shape.
-        serde_json::to_string(r)?
-    } else {
-        serde_json::to_string_pretty(r)?
-    };
-    println!("{s}");
+fn print_response(r: &Response) -> anyhow::Result<()> {
+    println!("{}", serde_json::to_string_pretty(r)?);
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parse_pane_or_surface_accepts_bare_uuid_and_prefix_forms() {
-        let pane = PaneId::new();
-        let s = pane.to_string();
-
-        assert_eq!(parse_pane_or_surface(&s).unwrap(), pane);
-        assert_eq!(
-            parse_pane_or_surface(&format!("surface:{s}")).unwrap(),
-            pane
-        );
-        assert_eq!(
-            parse_pane_or_surface(&format!("pane:{s}")).unwrap(),
-            pane
-        );
-    }
-
-    #[test]
-    fn parse_pane_or_surface_rejects_garbage() {
-        assert!(parse_pane_or_surface("not-a-uuid").is_err());
-        assert!(parse_pane_or_surface("surface:also-not-a-uuid").is_err());
-    }
-
-    #[test]
-    fn print_response_pretty_default_uses_indented_output() {
-        let resp = Response::Ok;
-        let pretty = serde_json::to_string_pretty(&resp).unwrap();
-        let compact = serde_json::to_string(&resp).unwrap();
-
-        // Sanity-check the format we expect on each side. Pretty output
-        // is multi-line for non-trivial structures — `Response::Ok`
-        // serializes to a single string either way, so use a richer
-        // variant to verify the shape difference.
-        let resp = Response::BrowserPaneOpened {
-            pane: PaneId::new(),
-            placement_strategy: flowmux_core::PlacementStrategy::SplitRight,
-        };
-        let pretty = serde_json::to_string_pretty(&resp).unwrap();
-        let compact = serde_json::to_string(&resp).unwrap();
-        assert!(pretty.contains('\n'), "pretty output should be multi-line");
-        assert!(
-            !compact.contains('\n'),
-            "compact (--json mode) output must be single-line"
-        );
-    }
 
     #[test]
     fn maps_notify_level_strings_to_core_levels() {
@@ -672,9 +524,11 @@ mod tests {
 
     #[test]
     fn browser_open_no_flags_defaults_to_right_split() {
-        // SAFETY: tests in this module mutate process-global env. Remove
-        // FLOWMUX_PANE_ID so a leak from another test doesn't change the
-        // expected target_pane = None outcome below.
+        // Ensure the env fallback does not leak from a parent test run —
+        // cargo runs tests in the same process, so a prior test that set
+        // FLOWMUX_PANE_ID would otherwise change the expected target_pane.
+        // SAFETY: tests in this module are single-threaded for this var
+        // (we re-set it in the dedicated env-fallback test below).
         unsafe {
             std::env::remove_var("FLOWMUX_PANE_ID");
         }
@@ -700,8 +554,8 @@ mod tests {
         let pane = PaneId::new();
         let pane_str = pane.to_string();
         // SAFETY: this test reads/writes a process-global env var. cargo
-        // serializes by default within a binary's test harness, and we
-        // remove the var at the end of the test.
+        // serializes by default within a binary's test harness, and the
+        // var is removed at the end of the test to keep neighbours clean.
         unsafe {
             std::env::set_var("FLOWMUX_PANE_ID", &pane_str);
         }
@@ -898,13 +752,13 @@ mod tests {
         let pane = PaneId::new();
         let req = build_request(Cmd::BrowserType {
             pane,
-            text: "안녕하세요 🚀".into(),
+            text: "hello there 🚀".into(),
         })
         .unwrap();
         assert!(matches!(
             req,
             Request::BrowserType { pane: got, text }
-                if got == pane && text == "안녕하세요 🚀"
+                if got == pane && text == "hello there 🚀"
         ));
     }
 

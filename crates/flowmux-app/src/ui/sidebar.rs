@@ -20,10 +20,10 @@
 
 use crate::bridge::{Bridge, GtkCommand};
 use crate::notifications::{NotificationEntry, NotificationLog};
-use flowmux_core::{NotificationLevel, Pane, PaneContent, PrState, SurfaceKind, Workspace, WorkspaceId};
+use flowmux_core::{NotificationLevel, PrState, Workspace, WorkspaceId};
 use gtk::prelude::*;
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 type RowsCell = Rc<RefCell<Vec<(WorkspaceId, gtk::ListBoxRow)>>>;
@@ -39,6 +39,12 @@ pub struct Sidebar {
     notification_log: NotificationLog,
     attentions: Rc<RefCell<HashSet<WorkspaceId>>>,
     bridge: Bridge,
+    /// Last computed subtitle lines per workspace, capped at 3 lines.
+    /// Kept so paths that do not know subtitle data, such as rename or color
+    /// changes, can redraw a row without losing its subtitles. WindowController
+    /// updates this via [`Sidebar::upsert_with_subtitles`] after
+    /// sync_workspace_label.
+    subtitle_cache: Rc<RefCell<HashMap<WorkspaceId, Vec<String>>>>,
 }
 
 impl Sidebar {
@@ -134,9 +140,9 @@ impl Sidebar {
         });
         toolbar.append(&bell_button);
 
-        // ---- Bottom footer: 좌측 작은 옵션 버튼 ----
-        // 클릭하면 bridge로 ShowOptionsDialog 보내 윈도우 dispatch에서
-        // 모달 다이얼로그를 띄운다.
+        // ---- Bottom footer: small left options button ----
+        // Click dispatches ShowOptionsDialog through the bridge so the window
+        // dispatcher can present the modal dialog.
         let footer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         footer.set_margin_top(2);
         footer.set_margin_bottom(4);
@@ -144,10 +150,10 @@ impl Sidebar {
         footer.set_margin_end(4);
         let options_btn = gtk::Button::from_icon_name("emblem-system-symbolic");
         options_btn.add_css_class("flat");
-        options_btn.set_tooltip_text(Some("옵션"));
+        options_btn.set_tooltip_text(Some("Options"));
         options_btn.set_focus_on_click(false);
-        // 작은 크기 — 사이드바의 다른 버튼과 동일한 high-contrast가
-        // 아니라 dimmed 톤으로 두어 시각적으로 잠잠하게.
+        // Keep it small and dimmed instead of matching the sidebar's more
+        // prominent buttons.
         options_btn.add_css_class("flowmux-sidebar-options");
         options_btn.set_halign(gtk::Align::Start);
         let bridge_for_options = bridge.clone();
@@ -175,14 +181,42 @@ impl Sidebar {
             notification_log,
             attentions,
             bridge,
+            subtitle_cache: Rc::new(RefCell::new(HashMap::new())),
         }
     }
 
+    /// Add or redraw a workspace row using cached subtitles. Used by paths
+    /// that do not know subtitle data, such as rename or color changes; the
+    /// subtitles stay at the last value supplied to [`Self::upsert_with_subtitles`].
     pub fn upsert(&self, ws: &Workspace) {
+        let cached = self.subtitle_cache.borrow().get(&ws.id).cloned();
+        let lines = cached.unwrap_or_default();
+        self.upsert_inner(ws, &lines);
+    }
+
+    /// Add or update a workspace row while supplying subtitle lines. Lines are
+    /// capped at 3, and an empty list removes the subtitle area. Repeated calls
+    /// for the same workspace replace the row content with the new subtitles.
+    pub fn upsert_with_subtitles(&self, ws: &Workspace, lines: &[String]) {
+        let trimmed: Vec<String> = lines.iter().take(3).cloned().collect();
+        self.subtitle_cache
+            .borrow_mut()
+            .insert(ws.id, trimmed.clone());
+        self.upsert_inner(ws, &trimmed);
+    }
+
+    /// Alias for `upsert`, used where the call site reads more clearly as a
+    /// refresh after rename, color changes, and similar updates.
+    pub fn refresh(&self, ws: &Workspace) {
+        self.upsert(ws);
+    }
+
+    fn upsert_inner(&self, ws: &Workspace, subtitles: &[String]) {
         let mut rows = self.rows.borrow_mut();
         if let Some((_, row)) = rows.iter().find(|(id, _)| *id == ws.id).cloned() {
             row.set_child(Some(&row_widget(
                 ws,
+                subtitles,
                 self.on_close.clone(),
                 self.bridge.clone(),
             )));
@@ -191,6 +225,7 @@ impl Sidebar {
         let row = gtk::ListBoxRow::new();
         row.set_child(Some(&row_widget(
             ws,
+            subtitles,
             self.on_close.clone(),
             self.bridge.clone(),
         )));
@@ -199,9 +234,9 @@ impl Sidebar {
         rows.push((ws.id, row));
     }
 
-    /// 드래그 앤 드랍 결과를 사이드 패널에 반영해 워크스페이스 행의 시각적
-    /// 위치를 새 인덱스로 옮긴다. `id`가 없으면 no-op이며,
-    /// `target_index`가 길이를 넘으면 마지막 슬롯으로 클램프된다.
+    /// Apply a drag-and-drop result to the side panel by moving the visual row
+    /// to a new index. Missing `id` is a no-op, and `target_index` is clamped
+    /// to the last slot when it exceeds the length.
     pub fn reorder(&self, id: WorkspaceId, target_index: usize) {
         let mut rows = self.rows.borrow_mut();
         let Some(current) = rows.iter().position(|(rid, _)| *rid == id) else {
@@ -217,9 +252,9 @@ impl Sidebar {
         }
 
         let (rid, row) = rows.remove(current);
-        // ListBox에서 위젯을 떼고 같은 위젯을 새 위치에 끼워 넣는다.
-        // `gtk::ListBox::insert(_, position)`는 position이 -1이거나
-        // 길이를 넘으면 끝에 추가한다.
+        // Detach the row widget from ListBox and insert the same widget at the
+        // new position. `gtk::ListBox::insert(_, position)` appends when
+        // position is -1 or beyond the length.
         self.list.remove(&row);
         self.list.insert(&row, target as i32);
         rows.insert(target, (rid, row));
@@ -261,6 +296,14 @@ impl Sidebar {
                 row.add_css_class("flowmux-attention");
             }
         }
+    }
+
+    /// Expose a cache copy so scenario tests can verify subtitle lines passed
+    /// to [`Self::upsert_with_subtitles`]. The side-panel row widget tree is a
+    /// GTK object and awkward to read directly, so the cache is the source of truth.
+    #[cfg(test)]
+    pub(crate) fn cached_subtitles(&self, id: WorkspaceId) -> Option<Vec<String>> {
+        self.subtitle_cache.borrow().get(&id).cloned()
     }
 
     /// Indicate a fresh notification by tinting the bell button.
@@ -347,22 +390,22 @@ fn format_time(ts: &chrono::DateTime<chrono::Utc>) -> String {
     local.format("%H:%M:%S").to_string()
 }
 
-/// 사이드 패널의 한 워크스페이스 행에 드래그 앤 드랍 컨트롤러를 연결한다.
+/// Attach drag-and-drop controllers to one side-panel workspace row.
 ///
-/// - `DragSource`: 행을 잡으면 워크스페이스 ID(UUID 문자열)를 ContentProvider에
-///   담아 드래그를 시작한다. 드래그 동안 원본 행은 살짝 흐려진다.
-/// - `DropTarget`: 다른 행 위에 드랍되면 드랍 위치 y로 행의 위/아래를
-///   결정해 [`GtkCommand::ReorderWorkspace`]를 보낸다.
+/// - `DragSource`: serializes the workspace ID as a UUID string in the
+///   ContentProvider and dims the source row during drag.
+/// - `DropTarget`: when dropped on another row, uses the drop y position to
+///   choose above or below and sends [`GtkCommand::ReorderWorkspace`].
 fn attach_dnd_handlers(row: &gtk::ListBoxRow, id: WorkspaceId, bridge: Bridge, rows: RowsCell) {
     let drag_source = gtk::DragSource::new();
     drag_source.set_actions(gtk::gdk::DragAction::MOVE);
     let id_for_prepare = id;
     drag_source.connect_prepare(move |_, _, _| {
         tracing::debug!(workspace = %id_for_prepare, "sidebar drag prepare");
-        // ContentProvider::for_value + DropTarget::new(String) 조합으로 type 매칭이
-        // 가장 확실하다. for_bytes(mime, bytes)는 mime-specific 컨텐츠가 되는데
-        // DropTarget::new(Bytes::static_type())로는 motion / drop 시그널이 매칭
-        // 되지 않아 DnD 자체가 작동하지 않았다.
+        // ContentProvider::for_value + DropTarget::new(String) gives the most
+        // reliable type match. for_bytes(mime, bytes) creates MIME-specific
+        // content that did not match DropTarget::new(Bytes::static_type()), so
+        // motion/drop signals never fired.
         let payload = id_for_prepare.to_string();
         Some(gtk::gdk::ContentProvider::for_value(&payload.to_value()))
     });
@@ -386,10 +429,10 @@ fn attach_dnd_handlers(row: &gtk::ListBoxRow, id: WorkspaceId, bridge: Bridge, r
 
     let drop_target =
         gtk::DropTarget::new(gtk::glib::types::Type::STRING, gtk::gdk::DragAction::MOVE);
-    // motion 시그널의 y로 행 위/아래 절반을 판정해 인디케이터 위치를 정한다.
-    // 드롭 로직도 같은 y 기준으로 new_index를 계산하므로, 사용자가 보는 파란
-    // 라인이 곧 드롭이 일어나는 위치다. 첫 행 위쪽 절반에 호버하면 인디케이터가
-    // 첫 행 위에 떠서 "맨 위로 이동" 시그널이 된다.
+    // Use motion y to choose the upper or lower half of the row and place the
+    // indicator. Drop logic uses the same y basis for new_index, so the blue
+    // line marks the actual drop position. Hovering the upper half of the first
+    // row signals "move to the top".
     let target_id_for_motion = id;
     let row_for_motion = row.clone();
     drop_target.connect_motion(move |_, _x, y| {
@@ -445,7 +488,7 @@ fn attach_dnd_handlers(row: &gtk::ListBoxRow, id: WorkspaceId, bridge: Bridge, r
             return false;
         };
 
-        // 드랍 y가 행의 절반보다 위면 target 앞, 아래면 뒤에 둔다.
+        // Drop above the target if y is in the upper half, otherwise below it.
         let row_height = row_for_drop.height();
         let above = if row_height > 0 {
             y < (row_height as f64) / 2.0
@@ -453,8 +496,9 @@ fn attach_dnd_handlers(row: &gtk::ListBoxRow, id: WorkspaceId, bridge: Bridge, r
             true
         };
 
-        // 최종 인덱스 계산. reorder_workspace는 "remove 후 insert(target)"
-        // 의미이므로, source가 target보다 앞에 있을 때 target index가 1 줄어든다.
+        // Compute the final index. reorder_workspace means "remove, then insert
+        // at target", so target index shifts down by one when the source was
+        // before the target.
         let new_index = match (above, source_idx < target_idx) {
             (true, true) => target_idx.saturating_sub(1),
             (true, false) => target_idx,
@@ -497,10 +541,16 @@ fn attach_dnd_handlers(row: &gtk::ListBoxRow, id: WorkspaceId, bridge: Bridge, r
     row.add_controller(drop_target);
 }
 
-fn row_widget(ws: &Workspace, on_close: Rc<dyn Fn(WorkspaceId)>, bridge: Bridge) -> gtk::Widget {
+fn row_widget(
+    ws: &Workspace,
+    subtitles: &[String],
+    on_close: Rc<dyn Fn(WorkspaceId)>,
+    bridge: Bridge,
+) -> gtk::Widget {
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    row.set_margin_top(6);
-    row.set_margin_bottom(6);
+    // User-requested vertical margin reduction from 6 to 3px; keep start/end.
+    row.set_margin_top(3);
+    row.set_margin_bottom(3);
     row.set_margin_start(4);
     row.set_margin_end(6);
 
@@ -508,7 +558,7 @@ fn row_widget(ws: &Workspace, on_close: Rc<dyn Fn(WorkspaceId)>, bridge: Bridge)
         row.append(&color_bar(color));
     }
 
-    let meta = build_meta_column(ws);
+    let meta = build_meta_column(ws, subtitles);
     meta.set_hexpand(true);
     meta.set_margin_start(6);
     row.append(&meta);
@@ -650,11 +700,12 @@ fn color_bar(color: &str) -> gtk::Widget {
     bar.upcast()
 }
 
-fn build_meta_column(ws: &Workspace) -> gtk::Box {
-    // Two-line layout:
-    //   line 1: workspace display title (custom_title 있으면 그것, 없으면 name)
-    //   line 2: last folder name [+ " / branch" if a git repo]  (dim caption)
-    // Optional 3rd line: linked PR badge / listening ports if present.
+fn build_meta_column(ws: &Workspace, subtitles: &[String]) -> gtk::Box {
+    // Layout:
+    //   line 1: workspace display title, custom_title if present, otherwise name
+    //   line 2..4: up to 3 subtitle lines supplied by the caller, usually
+    //              shortened MRU pane cwd paths in .../A/B/C form.
+    //   optional aux: linked PR badge / listening ports.
     let v = gtk::Box::new(gtk::Orientation::Vertical, 1);
 
     let title = gtk::Label::new(Some(ws.display_title()));
@@ -664,14 +715,20 @@ fn build_meta_column(ws: &Workspace) -> gtk::Box {
     title.add_css_class("heading");
     v.append(&title);
 
-    let subtitle_text = subtitle_for(ws);
-    let subtitle = gtk::Label::new(Some(&subtitle_text));
-    subtitle.set_halign(gtk::Align::Start);
-    subtitle.set_xalign(0.0);
-    subtitle.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
-    subtitle.add_css_class("caption");
-    subtitle.add_css_class("dim-label");
-    v.append(&subtitle);
+    for (i, line) in subtitles.iter().take(3).enumerate() {
+        let label = gtk::Label::new(Some(line.as_str()));
+        label.set_halign(gtk::Align::Start);
+        label.set_xalign(0.0);
+        label.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+        label.add_css_class("caption");
+        label.add_css_class("dim-label");
+        // Make the first subtitle, the MRU head, slightly stronger to indicate
+        // the terminal the user is currently viewing.
+        if i == 0 {
+            label.add_css_class("flowmux-sidebar-subtitle-primary");
+        }
+        v.append(&label);
+    }
 
     // Auxiliary line: PR badge + listening ports (kept compact).
     let aux = gtk::Box::new(gtk::Orientation::Horizontal, 6);
@@ -710,57 +767,6 @@ fn build_meta_column(ws: &Workspace) -> gtk::Box {
     v
 }
 
-/// Build the second line: "<last-folder>" or "<last-folder> / <branch>".
-fn subtitle_for(ws: &Workspace) -> String {
-    // 활성 터미널의 현재 cwd 폴더명을 우선 사용 — 사용자가 cd로
-    // 폴더를 이동하면 사이드 패널 부제도 즉시 따라간다. 활성 터미널이
-    // 없거나(브라우저 탭만 있는 pane) cwd 정보가 없으면 워크스페이스
-    // root_dir로 폴백.
-    let last_folder = active_terminal_folder(ws).unwrap_or_else(|| {
-        ws.root_dir
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or_else(|| ws.root_dir.to_str().unwrap_or(""))
-            .to_string()
-    });
-    match ws.git.as_ref() {
-        Some(g) => format!("{last_folder} / {}", g.branch),
-        None => last_folder,
-    }
-}
-
-/// 워크스페이스의 첫 번째 surface 트리에서 활성 터미널 surface를 찾아
-/// 그 cwd의 폴더명을 돌려준다. 단일 pane 워크스페이스에서는 사용자가
-/// 보고 있는 그 터미널의 cwd가, split 트리라면 첫(좌상단) leaf의 활성
-/// 터미널 cwd가 후보. 활성 surface가 브라우저거나 cwd가 없으면 None.
-fn active_terminal_folder(ws: &Workspace) -> Option<String> {
-    let pane = ws.surfaces.first()?.root_pane.clone();
-    walk_first_active_terminal_cwd(&pane)
-}
-
-fn walk_first_active_terminal_cwd(pane: &Pane) -> Option<String> {
-    match pane {
-        Pane::Leaf { content, .. } => match content {
-            PaneContent::Tabs { active, surfaces } => {
-                let s = surfaces
-                    .iter()
-                    .find(|s| s.id == *active)
-                    .or_else(|| surfaces.first())?;
-                if let SurfaceKind::Terminal { cwd: Some(cwd), .. } = &s.kind {
-                    cwd.file_name()
-                        .and_then(|n| n.to_str())
-                        .filter(|s| !s.is_empty())
-                        .map(|s| s.to_string())
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        },
-        Pane::Split { first, .. } => walk_first_active_terminal_cwd(first),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -796,29 +802,28 @@ mod tests {
         }
     }
 
+    /// Smoke test that row_widget can build a stable widget tree with a name
+    /// and subtitle lines. Requires GTK init, so headless environments skip it.
     #[test]
-    fn subtitle_uses_active_terminal_cwd_folder_when_available() {
-        let ws = ws_with_active_terminal_cwd(Some(PathBuf::from("/home/u/dev")));
-        // 서브타이틀은 root_dir("origin")이 아니라 활성 터미널의 cwd
-        // 폴더명("dev")을 우선해야 한다.
-        assert_eq!(subtitle_for(&ws), "dev");
-    }
+    fn row_widget_builds_with_one_to_three_subtitle_lines() {
+        if gtk::init().is_err() {
+            return;
+        }
+        let ws = ws_with_active_terminal_cwd(Some(PathBuf::from("/home/u/dev/os/flowmux")));
+        let bridge = crate::bridge::Bridge::new().0;
+        let on_close: Rc<dyn Fn(WorkspaceId)> = Rc::new(|_| {});
 
-    #[test]
-    fn subtitle_falls_back_to_root_dir_when_no_terminal_cwd() {
-        let ws = ws_with_active_terminal_cwd(None);
-        // 활성 터미널이 cwd를 모르면 root_dir 폴더명("origin")으로 폴백.
-        assert_eq!(subtitle_for(&ws), "origin");
-    }
-
-    #[test]
-    fn subtitle_appends_branch_when_workspace_has_git_info() {
-        let mut ws = ws_with_active_terminal_cwd(Some(PathBuf::from("/home/u/dev")));
-        ws.git = Some(flowmux_core::GitInfo {
-            branch: "main".into(),
-            remote_url: None,
-            linked_pr: None,
-        });
-        assert_eq!(subtitle_for(&ws), "dev / main");
+        for n in 0..=3 {
+            let lines: Vec<String> = (0..n).map(|i| format!(".../line{i}")).collect();
+            let _ = row_widget(&ws, &lines, on_close.clone(), bridge.clone());
+        }
+        // Even with 4 lines, build_meta_column truncates to 3 via take(3).
+        let four = vec![
+            "a".into(),
+            "b".into(),
+            "c".into(),
+            "d-overflow".into(),
+        ];
+        let _ = row_widget(&ws, &four, on_close, bridge);
     }
 }

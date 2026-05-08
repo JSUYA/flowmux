@@ -36,9 +36,9 @@ pub struct PaneRegistry {
     surface_tab_labels: HashMap<SurfaceId, gtk::Label>,
     pane_workspace: HashMap<PaneId, WorkspaceId>,
     surface_workspace: HashMap<SurfaceId, WorkspaceId>,
-    /// Pane::Split 노드의 PaneId → 그 split을 표현하는 `gtk::Paned`
-    /// 위젯. 종료 시 paned.position()/너비/높이로부터 ratio를 계산해
-    /// store에 기록하고, 다음 실행 시 같은 ratio로 복원.
+    /// PaneId of a Pane::Split node -> the `gtk::Paned` widget representing it.
+    /// On exit, compute the ratio from paned.position()/width/height, persist it
+    /// in the store, and restore the same ratio on next launch.
     split_paneds: HashMap<PaneId, gtk::Paned>,
     split_workspace: HashMap<PaneId, WorkspaceId>,
 }
@@ -60,16 +60,16 @@ impl PaneRegistry {
         self.pane_frames.get(&pane).cloned()
     }
 
-    /// `pane`이 속한 워크스페이스 id. Alt+화살표가 같은 워크스페이스 안에서만
-    /// 이동하도록 focus_in_direction의 후보 필터에 사용된다 — 다른 워크스페이스의
-    /// pane은 GtkStack에서 같은 좌표에 겹쳐 있어 compute_bounds가 잘못 잡으면
-    /// 포커스가 워크스페이스 밖으로 새어 나가던 회귀를 막는다.
+    /// Workspace id containing each `pane`. Used by focus_in_direction to keep
+    /// Alt+arrow movement inside the same workspace. Inactive workspaces can
+    /// overlap at the same GtkStack coordinates, so this prevents focus from
+    /// leaking to another workspace when compute_bounds is misleading.
     pub fn workspace_of_pane(&self, pane: PaneId) -> Option<WorkspaceId> {
         self.pane_workspace.get(&pane).copied()
     }
 
-    /// `workspace`에 속한 모든 pane id를 돌려준다 — focus_in_direction의 후보
-    /// 필터링용.
+    /// Return all pane ids belonging to `workspace` for focus_in_direction
+    /// candidate filtering.
     pub fn pane_ids_in_workspace(
         &self,
         workspace: WorkspaceId,
@@ -172,10 +172,10 @@ impl PaneRegistry {
         }
     }
 
-    /// 같은 pane 안에서 `surface`로 식별되는 탭을 `target_index` 위치로
-    /// 옮긴다. store 쪽 reorder가 성공한 후에만 호출되며, 탭바의
-    /// `gtk::Box`와 `surface_tabs` 벡터를 한 번에 동기화한다. `target_index`
-    /// 가 길이를 넘거나 자기 자리이면 no-op.
+    /// Move the tab identified by `surface` within the same pane to
+    /// `target_index`. Called only after store-side reorder succeeds; it keeps
+    /// the tab bar `gtk::Box` and `surface_tabs` vector in sync. Out-of-range
+    /// or same-position targets are no-ops.
     pub fn reorder_surface_widget(
         &mut self,
         pane: PaneId,
@@ -200,9 +200,9 @@ impl PaneRegistry {
         tabs.insert(new_index, entry);
         let order: Vec<gtk::Widget> = tabs.iter().map(|(_, w)| w.clone()).collect();
         if let Some(container) = self.pane_tab_containers.get(&pane).cloned() {
-            // GtkBox는 직접적인 reorder API가 없으므로, 새 순서 기준으로
-            // 모든 자식을 떼었다가 다시 append 하는 게 가장 안전하다.
-            // 위젯 자체는 유지되므로 핸들러/상태가 보존된다.
+            // GtkBox has no direct reorder API, so the safest path is to detach
+            // all children and append them in the new order. Widgets are reused,
+            // preserving handlers and state.
             let mut child = container.first_child();
             while let Some(c) = child {
                 let next = c.next_sibling();
@@ -215,9 +215,9 @@ impl PaneRegistry {
         }
     }
 
-    /// 등록된 모든 split paned의 현재 (split_id, ratio) 쌍을 돌려준다.
-    /// ratio는 paned.position() / 전체 길이로 계산. 아직 realize되지 않은
-    /// paned나 너비/높이가 0인 paned는 건너뛴다 — 의미 있는 ratio가 아니다.
+    /// Return current (split_id, ratio) pairs for all registered split paned
+    /// widgets. Ratio is paned.position() / total length. Skip unrealized paned
+    /// widgets or those with zero width/height because their ratio is meaningless.
     pub fn split_ratios(&self) -> Vec<(PaneId, f32)> {
         let mut out = Vec::new();
         for (split_id, paned) in &self.split_paneds {
@@ -238,8 +238,8 @@ impl PaneRegistry {
         out
     }
 
-    /// 한 split paned 위젯을 등록한다. 이미 같은 split_id가 있으면 위젯만
-    /// 갱신하고 workspace 매핑은 그대로 둔다.
+    /// Register one split paned widget. If the same split_id already exists,
+    /// update only the widget and keep the workspace mapping.
     pub fn register_split(&mut self, split_id: PaneId, workspace: WorkspaceId, paned: gtk::Paned) {
         self.split_paneds.insert(split_id, paned);
         self.split_workspace.insert(split_id, workspace);
@@ -267,13 +267,13 @@ impl PaneRegistry {
         }
     }
 
-    /// 같은 pane의 한 surface 탭/패널만 위젯 트리에서 떼어낸다. 같은
-    /// 워크스페이스 안의 다른 pane은 전혀 건드리지 않으므로 그쪽 셸
-    /// 세션 / 탭브라우저 navigate 상태가 그대로 보존된다. close_surface
-    /// 가 `SurfaceRemoved`를 돌려준 케이스에서만 호출 가능 — pane이
-    /// 통째로 제거된 경우엔 split 트리 변경이 필요하므로 별도 경로로.
+    /// Detach only one surface tab/panel from the same pane's widget tree.
+    /// Other panes in the same workspace are untouched, preserving shell
+    /// sessions and browser navigation state. Only call after close_surface
+    /// returned `SurfaceRemoved`; removing an entire pane needs a separate path
+    /// because the split tree changes.
     pub fn detach_surface_widget(&mut self, pane: PaneId, surface: SurfaceId) {
-        // 탭바에서 해당 탭 위젯 unparent.
+        // Unparent the tab widget from the tab bar.
         if let Some(tabs) = self.surface_tabs.get_mut(&pane) {
             if let Some(idx) = tabs.iter().position(|(id, _)| *id == surface) {
                 let (_, tab_widget) = tabs.remove(idx);
@@ -286,13 +286,13 @@ impl PaneRegistry {
                 }
             }
         }
-        // 같은 pane의 stack에서 surface 패널 제거.
+        // Remove the surface panel from the same pane's stack.
         if let Some(stack) = self.surface_stacks.get(&pane) {
             if let Some(child) = stack.child_by_name(&surface.to_string()) {
                 stack.remove(&child);
             }
         }
-        // PaneRegistry 내부 인덱스 정리.
+        // Clean PaneRegistry indexes.
         self.terminals.remove(&surface);
         self.browsers.remove(&surface);
         self.surface_tab_labels.remove(&surface);
@@ -306,14 +306,13 @@ impl PaneRegistry {
     }
 }
 
-/// `gtk::Paned`의 ratio를 첫 allocation 직후에 적용한다.
+/// Apply a `gtk::Paned` ratio immediately after its first allocation.
 ///
-/// `connect_realize` 시점에는 widget이 아직 allocate되지 않아
-/// `paned.width() / height()`가 0이고 그 상태로 `set_position`을 부르면
-/// 의미 없는 위치가 잡혀 다음 실행 때 사이즈가 살아나지 않는다. 그래서
-/// realize 직후 `idle_add_local`로 한 프레임 미루고, total이 0이면 다음
-/// idle에서 다시 시도한다. 최대 60번(약 1초) 재시도한 뒤 포기 — 비활성
-/// 워크스페이스라 끝까지 mapping 되지 않는 경우 무한 루프를 막는다.
+/// At `connect_realize` time the widget is not allocated yet, so paned.width()
+/// or height() is 0 and `set_position` would store a meaningless position for
+/// the next launch. Defer one frame with `idle_add_local`, retry while total is
+/// 0, and give up after 60 tries, about one second, to avoid infinite loops for
+/// inactive workspaces that never map.
 fn apply_ratio_when_sized(paned: &gtk::Paned, ratio: f32) {
     let weak = paned.downgrade();
     let mut attempts: u32 = 0;
@@ -337,33 +336,33 @@ fn apply_ratio_when_sized(paned: &gtk::Paned, ratio: f32) {
     });
 }
 
-/// [`split_pane_incremental`]의 결과.
+/// Result of [`split_pane_incremental`].
 pub enum IncrementalSplitOutcome {
-    /// 성공. target이 이미 다른 split 안에 있었으므로 stack 자식은 그대로다.
-    /// 호출자가 surfaces map을 갱신할 필요 없음.
+    /// Success. The target was already inside another split, so the stack child
+    /// is unchanged and the caller does not need to update the surfaces map.
     SucceededNested,
-    /// 성공. target이 워크스페이스 stack의 직속 자식이었으므로 stack
-    /// 자식이 새 `gtk::Paned`로 교체됐다. 호출자는 surfaces map을
-    /// 이 새 widget으로 갱신해야 다음 rerender / drop_workspace 경로가
-    /// 정상 동작한다.
+    /// Success. The target was a direct child of the workspace stack, so that
+    /// child was replaced by the new `gtk::Paned`. The caller must update the
+    /// surfaces map to this new widget for later rerender / drop_workspace paths.
     SucceededRoot { new_root: gtk::Widget },
-    /// incremental 경로 실패. 호출자가 안전하게 rerender_workspace로 폴백
-    /// 해야 한다 (registry에 target이 없거나 부모 컨테이너가 비정상).
+    /// Incremental path failed. The caller should safely fall back to
+    /// rerender_workspace, usually because the target is missing from the
+    /// registry or its parent container is unexpected.
     Failed,
 }
 
-/// 같은 워크스페이스 안의 다른 pane을 그대로 유지한 채 `target_pane`만
-/// 새 split으로 감싼다. flowmux-core::Pane::split_leaf와 동일한 의미 —
-/// `target_pane`의 PaneId는 보존되어 새 split의 첫 번째 자식으로 남고,
-/// `new_pane_id`로 식별되는 새 sibling이 두 번째 자식으로 추가된다.
+/// Wrap only `target_pane` in a new split while preserving other panes in the
+/// same workspace. Semantics match flowmux-core::Pane::split_leaf: `target_pane`
+/// keeps its PaneId as the first child of the new split, and the sibling
+/// identified by `new_pane_id` is added as the second child.
 ///
-/// 이 incremental 경로의 핵심은 target pane의 `gtk::Frame`을 그대로
-/// 재사용한다는 것 — 다른 pane의 VTE 셸 세션과 탭브라우저 navigate
-/// 상태가 rerender 없이 살아남는다. 호출 전에 daemon쪽 split_pane이
-/// 이미 실행돼 트리 모양은 결정돼 있어야 한다.
+/// The key to this incremental path is reusing the target pane's `gtk::Frame`,
+/// so other panes' VTE shell sessions and browser navigation state survive
+/// without rerender. The daemon-side split_pane must already have run before
+/// this call so the tree shape is decided.
 ///
-/// `parent_stack_name`은 target frame이 stack 직속 자식일 때 같은
-/// 이름으로 다시 add_named 하기 위해 호출자가 알려준다 (워크스페이스 id).
+/// `parent_stack_name` is supplied by the caller so a target frame that was a
+/// direct stack child can be re-added with the same name, the workspace id.
 pub fn split_pane_incremental(
     workspace: WorkspaceId,
     target_pane: PaneId,
@@ -385,7 +384,7 @@ pub fn split_pane_incremental(
         return IncrementalSplitOutcome::Failed;
     };
 
-    // 부모 컨테이너 종류 + target가 어느 슬롯에 있었는지를 detach 전에 기록.
+    // Record the parent container type and target slot before detach.
     enum Slot {
         PanedStart(gtk::Paned),
         PanedEnd(gtk::Paned),
@@ -405,16 +404,16 @@ pub fn split_pane_incremental(
         return IncrementalSplitOutcome::Failed;
     };
 
-    // target frame을 부모에서 떼어 낸다. set_*_child(None)은 이전 자식의
-    // unparent를 자동으로 처리한다.
+    // Detach the target frame from its parent. set_*_child(None) automatically
+    // unparents the previous child.
     match &slot {
         Slot::PanedStart(p) => p.set_start_child(gtk::Widget::NONE),
         Slot::PanedEnd(p) => p.set_end_child(gtk::Widget::NONE),
         Slot::Stack(s) => s.remove(&target_frame),
     }
 
-    // 새 sibling pane 위젯 빌드. cwd / argv는 새 sibling용 — target은
-    // 이미 build 끝나 있는 frame을 그대로 쓰므로 영향 없다.
+    // Build the new sibling pane widget. cwd / argv belong only to the sibling;
+    // the target reuses its already-built frame.
     let new_sibling = build_leaf_pane(
         workspace,
         new_pane_id,
@@ -450,7 +449,7 @@ pub fn split_pane_incremental(
 
     let paned_widget: gtk::Widget = paned.upcast();
 
-    // 빈 슬롯에 새 Paned를 다시 끼워 넣는다.
+    // Insert the new Paned back into the vacated slot.
     match slot {
         Slot::PanedStart(p) => {
             p.set_start_child(Some(&paned_widget));
@@ -637,7 +636,7 @@ fn build_leaf_pane(
     }
     tools.append(&split_down);
 
-    let add = pane_tool_button("tab-new-symbolic", "탭 추가");
+    let add = pane_tool_button("tab-new-symbolic", "Add tab");
     {
         let cb = callbacks.on_new_surface.clone();
         let pane_id = pane_id;
@@ -645,7 +644,7 @@ fn build_leaf_pane(
     }
     tools.append(&add);
 
-    let add_browser = pane_tool_button("web-browser-symbolic", "탭브라우저 추가");
+    let add_browser = pane_tool_button("web-browser-symbolic", "Add browser tab");
     {
         let cb = callbacks.on_new_browser_surface.clone();
         let pane_id = pane_id;
@@ -740,14 +739,13 @@ fn build_surface_tab_widget(
     (tab, label)
 }
 
-/// 같은 pane 안에서 탭(터미널/탭브라우저)을 좌우로 드래그 앤 드랍 reorder
-/// 하기 위한 컨트롤러를 탭 위젯에 붙인다.
+/// Attach controllers that reorder terminal or browser tabs left/right within
+/// the same pane by drag and drop.
 ///
-/// - `DragSource`: 탭을 잡으면 (PaneId, SurfaceId) 페어를 UTF-8로 직렬화한
-///   바이트를 ContentProvider에 담는다. 다른 pane 사이의 이동은 의도적으로
-///   막기 위해 PaneId를 함께 실어 DropTarget이 비교할 수 있도록 한다.
-/// - `DropTarget`: 같은 pane의 다른 탭 위에 드롭하면 드롭 위치 x로 좌/우를
-///   결정해 reorder 콜백을 호출한다. 다른 pane으로의 드롭은 거부한다.
+/// - `DragSource`: serializes the (PaneId, SurfaceId) pair as UTF-8 in the
+///   ContentProvider. PaneId is included so DropTarget can reject cross-pane moves.
+/// - `DropTarget`: dropping on another tab in the same pane uses x position to
+///   choose before/after and calls the reorder callback. Cross-pane drops are rejected.
 fn attach_tab_dnd_handlers(
     tab: &gtk::Box,
     pane_id: PaneId,
@@ -758,10 +756,10 @@ fn attach_tab_dnd_handlers(
     drag_source.set_actions(gtk::gdk::DragAction::MOVE);
     drag_source.connect_prepare(move |_, _, _| {
         tracing::debug!(%pane_id, %surface_id, "tab drag prepare");
-        // ContentProvider::for_value(String) + DropTarget::new(STRING) 조합으로
-        // 매칭한다. for_bytes(mime, bytes)는 mime-specific이라 generic
-        // Bytes type filter와 매칭되지 않아 motion/drop 시그널이 호출되지
-        // 않았다. PaneId와 SurfaceId를 '|' 구분자로 묶어 한 String에 담는다.
+        // Match with ContentProvider::for_value(String) + DropTarget::new(STRING).
+        // for_bytes(mime, bytes) is MIME-specific and did not match a generic
+        // Bytes type filter, so motion/drop signals were not called. Pack PaneId
+        // and SurfaceId into one String separated by '|'.
         let payload = format!("{pane_id}|{surface_id}");
         Some(gtk::gdk::ContentProvider::for_value(&payload.to_value()))
     });
@@ -785,10 +783,10 @@ fn attach_tab_dnd_handlers(
 
     let drop_target =
         gtk::DropTarget::new(gtk::glib::types::Type::STRING, gtk::gdk::DragAction::MOVE);
-    // motion 시그널의 x로 탭 좌/우 절반을 판정해 인디케이터 위치를 정한다.
-    // 드롭 로직도 같은 x 기준으로 final_index를 계산하므로, 사용자가 보는
-    // 파란 라인이 곧 드롭이 일어나는 위치다. 첫 탭의 왼쪽 절반에 호버하면
-    // 인디케이터가 첫 탭 왼쪽에 떠서 "맨 앞으로 이동" 시그널이 된다.
+    // Use motion x to choose the left or right half of the tab and place the
+    // indicator. Drop logic uses the same x basis for final_index, so the blue
+    // line marks the actual drop position. Hovering the left half of the first
+    // tab signals "move to the front".
     let tab_for_motion = tab.clone();
     drop_target.connect_motion(move |_, x, _y| {
         let width = tab_for_motion.width();
@@ -836,7 +834,7 @@ fn attach_tab_dnd_handlers(
             tracing::warn!(s = %src_surface_str, "tab drop: payload surface id invalid");
             return false;
         };
-        // pane 간 이동은 지원하지 않는다 — 같은 pane의 다른 탭 위에서만 reorder.
+        // Cross-pane moves are unsupported; reorder only over another tab in the same pane.
         if src_pane != target_pane {
             tracing::debug!(%src_pane, %target_pane, "tab drop: cross-pane drop ignored");
             return false;
@@ -846,9 +844,10 @@ fn attach_tab_dnd_handlers(
             return false;
         }
 
-        // 드롭 x가 탭 폭의 절반보다 왼쪽이면 target 앞, 오른쪽이면 뒤로.
-        // target_index는 *최종* 인덱스이므로, 탭바 내부에서 target tab의
-        // 현재 인덱스를 알아야 한다. 부모 GtkBox에서 형제 위치를 센다.
+        // If drop x is left of half the tab width, insert before the target;
+        // otherwise insert after it. Since target_index is the final index,
+        // count sibling positions in the parent GtkBox to find the target's
+        // current index.
         let Some(parent) = tab_for_drop.parent() else {
             return false;
         };
@@ -869,17 +868,13 @@ fn attach_tab_dnd_handlers(
             false
         };
 
-        // 같은 박스 안에서:
-        // - 소스가 타깃 *왼쪽*에 있을 때 (src_idx < target_index)
-        //     "타깃 앞"이면 target_index-1, "타깃 뒤"면 target_index.
-        // - 소스가 타깃 *오른쪽*에 있을 때 (src_idx > target_index)
-        //     "타깃 앞"이면 target_index, "타깃 뒤"면 target_index+1.
-        // 소스 인덱스를 모르기 때문에 +1 보정은 daemon의 클램프(min(len-1))
-        // 에 맡긴다. 결과가 자기 자리면 reorder_surface_in_pane이 None을
-        // 반환하므로 GTK 위젯 이동도 건너뛴다.
-        // 정확한 final_index 계산 — source remove 후 target 옆에 insert.
-        // PaneRegistry의 surface_tabs에서 src_surface 위치를 직접 빌려 본다
-        // (callback으로 노출).
+        // In the same box:
+        // - When the source is left of the target (src_idx < target_index),
+        //   "before target" means target_index - 1, and "after target" means target_index.
+        // - When the source is right of the target (src_idx > target_index),
+        //   "before target" means target_index, and "after target" means target_index + 1.
+        // The final_index is computed after removing the source and inserting
+        // next to target, using the source position exposed from PaneRegistry::surface_tabs.
         let src_index = (position_of_surface_cb)(target_pane, src_surface);
         let final_index = match (after, src_index) {
             (false, Some(s)) if s < target_index => target_index.saturating_sub(1),
@@ -910,9 +905,8 @@ fn attach_tab_dnd_handlers(
 /// pane has not been rendered yet (e.g. workspace not visible) — the
 /// caller can fall back to a full re-render.
 ///
-/// 이 경로는 기존 탭/탭브라우저의 GTK 위젯을 손대지 않으므로 다른
-/// pane에 띄워둔 탭브라우저의 navigate 상태와 터미널 셸 세션이
-/// 사라지지 않는다는 점이 핵심이다.
+/// This path leaves existing tab/browser GTK widgets untouched, preserving
+/// browser navigation state and terminal shell sessions in other panes.
 pub fn attach_surface_to_pane(
     pane_id: PaneId,
     workspace: WorkspaceId,
@@ -1036,10 +1030,9 @@ fn build_panel(
                 &socket,
                 bundled_cli.as_deref(),
             );
-            let pane =
-                TerminalPane::spawn(pane_id, argv, cwd.clone(), extra_env, callbacks.clone());
+            let pane = TerminalPane::spawn(pane_id, argv, cwd.clone(), extra_env, callbacks.clone());
             theme.apply_to_vte(&pane.widget);
-            // 새 터미널 위젯도 현재 옵션의 줌 배율로 시작한다.
+            // Start the new terminal widget with the current zoom option.
             pane.widget
                 .set_font_scale((callbacks.read_options)().zoom_factor());
 
@@ -1054,10 +1047,9 @@ fn build_panel(
                 });
             }
 
-            // OSC 0/2로 들어온 윈도우 타이틀(vi/claude/codex/tmux 등이
-            // 발행)을 탭 라벨 + 윈도우 타이틀에 반영. VTE가 빈 문자열
-            // 로 reset 보낼 수도 있으므로 dispatch 측에서 trim한 결과
-            // 가 비면 무시한다.
+            // Apply OSC 0/2 window titles emitted by vi/claude/codex/tmux and
+            // similar programs to the tab label and window title. VTE may send
+            // empty resets, so the dispatcher ignores trim-empty values.
             {
                 let cb = callbacks.on_terminal_title_changed.clone();
                 let surface_id = surface.id;
@@ -1077,9 +1069,9 @@ fn build_panel(
                 });
             }
 
-            // 포커스 enter/leave에 맞춰 frame에 .focused class를
-            // 토글한다. 포커스된 pane은 옵션의 focus_border_color로
-            // 1px 테두리를 그리도록 theme.rs CSS가 처리한다.
+            // Toggle the .focused class on frame focus enter/leave. theme.rs
+            // CSS draws a 1px border for the focused pane using the focus
+            // border options.
             let frame_in = frame.clone();
             let frame_out = frame.clone();
             let focus = gtk::EventControllerFocus::new();
@@ -1108,28 +1100,22 @@ fn build_panel(
                 callbacks.clone(),
                 opts.default_browser_engine.clone(),
             );
-            // 다이얼로그에서 적용된 줌 배율을 새 탭브라우저에 즉시
-            // 반영 — apply_zoom 호출 전에 만들어진 위젯도 옵션과
-            // 동기화된 상태에서 시작한다.
+            // Apply the zoom option to the new browser tab immediately so
+            // widgets created before apply_zoom still start in sync.
             pane.web_view.set_zoom_level(opts.zoom_factor());
 
-            // 탭브라우저도 포커스 표시 + on_focus 콜백 동일하게 처리.
-            // on_focus를 호출해야 WindowController.focused_pane이 갱신
-            // 되고 RefreshWindowTitle이 새 active surface 라벨로
-            // 윈도우 타이틀을 다시 계산한다 (브라우저 탭 클릭 시
-            // 윈도우 제목이 안 바뀌던 회귀 수정).
+            // Browser tabs use the same focus marker and on_focus callback.
+            // on_focus updates WindowController.focused_pane, then
+            // RefreshWindowTitle recomputes the window title from the new
+            // active surface label.
             //
-            // 컨트롤러는 web_view가 아니라 BrowserPane.root에 단다.
-            // BrowserPane은 [chrome row(주소창/back/forward/reload) +
-            // web_view]로 구성되는데, web_view에만 컨트롤러가 있으면
-            // 사용자가 주소창을 클릭한 순간 web_view가 leave를 받아
-            // frame의 .focused 테두리가 사라지고, 주소창 쪽에는 컨트롤러
-            // 가 없어 on_focus도 호출되지 않아 focused_pane이 갱신되지
-            // 않는 문제가 있었다 (Alt+화살표가 갑자기 동작하지 않는 증상).
-            // root에 달면 GTK4 EventControllerFocus가 widget+descendants
-            // 단위로 enter/leave를 emit하므로 chrome row와 web_view 사이
-            // 에서 포커스가 오가는 것은 무시되고, pane 바깥으로 나갈 때
-            // 만 leave가 발생한다.
+            // Attach the controller to BrowserPane.root, not web_view. A
+            // BrowserPane contains the chrome row plus web_view; if only web_view
+            // owns the controller, clicking the address bar makes web_view leave,
+            // clears the .focused border, and never calls on_focus for the chrome
+            // row. On root, GTK4 EventControllerFocus emits enter/leave for the
+            // widget plus descendants, so focus moves between the chrome row and
+            // web_view are ignored and leave fires only when focus exits the pane.
             let frame_in = frame.clone();
             let frame_out = frame.clone();
             let on_focus = callbacks.on_focus.clone();

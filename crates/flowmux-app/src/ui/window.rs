@@ -33,8 +33,8 @@ pub struct WindowController {
     pub window: adw::ApplicationWindow,
     pub focused_pane: FocusedPane,
     sidebar: Sidebar,
-    /// 사이드 패널과 콘텐츠 영역을 가르는 가장 바깥쪽 `gtk::Paned`.
-    /// 종료 시 position을 읽어 store에 저장 → 다음 실행 복원.
+    /// Outermost `gtk::Paned` separating the side panel and content area.
+    /// Its position is saved to the store on exit and restored on next launch.
     sidebar_split: gtk::Paned,
     stack: gtk::Stack,
     surfaces: Rc<RefCell<HashMap<WorkspaceId, gtk::Widget>>>,
@@ -45,10 +45,15 @@ pub struct WindowController {
     theme: Arc<ResolvedTheme>,
     notification_log: NotificationLog,
     options: Rc<RefCell<flowmux_config::options::Options>>,
-    /// 글로벌 CssProvider — 옵션 다이얼로그에서 포커스 테두리 색이
-    /// 바뀌면 같은 인스턴스의 CSS를 다시 로드해 모든 pane에 즉시
-    /// 반영한다.
+    /// Global CssProvider. When the options dialog changes focus border color
+    /// or opacity, reload CSS into this same instance so every pane updates immediately.
     css_provider: gtk::CssProvider,
+    /// MRU pane list per workspace, with the front as most recently focused and
+    /// capped at 3 panes. The side-panel label comes from the head pane's active
+    /// surface title, and subtitles come from the active terminal cwd paths for
+    /// the head through third panes, shortened to the last 3 folders with a
+    /// "..." prefix. Updated on focus moves within a workspace.
+    focus_mru: Rc<RefCell<HashMap<WorkspaceId, std::collections::VecDeque<PaneId>>>>,
 }
 
 impl WindowController {
@@ -69,12 +74,12 @@ impl WindowController {
         let surfaces: Rc<RefCell<HashMap<WorkspaceId, gtk::Widget>>> =
             Rc::new(RefCell::new(HashMap::new()));
 
-        // 사이드 패널 행 클릭(row-activated) 핸들러. Alt+숫자/Ctrl+Tab의
-        // 워크스페이스 전환과 동일한 activate_workspace 경로를 타도록
-        // bridge::ActivateWorkspace로 위임 — focused_pane이 이전 워크스페이스의
-        // pane을 그대로 가리켜서 Alt+화살표가 다른 워크스페이스의 pane으로
-        // 새어 나가던 회귀를 막는다. dispatcher가 GtkStack 가시성 + active
-        // workspace + first-leaf grab_focus까지 한 흐름으로 처리.
+        // Side-panel row click handler. Delegate through bridge::ActivateWorkspace
+        // so clicks use the same activate_workspace path as Alt+number/Ctrl+Tab.
+        // This prevents focused_pane from still pointing at the previous
+        // workspace and leaking Alt+arrow focus to another workspace. The
+        // dispatcher handles GtkStack visibility, active workspace state, and
+        // first-leaf grab_focus in one flow.
         let bridge_for_select = bridge.clone();
         let on_select = move |id: WorkspaceId| {
             let bridge = bridge_for_select.clone();
@@ -122,7 +127,7 @@ impl WindowController {
         // adw::OverlaySplitView so people can hide / widen the tab
         // list to taste.
         sidebar.root.set_size_request(160, -1);
-        // 저장된 사이드바 위치가 있으면 복원, 없으면 기본 260.
+        // Restore a saved sidebar position, otherwise use default 260.
         let stored_sidebar_pos = store.sidebar_position_blocking().unwrap_or(260);
         let split = gtk::Paned::builder()
             .orientation(gtk::Orientation::Horizontal)
@@ -139,7 +144,7 @@ impl WindowController {
         toolbar.add_top_bar(&adw::HeaderBar::new());
         toolbar.set_content(Some(&split));
 
-        // 저장된 윈도우 사이즈/maximize가 있으면 그대로, 없으면 기본 1280x800.
+        // Restore saved window size/maximized state, otherwise default to 1280x800.
         let stored_window = store.window_layout_blocking();
         let (default_w, default_h, was_maximized) = match &stored_window {
             Some(layout) => (layout.width.max(320), layout.height.max(240), layout.maximized),
@@ -173,6 +178,7 @@ impl WindowController {
             notification_log,
             options,
             css_provider,
+            focus_mru: Rc::new(RefCell::new(HashMap::new())),
         };
         controller.install_state_flush_on_close();
         controller.install_cwd_polling_fallback();
@@ -235,11 +241,12 @@ impl WindowController {
         self.focus_first_leaf_of(ws);
     }
 
-    /// daemon 측 split이 끝난 뒤 GTK 위젯 트리를 갱신한다. 가능한 경우엔
-    /// `target_pane`의 `gtk::Frame`을 그대로 새 `gtk::Paned`에 끼워 넣어
-    /// 같은 워크스페이스의 다른 pane(셸 세션 / 탭브라우저 navigate 상태)을
-    /// 초기화하지 않는다. 실패하면(예: registry에 target이 없거나 부모
-    /// 컨테이너가 비정상) 안전하게 [`Self::rerender_workspace`]로 폴백.
+    /// Update the GTK widget tree after the daemon-side split has completed.
+    /// When possible, reuse `target_pane`'s existing `gtk::Frame` inside the new
+    /// `gtk::Paned` so other panes in the same workspace, including shell
+    /// sessions and browser navigation state, are not reset. If this fails,
+    /// for example because the target is missing from the registry or the
+    /// parent container is unexpected, safely fall back to [`Self::rerender_workspace`].
     async fn apply_split_incremental_or_rerender(
         &self,
         ws_id: WorkspaceId,
@@ -251,9 +258,9 @@ impl WindowController {
             return;
         };
 
-        // 새 sibling pane의 PaneContent / cwd를 post-split 트리에서 찾는다.
-        // daemon::StateStore::split_pane이 0.5 ratio + tabbed_terminal로
-        // 만들었으므로 같은 값을 GTK 측에서도 사용한다.
+        // Find the new sibling pane's PaneContent / cwd in the post-split tree.
+        // daemon::StateStore::split_pane created it with a 0.5 ratio and
+        // tabbed_terminal, so mirror those values on the GTK side.
         let new_content = ws
             .surfaces
             .iter()
@@ -263,10 +270,9 @@ impl WindowController {
             return;
         };
 
-        // 새로 만들어진 Split 노드의 PaneId — 새 sibling을 자식으로
-        // 갖고 있는 split이 곧 그 split이다. 종료 시 ratio 저장 / 다음
-        // 실행 복원이 PaneId 기준으로 동작하므로 GTK 위젯도 같은 id로
-        // 등록해야 한다.
+        // PaneId of the newly created Split node. The split containing the new
+        // sibling as a child is the split we need. Ratio save/restore keys on
+        // PaneId, so register the GTK widget with the same id.
         let new_split_id = ws
             .surfaces
             .iter()
@@ -276,9 +282,9 @@ impl WindowController {
             return;
         };
 
-        // 새 터미널의 fallback cwd — surface 컨텐츠 안 cwd가 우선이고
-        // 이 값은 legacy / 빈 상태 fallback 용이라 워크스페이스 root_dir로
-        // 충분.
+        // Fallback cwd for the new terminal. Surface content cwd wins; this
+        // value is only for legacy or empty-state fallback, so workspace root_dir
+        // is enough.
         let new_cwd = Some(ws.root_dir.clone());
 
         let stack_name = ws.id.to_string();
@@ -299,9 +305,9 @@ impl WindowController {
 
         match outcome {
             IncrementalSplitOutcome::SucceededRoot { new_root } => {
-                // target가 stack의 root였다면 surfaces 추적 맵을 새 위젯으로
-                // 갱신해 다음 drop_workspace / rerender 시 옛 widget을
-                // 헛되이 stack에서 찾지 않도록 한다.
+                // If target was the stack root, update the surfaces tracking map
+                // to the new widget so later drop_workspace / rerender paths do
+                // not look for the old widget in the stack.
                 self.surfaces.borrow_mut().insert(ws.id, new_root);
                 self.refresh_window_title().await;
             }
@@ -315,16 +321,16 @@ impl WindowController {
         }
     }
 
-    /// 새로 만들어진 surface를 가능한 한 incremental하게 붙인다.
-    ///
-    /// 기존 동작: rerender_workspace 호출 → 워크스페이스 전체 위젯 재생성 →
-    /// 다른 pane의 탭브라우저 navigate 상태와 터미널 셸 세션이 모두
-    /// 사라짐.
-    ///
-    /// 새 동작: 해당 pane의 tab bar / stack에만 위젯을 append한다.
-    /// pane이 아직 화면에 렌더되지 않았거나 (예: 다른 워크스페이스가 보이고
-    /// 있을 때) registry에서 핸들을 못 찾은 경우엔 안전하게 전체
-    /// rerender로 폴백한다.
+    /// Attach a newly created surface incrementally whenever possible.
+///
+    /// Old behavior: call rerender_workspace, rebuild the entire workspace
+    /// widget, and lose browser navigation state plus terminal shell sessions in
+    /// other panes.
+///
+    /// New behavior: append only to the target pane's tab bar / stack. If the
+    /// pane is not rendered yet, for example because another workspace is
+    /// visible, or the registry cannot find handles, safely fall back to a full
+    /// rerender.
     async fn attach_or_rerender_surface(
         &self,
         ws_id: WorkspaceId,
@@ -349,13 +355,11 @@ impl WindowController {
             );
             if attached {
                 self.refresh_window_title().await;
-                // 새로 추가된 탭(터미널 / 탭브라우저)으로 키보드 포커스를
-                // 옮긴다. attach_surface_to_pane이 stack에 새 위젯을 붙이고
-                // visible_child를 새 surface로 바꾸지만 grab_focus까지는
-                // 하지 않아, Ctrl+Shift+T / Ctrl+Shift+B 직후 포커스가
-                // 이전(이제는 숨겨진) 위젯에 남아 있다가 윈도우로 떨어지는
-                // 회귀가 있었다. ActivateSurface 핸들러와 동일하게 idle에
-                // 한 번 미뤄 위젯 realize 직후 grab_focus한다.
+                // Move keyboard focus to the newly added terminal/browser tab.
+                // attach_surface_to_pane adds the widget and switches the visible
+                // child but does not grab focus, which previously left focus on
+                // the now-hidden old widget after Ctrl+Shift+T / Ctrl+Shift+B.
+                // Defer to idle like ActivateSurface so focus happens after realize.
                 let registry = self.pane_registry.clone();
                 glib::idle_add_local_once(move || {
                     let r = registry.borrow();
@@ -387,17 +391,15 @@ impl WindowController {
             if let Err(e) = controller.store.save_now_blocking() {
                 tracing::warn!(error = %e, "state save on close failed");
             }
-            // 모든 WebView의 진행 중인 load를 stop_loading으로만 취소한다.
-            // 이전 시도였던 `load_uri("about:blank")`는 그 자체가 새 load를
-            // 시작하기 때문에 곧이어 destroy 순간 in-flight loader가
-            // internally cancel되며 `internallyFailedLoadTimerFired` ERROR
-            // 두 줄이 stderr에 찍힌다. `try_close()`도 beforeunload 디스패치를
-            // 유발해 같은 race를 만들 수 있어 호출하지 않는다.
+            // Cancel all in-flight WebView loads with stop_loading only.
+            // The earlier `load_uri("about:blank")` attempt started a new load,
+            // which was then internally cancelled during destroy and printed two
+            // `internallyFailedLoadTimerFired` ERROR lines. `try_close()` can
+            // trigger beforeunload and the same race, so skip it too.
             //
-            // destroy 자체는 두 번의 idle 사이클을 미뤄, 첫 idle에서 GTK가
-            // webview 위젯의 unrealize를 진행하고 두 번째 idle에서 윈도우를
-            // 떨군다. polling-timer 회귀 방지 가드 때문에 timeout은 쓰지
-            // 않는다.
+            // Defer destroy by two idle cycles: first let GTK unrealize WebView
+            // widgets, then drop the window on the second idle. Avoid timeout to
+            // keep the polling-timer regression guard intact.
             for browser in controller.pane_registry.borrow().browsers.values() {
                 browser.web_view.stop_loading();
             }
@@ -410,9 +412,9 @@ impl WindowController {
         });
     }
 
-    /// 윈도우 제목을 "flowmux - {focused tab name}"으로 다시 계산한다.
-    /// 포커스된 pane이 없거나 그 pane에 active surface가 없으면
-    /// "flowmux"로 폴백한다.
+    /// Recompute the window title as "flowmux - {focused tab name}".
+    /// Fall back to "flowmux" when no pane is focused or the focused pane has no
+    /// active surface.
     async fn refresh_window_title(&self) {
         let focused = self.focused_pane.get();
         let title = match focused {
@@ -453,14 +455,83 @@ impl WindowController {
         Some(ws_id)
     }
 
-    /// `ws_id`로 식별되는 워크스페이스의 사이드바 행을 최신 상태로 다시
-    /// 그린다. 자동 갱신(cwd 변화, OSC 타이틀, 활성 탭 전환 등)으로
-    /// `Workspace::name`이나 [`Workspace::display_title`]가 바뀐 직후에
-    /// 호출되어, 사이드 패널 라벨이 즉시 따라가도록 한다.
+    /// Single entry point for recomputing workspace label and subtitles.
+///
+    /// Design:
+    ///   * Side-panel main label = active surface title from MRU[0], the most
+    ///     recently focused pane. Use the original OSC title when present;
+    ///     otherwise use the cwd folder name at full length, without truncation.
+    ///   * Subtitles = active terminal cwd for MRU[0..3], shortened to the last
+    ///     3 folders with a "..." prefix. Focus moves naturally update MRU and
+    ///     therefore the 3 subtitle lines.
+    ///   * If `custom_title` is locked, the user label takes display priority
+    ///     and only ws.name, the automatic value, is updated in the background.
+///
+    /// Updates both store and side panel. The daemon setter is idempotent so
+    /// repeated calls for the same ws_id, such as cwd polling, only mark disk
+    /// dirty and rebuild GTK when values actually change.
+    async fn sync_workspace_label(&self, ws_id: WorkspaceId) {
+        let Some(ws) = self.store.get_workspace(ws_id).await else {
+            return;
+        };
+
+        // Determine the ws.name update candidate from the MRU head's active surface.
+        let mru: Vec<PaneId> = self
+            .focus_mru
+            .borrow()
+            .get(&ws_id)
+            .map(|q| q.iter().copied().collect())
+            .unwrap_or_default();
+        // If MRU is empty, fall back to the workspace's first leaf. This happens
+        // during initial render before anything has focus.
+        let head_pane = mru
+            .first()
+            .copied()
+            .or_else(|| ws.surfaces.first().and_then(|s| s.root_pane.first_leaf_id()));
+
+        if let Some(head_pane) = head_pane {
+            if let Some(new_name) = focused_surface_full_title(&ws, head_pane) {
+                self.store.set_workspace_name(ws_id, new_name).await;
+            }
+        }
+
+        // Subtitle lines: MRU first, then tree traversal fallback. Terminals use
+        // shortened cwd paths; browser tabs use "Browser-{tab name}".
+        let subtitle_lines = collect_subtitle_lines(&ws, &mru, 3);
+
+        // Re-read the updated workspace from store before drawing the sidebar;
+        // the local ws is stale after set_workspace_name.
+        if let Some(ws) = self.store.get_workspace(ws_id).await {
+            self.sidebar.upsert_with_subtitles(&ws, &subtitle_lines);
+        }
+    }
+
+    /// Compatibility helper for existing call sites that redraw only a sidebar
+    /// row with a fresh workspace object, such as rename or color changes.
+    /// Subtitles use the last value cached by sync_workspace_label.
     async fn refresh_sidebar_for(&self, ws_id: WorkspaceId) {
         if let Some(ws) = self.store.get_workspace(ws_id).await {
-            self.sidebar.upsert(&ws);
+            self.sidebar.refresh(&ws);
         }
+    }
+
+    /// Handle a pane focus event, update MRU, and sync label/subtitles. Focusing
+    /// the same pane again moves it to the MRU head, though the label itself may
+    /// not change because set_workspace_name is idempotent.
+    async fn on_pane_focused(&self, pane: PaneId) {
+        let Some(ws_id) = self.store.workspace_for_pane(pane).await else {
+            return;
+        };
+        {
+            let mut mru = self.focus_mru.borrow_mut();
+            let queue = mru.entry(ws_id).or_default();
+            queue.retain(|p| *p != pane);
+            queue.push_front(pane);
+            while queue.len() > 3 {
+                queue.pop_back();
+            }
+        }
+        self.sync_workspace_label(ws_id).await;
     }
 
     fn flush_terminal_cwds_blocking(&self) {
@@ -470,12 +541,12 @@ impl WindowController {
         }
     }
 
-    /// VTE의 OSC 7 (`current-directory-uri::notify`)에만 의존하면 vte.sh
-    /// 통합이 안 된 셸(Ubuntu 기본 bash + flowmux spawn 등)에서는 cd해도
-    /// notify가 영원히 안 와서 탭 이름이 갱신되지 않는다. TerminalPane
-    /// ::current_dir() 안에 이미 있는 `/proc/<pid>/cwd` fallback을 써먹기
-    /// 위해 1초 주기로 poll한다 — 이벤트 경로(OSC 7)는 즉각 반응을
-    /// 유지하고, 이 polling은 OSC 7-naive 셸을 위한 안전망이다.
+    /// Relying only on VTE OSC 7 (`current-directory-uri::notify`) misses shells
+    /// without vte.sh integration, such as Ubuntu's default bash spawned by
+    /// flowmux; after `cd`, no notify ever arrives and the tab name stays stale.
+    /// Poll once per second to reuse TerminalPane::current_dir()'s
+    /// `/proc/<pid>/cwd` fallback. The OSC 7 event path remains immediate, and
+    /// polling is a safety net for OSC-7-naive shells.
     fn install_cwd_polling_fallback(&self) {
         let controller = self.clone();
         glib::timeout_add_local(Duration::from_secs(1), move || {
@@ -489,38 +560,38 @@ impl WindowController {
 
     async fn poll_terminal_cwds(&self) {
         let cwd_entries = self.pane_registry.borrow().terminal_cwds();
-        let mut any_changed = false;
+        let mut changed_workspaces: std::collections::HashSet<WorkspaceId> =
+            std::collections::HashSet::new();
         for (pane, surface, cwd) in cwd_entries {
-            // set_surface_cwd가 cwd_changed||title_changed인 경우만 Some을
-            // 돌려주므로 여기서 polling 비용은 사실상 cwd 변화가 있을 때만
-            // 발생한다. 폴더 이름이 바뀌면 store에 반영하고 탭 라벨도 즉시
-            // 갱신.
-            if self
-                .store
-                .update_surface_cwd(pane, surface, cwd)
-                .await
-                .is_some()
-            {
+            // set_surface_cwd returns Some only for cwd_changed || title_changed,
+            // so polling cost here is effectively paid only when cwd changes.
+            // When the folder name changes, update the store and tab label immediately.
+            if let Some(ws_id) = self.store.update_surface_cwd(pane, surface, cwd).await {
                 if let Some(title) = self.store.surface_title(pane, surface).await {
                     self.pane_registry
                         .borrow()
                         .set_surface_title(surface, &title);
                 }
-                any_changed = true;
+                changed_workspaces.insert(ws_id);
             }
         }
-        if any_changed {
+        if !changed_workspaces.is_empty() {
             self.refresh_window_title().await;
+            // For shells without OSC 7, this polling is the only cwd-change
+            // signal. Side-panel workspace names/subtitles are updated only via
+            // sync_workspace_label, so polling must use the same path to follow cd.
+            for ws_id in changed_workspaces {
+                self.sync_workspace_label(ws_id).await;
+            }
         }
     }
 
-    /// 종료 직전에 호출. 윈도우 사이즈 / maximize / 사이드바 divider /
-    /// 모든 split paned ratio를 store에 기록한다. 다음 실행 때 같은
-    /// 레이아웃으로 복원되도록.
+    /// Called right before exit. Record window size, maximized state, sidebar
+    /// divider, and every split paned ratio in the store so the next launch can
+    /// restore the same layout.
     fn flush_layout_blocking(&self) {
-        // 윈도우 사이즈 — maximize 중일 때는 default_size가 maximize 직전
-        // 사이즈를 그대로 들고 있으므로 그대로 쓰면 다음 실행 때 펼쳐진
-        // 크기가 자연스럽다.
+        // Window size. While maximized, default_size keeps the size from before
+        // maximizing, which is the natural expanded size for next launch.
         let (w, h) = self.window.default_size();
         let layout = flowmux_state::WindowLayout {
             width: w,
@@ -529,13 +600,13 @@ impl WindowController {
         };
         self.store.set_window_layout_blocking(layout);
 
-        // 사이드 패널 divider 위치.
+        // Side-panel divider position.
         let pos = self.sidebar_split.position();
         if pos > 0 {
             self.store.set_sidebar_position_blocking(pos);
         }
 
-        // 모든 pane split ratio.
+        // All pane split ratios.
         let ratios = self.pane_registry.borrow().split_ratios();
         for (split_id, ratio) in ratios {
             self.store
@@ -584,9 +655,9 @@ impl WindowController {
         });
     }
 
-    /// 활성 워크스페이스의 첫 leaf pane으로 포커스를 잡는다. 사용자가 사이드
-    /// 패널에서 워크스페이스만 클릭해 focused_pane이 None인 상태에서 Alt+화살표
-    /// 어떤 방향이든 누른 경우 폴백으로 사용된다.
+    /// Focus the active workspace's first leaf pane. Used as a fallback when the
+    /// user has only clicked a workspace in the side panel, focused_pane is None,
+    /// and any Alt+arrow direction is pressed.
     async fn focus_first_leaf_of_active_workspace(&self) {
         let Some(active) = self.store.active_or_first().await else {
             return;
@@ -623,7 +694,7 @@ impl WindowController {
                         return;
                     }
                     *options_cell.borrow_mut() = opts.clone();
-                    // 줌은 모든 기존 위젯에 즉시 반영.
+                    // Apply zoom immediately to all existing widgets.
                     let registry = registry.borrow();
                     for terminal in registry.terminals.values() {
                         terminal.widget.set_font_scale(opts.zoom_factor());
@@ -631,16 +702,17 @@ impl WindowController {
                     for browser in registry.browsers.values() {
                         browser.web_view.set_zoom_level(opts.zoom_factor());
                     }
-                    // 포커스 테두리 색은 CSS 한 줄을 다시 로드해 반영 —
-                    // 같은 CssProvider 인스턴스라 새 변경이 모든 위젯에
-                    // 자동으로 다시 적용된다.
-                    css_provider.load_from_string(
-                        &theme.css(opts.focus_border_color_or_default()),
-                    );
+                    // Focus border color/opacity apply by reloading one CSS string
+                    // into the same CssProvider instance, so all widgets update automatically.
+                    css_provider.load_from_string(&theme.css(
+                        opts.focus_border_color_or_default(),
+                        opts.focus_border_alpha(),
+                    ));
                     tracing::info!(
                         zoom_percent = opts.zoom_percent,
                         engine = ?opts.default_browser_engine,
                         focus_border_color = %opts.focus_border_color,
+                        focus_border_opacity = opts.focus_border_opacity,
                         "options applied"
                     );
                 });
@@ -677,10 +749,9 @@ impl WindowController {
                             ws_id, pane, new_pane, direction,
                         )
                         .await;
-                        // 새 pane으로 키보드 포커스를 옮긴다 — incremental
-                        // 경로든 rerender 폴백 경로든 동일하게 동작. split이
-                        // 탭브라우저로 만들어진 경우(BrowserOpenSplit 경로)
-                        // 에도 web_view에 포커스가 가도록 양쪽 모두 처리.
+                        // Move keyboard focus to the new pane for both the
+                        // incremental path and rerender fallback. Also handle
+                        // browser splits from BrowserOpenSplit so web_view receives focus.
                         let registry = self.pane_registry.clone();
                         glib::idle_add_local_once(move || {
                             let r = registry.borrow();
@@ -742,12 +813,11 @@ impl WindowController {
                 }
             }
             GtkCommand::OpenUrlInBrowserTab { pane, url } => {
-                // 터미널에서 Ctrl+클릭한 URL을 같은 pane에 새 탭브라우저로 연다.
-                // 새 탭브라우저는 BrowserPane::build에서 initial_url로 url을
-                // 받아 즉시 load_uri를 수행하므로, 별도 navigate 명령은 필요
-                // 없다. surface 생성에 실패하면(예: pane이 이미 사라진 경우)
-                // 조용히 무시 — 사용자가 Ctrl+클릭한 직후 pane이 사라지는
-                // 흔치 않은 race이고, 실패 메시지가 도움이 되지 않는다.
+                // Open a Ctrl-clicked terminal URL in a new browser tab in the
+                // same pane. BrowserPane::build receives the URL as initial_url
+                // and immediately load_uri's it, so no extra navigate command is
+                // needed. If surface creation fails, for example because the pane
+                // disappeared right after the click, ignore it quietly.
                 if let Some((ws_id, surface_id)) = self
                     .store
                     .add_browser_surface_to_pane(pane, url)
@@ -764,19 +834,17 @@ impl WindowController {
                     .activate_surface(pane, surface);
                 self.refresh_window_title().await;
                 if let Some(ws_id) = ws_id {
-                    // 탭 전환으로 single-pane 워크스페이스의 자동값(name)이
-                    // 새 활성 surface의 라벨로 따라갔을 수 있으므로 사이드바
-                    // 라벨도 다시 그린다 (자동 모드일 때만 표시 변화).
-                    self.refresh_sidebar_for(ws_id).await;
+                    // Tab activation changes the active surface used for the
+                    // side-panel name and subtitles.
+                    self.sync_workspace_label(ws_id).await;
                 }
-                // 탭(클릭 / Shift+Tab 사이클 / IPC 등 모든 경로)으로
-                // surface가 활성화된 직후, 키보드 포커스를 새로 활성된
-                // 위젯(터미널의 vte::Terminal 또는 브라우저의 WebView)
-                // 으로 옮긴다. 이렇게 해야 사용자가 그대로 타이핑하면
-                // 새 탭의 셸/페이지로 키 입력이 들어가고, Tab 키도 셸의
-                // 자동완성으로 처리된다 (탭바로 포커스 traversal 되지
-                // 않음). 위젯이 stack에 추가된 직후라 idle_add로 한
-                // 프레임 미룬다.
+                // After a surface is activated through any path, click,
+                // Shift+Tab cycle, IPC, and so on, move keyboard focus to the
+                // newly active widget: the terminal's vte::Terminal or the
+                // browser's WebView. That lets typing go to the new tab's shell
+                // or page and keeps Tab as shell completion instead of tab-bar
+                // traversal. Defer one frame because the widget was just added
+                // to the stack.
                 let registry = self.pane_registry.clone();
                 glib::idle_add_local_once(move || {
                     let r = registry.borrow();
@@ -798,12 +866,11 @@ impl WindowController {
                         let _ = ack.send(Ok(()));
                     }
                     Some(flowmux_daemon::CloseOutcome::SurfaceRemoved { workspace }) => {
-                        // 같은 pane의 한 surface만 사라진 케이스 — 전체
-                        // 워크스페이스를 재렌더링하면 다른 pane의 셸 / 탭
-                        // 브라우저 상태가 다 사라지는 회귀가 있어 incremental
-                        // detach만 한다. store가 active를 새 surface로 옮겨
-                        // 줬으면 그 값으로 activate_surface 호출해 stack /
-                        // 탭 강조를 동기화.
+                        // Only one surface in the same pane disappeared. Full
+                        // workspace rerender would lose other panes' shell and
+                        // browser state, so detach incrementally. If the store
+                        // moved active to a new surface, activate it to sync the
+                        // stack and tab highlight.
                         self.pane_registry
                             .borrow_mut()
                             .detach_surface_widget(pane, surface);
@@ -822,11 +889,10 @@ impl WindowController {
                         let _ = ack.send(Ok(()));
                     }
                     Some(flowmux_daemon::CloseOutcome::PaneRemoved { workspace }) => {
-                        // pane이 통째로 사라진 케이스 — split 트리 변경이
-                        // 필요해 incremental은 복잡하다. 한 pane만 닫혔어도
-                        // 같은 워크스페이스 안의 다른 pane 위젯이 함께
-                        // 재생성될 수 있으나, 적어도 다른 워크스페이스에는
-                        // 영향 없다. (pane-detach incremental은 후속 작업)
+                        // An entire pane disappeared. The split tree changed, so
+                        // incremental handling is more complex. A single closed
+                        // pane can rebuild other panes in the same workspace, but
+                        // at least other workspaces are unaffected.
                         if let Some(ws) = self.store.get_workspace(workspace).await {
                             self.rerender_workspace(&ws);
                         }
@@ -873,10 +939,9 @@ impl WindowController {
                 ack,
             } => {
                 tracing::info!(%pane, %surface, target_index, "ReorderSurface dispatch start");
-                // store 측 reorder가 변화 없음(None)을 반환하면 GTK 위젯도
-                // 그대로 둔다. 위젯 reorder는 메인 스레드의 PaneRegistry가
-                // 갖고 있는 탭바 gtk::Box와 surface_tabs 인덱스를 모두
-                // 동시에 업데이트해야 일관성이 깨지지 않는다.
+                // If store-side reorder returns no change (None), leave GTK
+                // widgets unchanged. Widget reorder must update both the tab-bar
+                // gtk::Box and surface_tabs indexes held by main-thread PaneRegistry.
                 let store_result = self
                     .store
                     .reorder_surface_in_pane(pane, surface, target_index)
@@ -900,7 +965,7 @@ impl WindowController {
                 let ws_id = self.update_terminal_cwd(pane, surface, cwd).await;
                 self.refresh_window_title().await;
                 if let Some(ws_id) = ws_id {
-                    self.refresh_sidebar_for(ws_id).await;
+                    self.sync_workspace_label(ws_id).await;
                 }
             }
             GtkCommand::BrowserUriChanged { pane, surface, url } => {
@@ -922,7 +987,7 @@ impl WindowController {
                             .set_surface_title(surface, &latest);
                     }
                     self.refresh_window_title().await;
-                    self.refresh_sidebar_for(ws_id).await;
+                    self.sync_workspace_label(ws_id).await;
                 }
             }
             GtkCommand::TerminalTitleChanged {
@@ -930,12 +995,10 @@ impl WindowController {
                 surface,
                 title,
             } => {
-                // VTE가 OSC 0/2로 받은 윈도우 타이틀이다. 셸 자체가
-                // 보내는 prompt 형태(예: "user@host:~/path")는 이미
-                // cwd-driven 라벨과 중복되니 trim 후 빈/공백만 남는
-                // 경우 무시. 그 외엔 BrowserTitleChanged와 동일
-                // 처리(title_locked 존중) — store가 적용되면 탭
-                // 라벨과 윈도우 제목을 갱신.
+                // VTE received an OSC 0/2 window title. Prompt-shaped shell
+                // titles such as "user@host:~/path" duplicate cwd-driven labels,
+                // and trim-empty or whitespace-only values are ignored. Everything
+                // else follows BrowserTitleChanged semantics, respecting title_locked.
                 if title.trim().is_empty() {
                     return;
                 }
@@ -950,11 +1013,14 @@ impl WindowController {
                             .set_surface_title(surface, &latest);
                     }
                     self.refresh_window_title().await;
-                    self.refresh_sidebar_for(ws_id).await;
+                    self.sync_workspace_label(ws_id).await;
                 }
             }
             GtkCommand::RefreshWindowTitle => {
                 self.refresh_window_title().await;
+            }
+            GtkCommand::PaneFocused { pane } => {
+                self.on_pane_focused(pane).await;
             }
             GtkCommand::NewWorkspace { root } => {
                 // Prefer the focused pane's cwd so a new tab opens
@@ -1012,9 +1078,9 @@ impl WindowController {
             }
             GtkCommand::ShowRenameDialog { id } => {
                 if let Some(ws) = self.store.get_workspace(id).await {
-                    // 프리필은 cmux와 동일 — custom_title이 있으면 그 값으로
-                    // 시작해 사용자가 부분 수정할 수 있게 하고, 없으면
-                    // 현재 표시 중인 자동 이름(`name`)을 보여 준다.
+                    // Match cmux prefill behavior: start from custom_title when
+                    // present so the user can edit it, otherwise show the current
+                    // automatic name (`name`).
                     let prefill = ws
                         .custom_title
                         .as_deref()
@@ -1474,10 +1540,10 @@ impl WindowController {
             Some(p) => p,
             None => return,
         };
-        // Alt+화살표는 같은 워크스페이스 안에서만 이동한다. GtkStack은 비활성
-        // 워크스페이스의 위젯도 같은 좌표에 겹쳐 들고 있어 compute_bounds가
-        // 0이 아닌 값을 돌려주는 경우가 있어, 워크스페이스 필터 없이는 다른
-        // 워크스페이스의 pane으로 포커스가 새어 나가는 회귀가 있었다.
+        // Alt+arrow moves only within the same workspace. GtkStack can keep
+        // inactive workspace widgets overlapping at the same coordinates, where
+        // compute_bounds may return non-zero values; without the workspace
+        // filter, focus could leak into another workspace.
         let Some(workspace) = registry.workspace_of_pane(from) else {
             return;
         };
@@ -1523,9 +1589,9 @@ impl WindowController {
         }
         let _ = Rect::new(0.0, 0.0, 0.0, 0.0); // ensure import used in non-tests path
         if let Some((id, _)) = best {
-            // 타깃 pane의 활성 탭이 탭브라우저인 경우 web_view로 포커스를
-            // 옮긴다. 이전에는 active_terminal만 시도해 탭브라우저 pane은
-            // Alt+화살표로 이동이 안 됐다.
+            // If the target pane's active tab is a browser tab, focus web_view.
+            // Previously only active_terminal was tried, so browser panes could
+            // not be reached with Alt+arrow.
             if let Some(term) = registry.active_terminal(id) {
                 term.widget.grab_focus();
             } else if let Some(browser) = registry.active_browser(id) {
@@ -1566,6 +1632,118 @@ impl WindowController {
     }
 }
 
+/// Return the active surface title for `focused_pane` at original length for
+/// the side-panel label. User-renamed labels or OSC 0/2 labels already use
+/// surface.title as the original value. Otherwise, for terminals, extract the
+/// cwd folder name at full length because surface.title may be truncated to 15
+/// characters for tab display.
+fn focused_surface_full_title(ws: &flowmux_core::Workspace, focused_pane: PaneId) -> Option<String> {
+    use flowmux_core::SurfaceKind;
+    let active = ws
+        .surfaces
+        .first()
+        .and_then(|s| s.root_pane.active_surface_id(focused_pane))?;
+    let surface = ws
+        .surfaces
+        .first()
+        .and_then(|s| s.root_pane.find_surface(focused_pane, active))?;
+    if surface.title_locked {
+        return Some(surface.title.clone());
+    }
+    if let SurfaceKind::Terminal { cwd: Some(cwd), .. } = &surface.kind {
+        let derived = flowmux_core::terminal_tab_title_for_cwd(Some(cwd));
+        if surface.title == derived {
+            // surface.title is the truncated cwd folder name. Rebuild the full
+            // length value so the side panel can ellipsize it to available width.
+            if let Some(folder) = cwd.file_name().and_then(|n| n.to_str()) {
+                if !folder.is_empty() {
+                    return Some(folder.to_string());
+                }
+            }
+        }
+    }
+    Some(surface.title.clone())
+}
+
+/// Build one subtitle line from each active surface in `pane_ids` MRU order.
+///   * Active terminal surfaces with cwd use [`shorten_cwd_path`].
+///   * Active terminal surfaces without cwd are skipped to avoid caching the
+///     first-spawn race as a subtitle.
+///   * Active browser tabs use `Browser-{tab name}`.
+/// Result length never exceeds `cap`. If MRU is empty or short, DFS over tree
+/// leaves left-first to keep side-panel subtitles populated.
+fn collect_subtitle_lines(
+    ws: &flowmux_core::Workspace,
+    mru: &[PaneId],
+    cap: usize,
+) -> Vec<String> {
+    use flowmux_core::SurfaceKind;
+    let Some(root) = ws.surfaces.first().map(|s| &s.root_pane) else {
+        return Vec::new();
+    };
+    let line_for = |pane_id: PaneId| -> Option<String> {
+        let active = root.active_surface_id(pane_id)?;
+        let surface = root.find_surface(pane_id, active)?;
+        match &surface.kind {
+            SurfaceKind::Terminal { cwd: Some(cwd), .. } => Some(shorten_cwd_path(cwd)),
+            SurfaceKind::Terminal { cwd: None, .. } => None,
+            SurfaceKind::Browser { .. } => Some(format!("Browser-{}", surface.title)),
+        }
+    };
+
+    let mut out: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<PaneId> = std::collections::HashSet::new();
+    for pane in mru {
+        if seen.contains(pane) {
+            continue;
+        }
+        if let Some(line) = line_for(*pane) {
+            out.push(line);
+            seen.insert(*pane);
+            if out.len() >= cap {
+                return out;
+            }
+        }
+    }
+    // MRU is empty or short, so fill from tree leaves by left-first DFS.
+    let mut all_leaves: Vec<PaneId> = Vec::new();
+    root.for_each_leaf(|id| all_leaves.push(id));
+    for pane in all_leaves {
+        if out.len() >= cap {
+            break;
+        }
+        if seen.contains(&pane) {
+            continue;
+        }
+        if let Some(line) = line_for(pane) {
+            out.push(line);
+            seen.insert(pane);
+        }
+    }
+    out
+}
+
+/// Keep only the last 3 normal path components and shorten the prefix to "...".
+/// Paths with 3 or fewer components are shown unchanged. Examples:
+///   * `/home/junsu/dev/os/flowmux` → `.../dev/os/flowmux`
+///   * `/home/junsu`               → `/home/junsu`
+///   * `/`                          → `/`
+pub(crate) fn shorten_cwd_path(path: &std::path::Path) -> String {
+    use std::path::Component;
+    let names: Vec<&str> = path
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(s) => s.to_str(),
+            _ => None,
+        })
+        .collect();
+    if names.len() <= 3 {
+        return path.display().to_string();
+    }
+    let last3 = &names[names.len() - 3..];
+    format!(".../{}", last3.join("/"))
+}
+
 fn make_callbacks(
     focused: FocusedPane,
     bridge: Bridge,
@@ -1591,6 +1769,7 @@ fn make_callbacks(
                 focused.set(Some(pane));
                 let bridge = bridge.clone();
                 glib::MainContext::default().spawn_local(async move {
+                    let _ = bridge.tx.send(GtkCommand::PaneFocused { pane }).await;
                     let _ = bridge.tx.send(GtkCommand::RefreshWindowTitle).await;
                 });
             }))
@@ -1931,7 +2110,7 @@ fn show_rename_dialog(
 ) {
     let dialog = adw::AlertDialog::new(
         Some("Rename Tab"),
-        Some("비어 있는 채로 OK 하면 자동 모드로 되돌아갑니다."),
+        Some("Leave empty and click OK to return to automatic mode."),
     );
     let entry = gtk::Entry::new();
     entry.set_text(current_name);
@@ -1947,10 +2126,9 @@ fn show_rename_dialog(
     let entry_for_resp = entry.clone();
     dialog.connect_response(None, move |dialog, response| {
         if response == "ok" {
-            // cmux와 동일 — 빈 입력 / 공백만 있는 입력도 그대로 daemon에
-            // 전달해 custom_title을 None으로 되돌리는 신호로 쓴다.
-            // daemon::rename_workspace가 trim 후 의미 없는 입력을 자동
-            // 모드 복귀로 해석한다.
+            // Match cmux: pass empty or whitespace-only input through to the
+            // daemon as the signal to reset custom_title to None. The daemon
+            // trims and interprets meaningless input as returning to automatic mode.
             let new_name = entry_for_resp.text().to_string();
             let bridge = bridge.clone();
             glib::MainContext::default().spawn_local(async move {
@@ -2281,10 +2459,9 @@ mod tests {
         assert!(surfaces[0].title_locked);
     }
 
-    /// 포커스 변경 / 탭 활성화 / RefreshWindowTitle 명령에 따라
-    /// adw::ApplicationWindow.title이 "flowmux - {focused tab name}"
-    /// 형식으로 갱신되는지 검증한다. 포커스가 없을 때는 "flowmux"
-    /// 단독.
+    /// Verify that focus changes, tab activation, and RefreshWindowTitle update
+    /// adw::ApplicationWindow.title to "flowmux - {focused tab name}". With no
+    /// focus, it falls back to plain "flowmux".
     #[gtk::test]
     async fn refresh_window_title_uses_focused_pane_active_surface() {
         adw::init().expect("libadwaita should initialize in GTK test");
@@ -2312,7 +2489,7 @@ mod tests {
         );
         controller.render_workspace(&ws);
 
-        // 포커스가 없는 초기 상태에서는 단독 "flowmux"로 폴백.
+        // Initial state with no focus falls back to plain "flowmux".
         controller.focused_pane.set(None);
         controller
             .dispatch(GtkCommand::RefreshWindowTitle)
@@ -2322,7 +2499,7 @@ mod tests {
             Some("flowmux")
         );
 
-        // 포커스가 잡히면 "flowmux - {tab name}"으로 바뀐다.
+        // With focus, the title becomes "flowmux - {tab name}".
         let expected_tab_name = store.surface_title(pane, surface).await.unwrap();
         controller.focused_pane.set(Some(pane));
         controller
@@ -2333,7 +2510,7 @@ mod tests {
             Some(format!("flowmux - {expected_tab_name}"))
         );
 
-        // RenameSurface 디스패치 후에도 윈도우 제목이 새 이름을 따라간다.
+        // After RenameSurface dispatch, the window title follows the new name.
         let (ack_tx, ack_rx) = oneshot::channel();
         controller
             .dispatch(GtkCommand::RenameSurface {
@@ -2350,10 +2527,9 @@ mod tests {
         );
     }
 
-    /// `BrowserUriChanged` 디스패치가 store에 마지막 navigate URL을
-    /// 반영하는지 검증한다. webkit::WebView를 띄우지 않고 store
-    /// 상호작용만 검증하기 위해, 미리 add_browser_surface_to_pane으로
-    /// state에 browser surface를 만들어 두고 dispatch한다.
+    /// Verify that `BrowserUriChanged` dispatch stores the last navigated URL.
+    /// To test only store interaction without launching webkit::WebView, create
+    /// a browser surface in state with add_browser_surface_to_pane first.
     #[gtk::test]
     async fn browser_uri_changed_dispatch_persists_url_in_state() {
         adw::init().expect("libadwaita should initialize in GTK test");
@@ -2365,7 +2541,7 @@ mod tests {
             .await;
         let ws = store.get_workspace(ws_id).await.unwrap();
         let pane = ws.surfaces[0].root_pane.first_leaf_id().unwrap();
-        // browser surface를 직접 추가해서 webkit init 부담을 피한다.
+        // Add the browser surface directly to avoid WebKit init cost.
         let (_, browser) = store
             .add_browser_surface_to_pane(pane, "https://before.test".into())
             .await
@@ -2403,9 +2579,8 @@ mod tests {
         ));
     }
 
-    /// `BrowserTitleChanged` 디스패치가 store/탭 라벨 모두를 갱신.
-    /// 사용자가 직접 rename한 surface는 자동 갱신되지 않음을 함께
-    /// 검증.
+    /// `BrowserTitleChanged` dispatch updates both store and tab label, while
+    /// user-renamed surfaces remain protected from automatic updates.
     #[gtk::test]
     async fn browser_title_changed_dispatch_updates_state_but_skips_locked() {
         adw::init().expect("libadwaita should initialize in GTK test");
@@ -2443,7 +2618,7 @@ mod tests {
             gtk::CssProvider::new(),
         );
 
-        // A: title_locked=false → 갱신.
+        // A: title_locked=false -> updated.
         controller
             .dispatch(GtkCommand::BrowserTitleChanged {
                 pane,
@@ -2456,7 +2631,7 @@ mod tests {
             Some("Hello — Page A")
         );
 
-        // B: title_locked=true → 그대로 "Pinned".
+        // B: title_locked=true -> stays "Pinned".
         controller
             .dispatch(GtkCommand::BrowserTitleChanged {
                 pane,
@@ -2470,9 +2645,9 @@ mod tests {
         );
     }
 
-    /// `TerminalTitleChanged` 디스패치가 OSC 0/2 제목으로 탭 라벨을
-    /// 갱신한다. 빈 문자열은 무시되고, title_locked=true인 surface는
-    /// 보호된다 (사용자 rename 우선).
+    /// `TerminalTitleChanged` dispatch updates the tab label from OSC 0/2
+    /// titles. Empty strings are ignored, and title_locked=true surfaces are
+    /// protected because user rename wins.
     #[gtk::test]
     async fn terminal_title_changed_dispatch_updates_tab_and_skips_locked() {
         adw::init().expect("libadwaita should initialize in GTK test");
@@ -2484,7 +2659,7 @@ mod tests {
             .await;
         let ws = store.get_workspace(ws_id).await.unwrap();
         let pane = ws.surfaces[0].root_pane.first_leaf_id().unwrap();
-        // 첫 channel 생성 시 자동으로 만들어진 terminal surface 그대로 사용.
+        // Reuse the terminal surface automatically created with the first workspace.
         let surface_a = match &ws.surfaces[0].root_pane {
             flowmux_core::Pane::Leaf {
                 content: flowmux_core::PaneContent::Tabs { surfaces, .. },
@@ -2514,7 +2689,7 @@ mod tests {
             gtk::CssProvider::new(),
         );
 
-        // 1. 정상적인 OSC 2 → 탭 라벨 갱신.
+        // 1. Normal OSC 2 -> tab label updates.
         controller
             .dispatch(GtkCommand::TerminalTitleChanged {
                 pane,
@@ -2527,7 +2702,7 @@ mod tests {
             Some("vi src/main.rs")
         );
 
-        // 2. 빈 문자열 → 무시 (셸 종료 / OSC reset 시).
+        // 2. Empty string -> ignored for shell exit / OSC reset.
         controller
             .dispatch(GtkCommand::TerminalTitleChanged {
                 pane,
@@ -2541,7 +2716,7 @@ mod tests {
             "empty OSC title should not erase the active label"
         );
 
-        // 3. 공백만 있는 타이틀 → 무시.
+        // 3. Whitespace-only title -> ignored.
         controller
             .dispatch(GtkCommand::TerminalTitleChanged {
                 pane,
@@ -2554,7 +2729,7 @@ mod tests {
             Some("vi src/main.rs")
         );
 
-        // 4. title_locked=true → 무시.
+        // 4. title_locked=true -> ignored.
         controller
             .dispatch(GtkCommand::TerminalTitleChanged {
                 pane,
@@ -2568,16 +2743,16 @@ mod tests {
         );
     }
 
-    /// 회귀 테스트: bash가 매 프롬프트마다 OSC 7(cwd) + OSC 0/2(`user@host:
-    /// /path` 형태의 윈도우 타이틀)를 같이 쏘는데, OSC 0/2가 cwd 기반
-    /// 폴더 라벨을 덮어쓰면 안 된다. 대신 cwd 변경에 맞춰 탭 이름과
-    /// 윈도우 타이틀이 함께 폴더 이름으로 업데이트되어야 한다. vi/codex
-    /// 같은 외부 프로그램 타이틀은 그대로 들어와야 한다.
+    /// Regression test: bash emits OSC 7 (cwd) and OSC 0/2 prompt-shaped window
+    /// titles like `user@host: /path` on each prompt. OSC 0/2 must not overwrite
+    /// cwd-driven folder labels. Instead, cwd changes should update both tab and
+    /// window title to the folder name, while external program titles such as
+    /// vi/codex should still pass through.
     #[gtk::test]
     async fn terminal_cwd_change_updates_tab_and_window_title_and_ignores_shell_ps1_echo() {
         adw::init().expect("libadwaita should initialize in GTK test");
-        // $HOME 영향을 피하기 위해 /tmp 아래의 절대 경로 사용 — 셸 PS1
-        // 매칭은 절대경로 형태("user@host: /tmp/...")만으로 충분히 검증.
+        // Use absolute paths under /tmp to avoid $HOME effects. Absolute-path
+        // PS1 matching is sufficient to verify this flow.
         let initial = std::env::temp_dir().join("flowmux-ui-cwd-flow-one");
         let next = std::env::temp_dir().join("flowmux-ui-cwd-flow-two");
         std::fs::create_dir_all(&initial).unwrap();
@@ -2607,7 +2782,7 @@ mod tests {
         controller.focused_pane.set(Some(pane));
         controller.dispatch(GtkCommand::RefreshWindowTitle).await;
 
-        // 초기: 탭/윈도우 타이틀이 워크스페이스 root 폴더 이름.
+        // Initial: tab/window title is the workspace root folder name.
         let initial_title = store.surface_title(pane, surface).await.unwrap();
         assert_eq!(initial_title, "flowmux-ui-cwd-fl...");
         assert_eq!(
@@ -2615,9 +2790,9 @@ mod tests {
             Some(format!("flowmux - {initial_title}"))
         );
 
-        // 사용자가 `cd flowmux-ui-cwd-flow-two` — bash의 경우 PROMPT_COMMAND
-        // (OSC 7 cwd)가 PS1 확장(OSC 0/2 윈도우 타이틀)보다 먼저 emit
-        // 된다. 같은 순서로 dispatch.
+        // User runs `cd flowmux-ui-cwd-flow-two`. In bash, PROMPT_COMMAND
+        // (OSC 7 cwd) emits before PS1 expansion (OSC 0/2 window title), so
+        // dispatch in the same order.
         controller
             .dispatch(GtkCommand::TerminalCwdChanged {
                 pane,
@@ -2628,18 +2803,17 @@ mod tests {
         assert_eq!(
             store.surface_title(pane, surface).await.as_deref(),
             Some("flowmux-ui-cwd-fl..."),
-            "OSC 7으로 cwd가 바뀌면 탭 라벨이 새 폴더 이름으로 업데이트",
+            "OSC 7 cwd changes update the tab label to the new folder name",
         );
         assert_eq!(
             controller.window.title().map(|s| s.to_string()),
             Some("flowmux - flowmux-ui-cwd-fl...".into()),
-            "윈도우 타이틀도 새 탭 이름을 따라간다",
+            "the window title follows the new tab name",
         );
 
-        // bash가 같은 프롬프트에 이어서 OSC 0/2(`user@host: /new/path`)도
-        // emit — cwd가 이미 갱신된 상태이므로 PS1 echo로 인식되어
-        // 무시되어야 한다. 회귀의 핵심: 이 단계에서 라벨이 PS1 형태로
-        // 굳어 버리면 안 된다.
+        // bash then emits OSC 0/2 (`user@host: /new/path`) for the same prompt.
+        // Since cwd is already updated, this must be recognized as a PS1 echo
+        // and ignored. The regression would freeze the label in PS1 form here.
         controller
             .dispatch(GtkCommand::TerminalTitleChanged {
                 pane,
@@ -2650,16 +2824,16 @@ mod tests {
         assert_eq!(
             store.surface_title(pane, surface).await.as_deref(),
             Some("flowmux-ui-cwd-fl..."),
-            "셸 PS1 OSC 0/2는 cwd 기반 라벨을 덮어쓰지 않아야 한다",
+            "shell PS1 OSC 0/2 must not overwrite cwd-driven labels",
         );
         assert_eq!(
             controller.window.title().map(|s| s.to_string()),
             Some("flowmux - flowmux-ui-cwd-fl...".into()),
         );
 
-        // cd 없이 bash가 또 한 번 프롬프트를 그릴 때(공백 엔터 등) 같은
-        // PS1 echo가 다시 와도 (debian_chroot prefix + 공백 없는 변형)
-        // 동일하게 무시되어야 한다.
+        // If bash draws another prompt without cd, such as after an empty Enter,
+        // the same PS1 echo with debian_chroot prefix and no-space variant must
+        // also be ignored.
         controller
             .dispatch(GtkCommand::TerminalTitleChanged {
                 pane,
@@ -2672,7 +2846,7 @@ mod tests {
             Some("flowmux-ui-cwd-fl...")
         );
 
-        // 외부 프로그램 타이틀(vi 등)은 정상 반영 — 탭/윈도우 모두 갱신.
+        // External program titles, such as vi, still apply to both tab and window.
         controller
             .dispatch(GtkCommand::TerminalTitleChanged {
                 pane,
@@ -2690,9 +2864,9 @@ mod tests {
         );
     }
 
-    /// 새 탭이 추가(NewSurface)되면 그 탭이 active로 잡혀 윈도우
-    /// 제목도 새 탭 이름으로 갱신된다. 기존 활성 탭 이름을 유지하면
-    /// 안 된다.
+    /// When a new tab is added (NewSurface), that tab becomes active and the
+    /// window title updates to the new tab name instead of keeping the previous
+    /// active tab name.
     #[gtk::test]
     async fn new_surface_dispatch_updates_window_title_to_new_tab() {
         adw::init().expect("libadwaita should initialize in GTK test");
@@ -2722,8 +2896,8 @@ mod tests {
         controller.dispatch(GtkCommand::RefreshWindowTitle).await;
         let initial = controller.window.title().map(|s| s.to_string());
 
-        // dispatch가 자체적으로 새 terminal surface를 만들고, attach 후
-        // refresh_window_title 까지 호출한다.
+        // dispatch creates a new terminal surface itself, attaches it, and then
+        // calls refresh_window_title.
         controller
             .dispatch(GtkCommand::NewSurface { pane })
             .await;
@@ -2734,7 +2908,7 @@ mod tests {
             title_now.as_deref().unwrap().starts_with("flowmux - "),
             "title should keep the flowmux prefix, got {title_now:?}"
         );
-        // 새 탭이 active 라면 store에서 그 surface의 title이 곧 윈도우 제목.
+        // If the new tab is active, that surface title is the window title source.
         let active = controller
             .pane_registry
             .borrow()
@@ -2748,8 +2922,7 @@ mod tests {
         );
     }
 
-    /// ActivateSurface 디스패치만으로도 윈도우 제목이 활성 탭 기준
-    /// 으로 다시 계산된다.
+    /// ActivateSurface dispatch alone recomputes the window title from the active tab.
     #[gtk::test]
     async fn activate_surface_dispatch_refreshes_window_title() {
         adw::init().expect("libadwaita should initialize in GTK test");
@@ -2801,16 +2974,16 @@ mod tests {
                 surface: browser,
             })
             .await;
-        // browser surface는 add_browser_surface_to_pane 시 "Browser"로 저장.
+        // add_browser_surface_to_pane stores browser surfaces as "Browser".
         assert_eq!(
             controller.window.title().map(|s| s.to_string()).as_deref(),
             Some("flowmux - Browser")
         );
     }
 
-    /// ReorderSurface 디스패치가 store와 PaneRegistry를 모두 갱신하고
-    /// 활성 탭이 보존되는지, 같은 자리로 보내면 no-op인지, 다른 pane의
-    /// 탭은 영향이 없는지 한 번에 검증한다.
+    /// Verify that ReorderSurface dispatch updates both store and PaneRegistry,
+    /// preserves the active tab, treats same-position moves as no-ops, and does
+    /// not affect tabs in other panes.
     #[gtk::test]
     async fn reorder_surface_dispatch_updates_store_and_widget_order() {
         adw::init().expect("libadwaita should initialize in GTK test");
@@ -2831,7 +3004,7 @@ mod tests {
             .add_browser_surface_to_pane(pane, "https://three.test".into())
             .await
             .unwrap();
-        // 활성 탭을 첫 번째로 되돌려 둔다 — browser가 마지막에 추가돼서 active.
+        // Restore the active tab to first; the browser was added last and became active.
         store.set_active_surface(pane, first).await;
 
         let (bridge, _rx) = Bridge::new();
@@ -2849,7 +3022,7 @@ mod tests {
         let ws = store.get_workspace(ws_id).await.unwrap();
         controller.render_workspace(&ws);
 
-        // first(인덱스 0) → 마지막(인덱스 2)
+        // first (index 0) -> last (index 2).
         let (ack_tx, ack_rx) = oneshot::channel();
         controller
             .dispatch(GtkCommand::ReorderSurface {
@@ -2861,7 +3034,7 @@ mod tests {
             .await;
         ack_rx.await.unwrap().unwrap();
 
-        // store 측 순서 확인.
+        // Check store-side order.
         let snap = store.get_workspace(ws_id).await.unwrap();
         let flowmux_core::Pane::Leaf {
             content: flowmux_core::PaneContent::Tabs { active, surfaces },
@@ -2875,10 +3048,10 @@ mod tests {
             vec![second, browser, first],
             "store reorder failed"
         );
-        // 활성 탭은 first로 그대로.
+        // The active tab remains first.
         assert_eq!(*active, first);
 
-        // 같은 자리로 다시 디스패치 → store가 None을 돌려주므로 위젯도 그대로.
+        // Dispatch same-position again -> store returns None, so widgets stay unchanged.
         let (ack_tx, ack_rx) = oneshot::channel();
         controller
             .dispatch(GtkCommand::ReorderSurface {
@@ -2902,7 +3075,7 @@ mod tests {
             vec![second, browser, first]
         );
 
-        // 길이를 넘는 인덱스 → 끝으로 클램프되어 자기 자리이므로 no-op.
+        // Out-of-range index clamps to the end, which is its current position, so no-op.
         let (ack_tx, ack_rx) = oneshot::channel();
         controller
             .dispatch(GtkCommand::ReorderSurface {
@@ -2914,7 +3087,7 @@ mod tests {
             .await;
         ack_rx.await.unwrap().unwrap();
 
-        // browser(가운데)를 처음으로.
+        // Move browser, currently in the middle, to the front.
         let (ack_tx, ack_rx) = oneshot::channel();
         controller
             .dispatch(GtkCommand::ReorderSurface {
@@ -2937,19 +3110,19 @@ mod tests {
             surfaces.iter().map(|s| s.id).collect::<Vec<_>>(),
             vec![browser, second, first]
         );
-        // 활성은 여전히 first.
+        // Active remains first.
         assert_eq!(*active, first);
     }
 
-    /// `poll_terminal_cwds`는 OSC 7가 없는 셸을 위한 안전망. 직접 호출
-    /// 했을 때 등록된 (pane, surface, cwd)에 대해 store/탭 라벨이 갱신
-    /// 되는지, 변동이 없으면 no-op인지 확인한다 — 1초 timer 핸들러
-    /// (`install_cwd_polling_fallback`)가 매 tick마다 호출하는 본체.
+    /// `poll_terminal_cwds` is the safety net for shells without OSC 7. Directly
+    /// calling it should update store/tab labels for registered (pane, surface,
+    /// cwd) entries and no-op when nothing changed. This is the body called by
+    /// the one-second timer handler (`install_cwd_polling_fallback`) each tick.
     #[gtk::test]
     async fn poll_terminal_cwds_picks_up_changes_without_osc7_event() {
         adw::init().expect("libadwaita should initialize in GTK test");
-        // 폴더 이름은 truncate(15자) 후에도 서로 달라야 한다 — assert_ne!를
-        // 의미 있게 만들기 위해 prefix까지 다르게.
+        // Folder names must still differ after 15-character truncation, so make
+        // their prefixes different enough for assert_ne! to be meaningful.
         let initial = std::env::temp_dir().join("alpha-poll-cwd");
         std::fs::create_dir_all(&initial).unwrap();
         let store = StateStore::new_lazy(State::default());
@@ -2975,8 +3148,8 @@ mod tests {
         controller.render_workspace(&ws);
         controller.focused_pane.set(Some(pane));
 
-        // 변동 없으면 poll은 no-op (store update_surface_cwd가 false 반환).
-        // 같은 cwd로 또 한 번 dispatch해서 흐름이 깨지지 않는지 확인.
+        // With no change, poll is a no-op because store update_surface_cwd returns
+        // false. Dispatch the same cwd again to confirm the flow stays intact.
         controller
             .dispatch(GtkCommand::TerminalCwdChanged {
                 pane,
@@ -2986,9 +3159,8 @@ mod tests {
             .await;
         let stable = store.surface_title(pane, surface).await;
 
-        // poll이 새 cwd를 발견했다고 가정한 시나리오를 dispatch로 흉내
-        // — TerminalCwdChanged가 poll 본체와 동일한 update_terminal_cwd
-        // 경로를 통과하므로 한 흐름으로 검증된다.
+        // Simulate poll discovering a new cwd by dispatching TerminalCwdChanged.
+        // It goes through the same update_terminal_cwd path as the poll body.
         let next = std::env::temp_dir().join("bravo-poll-cwd");
         std::fs::create_dir_all(&next).unwrap();
         controller
@@ -2999,15 +3171,15 @@ mod tests {
             })
             .await;
         let updated = store.surface_title(pane, surface).await;
-        assert_ne!(stable, updated, "탭 라벨이 새 폴더 이름으로 갱신");
+        assert_ne!(stable, updated, "tab label updates to the new folder name");
         assert_eq!(updated.as_deref(), Some("bravo-poll-cwd"));
         assert_eq!(
             controller.window.title().map(|s| s.to_string()).as_deref(),
             Some("flowmux - bravo-poll-cwd")
         );
 
-        // poll 본체 직접 호출 — 한 번 더 호출해도 cwd가 그대로면 no-op
-        // (store가 변동 없음으로 false 반환). 라벨/윈도우 타이틀 그대로.
+        // Direct poll body call. Calling again with the same cwd is a no-op
+        // because the store reports no change. Label/window title stay unchanged.
         controller.poll_terminal_cwds().await;
         assert_eq!(
             store.surface_title(pane, surface).await.as_deref(),
@@ -3015,11 +3187,10 @@ mod tests {
         );
     }
 
-    /// 회귀 방지: vi/claude 같은 외부 프로그램이 띄운 OSC 0/2 타이틀이
-    /// 1초 cwd polling fallback에 의해 폴더명으로 되돌아가지 않아야
-    /// 한다. poll_terminal_cwds는 같은 cwd를 매 tick마다 전달하므로,
-    /// 그 경로에서 `surface.title`을 절대 건드리지 않아야 한다는 것이
-    /// 핵심.
+    /// Regression guard: OSC 0/2 titles from external programs such as vi or
+    /// claude must not be reverted to the folder name by the one-second cwd
+    /// polling fallback. poll_terminal_cwds passes the same cwd each tick, so
+    /// that path must never touch `surface.title`.
     #[gtk::test]
     async fn program_title_persists_across_cwd_polling() {
         adw::init().expect("libadwaita should initialize in GTK test");
@@ -3049,7 +3220,7 @@ mod tests {
         controller.focused_pane.set(Some(pane));
         controller.dispatch(GtkCommand::RefreshWindowTitle).await;
 
-        // 외부 프로그램(claude) 진입 — OSC 2가 "Claude Code" 발행.
+        // Enter an external program (claude): OSC 2 emits "Claude Code".
         controller
             .dispatch(GtkCommand::TerminalTitleChanged {
                 pane,
@@ -3066,22 +3237,21 @@ mod tests {
             Some("flowmux - Claude Code")
         );
 
-        // 이 시점에서 polling이 fire — 같은 cwd를 또 보고. 프로그램이 cd하지
-        // 않았으므로 cwd는 동일. 두 번 연속으로 polling을 돌려도 타이틀이
-        // 흔들리지 않아야 한다.
+        // Polling fires now and sees the same cwd because the program did not cd.
+        // Running polling twice in a row must not disturb the title.
         controller.poll_terminal_cwds().await;
         controller.poll_terminal_cwds().await;
         assert_eq!(
             store.surface_title(pane, surface).await.as_deref(),
             Some("Claude Code"),
-            "프로그램 타이틀이 cwd polling에 의해 폴더명으로 되돌아가면 안 된다",
+            "program titles must not be reverted to folder names by cwd polling",
         );
         assert_eq!(
             controller.window.title().map(|s| s.to_string()).as_deref(),
             Some("flowmux - Claude Code")
         );
 
-        // claude 종료 후 사용자가 다른 폴더로 이동하면 폴더명 라벨로 자연스럽게 복귀.
+        // After claude exits, moving to another folder naturally restores a folder label.
         let next = std::env::temp_dir().join("flowmux-program-title-after");
         std::fs::create_dir_all(&next).unwrap();
         controller
@@ -3097,11 +3267,10 @@ mod tests {
         );
     }
 
-    /// 회귀 방지: Alt+화살표 후보 필터가 같은 워크스페이스 내부 pane만
-    /// 보아야 한다. PaneRegistry::pane_ids_in_workspace가 다른 워크스페이스
-    /// 의 pane을 누락 없이 걸러내는지 확인 — focus_in_direction이 이 함수로
-    /// 후보 리스트를 만들기 때문에 이게 깨끗하면 다른 워크스페이스로 포커스가
-    /// 새어나갈 수 없다.
+    /// Regression guard: the Alt+arrow candidate filter must only consider panes
+    /// inside the same workspace. Verify PaneRegistry::pane_ids_in_workspace
+    /// filters out panes from other workspaces, because focus_in_direction builds
+    /// its candidate list through this function.
     #[gtk::test]
     async fn pane_ids_in_workspace_isolates_other_workspaces() {
         adw::init().expect("libadwaita should initialize in GTK test");
@@ -3139,16 +3308,22 @@ mod tests {
             r.pane_ids_in_workspace(ws_b_id).collect();
 
         assert!(in_a.contains(&pane_a));
-        assert!(!in_a.contains(&pane_b), "ws_a 후보에 ws_b의 pane이 포함되면 안 된다");
+        assert!(
+            !in_a.contains(&pane_b),
+            "ws_a candidates must not include ws_b panes"
+        );
         assert!(in_b.contains(&pane_b));
-        assert!(!in_b.contains(&pane_a), "ws_b 후보에 ws_a의 pane이 포함되면 안 된다");
+        assert!(
+            !in_b.contains(&pane_a),
+            "ws_b candidates must not include ws_a panes"
+        );
         assert_eq!(r.workspace_of_pane(pane_a), Some(ws_a_id));
         assert_eq!(r.workspace_of_pane(pane_b), Some(ws_b_id));
     }
 
-    /// 사용자가 사이드 패널에서 워크스페이스만 클릭해 focused_pane이 None인
-    /// 상태에서 Alt+화살표를 누르면, dispatcher가 활성 워크스페이스의 첫 leaf
-    /// pane으로 포커스를 잡아야 한다. 방향이 무엇이든 결과는 같다.
+    /// If the user clicks only a workspace in the side panel and focused_pane is
+    /// None, pressing any Alt+arrow direction should make the dispatcher focus
+    /// the active workspace's first leaf pane.
     #[gtk::test]
     async fn focus_direction_from_none_falls_back_to_first_leaf_of_active_workspace() {
         adw::init().expect("libadwaita should initialize in GTK test");
@@ -3173,8 +3348,7 @@ mod tests {
             gtk::CssProvider::new(),
         );
         controller.render_workspace(&ws);
-        // 사용자가 워크스페이스만 클릭하고 아직 어떤 pane에도 포커스 안 잡힌
-        // 상태를 재현.
+        // Reproduce a state where the user clicked a workspace but no pane is focused yet.
         controller.focused_pane.set(None);
 
         controller
@@ -3183,11 +3357,10 @@ mod tests {
                 dir: FocusDir::Left,
             })
             .await;
-        // grab_focus는 focus_first_leaf_of가 큐잉한 idle_add_local_once 안에서
-        // 일어난다. idle 큐는 FIFO이므로 그 직후 또 하나의 idle을 큐잉해 oneshot
-        // 으로 신호 받는 시점에는 앞선 grab_focus가 이미 돌아간 상태이다 —
-        // gtk async test 안에서 main loop을 직접 iteration 하지 않고 idle을
-        // 비우는 안전한 패턴.
+        // grab_focus runs inside the idle_add_local_once queued by
+        // focus_first_leaf_of. The idle queue is FIFO, so queueing another idle
+        // and waiting on a oneshot means the earlier grab_focus has already run,
+        // without manually iterating the main loop in an async GTK test.
         let (idle_tx, idle_rx) = oneshot::channel();
         glib::idle_add_local_once(move || {
             let _ = idle_tx.send(());
@@ -3197,20 +3370,19 @@ mod tests {
         assert_eq!(
             controller.focused_pane.get(),
             Some(first_leaf),
-            "focused_pane이 활성 워크스페이스의 첫 leaf로 잡혀야 한다",
+            "focused_pane should become the active workspace's first leaf",
         );
     }
 
-    /// 회귀 방지: 워크스페이스가 두 개 이상 있을 때 사이드 패널에서 두번째
-    /// 워크스페이스를 클릭하고 Alt+화살표를 누르면, 첫번째 워크스페이스에
-    /// 있는 pane에 포커스가 가서 거기서 이동이 시작되던 회귀.
+    /// Regression guard: with multiple workspaces, clicking the second workspace
+    /// in the side panel and pressing Alt+arrow used to focus a pane in the
+    /// first workspace and start movement from there.
     ///
-    /// 사이드 패널 클릭(row-activated)은 GtkCommand::ActivateWorkspace로
-    /// 디스패치되어 dispatcher가 activate_workspace를 호출한다. 그 안에서
-    /// focus_first_leaf_of가 idle로 새 워크스페이스의 첫 leaf에 grab_focus
-    /// 하고, 그 grab_focus가 on_focus 콜백을 통해 focused_pane을 새
-    /// 워크스페이스의 pane으로 갱신한다. 이 흐름이 끊기면 focused_pane이
-    /// 이전 워크스페이스의 pane을 가리켜 Alt+화살표가 엉뚱한 곳에서 시작.
+    /// Side-panel clicks dispatch GtkCommand::ActivateWorkspace, and the
+    /// dispatcher calls activate_workspace. Inside it, focus_first_leaf_of queues
+    /// grab_focus on the new workspace's first leaf; that grab_focus updates
+    /// focused_pane through on_focus. If this flow breaks, focused_pane still
+    /// points at the previous workspace and Alt+arrow starts from the wrong pane.
     #[gtk::test]
     async fn clicking_second_workspace_moves_focus_into_it_so_alt_arrow_stays_there() {
         adw::init().expect("libadwaita should initialize in GTK test");
@@ -3240,17 +3412,17 @@ mod tests {
         );
         controller.render_workspace(&ws_a);
         controller.render_workspace(&ws_b);
-        // 사용자가 처음에 ws_a에서 작업하던 상태 — focused_pane이 ws_a의 pane.
+        // User initially worked in ws_a, so focused_pane is ws_a's pane.
         controller.focused_pane.set(Some(pane_a));
         store.set_active_workspace(Some(ws_a_id)).await;
 
-        // 사이드 패널에서 ws_b 행 클릭 → on_select가 GtkCommand::ActivateWorkspace
-        // 를 디스패치한다. 같은 흐름을 직접 디스패치로 흉내.
+        // Clicking ws_b in the side panel dispatches GtkCommand::ActivateWorkspace.
+        // Reproduce that same flow by dispatching directly.
         controller
             .dispatch(GtkCommand::ActivateWorkspace { id: ws_b_id })
             .await;
-        // activate_workspace의 focus_first_leaf_of가 큐잉한 idle을 비우기
-        // 위해 oneshot으로 idle 한 번을 통과시킨다.
+        // Pass through one idle via oneshot to flush the idle queued by
+        // activate_workspace's focus_first_leaf_of.
         let (idle_tx, idle_rx) = oneshot::channel();
         glib::idle_add_local_once(move || {
             let _ = idle_tx.send(());
@@ -3260,22 +3432,508 @@ mod tests {
         assert_eq!(
             controller.focused_pane.get(),
             Some(pane_b),
-            "사이드 패널에서 ws_b를 클릭하면 focused_pane이 ws_b의 첫 leaf로 잡혀야 한다 — 이게 안 되면 Alt+화살표가 ws_a로 새어 나간다",
+            "clicking ws_b in the side panel should focus ws_b's first leaf",
         );
 
-        // 이 시점에서 Alt+화살표를 눌러도 focus_in_direction의 source가
-        // ws_b의 pane이고, 직전 fix가 후보를 같은 워크스페이스로 좁히므로
-        // ws_a로 새어 나갈 수 없다. 즉 source의 워크스페이스가 ws_b임을
-        // 직접 확인.
+        // At this point, even if Alt+arrow is pressed, focus_in_direction uses a
+        // source pane from ws_b and the candidate filter stays within that
+        // workspace. Confirm the source belongs to ws_b.
         let r = controller.pane_registry.borrow();
         assert_eq!(
             r.workspace_of_pane(controller.focused_pane.get().unwrap()),
             Some(ws_b_id),
-            "Alt+화살표가 시작할 source pane은 ws_b 소속이어야 한다",
+            "Alt+arrow source pane should belong to ws_b",
         );
         let in_b: std::collections::HashSet<_> =
             r.pane_ids_in_workspace(ws_b_id).collect();
         assert!(in_b.contains(&pane_b));
         assert!(!in_b.contains(&pane_a));
+    }
+
+    // ===== Side-panel label/subtitle scenario =====
+
+    #[test]
+    fn shorten_cwd_path_keeps_last_three_components() {
+        use std::path::Path;
+        // 5 components -> last 3 with ... prefix.
+        assert_eq!(
+            shorten_cwd_path(Path::new("/home/junsu/dev/os/flowmux")),
+            ".../dev/os/flowmux"
+        );
+        // Exactly 3 components -> unchanged.
+        assert_eq!(shorten_cwd_path(Path::new("/dev/os/flowmux")), "/dev/os/flowmux");
+        // 2 components -> unchanged.
+        assert_eq!(shorten_cwd_path(Path::new("/home/junsu")), "/home/junsu");
+        // Single component / root.
+        assert_eq!(shorten_cwd_path(Path::new("/tmp")), "/tmp");
+        // Deeper paths still keep the last 3.
+        assert_eq!(
+            shorten_cwd_path(Path::new("/a/b/c/d/e/f/g")),
+            ".../e/f/g"
+        );
+    }
+
+    #[test]
+    fn focused_surface_full_title_reconstructs_full_folder_for_terminal() {
+        // Even if surface.title is truncated for a long folder name, reconstruct
+        // the full length from cwd.
+        use flowmux_core::{PaneSurface, Surface, SurfaceId, SurfaceKind};
+        let cwd = std::path::PathBuf::from("/tmp/DynamicGenerativeUI");
+        let mut surface = PaneSurface::terminal(
+            flowmux_core::terminal_tab_title_for_cwd(Some(&cwd)),
+            Some(cwd.clone()),
+        );
+        // surface.title is truncated ("DynamicGenerati...").
+        assert!(surface.title.ends_with("..."));
+        let surface_id = surface.id;
+        // mut not actually needed, kept for clarity.
+        surface.title_locked = false;
+        let pane_id = PaneId::new();
+        let ws = flowmux_core::Workspace {
+            id: WorkspaceId::new(),
+            name: "any".into(),
+            custom_title: None,
+            root_dir: cwd.clone(),
+            git: None,
+            listening_ports: vec![],
+            surfaces: vec![Surface {
+                id: SurfaceId::new(),
+                kind: SurfaceKind::Terminal {
+                    shell: None,
+                    cwd: Some(cwd.clone()),
+                },
+                title: "main".into(),
+                root_pane: flowmux_core::Pane::Leaf {
+                    id: pane_id,
+                    content: flowmux_core::PaneContent::Tabs {
+                        active: surface_id,
+                        surfaces: vec![surface],
+                    },
+                },
+            }],
+            color: None,
+        };
+
+        assert_eq!(
+            focused_surface_full_title(&ws, pane_id).as_deref(),
+            Some("DynamicGenerativeUI")
+        );
+    }
+
+    #[test]
+    fn focused_surface_full_title_respects_locked_or_osc_titles() {
+        use flowmux_core::{PaneSurface, Surface, SurfaceId, SurfaceKind};
+        // User rename to "MyName" sets title_locked=true. Use that label as the
+        // workspace name candidate and do not overwrite it with the cwd folder.
+        let cwd = std::path::PathBuf::from("/tmp/some-folder");
+        let mut surface = PaneSurface::terminal("MyName", Some(cwd.clone()));
+        surface.title_locked = true;
+        let surface_id = surface.id;
+        let pane_id = PaneId::new();
+        let ws = flowmux_core::Workspace {
+            id: WorkspaceId::new(),
+            name: "any".into(),
+            custom_title: None,
+            root_dir: cwd.clone(),
+            git: None,
+            listening_ports: vec![],
+            surfaces: vec![Surface {
+                id: SurfaceId::new(),
+                kind: SurfaceKind::Terminal {
+                    shell: None,
+                    cwd: Some(cwd),
+                },
+                title: "main".into(),
+                root_pane: flowmux_core::Pane::Leaf {
+                    id: pane_id,
+                    content: flowmux_core::PaneContent::Tabs {
+                        active: surface_id,
+                        surfaces: vec![surface],
+                    },
+                },
+            }],
+            color: None,
+        };
+        assert_eq!(
+            focused_surface_full_title(&ws, pane_id).as_deref(),
+            Some("MyName")
+        );
+    }
+
+    #[test]
+    fn collect_subtitle_lines_walks_mru_then_falls_back_to_tree() {
+        // Three leaves in a split tree. When MRU contains only part of them, the
+        // rest should be filled by tree DFS.
+        use flowmux_core::{Pane, PaneContent, SplitDirection};
+        let l_id = PaneId::new();
+        let m_id = PaneId::new();
+        let r_id = PaneId::new();
+        let cwd_l = std::path::PathBuf::from("/tmp/L");
+        let cwd_m = std::path::PathBuf::from("/tmp/M");
+        let cwd_r = std::path::PathBuf::from("/tmp/R");
+        let ws = flowmux_core::Workspace {
+            id: WorkspaceId::new(),
+            name: "any".into(),
+            custom_title: None,
+            root_dir: "/tmp".into(),
+            git: None,
+            listening_ports: vec![],
+            surfaces: vec![flowmux_core::Surface {
+                id: flowmux_core::SurfaceId::new(),
+                kind: flowmux_core::SurfaceKind::Terminal {
+                    shell: None,
+                    cwd: None,
+                },
+                title: "main".into(),
+                root_pane: Pane::Split {
+                    id: PaneId::new(),
+                    direction: SplitDirection::Vertical,
+                    ratio: 0.5,
+                    first: Box::new(Pane::Leaf {
+                        id: l_id,
+                        content: PaneContent::tabbed_terminal("L", Some(cwd_l.clone())),
+                    }),
+                    second: Box::new(Pane::Split {
+                        id: PaneId::new(),
+                        direction: SplitDirection::Horizontal,
+                        ratio: 0.5,
+                        first: Box::new(Pane::Leaf {
+                            id: m_id,
+                            content: PaneContent::tabbed_terminal("M", Some(cwd_m.clone())),
+                        }),
+                        second: Box::new(Pane::Leaf {
+                            id: r_id,
+                            content: PaneContent::tabbed_terminal("R", Some(cwd_r.clone())),
+                        }),
+                    }),
+                },
+            }],
+            color: None,
+        };
+
+        // MRU only: when order is r -> m -> l, subtitles follow that order.
+        let mru = vec![r_id, m_id, l_id];
+        let lines = collect_subtitle_lines(&ws, &mru, 3);
+        assert_eq!(
+            lines,
+            vec![
+                shorten_cwd_path(&cwd_r),
+                shorten_cwd_path(&cwd_m),
+                shorten_cwd_path(&cwd_l),
+            ]
+        );
+
+        // One MRU entry only -> fill the rest by left-first tree DFS.
+        let mru = vec![r_id];
+        let lines = collect_subtitle_lines(&ws, &mru, 3);
+        assert_eq!(
+            lines,
+            vec![
+                shorten_cwd_path(&cwd_r),
+                shorten_cwd_path(&cwd_l),
+                shorten_cwd_path(&cwd_m),
+            ]
+        );
+
+        // Empty MRU -> all lines come from tree DFS.
+        let lines = collect_subtitle_lines(&ws, &[], 3);
+        assert_eq!(
+            lines,
+            vec![
+                shorten_cwd_path(&cwd_l),
+                shorten_cwd_path(&cwd_m),
+                shorten_cwd_path(&cwd_r),
+            ]
+        );
+    }
+
+    /// A leaf whose active surface is a browser tab emits a `Browser-{tab name}`
+    /// subtitle instead of cwd. Even when terminal and browser tabs share one
+    /// leaf, only the currently active tab kind is considered.
+    #[test]
+    fn collect_subtitle_lines_uses_browser_prefix_for_browser_panes() {
+        use flowmux_core::{
+            Pane, PaneContent, PaneSurface, Surface, SurfaceId, SurfaceKind,
+        };
+        let pane_id = PaneId::new();
+        let term_surface = PaneSurface::terminal("dev", Some(std::path::PathBuf::from("/tmp/dev")));
+        let browser_surface =
+            PaneSurface::browser("DocsHome", "https://example.com/docs/home".into());
+        let browser_active = browser_surface.id;
+        let ws = flowmux_core::Workspace {
+            id: WorkspaceId::new(),
+            name: "any".into(),
+            custom_title: None,
+            root_dir: "/tmp".into(),
+            git: None,
+            listening_ports: vec![],
+            surfaces: vec![Surface {
+                id: SurfaceId::new(),
+                kind: SurfaceKind::Terminal {
+                    shell: None,
+                    cwd: None,
+                },
+                title: "main".into(),
+                root_pane: Pane::Leaf {
+                    id: pane_id,
+                    content: PaneContent::Tabs {
+                        active: browser_active,
+                        surfaces: vec![term_surface, browser_surface],
+                    },
+                },
+            }],
+            color: None,
+        };
+
+        // Active browser -> one "Browser-DocsHome" line.
+        let lines = collect_subtitle_lines(&ws, &[pane_id], 3);
+        assert_eq!(lines, vec!["Browser-DocsHome".to_string()]);
+        // Same with empty MRU; tree DFS reaches the same leaf.
+        let lines = collect_subtitle_lines(&ws, &[], 3);
+        assert_eq!(lines, vec!["Browser-DocsHome".to_string()]);
+    }
+
+    /// Scenario test for the requested side-panel workspace row behavior:
+    ///   1. On focus, ws.name = active surface label and subtitles = that cwd.
+    ///   2. One cd immediately updates ws.name and subtitles to the new folder/path.
+    ///   3. "Change name" locks display_title while ws.name keeps tracking cwd.
+    ///   4. After split, MRU head pane decides ws.name and subtitles use MRU order.
+    ///   5. Moving focus to another pane puts that pane's cwd on the first subtitle.
+    ///   6. With three split panes, focusing each once produces three subtitles.
+    ///   7. Refocusing an existing MRU pane keeps length 3 and only updates the head.
+    #[gtk::test]
+    async fn scenario_workspace_name_and_subtitles_track_focused_terminals_end_to_end() {
+        adw::init().expect("libadwaita should initialize in GTK test");
+        // Only root_dir must exist because VTE terminal spawn uses it. Other cwd
+        // values are handled as strings by store / sync logic.
+        let root = std::env::temp_dir().join("flowmux-scn-name-subtitles");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let store = StateStore::new_lazy(State::default());
+        let ws_id = store.create_workspace(None, root.clone()).await;
+        let ws = store.get_workspace(ws_id).await.unwrap();
+        let pane_a = ws.surfaces[0].root_pane.first_leaf_id().unwrap();
+        let surface_a = ws.surfaces[0]
+            .root_pane
+            .active_surface_id(pane_a)
+            .unwrap();
+
+        let (bridge, _rx) = Bridge::new();
+        let app = adw::Application::builder()
+            .application_id("com.flowmux.App.UiTest.Scenario.NameSubtitles")
+            .build();
+        app.register(None::<&gtk::gio::Cancellable>).unwrap();
+        let controller = WindowController::new(
+            &app,
+            store.clone(),
+            Arc::new(ResolvedTheme::load()),
+            bridge,
+            gtk::CssProvider::new(),
+        );
+        controller.render_workspace(&ws);
+
+        // 1. Single-pane focus: ws.name = root folder name, subtitles = root cwd.
+        controller
+            .dispatch(GtkCommand::PaneFocused { pane: pane_a })
+            .await;
+        {
+            let ws = store.get_workspace(ws_id).await.unwrap();
+            assert_eq!(
+                ws.display_title(),
+                "flowmux-scn-name-subtitles",
+                "initial workspace name is the root_dir folder name",
+            );
+        }
+        let subs = controller
+            .sidebar
+            .cached_subtitles(ws_id)
+            .expect("PaneFocused should cache subtitles");
+        assert_eq!(subs.len(), 1, "one leaf -> one subtitle");
+        assert_eq!(
+            subs[0],
+            shorten_cwd_path(&root),
+            "first subtitle is the focused pane cwd after shortening",
+        );
+
+        // 2. cd -> ws.name is the new folder, subtitles keep the last 3 folders.
+        let project_a = std::path::PathBuf::from("/home/flowmux-scn/dev/projectA");
+        controller
+            .dispatch(GtkCommand::TerminalCwdChanged {
+                pane: pane_a,
+                surface: surface_a,
+                cwd: project_a.clone(),
+            })
+            .await;
+        {
+            let ws = store.get_workspace(ws_id).await.unwrap();
+            assert_eq!(ws.name, "projectA", "ws.name reflects the new folder after cd");
+            assert_eq!(
+                ws.display_title(),
+                "projectA",
+                "without custom_title, the automatic value is displayed",
+            );
+        }
+        let subs = controller.sidebar.cached_subtitles(ws_id).unwrap();
+        assert_eq!(
+            subs[0], ".../flowmux-scn/dev/projectA",
+            "4 components -> last 3 with \"...\" prefix",
+        );
+
+        // 3. Change name -> display_title stays fixed while automatic ws.name keeps tracking.
+        let (rename_ack, rename_rx) = oneshot::channel();
+        controller
+            .dispatch(GtkCommand::RenameWorkspace {
+                id: ws_id,
+                name: "MyName".into(),
+                ack: rename_ack,
+            })
+            .await;
+        let _ = rename_rx.await;
+        {
+            let ws = store.get_workspace(ws_id).await.unwrap();
+            assert_eq!(ws.display_title(), "MyName", "custom name takes priority");
+        }
+
+        let project_b = std::path::PathBuf::from("/home/flowmux-scn/dev/projectB");
+        controller
+            .dispatch(GtkCommand::TerminalCwdChanged {
+                pane: pane_a,
+                surface: surface_a,
+                cwd: project_b.clone(),
+            })
+            .await;
+        {
+            let ws = store.get_workspace(ws_id).await.unwrap();
+            assert_eq!(
+                ws.display_title(),
+                "MyName",
+                "custom name stays visible after cd",
+            );
+            assert_eq!(ws.name, "projectB", "automatic name keeps tracking folder names");
+        }
+        let subs = controller.sidebar.cached_subtitles(ws_id).unwrap();
+        assert_eq!(
+            subs[0], ".../flowmux-scn/dev/projectB",
+            "subtitle updates immediately after the terminal event",
+        );
+
+        // 4. Split -> two leaves, focus second pane -> two subtitles, new pane as head.
+        let (_, pane_b) = store
+            .split_pane(pane_a, SplitDirection::Vertical)
+            .await
+            .expect("split should succeed");
+        let ws_after = store.get_workspace(ws_id).await.unwrap();
+        let surface_b = ws_after.surfaces[0]
+            .root_pane
+            .active_surface_id(pane_b)
+            .unwrap();
+        let project_c = std::path::PathBuf::from("/home/flowmux-scn/dev/projectC");
+        store
+            .update_surface_cwd(pane_b, surface_b, project_c.clone())
+            .await;
+
+        controller
+            .dispatch(GtkCommand::PaneFocused { pane: pane_b })
+            .await;
+        {
+            let ws = store.get_workspace(ws_id).await.unwrap();
+            assert_eq!(
+                ws.name, "projectC",
+                "MRU head is pane_b, so ws.name follows that surface label",
+            );
+            assert_eq!(
+                ws.display_title(),
+                "MyName",
+                "rename lock remains after split",
+            );
+        }
+        let subs = controller.sidebar.cached_subtitles(ws_id).unwrap();
+        assert_eq!(subs.len(), 2, "two split panes with focus history -> two subtitles");
+        assert_eq!(
+            subs[0], ".../flowmux-scn/dev/projectC",
+            "MRU[0] = newly focused pane_b",
+        );
+        assert_eq!(
+            subs[1], ".../flowmux-scn/dev/projectB",
+            "MRU[1] = previously focused pane_a",
+        );
+
+        // 5. Focus pane_a again -> subtitles reorder to [A, B].
+        controller
+            .dispatch(GtkCommand::PaneFocused { pane: pane_a })
+            .await;
+        let subs = controller.sidebar.cached_subtitles(ws_id).unwrap();
+        assert_eq!(
+            subs[0], ".../flowmux-scn/dev/projectB",
+            "focus move makes pane_a the MRU head, so first subtitle uses its cwd",
+        );
+        assert_eq!(subs[1], ".../flowmux-scn/dev/projectC");
+
+        // 6. Third split -> three subtitles after each pane has focus once.
+        let (_, pane_c) = store
+            .split_pane(pane_b, SplitDirection::Horizontal)
+            .await
+            .expect("second split");
+        let ws_after = store.get_workspace(ws_id).await.unwrap();
+        let surface_c = ws_after.surfaces[0]
+            .root_pane
+            .active_surface_id(pane_c)
+            .unwrap();
+        let project_d = std::path::PathBuf::from("/home/flowmux-scn/dev/projectD");
+        store
+            .update_surface_cwd(pane_c, surface_c, project_d.clone())
+            .await;
+        controller
+            .dispatch(GtkCommand::PaneFocused { pane: pane_c })
+            .await;
+
+        let subs = controller.sidebar.cached_subtitles(ws_id).unwrap();
+        assert_eq!(
+            subs.len(),
+            3,
+            "three split panes with each focused once -> three subtitles",
+        );
+        assert_eq!(subs[0], ".../flowmux-scn/dev/projectD", "MRU[0]=C just focused");
+        assert_eq!(subs[1], ".../flowmux-scn/dev/projectB", "MRU[1]=A");
+        assert_eq!(subs[2], ".../flowmux-scn/dev/projectC", "MRU[2]=B");
+
+        // 7. Refocus a pane already in MRU -> update only the head, keep length 3.
+        controller
+            .dispatch(GtkCommand::PaneFocused { pane: pane_a })
+            .await;
+        let subs = controller.sidebar.cached_subtitles(ws_id).unwrap();
+        assert_eq!(subs.len(), 3, "refocusing an existing MRU pane keeps length");
+        assert_eq!(subs[0], ".../flowmux-scn/dev/projectB", "MRU head = pane_a");
+        assert_eq!(subs[1], ".../flowmux-scn/dev/projectD", "MRU[1] = pane_c");
+        assert_eq!(subs[2], ".../flowmux-scn/dev/projectC", "MRU[2] = pane_b");
+
+        // 8. Add a browser surface inside pane_a. The store makes it active, and
+        // another PaneFocused sync turns that pane's subtitle into
+        // "Browser-{tab name}".
+        let (_, browser_surface) = store
+            .add_browser_surface_to_pane(pane_a, "https://example.com/docs".into())
+            .await
+            .expect("add browser surface to pane_a");
+        // Give the browser tab the visible tab name so it is easy to verify the
+        // subtitle uses that label exactly.
+        store
+            .rename_surface(pane_a, browser_surface, "DocsHome".into())
+            .await;
+        // PaneFocused sees the active surface after add_browser_surface_to_pane,
+        // which is browser_surface. The ActivateSurface dispatch path tries to
+        // update PaneRegistry GTK widgets, so this test triggers
+        // sync_workspace_label through PaneFocused only.
+        controller
+            .dispatch(GtkCommand::PaneFocused { pane: pane_a })
+            .await;
+
+        let subs = controller.sidebar.cached_subtitles(ws_id).unwrap();
+        assert_eq!(
+            subs[0], "Browser-DocsHome",
+            "active browser tabs use Browser-{{tab name}} subtitles",
+        );
+        // The remaining two lines still come from other leaves' terminal cwd.
+        assert_eq!(subs[1], ".../flowmux-scn/dev/projectD", "MRU[1] = pane_c");
+        assert_eq!(subs[2], ".../flowmux-scn/dev/projectC", "MRU[2] = pane_b");
     }
 }

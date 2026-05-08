@@ -19,7 +19,7 @@ pub use agent_sessions::AgentSessionStore;
 
 pub const SCHEMA_VERSION: u32 = 1;
 
-/// 창 사이즈 + maximize 여부. 종료 시 저장하고 다음 실행에 복원.
+/// Window size and maximized state, saved on exit and restored on next launch.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WindowLayout {
     pub width: i32,
@@ -38,10 +38,10 @@ pub struct State {
     /// Most-recently-active workspace, used to focus on launch.
     #[serde(default)]
     pub active_workspace: Option<flowmux_core::WorkspaceId>,
-    /// 마지막 종료 시점 윈도우 크기 / maximize 상태. 첫 실행에는 None.
+    /// Window size and maximized state from the last exit. `None` on first launch.
     #[serde(default)]
     pub window: Option<WindowLayout>,
-    /// 사이드 패널과 콘텐츠 영역 사이 divider의 픽셀 위치. 첫 실행에는 None.
+    /// Pixel position of the divider between the side panel and content. `None` on first launch.
     #[serde(default)]
     pub sidebar_position: Option<i32>,
     pub last_saved: chrono::DateTime<chrono::Utc>,
@@ -194,8 +194,8 @@ mod tests {
 
     #[test]
     fn missing_layout_fields_load_as_none() {
-        // 이전 버전에서 저장된 state.json은 window / sidebar_position 필드가
-        // 없다. #[serde(default)] 덕분에 None으로 로드되어야 한다.
+        // Older state.json files do not contain window / sidebar_position.
+        // #[serde(default)] should load them as None.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.json");
         std::fs::write(
