@@ -10,7 +10,7 @@ use flowmux_core::{
     terminal_tab_title_for_cwd, CloseSurfaceOutcome, Pane, PaneContent, PaneId, PaneSurface,
     RemoveOutcome, SplitDirection, Surface, SurfaceId, SurfaceKind, Workspace, WorkspaceId,
 };
-use flowmux_state::State;
+use flowmux_state::{State, WindowLayout};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, Notify};
@@ -510,6 +510,64 @@ impl StateStore {
         drop(s);
         self.mark_dirty();
         true
+    }
+
+    /// 저장된 윈도우 사이즈/maximize. 첫 실행에는 None.
+    pub fn window_layout_blocking(&self) -> Option<WindowLayout> {
+        self.inner.blocking_lock().window.clone()
+    }
+
+    /// 저장된 사이드 패널 divider 픽셀 위치. 첫 실행에는 None.
+    pub fn sidebar_position_blocking(&self) -> Option<i32> {
+        self.inner.blocking_lock().sidebar_position
+    }
+
+    /// 윈도우 사이즈/maximize 상태를 state에 기록한다. close 시 GTK 메인
+    /// 스레드에서 동기적으로 호출되므로 blocking 변형으로 둔다 — async
+    /// runtime이 종료 핸들러 안에서 살아 있다는 보장이 없다.
+    pub fn set_window_layout_blocking(&self, layout: WindowLayout) {
+        let mut s = self.inner.blocking_lock();
+        if s.window.as_ref() == Some(&layout) {
+            return;
+        }
+        s.window = Some(layout);
+        drop(s);
+        self.mark_dirty();
+    }
+
+    /// 사이드 패널 / 콘텐츠 영역 사이 divider 픽셀 위치를 기록.
+    pub fn set_sidebar_position_blocking(&self, position: i32) {
+        let mut s = self.inner.blocking_lock();
+        if s.sidebar_position == Some(position) {
+            return;
+        }
+        s.sidebar_position = Some(position);
+        drop(s);
+        self.mark_dirty();
+    }
+
+    /// pane split divider의 ratio를 모델에 반영. `split_id`는 트리 안의
+    /// `Pane::Split` 노드 PaneId. 매칭되는 split이 없거나 ratio가 같으면
+    /// `false` (호출자가 dirty mark을 건너뛸 수 있도록).
+    pub fn set_pane_split_ratio_blocking(&self, split_id: PaneId, ratio: f32) -> bool {
+        let mut s = self.inner.blocking_lock();
+        let mut updated = false;
+        for ws in s.workspaces.iter_mut() {
+            for surface in ws.surfaces.iter_mut() {
+                if surface.root_pane.set_split_ratio(split_id, ratio) {
+                    updated = true;
+                    break;
+                }
+            }
+            if updated {
+                break;
+            }
+        }
+        drop(s);
+        if updated {
+            self.mark_dirty();
+        }
+        updated
     }
 
     /// Remove an entire workspace. Used by the sidebar's X close
@@ -2325,5 +2383,100 @@ mod tests {
             surfaces.iter().map(|s| s.id).collect::<Vec<_>>(),
             vec![alpha_second, alpha_first]
         );
+    }
+
+    /// 윈도우 사이즈와 사이드바 위치 setter는 blocking이므로 별도 tokio
+    /// 런타임 안에서 spawn_blocking으로 호출해 인메모리 mutex 충돌이 없는
+    /// 지 본다. 동일 값으로 다시 호출하면 mark_dirty가 트리거되지 않는
+    /// 의미상 idempotent도 함께 검증.
+    #[tokio::test]
+    async fn window_layout_setter_persists_value() {
+        let store = StateStore::new_lazy(State::default());
+        let store_for_blocking = store.clone();
+        tokio::task::spawn_blocking(move || {
+            store_for_blocking.set_window_layout_blocking(WindowLayout {
+                width: 1440,
+                height: 900,
+                maximized: false,
+            });
+        })
+        .await
+        .unwrap();
+
+        let snap = store.snapshot().await;
+        assert_eq!(
+            snap.window,
+            Some(WindowLayout {
+                width: 1440,
+                height: 900,
+                maximized: false,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn sidebar_position_setter_persists_value() {
+        let store = StateStore::new_lazy(State::default());
+        let store_for_blocking = store.clone();
+        tokio::task::spawn_blocking(move || {
+            store_for_blocking.set_sidebar_position_blocking(280);
+        })
+        .await
+        .unwrap();
+        assert_eq!(store.snapshot().await.sidebar_position, Some(280));
+    }
+
+    /// pane split ratio setter — 정상 케이스, 트리 안에 없는 split id,
+    /// 같은 ratio (no-op)를 한 시나리오로 본다.
+    #[tokio::test]
+    async fn pane_split_ratio_setter_updates_only_matching_split() {
+        let store = StateStore::new_lazy(State::default());
+        let ws_id = store
+            .create_workspace(Some("demo".into()), std::path::PathBuf::from("/tmp/demo"))
+            .await;
+        let original = first_pane(&store.get_workspace(ws_id).await.unwrap());
+        // split_pane이 새 Split 노드를 만들고, 그 PaneId는
+        // workspace 트리 안의 첫 surface의 root_pane이다.
+        let _ = store
+            .split_pane(original, SplitDirection::Vertical)
+            .await
+            .unwrap();
+        let ws = store.get_workspace(ws_id).await.unwrap();
+        let split_id = match &ws.surfaces[0].root_pane {
+            Pane::Split { id, .. } => *id,
+            _ => panic!("expected split"),
+        };
+
+        let store_for_blocking = store.clone();
+        let updated = tokio::task::spawn_blocking(move || {
+            store_for_blocking.set_pane_split_ratio_blocking(split_id, 0.7)
+        })
+        .await
+        .unwrap();
+        assert!(updated);
+
+        let ws = store.get_workspace(ws_id).await.unwrap();
+        let Pane::Split { ratio, .. } = &ws.surfaces[0].root_pane else {
+            unreachable!()
+        };
+        assert!((ratio - 0.7).abs() < 0.001);
+
+        // 동일 ratio 다시 호출 → false.
+        let store_for_blocking = store.clone();
+        let again = tokio::task::spawn_blocking(move || {
+            store_for_blocking.set_pane_split_ratio_blocking(split_id, 0.7)
+        })
+        .await
+        .unwrap();
+        assert!(!again);
+
+        // 모르는 split id → false, 트리 변경 없음.
+        let store_for_blocking = store.clone();
+        let unknown = tokio::task::spawn_blocking(move || {
+            store_for_blocking.set_pane_split_ratio_blocking(PaneId::new(), 0.3)
+        })
+        .await
+        .unwrap();
+        assert!(!unknown);
     }
 }

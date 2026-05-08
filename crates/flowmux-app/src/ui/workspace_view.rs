@@ -36,6 +36,11 @@ pub struct PaneRegistry {
     surface_tab_labels: HashMap<SurfaceId, gtk::Label>,
     pane_workspace: HashMap<PaneId, WorkspaceId>,
     surface_workspace: HashMap<SurfaceId, WorkspaceId>,
+    /// Pane::Split 노드의 PaneId → 그 split을 표현하는 `gtk::Paned`
+    /// 위젯. 종료 시 paned.position()/너비/높이로부터 ratio를 계산해
+    /// store에 기록하고, 다음 실행 시 같은 ratio로 복원.
+    split_paneds: HashMap<PaneId, gtk::Paned>,
+    split_workspace: HashMap<PaneId, WorkspaceId>,
 }
 
 impl PaneRegistry {
@@ -129,6 +134,16 @@ impl PaneRegistry {
             self.pane_workspace.remove(&pane);
         }
 
+        let split_ids: Vec<PaneId> = self
+            .split_workspace
+            .iter()
+            .filter_map(|(split, owner)| (*owner == workspace).then_some(*split))
+            .collect();
+        for split in split_ids {
+            self.split_paneds.remove(&split);
+            self.split_workspace.remove(&split);
+        }
+
         let surfaces: Vec<SurfaceId> = self
             .surface_workspace
             .iter()
@@ -183,6 +198,36 @@ impl PaneRegistry {
                 container.append(w);
             }
         }
+    }
+
+    /// 등록된 모든 split paned의 현재 (split_id, ratio) 쌍을 돌려준다.
+    /// ratio는 paned.position() / 전체 길이로 계산. 아직 realize되지 않은
+    /// paned나 너비/높이가 0인 paned는 건너뛴다 — 의미 있는 ratio가 아니다.
+    pub fn split_ratios(&self) -> Vec<(PaneId, f32)> {
+        let mut out = Vec::new();
+        for (split_id, paned) in &self.split_paneds {
+            let total = match paned.orientation() {
+                gtk::Orientation::Horizontal => paned.width(),
+                _ => paned.height(),
+            };
+            if total <= 0 {
+                continue;
+            }
+            let pos = paned.position();
+            if pos <= 0 {
+                continue;
+            }
+            let ratio = (pos as f32) / (total as f32);
+            out.push((*split_id, ratio));
+        }
+        out
+    }
+
+    /// 한 split paned 위젯을 등록한다. 이미 같은 split_id가 있으면 위젯만
+    /// 갱신하고 workspace 매핑은 그대로 둔다.
+    pub fn register_split(&mut self, split_id: PaneId, workspace: WorkspaceId, paned: gtk::Paned) {
+        self.split_paneds.insert(split_id, paned);
+        self.split_workspace.insert(split_id, workspace);
     }
 
     pub fn activate_surface(&mut self, pane: PaneId, surface: SurfaceId) {
@@ -277,6 +322,7 @@ pub fn split_pane_incremental(
     workspace: WorkspaceId,
     target_pane: PaneId,
     new_pane_id: PaneId,
+    new_split_id: PaneId,
     direction: SplitDirection,
     ratio: f32,
     new_content: PaneContent,
@@ -357,6 +403,10 @@ pub fn split_pane_incremental(
         }
     });
 
+    registry
+        .borrow_mut()
+        .register_split(new_split_id, workspace, paned.clone());
+
     let paned_widget: gtk::Widget = paned.upcast();
 
     // 빈 슬롯에 새 Paned를 다시 끼워 넣는다.
@@ -418,11 +468,11 @@ fn build_pane(
             workspace, *id, content, argv, cwd, callbacks, registry, theme,
         ),
         Pane::Split {
+            id: split_id,
             direction,
             ratio,
             first,
             second,
-            ..
         } => {
             let orient = match direction {
                 SplitDirection::Horizontal => gtk::Orientation::Vertical,
@@ -440,7 +490,7 @@ fn build_pane(
                 registry.clone(),
                 theme.clone(),
             );
-            let right = build_pane(workspace, second, argv, cwd, callbacks, registry, theme);
+            let right = build_pane(workspace, second, argv, cwd, callbacks, registry.clone(), theme);
             paned.set_start_child(Some(&left));
             paned.set_end_child(Some(&right));
             paned.set_resize_start_child(true);
@@ -457,6 +507,9 @@ fn build_pane(
                     p.set_position((total as f32 * r) as i32);
                 }
             });
+            registry
+                .borrow_mut()
+                .register_split(*split_id, workspace, paned.clone());
             paned.upcast()
         }
     }

@@ -16,6 +16,15 @@ use std::path::{Path, PathBuf};
 
 pub const SCHEMA_VERSION: u32 = 1;
 
+/// 창 사이즈 + maximize 여부. 종료 시 저장하고 다음 실행에 복원.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WindowLayout {
+    pub width: i32,
+    pub height: i32,
+    #[serde(default)]
+    pub maximized: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct State {
     pub schema_version: u32,
@@ -26,6 +35,12 @@ pub struct State {
     /// Most-recently-active workspace, used to focus on launch.
     #[serde(default)]
     pub active_workspace: Option<flowmux_core::WorkspaceId>,
+    /// 마지막 종료 시점 윈도우 크기 / maximize 상태. 첫 실행에는 None.
+    #[serde(default)]
+    pub window: Option<WindowLayout>,
+    /// 사이드 패널과 콘텐츠 영역 사이 divider의 픽셀 위치. 첫 실행에는 None.
+    #[serde(default)]
+    pub sidebar_position: Option<i32>,
     pub last_saved: chrono::DateTime<chrono::Utc>,
 }
 
@@ -36,6 +51,8 @@ impl Default for State {
             workspaces: vec![],
             workspace_order: vec![],
             active_workspace: None,
+            window: None,
+            sidebar_position: None,
             last_saved: chrono::Utc::now(),
         }
     }
@@ -144,6 +161,51 @@ mod tests {
         assert_eq!(back.workspaces.len(), 1);
         assert_eq!(back.workspaces[0].name, "demo");
         assert_eq!(back.active_workspace, Some(id));
+    }
+
+    #[test]
+    fn window_and_sidebar_position_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut state = State::default();
+        state.window = Some(WindowLayout {
+            width: 1600,
+            height: 900,
+            maximized: true,
+        });
+        state.sidebar_position = Some(312);
+        save_to(&path, &state).unwrap();
+
+        let back = load_from(&path).unwrap();
+        assert_eq!(
+            back.window,
+            Some(WindowLayout {
+                width: 1600,
+                height: 900,
+                maximized: true,
+            })
+        );
+        assert_eq!(back.sidebar_position, Some(312));
+    }
+
+    #[test]
+    fn missing_layout_fields_load_as_none() {
+        // 이전 버전에서 저장된 state.json은 window / sidebar_position 필드가
+        // 없다. #[serde(default)] 덕분에 None으로 로드되어야 한다.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "schema_version": 1,
+                "workspaces": [],
+                "last_saved": "2026-01-01T00:00:00Z"
+            }"#,
+        )
+        .unwrap();
+        let state = load_from(&path).unwrap();
+        assert_eq!(state.window, None);
+        assert_eq!(state.sidebar_position, None);
     }
 
     #[test]

@@ -639,6 +639,62 @@ impl Pane {
         }
     }
 
+    /// `child`(leaf 또는 split)를 직접 자식으로 갖고 있는 Split 노드의
+    /// `PaneId`를 반환. 인접 split이 아니면 더 깊이 재귀해서 찾는다.
+    /// `child`가 트리의 루트이거나 트리 안에 없으면 `None`.
+    ///
+    /// incremental split이 끝난 직후 새 sibling을 통해 방금 만들어진
+    /// Split 노드의 PaneId를 GTK 측에서 조회할 때 쓴다.
+    pub fn parent_split_id(&self, child: PaneId) -> Option<PaneId> {
+        if let Pane::Split {
+            id, first, second, ..
+        } = self
+        {
+            let first_id = match first.as_ref() {
+                Pane::Leaf { id, .. } => *id,
+                Pane::Split { id, .. } => *id,
+            };
+            let second_id = match second.as_ref() {
+                Pane::Leaf { id, .. } => *id,
+                Pane::Split { id, .. } => *id,
+            };
+            if first_id == child || second_id == child {
+                return Some(*id);
+            }
+            return first
+                .parent_split_id(child)
+                .or_else(|| second.parent_split_id(child));
+        }
+        None
+    }
+
+    /// `target` 으로 식별되는 Split 노드의 ratio를 갱신. ratio가 0/1
+    /// 양 끝으로 가는 걸 막기 위해 [0.05, 0.95]로 클램프하고, 의미
+    /// 있는 변화가 있을 때만 `true` 반환 — 호출자가 dirty mark를
+    /// 건너뛸 수 있도록.
+    pub fn set_split_ratio(&mut self, target: PaneId, new_ratio: f32) -> bool {
+        let clamped = new_ratio.clamp(0.05, 0.95);
+        match self {
+            Pane::Split {
+                id,
+                ratio,
+                first,
+                second,
+                ..
+            } => {
+                if *id == target {
+                    if (*ratio - clamped).abs() < f32::EPSILON {
+                        return false;
+                    }
+                    *ratio = clamped;
+                    return true;
+                }
+                first.set_split_ratio(target, clamped) || second.set_split_ratio(target, clamped)
+            }
+            Pane::Leaf { .. } => false,
+        }
+    }
+
     /// `target` 으로 식별되는 leaf의 [`PaneContent`] 클론을 반환한다.
     /// 같은 트리 안에 매칭되는 leaf가 없거나 target가 split 노드면
     /// `None`. incremental split 경로가 새로 생긴 sibling pane의 초기
@@ -1245,6 +1301,163 @@ mod tests {
         };
         assert!(pane.find_surface(PaneId::new(), SurfaceId::new()).is_none());
         assert!(pane.find_surface(pane_id, SurfaceId::new()).is_none());
+    }
+
+    #[test]
+    fn parent_split_id_finds_immediate_owner() {
+        let l = PaneId::new();
+        let r = PaneId::new();
+        let split_id = PaneId::new();
+        let tree = Pane::Split {
+            id: split_id,
+            direction: SplitDirection::Vertical,
+            ratio: 0.5,
+            first: Box::new(Pane::Leaf {
+                id: l,
+                content: PaneContent::tabbed_terminal("L", None),
+            }),
+            second: Box::new(Pane::Leaf {
+                id: r,
+                content: PaneContent::tabbed_terminal("R", None),
+            }),
+        };
+        assert_eq!(tree.parent_split_id(l), Some(split_id));
+        assert_eq!(tree.parent_split_id(r), Some(split_id));
+        // Split 자신은 누구의 자식도 아니므로 None — 루트 시점.
+        assert_eq!(tree.parent_split_id(split_id), None);
+        assert_eq!(tree.parent_split_id(PaneId::new()), None);
+    }
+
+    #[test]
+    fn parent_split_id_walks_into_nested_tree() {
+        let outer = PaneId::new();
+        let inner = PaneId::new();
+        let l = PaneId::new();
+        let m = PaneId::new();
+        let r = PaneId::new();
+        let tree = Pane::Split {
+            id: outer,
+            direction: SplitDirection::Vertical,
+            ratio: 0.5,
+            first: Box::new(Pane::Leaf {
+                id: l,
+                content: PaneContent::tabbed_terminal("L", None),
+            }),
+            second: Box::new(Pane::Split {
+                id: inner,
+                direction: SplitDirection::Horizontal,
+                ratio: 0.5,
+                first: Box::new(Pane::Leaf {
+                    id: m,
+                    content: PaneContent::tabbed_terminal("M", None),
+                }),
+                second: Box::new(Pane::Leaf {
+                    id: r,
+                    content: PaneContent::tabbed_terminal("R", None),
+                }),
+            }),
+        };
+        assert_eq!(tree.parent_split_id(l), Some(outer));
+        assert_eq!(tree.parent_split_id(inner), Some(outer));
+        assert_eq!(tree.parent_split_id(m), Some(inner));
+        assert_eq!(tree.parent_split_id(r), Some(inner));
+    }
+
+    #[test]
+    fn set_split_ratio_updates_matching_node_only() {
+        let outer = PaneId::new();
+        let inner = PaneId::new();
+        let l = PaneId::new();
+        let m = PaneId::new();
+        let r = PaneId::new();
+        let mut tree = Pane::Split {
+            id: outer,
+            direction: SplitDirection::Vertical,
+            ratio: 0.5,
+            first: Box::new(Pane::Leaf {
+                id: l,
+                content: PaneContent::tabbed_terminal("L", None),
+            }),
+            second: Box::new(Pane::Split {
+                id: inner,
+                direction: SplitDirection::Horizontal,
+                ratio: 0.5,
+                first: Box::new(Pane::Leaf {
+                    id: m,
+                    content: PaneContent::tabbed_terminal("M", None),
+                }),
+                second: Box::new(Pane::Leaf {
+                    id: r,
+                    content: PaneContent::tabbed_terminal("R", None),
+                }),
+            }),
+        };
+        assert!(tree.set_split_ratio(outer, 0.7));
+        assert!(tree.set_split_ratio(inner, 0.3));
+        assert!(!tree.set_split_ratio(PaneId::new(), 0.5));
+        assert!(!tree.set_split_ratio(l, 0.5));
+
+        let Pane::Split {
+            ratio: outer_r,
+            second,
+            ..
+        } = &tree
+        else {
+            panic!("expected outer split")
+        };
+        assert!((outer_r - 0.7).abs() < 0.001);
+        let Pane::Split { ratio: inner_r, .. } = second.as_ref() else {
+            panic!("expected inner split")
+        };
+        assert!((inner_r - 0.3).abs() < 0.001);
+    }
+
+    #[test]
+    fn set_split_ratio_clamps_extreme_values() {
+        let split_id = PaneId::new();
+        let mut tree = Pane::Split {
+            id: split_id,
+            direction: SplitDirection::Vertical,
+            ratio: 0.5,
+            first: Box::new(Pane::Leaf {
+                id: PaneId::new(),
+                content: PaneContent::tabbed_terminal("L", None),
+            }),
+            second: Box::new(Pane::Leaf {
+                id: PaneId::new(),
+                content: PaneContent::tabbed_terminal("R", None),
+            }),
+        };
+        assert!(tree.set_split_ratio(split_id, 1.0));
+        let Pane::Split { ratio, .. } = &tree else {
+            unreachable!()
+        };
+        assert!((ratio - 0.95).abs() < 0.001);
+
+        assert!(tree.set_split_ratio(split_id, 0.0));
+        let Pane::Split { ratio, .. } = &tree else {
+            unreachable!()
+        };
+        assert!((ratio - 0.05).abs() < 0.001);
+    }
+
+    #[test]
+    fn set_split_ratio_returns_false_when_unchanged() {
+        let split_id = PaneId::new();
+        let mut tree = Pane::Split {
+            id: split_id,
+            direction: SplitDirection::Vertical,
+            ratio: 0.5,
+            first: Box::new(Pane::Leaf {
+                id: PaneId::new(),
+                content: PaneContent::tabbed_terminal("L", None),
+            }),
+            second: Box::new(Pane::Leaf {
+                id: PaneId::new(),
+                content: PaneContent::tabbed_terminal("R", None),
+            }),
+        };
+        assert!(!tree.set_split_ratio(split_id, 0.5));
     }
 
     #[test]

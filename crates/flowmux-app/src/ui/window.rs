@@ -30,6 +30,9 @@ pub struct WindowController {
     pub window: adw::ApplicationWindow,
     pub focused_pane: FocusedPane,
     sidebar: Sidebar,
+    /// 사이드 패널과 콘텐츠 영역을 가르는 가장 바깥쪽 `gtk::Paned`.
+    /// 종료 시 position을 읽어 store에 저장 → 다음 실행 복원.
+    sidebar_split: gtk::Paned,
     stack: gtk::Stack,
     surfaces: Rc<RefCell<HashMap<WorkspaceId, gtk::Widget>>>,
     pane_registry: Rc<RefCell<PaneRegistry>>,
@@ -115,6 +118,8 @@ impl WindowController {
         // adw::OverlaySplitView so people can hide / widen the tab
         // list to taste.
         sidebar.root.set_size_request(160, -1);
+        // 저장된 사이드바 위치가 있으면 복원, 없으면 기본 260.
+        let stored_sidebar_pos = store.sidebar_position_blocking().unwrap_or(260);
         let split = gtk::Paned::builder()
             .orientation(gtk::Orientation::Horizontal)
             .start_child(&sidebar.root)
@@ -123,20 +128,29 @@ impl WindowController {
             .resize_end_child(true)
             .shrink_start_child(false)
             .shrink_end_child(false)
-            .position(260)
+            .position(stored_sidebar_pos)
             .build();
 
         let toolbar = adw::ToolbarView::new();
         toolbar.add_top_bar(&adw::HeaderBar::new());
         toolbar.set_content(Some(&split));
 
+        // 저장된 윈도우 사이즈/maximize가 있으면 그대로, 없으면 기본 1280x800.
+        let stored_window = store.window_layout_blocking();
+        let (default_w, default_h, was_maximized) = match &stored_window {
+            Some(layout) => (layout.width.max(320), layout.height.max(240), layout.maximized),
+            None => (1280, 800, false),
+        };
         let window = adw::ApplicationWindow::builder()
             .application(app)
-            .default_width(1280)
-            .default_height(800)
+            .default_width(default_w)
+            .default_height(default_h)
             .title("flowmux")
             .build();
         window.set_content(Some(&toolbar));
+        if was_maximized {
+            window.maximize();
+        }
 
         register_workspace_actions(&window, &store, &bridge);
 
@@ -144,6 +158,7 @@ impl WindowController {
             window,
             focused_pane,
             sidebar,
+            sidebar_split: split,
             stack,
             surfaces,
             pane_registry,
@@ -243,6 +258,19 @@ impl WindowController {
             return;
         };
 
+        // 새로 만들어진 Split 노드의 PaneId — 새 sibling을 자식으로
+        // 갖고 있는 split이 곧 그 split이다. 종료 시 ratio 저장 / 다음
+        // 실행 복원이 PaneId 기준으로 동작하므로 GTK 위젯도 같은 id로
+        // 등록해야 한다.
+        let new_split_id = ws
+            .surfaces
+            .iter()
+            .find_map(|s| s.root_pane.parent_split_id(new_pane));
+        let Some(new_split_id) = new_split_id else {
+            self.rerender_workspace(&ws);
+            return;
+        };
+
         // 새 터미널의 fallback cwd — surface 컨텐츠 안 cwd가 우선이고
         // 이 값은 legacy / 빈 상태 fallback 용이라 워크스페이스 root_dir로
         // 충분.
@@ -253,6 +281,7 @@ impl WindowController {
             ws.id,
             target_pane,
             new_pane,
+            new_split_id,
             direction,
             0.5,
             new_content,
@@ -333,6 +362,7 @@ impl WindowController {
         let controller = self.clone();
         self.window.connect_close_request(move |_| {
             controller.flush_terminal_cwds_blocking();
+            controller.flush_layout_blocking();
             if let Err(e) = controller.store.save_now_blocking() {
                 tracing::warn!(error = %e, "state save on close failed");
             }
@@ -410,6 +440,35 @@ impl WindowController {
         let cwd_entries = self.pane_registry.borrow().terminal_cwds();
         for (pane, surface, cwd) in cwd_entries {
             let _ = self.store.update_surface_cwd_blocking(pane, surface, cwd);
+        }
+    }
+
+    /// 종료 직전에 호출. 윈도우 사이즈 / maximize / 사이드바 divider /
+    /// 모든 split paned ratio를 store에 기록한다. 다음 실행 때 같은
+    /// 레이아웃으로 복원되도록.
+    fn flush_layout_blocking(&self) {
+        // 윈도우 사이즈 — maximize 중일 때는 default_size가 maximize 직전
+        // 사이즈를 그대로 들고 있으므로 그대로 쓰면 다음 실행 때 펼쳐진
+        // 크기가 자연스럽다.
+        let (w, h) = self.window.default_size();
+        let layout = flowmux_state::WindowLayout {
+            width: w,
+            height: h,
+            maximized: self.window.is_maximized(),
+        };
+        self.store.set_window_layout_blocking(layout);
+
+        // 사이드 패널 divider 위치.
+        let pos = self.sidebar_split.position();
+        if pos > 0 {
+            self.store.set_sidebar_position_blocking(pos);
+        }
+
+        // 모든 pane split ratio.
+        let ratios = self.pane_registry.borrow().split_ratios();
+        for (split_id, ratio) in ratios {
+            self.store
+                .set_pane_split_ratio_blocking(split_id, ratio);
         }
     }
 
