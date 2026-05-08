@@ -22,3 +22,6 @@ Thumbs.db
 
 # Local upstream checkout (created by scripts/sync-upstream.sh)
 /.upstream-cmux/
+
+# Local-only working notes (not for commit)
+/docs/upstream-mapping/_local/
