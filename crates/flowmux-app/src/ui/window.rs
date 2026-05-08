@@ -435,18 +435,28 @@ impl WindowController {
         self.window.set_title(Some(&next));
     }
 
-    async fn update_terminal_cwd(&self, pane: PaneId, surface: SurfaceId, cwd: std::path::PathBuf) {
-        if self
-            .store
-            .update_surface_cwd(pane, surface, cwd)
-            .await
-            .is_some()
-        {
-            if let Some(title) = self.store.surface_title(pane, surface).await {
-                self.pane_registry
-                    .borrow()
-                    .set_surface_title(surface, &title);
-            }
+    async fn update_terminal_cwd(
+        &self,
+        pane: PaneId,
+        surface: SurfaceId,
+        cwd: std::path::PathBuf,
+    ) -> Option<WorkspaceId> {
+        let ws_id = self.store.update_surface_cwd(pane, surface, cwd).await?;
+        if let Some(title) = self.store.surface_title(pane, surface).await {
+            self.pane_registry
+                .borrow()
+                .set_surface_title(surface, &title);
+        }
+        Some(ws_id)
+    }
+
+    /// `ws_id`로 식별되는 워크스페이스의 사이드바 행을 최신 상태로 다시
+    /// 그린다. 자동 갱신(cwd 변화, OSC 타이틀, 활성 탭 전환 등)으로
+    /// `Workspace::name`이나 [`Workspace::display_title`]가 바뀐 직후에
+    /// 호출되어, 사이드 패널 라벨이 즉시 따라가도록 한다.
+    async fn refresh_sidebar_for(&self, ws_id: WorkspaceId) {
+        if let Some(ws) = self.store.get_workspace(ws_id).await {
+            self.sidebar.upsert(&ws);
         }
     }
 
@@ -745,11 +755,17 @@ impl WindowController {
                 }
             }
             GtkCommand::ActivateSurface { pane, surface } => {
-                self.store.set_active_surface(pane, surface).await;
+                let ws_id = self.store.set_active_surface(pane, surface).await;
                 self.pane_registry
                     .borrow_mut()
                     .activate_surface(pane, surface);
                 self.refresh_window_title().await;
+                if let Some(ws_id) = ws_id {
+                    // 탭 전환으로 single-pane 워크스페이스의 자동값(name)이
+                    // 새 활성 surface의 라벨로 따라갔을 수 있으므로 사이드바
+                    // 라벨도 다시 그린다 (자동 모드일 때만 표시 변화).
+                    self.refresh_sidebar_for(ws_id).await;
+                }
                 // 탭(클릭 / Shift+Tab 사이클 / IPC 등 모든 경로)으로
                 // surface가 활성화된 직후, 키보드 포커스를 새로 활성된
                 // 위젯(터미널의 vte::Terminal 또는 브라우저의 WebView)
@@ -878,8 +894,11 @@ impl WindowController {
                 let _ = ack.send(Ok(()));
             }
             GtkCommand::TerminalCwdChanged { pane, surface, cwd } => {
-                self.update_terminal_cwd(pane, surface, cwd).await;
+                let ws_id = self.update_terminal_cwd(pane, surface, cwd).await;
                 self.refresh_window_title().await;
+                if let Some(ws_id) = ws_id {
+                    self.refresh_sidebar_for(ws_id).await;
+                }
             }
             GtkCommand::BrowserUriChanged { pane, surface, url } => {
                 let _ = self.store.update_browser_url(pane, surface, url).await;
@@ -889,11 +908,10 @@ impl WindowController {
                 surface,
                 title,
             } => {
-                if self
+                if let Some(ws_id) = self
                     .store
                     .update_surface_auto_title(pane, surface, title)
                     .await
-                    .is_some()
                 {
                     if let Some(latest) = self.store.surface_title(pane, surface).await {
                         self.pane_registry
@@ -901,6 +919,7 @@ impl WindowController {
                             .set_surface_title(surface, &latest);
                     }
                     self.refresh_window_title().await;
+                    self.refresh_sidebar_for(ws_id).await;
                 }
             }
             GtkCommand::TerminalTitleChanged {
@@ -917,11 +936,10 @@ impl WindowController {
                 if title.trim().is_empty() {
                     return;
                 }
-                if self
+                if let Some(ws_id) = self
                     .store
                     .update_surface_auto_title(pane, surface, title)
                     .await
-                    .is_some()
                 {
                     if let Some(latest) = self.store.surface_title(pane, surface).await {
                         self.pane_registry
@@ -929,6 +947,7 @@ impl WindowController {
                             .set_surface_title(surface, &latest);
                     }
                     self.refresh_window_title().await;
+                    self.refresh_sidebar_for(ws_id).await;
                 }
             }
             GtkCommand::RefreshWindowTitle => {

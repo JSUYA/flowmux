@@ -430,9 +430,18 @@ impl StateStore {
         updated
     }
 
-    /// 외부 신호로부터 받은 자동 타이틀(브라우저 페이지 제목 등)을
-    /// surface에 반영한다. 사용자가 직접 rename 한 surface(title_locked)는
-    /// 건드리지 않는다.
+    /// 외부 신호로부터 받은 자동 타이틀(브라우저 페이지 제목 / 터미널
+    /// OSC 0/2 등)을 surface에 반영한다. 사용자가 직접 rename 한 surface
+    /// (title_locked)는 건드리지 않는다.
+    ///
+    /// cmux의 single-panel auto-sync 룰을 같은 호출 안에서 함께 적용한다 —
+    /// 워크스페이스에 split이 전혀 없고 (단일 Leaf), 갱신된 surface가 그
+    /// 레이프의 활성 탭이며, 사용자가 직접 지정한 `custom_title`이 없는
+    /// 경우, 워크스페이스의 자동 결정값(`name`)도 같은 타이틀로 따라간다.
+    /// 이렇게 해서 사이드 패널의 [`Workspace::display_title`]이 활성 탭의
+    /// OSC 타이틀(예: "Claude Code")을 자연스럽게 비춘다. split이 있거나
+    /// 사용자가 rename으로 custom_title을 잠가 둔 경우엔 어떤 자동 갱신도
+    /// 워크스페이스 라벨에 영향을 주지 않는다.
     pub async fn update_surface_auto_title(
         &self,
         pane: PaneId,
@@ -442,16 +451,21 @@ impl StateStore {
         let mut s = self.inner.lock().await;
         let mut updated = None;
         for ws in s.workspaces.iter_mut() {
+            let mut hit = false;
             for surface in ws.surfaces.iter_mut() {
                 if surface
                     .root_pane
                     .set_surface_title_auto(pane, surface_id, title.clone())
                 {
-                    updated = Some(ws.id);
+                    hit = true;
                     break;
                 }
             }
-            if updated.is_some() {
+            if hit {
+                if workspace_should_sync_to_surface(ws, surface_id) && ws.name != title {
+                    ws.name = title.clone();
+                }
+                updated = Some(ws.id);
                 break;
             }
         }
@@ -727,13 +741,30 @@ impl StateStore {
     ) -> Option<WorkspaceId> {
         let mut s = self.inner.lock().await;
         for ws in s.workspaces.iter_mut() {
+            let mut hit = false;
             for surface in ws.surfaces.iter_mut() {
                 if surface.root_pane.set_active_surface(pane, surface_id) {
-                    let ws_id = ws.id;
-                    drop(s);
-                    self.mark_dirty();
-                    return Some(ws_id);
+                    hit = true;
+                    break;
                 }
+            }
+            if hit {
+                // 활성 탭이 바뀌면 single-pane 워크스페이스의 자동
+                // 결정값(`name`)도 새 활성 탭 라벨로 따라간다 — cmux의
+                // single-panel auto-sync 룰을 탭 전환에도 그대로 적용.
+                if workspace_should_sync_to_surface(ws, surface_id) {
+                    if let Some(active_title) =
+                        ws.surfaces[0].root_pane.surface_title(pane, surface_id)
+                    {
+                        if ws.name != active_title {
+                            ws.name = active_title.to_string();
+                        }
+                    }
+                }
+                let ws_id = ws.id;
+                drop(s);
+                self.mark_dirty();
+                return Some(ws_id);
             }
         }
         None
@@ -792,6 +823,23 @@ impl StateStore {
     }
 }
 
+/// 워크스페이스에 split이 없고(단일 Leaf), `surface_id`가 그 leaf의
+/// 활성 탭이라면 `true`. 이 조건이 맞을 때만 surface auto-title이
+/// 워크스페이스의 자동 결정값(`name`)으로 함께 동기화된다 — cmux의
+/// "single panel only" 룰과 동일.
+fn workspace_should_sync_to_surface(ws: &Workspace, surface_id: SurfaceId) -> bool {
+    if ws.surfaces.len() != 1 {
+        return false;
+    }
+    let Pane::Leaf { content, .. } = &ws.surfaces[0].root_pane else {
+        return false;
+    };
+    let PaneContent::Tabs { active, .. } = content else {
+        return false;
+    };
+    *active == surface_id
+}
+
 fn update_surface_cwd_in_state(
     state: &mut State,
     pane: PaneId,
@@ -799,13 +847,30 @@ fn update_surface_cwd_in_state(
     cwd: std::path::PathBuf,
 ) -> Option<WorkspaceId> {
     for ws in state.workspaces.iter_mut() {
+        let mut hit = false;
         for surface in ws.surfaces.iter_mut() {
             if surface
                 .root_pane
                 .set_surface_cwd(pane, surface_id, cwd.clone())
             {
-                return Some(ws.id);
+                hit = true;
+                break;
             }
+        }
+        if hit {
+            // cwd 변경으로 surface 라벨이 새 폴더명으로 갱신됐을 수 있다.
+            // single-pane 워크스페이스라면 같은 폴더명이 워크스페이스의
+            // 자동 결정값(`name`)으로도 따라가도록 동기화한다 — surface의
+            // 새 title을 직접 읽어 와 사용한다.
+            if workspace_should_sync_to_surface(ws, surface_id) {
+                if let Some(active_title) = ws.surfaces[0].root_pane.surface_title(pane, surface_id)
+                {
+                    if ws.name != active_title {
+                        ws.name = active_title.to_string();
+                    }
+                }
+            }
+            return Some(ws.id);
         }
     }
     None
@@ -2560,5 +2625,188 @@ mod tests {
         .await
         .unwrap();
         assert!(!unknown);
+    }
+
+    /// 단일 pane 워크스페이스에서 활성 surface의 OSC 타이틀이 도착하면
+    /// `Workspace::name`도 같은 값으로 따라가야 한다 — cmux의 single-panel
+    /// auto-sync 룰. custom_title이 None이면 display_title도 자연스럽게
+    /// 새 타이틀을 비춘다.
+    #[tokio::test]
+    async fn update_surface_auto_title_syncs_workspace_name_for_single_pane() {
+        let store = StateStore::new_lazy(State::default());
+        let ws_id = store
+            .create_workspace(Some("auto".into()), std::path::PathBuf::from("/tmp/auto"))
+            .await;
+        let ws = store.get_workspace(ws_id).await.unwrap();
+        let pane = first_pane(&ws);
+        let active = first_pane_active_surface(&ws);
+
+        // 외부 프로그램이 OSC 0/2로 "Claude Code"를 보냄.
+        let updated = store
+            .update_surface_auto_title(pane, active, "Claude Code".into())
+            .await;
+        assert_eq!(updated, Some(ws_id));
+
+        let ws = store.get_workspace(ws_id).await.unwrap();
+        assert_eq!(ws.name, "Claude Code");
+        assert_eq!(ws.custom_title, None);
+        assert_eq!(ws.display_title(), "Claude Code");
+    }
+
+    /// custom_title이 설정돼 있어도 자동값(name)은 OSC를 따라가지만,
+    /// display_title은 custom이 우선이라 사용자가 잠근 라벨이 흔들리지
+    /// 않는다.
+    #[tokio::test]
+    async fn auto_title_sync_does_not_override_custom_title() {
+        let store = StateStore::new_lazy(State::default());
+        let ws_id = store
+            .create_workspace(Some("auto".into()), std::path::PathBuf::from("/tmp/auto"))
+            .await;
+        // 사용자가 rename → custom_title 잠금.
+        store.rename_workspace(ws_id, "MyName".into()).await;
+
+        let ws = store.get_workspace(ws_id).await.unwrap();
+        let pane = first_pane(&ws);
+        let active = first_pane_active_surface(&ws);
+
+        store
+            .update_surface_auto_title(pane, active, "Claude Code".into())
+            .await;
+
+        let ws = store.get_workspace(ws_id).await.unwrap();
+        assert_eq!(ws.name, "Claude Code"); // 자동값은 따라감
+        assert_eq!(ws.custom_title.as_deref(), Some("MyName"));
+        assert_eq!(ws.display_title(), "MyName"); // 표시는 custom 그대로
+    }
+
+    /// split이 있는 워크스페이스(multi-pane)에서는 surface OSC가 와도
+    /// 워크스페이스 name은 건드리지 않는다 — cmux의 single-panel-only 룰.
+    #[tokio::test]
+    async fn auto_title_sync_skips_when_workspace_is_split() {
+        let store = StateStore::new_lazy(State::default());
+        let ws_id = store
+            .create_workspace(Some("auto".into()), std::path::PathBuf::from("/tmp/auto"))
+            .await;
+        let original = first_pane(&store.get_workspace(ws_id).await.unwrap());
+        // split → 더 이상 single-pane 아님.
+        store
+            .split_pane(original, SplitDirection::Vertical)
+            .await
+            .unwrap();
+
+        let ws = store.get_workspace(ws_id).await.unwrap();
+        // 첫 번째 leaf의 active surface로 OSC를 보낸다.
+        let active_in_first = match &ws.surfaces[0].root_pane {
+            Pane::Split { first, .. } => match first.as_ref() {
+                Pane::Leaf { id, content } => match content {
+                    PaneContent::Tabs { active, .. } => (*id, *active),
+                    _ => panic!("expected tabs"),
+                },
+                _ => panic!("expected leaf"),
+            },
+            _ => panic!("expected split"),
+        };
+        let (pane, surface) = active_in_first;
+
+        store
+            .update_surface_auto_title(pane, surface, "Claude Code".into())
+            .await;
+
+        let ws = store.get_workspace(ws_id).await.unwrap();
+        // surface의 라벨은 갱신되지만 워크스페이스 name은 그대로.
+        assert_eq!(ws.name, "auto");
+    }
+
+    /// 비활성 탭의 OSC가 와도 single-pane 워크스페이스의 name은 건드리지
+    /// 않는다 — 활성 탭만 동기화 대상이다.
+    #[tokio::test]
+    async fn auto_title_sync_skips_inactive_surface() {
+        let store = StateStore::new_lazy(State::default());
+        let ws_id = store
+            .create_workspace(Some("auto".into()), std::path::PathBuf::from("/tmp/auto"))
+            .await;
+        let ws = store.get_workspace(ws_id).await.unwrap();
+        let pane = first_pane(&ws);
+        let first = first_pane_active_surface(&ws);
+        // 두 번째 탭을 추가하면 active가 두 번째로 옮겨가므로, 첫 번째로
+        // 다시 전환해 첫 번째를 active 상태로 둔다.
+        let second = store
+            .add_terminal_surface_to_pane(pane, Some(std::path::PathBuf::from("/tmp/auto")))
+            .await
+            .unwrap()
+            .1;
+        store.set_active_surface(pane, first).await;
+
+        // 두 번째(비활성)의 OSC가 와도 ws.name은 안 바뀐다.
+        store
+            .update_surface_auto_title(pane, second, "Background".into())
+            .await;
+        let ws = store.get_workspace(ws_id).await.unwrap();
+        assert_eq!(ws.name, "auto");
+    }
+
+    /// 탭 전환만으로도 single-pane 워크스페이스의 name이 새 활성 탭의
+    /// 라벨로 바뀐다. 사용자가 한 leaf 안에서 OSC가 다른 두 탭 사이를
+    /// 오갈 때 사이드바가 자연스럽게 따라간다.
+    #[tokio::test]
+    async fn set_active_surface_syncs_workspace_name_to_new_active() {
+        let store = StateStore::new_lazy(State::default());
+        let ws_id = store
+            .create_workspace(Some("auto".into()), std::path::PathBuf::from("/tmp/auto"))
+            .await;
+        let ws = store.get_workspace(ws_id).await.unwrap();
+        let pane = first_pane(&ws);
+        let first_surface = first_pane_active_surface(&ws);
+
+        // 첫 번째 탭 라벨을 명시적으로 다른 값으로 바꿔둔다 (rename으로
+        // surface title_locked 됨).
+        store
+            .rename_surface(pane, first_surface, "First Title".into())
+            .await
+            .unwrap();
+        // 그 사이 활성 surface OSC가 들어왔다고 가정 — single-pane이고
+        // 활성이 first_surface → ws.name 동기화.
+        store
+            .update_surface_auto_title(pane, first_surface, "ignored".into())
+            .await;
+        // title_locked라 surface 라벨은 그대로지만 workspace.name은
+        // 어떨까? set_surface_title_auto가 false 반환 → hit=false →
+        // ws.name 갱신 안 됨. 즉 잠긴 surface로는 sync 트리거 안 됨.
+        let ws = store.get_workspace(ws_id).await.unwrap();
+        assert_eq!(ws.name, "auto");
+
+        // 두 번째 탭을 추가하고 활성 전환 → name이 그 탭 라벨로 sync.
+        let (_, second) = store
+            .add_terminal_surface_to_pane(pane, Some(std::path::PathBuf::from("/tmp/auto/sub")))
+            .await
+            .unwrap();
+        store.set_active_surface(pane, second).await;
+
+        let ws = store.get_workspace(ws_id).await.unwrap();
+        // active 전환 시점의 두 번째 surface 라벨은 cwd 폴더명("sub")이라
+        // ws.name도 "sub"로 따라가야 한다.
+        assert_eq!(ws.name, "sub");
+    }
+
+    /// cwd 변경(폴더 이동)도 single-pane 워크스페이스의 name 동기화 대상.
+    /// 사용자가 cd로 폴더를 옮기면 사이드바 라벨도 새 폴더명으로 따라간다.
+    #[tokio::test]
+    async fn cwd_change_syncs_workspace_name_for_single_pane() {
+        let store = StateStore::new_lazy(State::default());
+        let ws_id = store
+            .create_workspace(Some("origin".into()), std::path::PathBuf::from("/tmp/origin"))
+            .await;
+        let ws = store.get_workspace(ws_id).await.unwrap();
+        let pane = first_pane(&ws);
+        let active = first_pane_active_surface(&ws);
+
+        // cwd가 다른 폴더로 바뀌면 surface 라벨이 새 폴더명으로 갱신되고
+        // ws.name도 같이 따라간다.
+        store
+            .update_surface_cwd(pane, active, std::path::PathBuf::from("/tmp/elsewhere"))
+            .await;
+        let ws = store.get_workspace(ws_id).await.unwrap();
+        assert_eq!(ws.name, "elsewhere");
+        assert_eq!(ws.display_title(), "elsewhere");
     }
 }
