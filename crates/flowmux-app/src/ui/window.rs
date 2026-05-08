@@ -267,6 +267,20 @@ impl WindowController {
             if let Err(e) = controller.store.save_now_blocking() {
                 tracing::warn!(error = %e, "state save on close failed");
             }
+            // 모든 WebView를 명시적으로 정리해 종료 race를 줄인다.
+            //   * stop_loading() — 진행 중인 fetch / navigation을 취소.
+            //     WebProcess의 internallyFailedLoadTimerFired ERROR가
+            //     보고되던 회귀가 여기서 발생: 종료 시점에 미완성 load
+            //     가 남아 있는 채로 NetworkSession이 정리되면 timer가
+            //     dangling이 된다.
+            //   * try_close() — page-level beforeunload + 내부 cleanup.
+            //     사이트가 onbeforeunload 다이얼로그를 띄우려 할 수도
+            //     있으나, 종료 close_request 응답에서는 GTK가 이미
+            //     dialog를 차단한다.
+            for browser in controller.pane_registry.borrow().browsers.values() {
+                browser.web_view.stop_loading();
+                browser.web_view.try_close();
+            }
             glib::Propagation::Proceed
         });
     }
@@ -533,8 +547,36 @@ impl WindowController {
                         self.activate_active_or_show_empty().await;
                         let _ = ack.send(Ok(()));
                     }
-                    Some(flowmux_daemon::CloseOutcome::PaneRemoved { workspace })
-                    | Some(flowmux_daemon::CloseOutcome::SurfaceRemoved { workspace }) => {
+                    Some(flowmux_daemon::CloseOutcome::SurfaceRemoved { workspace }) => {
+                        // 같은 pane의 한 surface만 사라진 케이스 — 전체
+                        // 워크스페이스를 재렌더링하면 다른 pane의 셸 / 탭
+                        // 브라우저 상태가 다 사라지는 회귀가 있어 incremental
+                        // detach만 한다. store가 active를 새 surface로 옮겨
+                        // 줬으면 그 값으로 activate_surface 호출해 stack /
+                        // 탭 강조를 동기화.
+                        self.pane_registry
+                            .borrow_mut()
+                            .detach_surface_widget(pane, surface);
+                        if let Some(ws) = self.store.get_workspace(workspace).await {
+                            if let Some(active) = ws
+                                .surfaces
+                                .iter()
+                                .find_map(|s| s.root_pane.active_surface_id(pane))
+                            {
+                                self.pane_registry
+                                    .borrow_mut()
+                                    .activate_surface(pane, active);
+                            }
+                        }
+                        self.refresh_window_title().await;
+                        let _ = ack.send(Ok(()));
+                    }
+                    Some(flowmux_daemon::CloseOutcome::PaneRemoved { workspace }) => {
+                        // pane이 통째로 사라진 케이스 — split 트리 변경이
+                        // 필요해 incremental은 복잡하다. 한 pane만 닫혔어도
+                        // 같은 워크스페이스 안의 다른 pane 위젯이 함께
+                        // 재생성될 수 있으나, 적어도 다른 워크스페이스에는
+                        // 영향 없다. (pane-detach incremental은 후속 작업)
                         if let Some(ws) = self.store.get_workspace(workspace).await {
                             self.rerender_workspace(&ws);
                         }

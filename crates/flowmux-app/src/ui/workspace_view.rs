@@ -206,6 +206,44 @@ impl PaneRegistry {
             }
         }
     }
+
+    /// 같은 pane의 한 surface 탭/패널만 위젯 트리에서 떼어낸다. 같은
+    /// 워크스페이스 안의 다른 pane은 전혀 건드리지 않으므로 그쪽 셸
+    /// 세션 / 탭브라우저 navigate 상태가 그대로 보존된다. close_surface
+    /// 가 `SurfaceRemoved`를 돌려준 케이스에서만 호출 가능 — pane이
+    /// 통째로 제거된 경우엔 split 트리 변경이 필요하므로 별도 경로로.
+    pub fn detach_surface_widget(&mut self, pane: PaneId, surface: SurfaceId) {
+        // 탭바에서 해당 탭 위젯 unparent.
+        if let Some(tabs) = self.surface_tabs.get_mut(&pane) {
+            if let Some(idx) = tabs.iter().position(|(id, _)| *id == surface) {
+                let (_, tab_widget) = tabs.remove(idx);
+                if let Some(parent) = tab_widget.parent() {
+                    if let Some(b) = parent.downcast_ref::<gtk::Box>() {
+                        b.remove(&tab_widget);
+                    } else {
+                        tab_widget.unparent();
+                    }
+                }
+            }
+        }
+        // 같은 pane의 stack에서 surface 패널 제거.
+        if let Some(stack) = self.surface_stacks.get(&pane) {
+            if let Some(child) = stack.child_by_name(&surface.to_string()) {
+                stack.remove(&child);
+            }
+        }
+        // PaneRegistry 내부 인덱스 정리.
+        self.terminals.remove(&surface);
+        self.browsers.remove(&surface);
+        self.surface_tab_labels.remove(&surface);
+        self.surface_workspace.remove(&surface);
+        if self.active_terminal_by_pane.get(&pane) == Some(&surface) {
+            self.active_terminal_by_pane.remove(&pane);
+        }
+        if self.active_browser_by_pane.get(&pane) == Some(&surface) {
+            self.active_browser_by_pane.remove(&pane);
+        }
+    }
 }
 
 pub fn build_surface(
