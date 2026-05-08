@@ -297,6 +297,20 @@ pub enum SplitDirection {
     Vertical,
 }
 
+/// How `flowmux browser open` placed its new browser surface relative to
+/// the requesting terminal pane. Mirrors cmux's `placement_strategy`
+/// response field (`reuse_right_sibling` / `split_right` / `external`).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PlacementStrategy {
+    /// A browser leaf already existed on the source pane's right side;
+    /// the new URL was added to that pane as another surface tab.
+    ReuseRightSibling,
+    /// No suitable existing browser leaf — the source pane was split
+    /// vertically and a fresh browser pane was put in the right sibling.
+    SplitRight,
+}
+
 impl Pane {
     /// Find the leaf with `target` and replace it with a new split that
     /// keeps the original leaf as `first` and adds a fresh sibling as
@@ -850,6 +864,112 @@ impl Pane {
                 },
             },
         }
+    }
+
+    /// True if the leaf with `target` carries any browser surface (legacy
+    /// `Browser` shape or a tab inside the new `Tabs` shape).
+    pub fn pane_has_browser_surface(&self, target: PaneId) -> bool {
+        match self {
+            Pane::Leaf { id, content } if *id == target => content_has_browser(content),
+            Pane::Leaf { .. } => false,
+            Pane::Split { first, second, .. } => {
+                first.pane_has_browser_surface(target)
+                    || second.pane_has_browser_surface(target)
+            }
+        }
+    }
+
+    /// cmux-equivalent of `Workspace.preferredBrowserTargetPane`. Walks
+    /// the split tree from the leaf with `from` upward, and for each
+    /// vertical-split ancestor where `from` is in the `first` (left)
+    /// subtree, searches the `second` (right) subtree for the nearest
+    /// leaf that already hosts a browser surface. Returns `None` when
+    /// no such right sibling exists, in which case callers should
+    /// `split_leaf(from, Vertical, ...)` to create one.
+    ///
+    /// Geometry-based ordering (`y-center` then `x` distance, as in
+    /// cmux) is approximated by tree distance: the closest ancestor
+    /// wins, and within an ancestor's right subtree the depth-first
+    /// leftmost browser leaf wins. For typical terminal-on-left /
+    /// browser-on-right layouts the result matches cmux's behavior.
+    pub fn find_right_sibling_browser_leaf(&self, from: PaneId) -> Option<PaneId> {
+        match find_right_sibling_browser_leaf_inner(self, from) {
+            RightSiblingSearch::Match(p) => Some(p),
+            _ => None,
+        }
+    }
+}
+
+fn content_has_browser(content: &PaneContent) -> bool {
+    match content {
+        PaneContent::Browser { .. } => true,
+        PaneContent::Tabs { surfaces, .. } => surfaces
+            .iter()
+            .any(|s| matches!(s.kind, SurfaceKind::Browser { .. })),
+        PaneContent::Terminal { .. } => false,
+    }
+}
+
+/// First leaf in DFS order that carries a browser surface, or `None`.
+/// Used inside the right-sibling search to scan a sibling subtree.
+fn first_browser_leaf_in(node: &Pane) -> Option<PaneId> {
+    match node {
+        Pane::Leaf { id, content } => {
+            if content_has_browser(content) {
+                Some(*id)
+            } else {
+                None
+            }
+        }
+        Pane::Split { first, second, .. } => {
+            first_browser_leaf_in(first).or_else(|| first_browser_leaf_in(second))
+        }
+    }
+}
+
+#[derive(Debug)]
+enum RightSiblingSearch {
+    /// `from` was located in this subtree, no browser-bearing right
+    /// sibling has been found yet — caller should keep walking up.
+    Found,
+    /// A right-sibling browser leaf has been picked; bubble up.
+    Match(PaneId),
+    /// `from` is not in this subtree at all.
+    NotInSubtree,
+}
+
+fn find_right_sibling_browser_leaf_inner(node: &Pane, from: PaneId) -> RightSiblingSearch {
+    match node {
+        Pane::Leaf { id, .. } => {
+            if *id == from {
+                RightSiblingSearch::Found
+            } else {
+                RightSiblingSearch::NotInSubtree
+            }
+        }
+        Pane::Split {
+            direction,
+            first,
+            second,
+            ..
+        } => match find_right_sibling_browser_leaf_inner(first, from) {
+            RightSiblingSearch::Match(p) => RightSiblingSearch::Match(p),
+            RightSiblingSearch::Found => {
+                // `from` lives in our `first` subtree. If we're a
+                // vertical split, our `second` subtree is the right
+                // side of `from` — search it for a browser leaf.
+                if matches!(direction, SplitDirection::Vertical) {
+                    if let Some(p) = first_browser_leaf_in(second) {
+                        return RightSiblingSearch::Match(p);
+                    }
+                }
+                RightSiblingSearch::Found
+            }
+            RightSiblingSearch::NotInSubtree => {
+                // Try the right subtree.
+                find_right_sibling_browser_leaf_inner(second, from)
+            }
+        },
     }
 }
 
@@ -2216,5 +2336,191 @@ mod tests {
         assert_eq!(ws.name, "old-project");
         assert_eq!(ws.custom_title, None);
         assert_eq!(ws.display_title(), "old-project");
+    }
+
+    // ----- right-sibling browser reuse (Phase 2) ----------------------
+
+    fn term_leaf(id: PaneId) -> Pane {
+        Pane::Leaf {
+            id,
+            content: PaneContent::tabbed_terminal("term", None),
+        }
+    }
+
+    fn browser_leaf(id: PaneId) -> Pane {
+        Pane::Leaf {
+            id,
+            content: PaneContent::tabbed_browser("Browser", "https://x".into()),
+        }
+    }
+
+    fn vsplit(first: Pane, second: Pane) -> Pane {
+        Pane::Split {
+            id: PaneId::new(),
+            direction: SplitDirection::Vertical,
+            ratio: 0.5,
+            first: Box::new(first),
+            second: Box::new(second),
+        }
+    }
+
+    fn hsplit(first: Pane, second: Pane) -> Pane {
+        Pane::Split {
+            id: PaneId::new(),
+            direction: SplitDirection::Horizontal,
+            ratio: 0.5,
+            first: Box::new(first),
+            second: Box::new(second),
+        }
+    }
+
+    #[test]
+    fn pane_has_browser_surface_detects_tabs_and_legacy_shapes() {
+        let leaf_id = PaneId::new();
+        let pane = Pane::Leaf {
+            id: leaf_id,
+            content: PaneContent::tabbed_browser("Browser", "https://x".into()),
+        };
+        assert!(pane.pane_has_browser_surface(leaf_id));
+
+        let term_id = PaneId::new();
+        let term = term_leaf(term_id);
+        assert!(!term.pane_has_browser_surface(term_id));
+
+        let legacy_id = PaneId::new();
+        let legacy = Pane::Leaf {
+            id: legacy_id,
+            content: PaneContent::Browser {
+                url: "https://x".into(),
+            },
+        };
+        assert!(legacy.pane_has_browser_surface(legacy_id));
+    }
+
+    #[test]
+    fn right_sibling_returns_none_when_no_split_exists() {
+        let term_id = PaneId::new();
+        let pane = term_leaf(term_id);
+        assert!(pane.find_right_sibling_browser_leaf(term_id).is_none());
+    }
+
+    #[test]
+    fn right_sibling_finds_browser_directly_to_the_right() {
+        let term_id = PaneId::new();
+        let browser_id = PaneId::new();
+        let pane = vsplit(term_leaf(term_id), browser_leaf(browser_id));
+        assert_eq!(
+            pane.find_right_sibling_browser_leaf(term_id),
+            Some(browser_id),
+            "vertical split with browser on right should reuse"
+        );
+    }
+
+    #[test]
+    fn right_sibling_skips_horizontal_split_below() {
+        let term_id = PaneId::new();
+        let browser_id = PaneId::new();
+        let pane = hsplit(term_leaf(term_id), browser_leaf(browser_id));
+        assert!(
+            pane.find_right_sibling_browser_leaf(term_id).is_none(),
+            "horizontal split is up/down, not right — must not reuse"
+        );
+    }
+
+    #[test]
+    fn right_sibling_does_not_reuse_when_caller_is_on_the_right() {
+        // Browser is on the LEFT of the caller — reuse must not pick it.
+        let term_id = PaneId::new();
+        let browser_id = PaneId::new();
+        let pane = vsplit(browser_leaf(browser_id), term_leaf(term_id));
+        assert!(
+            pane.find_right_sibling_browser_leaf(term_id).is_none(),
+            "right-sibling search must not pick a left sibling"
+        );
+    }
+
+    #[test]
+    fn right_sibling_picks_nearest_ancestor_first() {
+        // Tree:
+        //
+        //         vsplit
+        //        /      \
+        //   vsplit    browser_far  (far right)
+        //   /     \
+        // term  browser_near       (immediate right)
+        //
+        // We must pick browser_near, not browser_far — closest ancestor wins.
+        let term_id = PaneId::new();
+        let near_id = PaneId::new();
+        let far_id = PaneId::new();
+        let pane = vsplit(
+            vsplit(term_leaf(term_id), browser_leaf(near_id)),
+            browser_leaf(far_id),
+        );
+        assert_eq!(
+            pane.find_right_sibling_browser_leaf(term_id),
+            Some(near_id)
+        );
+    }
+
+    #[test]
+    fn right_sibling_falls_through_to_outer_ancestor_when_immediate_right_is_terminal() {
+        // Tree:
+        //
+        //          vsplit
+        //         /      \
+        //     vsplit    browser_far
+        //     /     \
+        //  term   term_neighbor
+        //
+        // Immediate right (term_neighbor) is not a browser → walk up to
+        // outer vsplit → second is browser_far → that's the result.
+        let term_id = PaneId::new();
+        let neighbor_id = PaneId::new();
+        let far_id = PaneId::new();
+        let pane = vsplit(
+            vsplit(term_leaf(term_id), term_leaf(neighbor_id)),
+            browser_leaf(far_id),
+        );
+        assert_eq!(
+            pane.find_right_sibling_browser_leaf(term_id),
+            Some(far_id)
+        );
+    }
+
+    #[test]
+    fn right_sibling_returns_first_browser_in_complex_subtree() {
+        // Right subtree is itself split — pick the leftmost (DFS-first)
+        // browser leaf inside it, which is the visually "closer" one.
+        let term_id = PaneId::new();
+        let browser_a = PaneId::new();
+        let browser_b = PaneId::new();
+        let pane = vsplit(
+            term_leaf(term_id),
+            hsplit(browser_leaf(browser_a), browser_leaf(browser_b)),
+        );
+        assert_eq!(
+            pane.find_right_sibling_browser_leaf(term_id),
+            Some(browser_a)
+        );
+    }
+
+    #[test]
+    fn right_sibling_returns_none_when_all_right_subtrees_are_terminals() {
+        let term_id = PaneId::new();
+        let other = PaneId::new();
+        let pane = vsplit(term_leaf(term_id), term_leaf(other));
+        assert!(pane.find_right_sibling_browser_leaf(term_id).is_none());
+    }
+
+    #[test]
+    fn placement_strategy_serializes_as_snake_case() {
+        let json = serde_json::to_string(&PlacementStrategy::ReuseRightSibling).unwrap();
+        assert_eq!(json, r#""reuse_right_sibling""#);
+        let json = serde_json::to_string(&PlacementStrategy::SplitRight).unwrap();
+        assert_eq!(json, r#""split_right""#);
+        // Round-trip both variants.
+        let back: PlacementStrategy = serde_json::from_str(r#""reuse_right_sibling""#).unwrap();
+        assert_eq!(back, PlacementStrategy::ReuseRightSibling);
     }
 }

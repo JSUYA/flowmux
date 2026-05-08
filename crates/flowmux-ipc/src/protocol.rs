@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-use flowmux_core::{NotificationLevel, PaneId, SplitDirection, SurfaceId, WorkspaceId};
+use flowmux_core::{
+    NotificationLevel, PaneId, PlacementStrategy, SplitDirection, SurfaceId, WorkspaceId,
+};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -181,7 +183,14 @@ pub enum Response {
     BrowserResult { value: String },
     BrowserOk,
     BrowserBoolResult { value: bool },
-    BrowserPaneOpened { pane: PaneId },
+    /// Reply to `BrowserOpen`. `placement_strategy` mirrors cmux's
+    /// response field so agents can tell whether their URL was added
+    /// as a tab to an existing right-sibling browser pane or whether
+    /// the daemon created a fresh split for it.
+    BrowserPaneOpened {
+        pane: PaneId,
+        placement_strategy: PlacementStrategy,
+    },
     CookiesImported { count: usize },
     Error(RpcError),
 }
@@ -333,10 +342,35 @@ mod tests {
     #[test]
     fn browser_pane_opened_response_serializes() {
         let pane = PaneId::new();
-        let r = Response::BrowserPaneOpened { pane };
+        let r = Response::BrowserPaneOpened {
+            pane,
+            placement_strategy: PlacementStrategy::SplitRight,
+        };
         let s = serde_json::to_string(&r).unwrap();
         let back: Response = serde_json::from_str(&s).unwrap();
-        assert!(matches!(back, Response::BrowserPaneOpened { pane: p } if p == pane));
+        assert!(matches!(
+            back,
+            Response::BrowserPaneOpened {
+                pane: p,
+                placement_strategy: PlacementStrategy::SplitRight,
+            } if p == pane
+        ));
+    }
+
+    #[test]
+    fn browser_pane_opened_carries_placement_strategy_on_wire() {
+        let pane = PaneId::new();
+        let s = serde_json::to_string(&Response::BrowserPaneOpened {
+            pane,
+            placement_strategy: PlacementStrategy::ReuseRightSibling,
+        })
+        .unwrap();
+        // Wire shape: snake_case strategy, alongside pane uuid.
+        assert!(
+            s.contains(r#""placement_strategy":"reuse_right_sibling""#),
+            "wire should expose snake_case strategy: {s}"
+        );
+        assert!(s.contains(&pane.to_string()));
     }
 
     #[test]

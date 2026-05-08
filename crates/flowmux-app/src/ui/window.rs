@@ -3,7 +3,9 @@
 //! stack and exposes a [`WindowController`] that routes [`GtkCommand`]
 //! values from the bridge to widget operations.
 
-use crate::bridge::{Bridge, BrowserActionResult, BrowserOp, FocusDir, GtkCommand, WsNav};
+use crate::bridge::{
+    Bridge, BrowserActionResult, BrowserOp, BrowserOpenOutcome, FocusDir, GtkCommand, WsNav,
+};
 use crate::keybindings::FocusedPane;
 use crate::notifications::{NotificationEntry, NotificationLog};
 use crate::theme::ResolvedTheme;
@@ -14,7 +16,7 @@ use crate::ui::workspace_view::{
     PaneRegistry,
 };
 use adw::prelude::*;
-use flowmux_core::{PaneId, SplitDirection, SurfaceId, Workspace, WorkspaceId};
+use flowmux_core::{PaneId, PlacementStrategy, SplitDirection, SurfaceId, Workspace, WorkspaceId};
 use flowmux_daemon::StateStore;
 use gtk::glib;
 use std::cell::{Cell, RefCell};
@@ -1219,6 +1221,43 @@ impl WindowController {
                     let _ = ack.send(Err("no target pane focused".into()));
                     return;
                 };
+
+                // cmux preferredBrowserTargetPane policy: if the source
+                // pane already has a browser leaf on its right side,
+                // append a new tab there instead of creating a new
+                // split. Falls back to a fresh vertical split when no
+                // such right sibling exists.
+                if let Some(reuse_target) =
+                    self.store.find_right_sibling_browser_leaf(target).await
+                {
+                    match self
+                        .store
+                        .add_browser_surface_to_pane(reuse_target, url.clone())
+                        .await
+                    {
+                        Some((workspace, _surface)) => {
+                            if let Some(ws) = self.store.get_workspace(workspace).await {
+                                self.rerender_workspace(&ws);
+                            }
+                            let _ = ack.send(Ok(BrowserOpenOutcome {
+                                pane: reuse_target,
+                                placement_strategy:
+                                    PlacementStrategy::ReuseRightSibling,
+                            }));
+                            return;
+                        }
+                        None => {
+                            // The right-sibling pane disappeared between
+                            // discovery and update — fall through to the
+                            // split path so the agent still gets a pane.
+                            tracing::debug!(
+                                %reuse_target,
+                                "right-sibling browser leaf disappeared; falling back to split"
+                            );
+                        }
+                    }
+                }
+
                 match self
                     .store
                     .split_pane_with_browser(target, direction, url)
@@ -1231,7 +1270,10 @@ impl WindowController {
                         if let Some(ws) = self.store.get_workspace(workspace).await {
                             self.rerender_workspace(&ws);
                         }
-                        let _ = ack.send(Ok(new_pane));
+                        let _ = ack.send(Ok(BrowserOpenOutcome {
+                            pane: new_pane,
+                            placement_strategy: PlacementStrategy::SplitRight,
+                        }));
                     }
                 }
             }

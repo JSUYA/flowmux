@@ -8,9 +8,20 @@
 //! them via `glib::MainContext::spawn_local` and dispatches into the
 //! window controller.
 
-use flowmux_core::{NotificationLevel, PaneId, SplitDirection, SurfaceId, WorkspaceId};
+use flowmux_core::{
+    NotificationLevel, PaneId, PlacementStrategy, SplitDirection, SurfaceId, WorkspaceId,
+};
 use std::path::PathBuf;
 use tokio::sync::oneshot;
+
+/// Result of a successful `BrowserOpenSplit`. The dispatcher reports
+/// both the new browser pane's id and how it was placed (cmux's
+/// `placement_strategy`) so the IPC layer can forward both to the agent.
+#[derive(Debug, Clone, Copy)]
+pub struct BrowserOpenOutcome {
+    pub pane: PaneId,
+    pub placement_strategy: PlacementStrategy,
+}
 
 /// Cmux-style scriptable browser controller verb. One variant per
 /// public method on `flowmux_browser::BrowserController`. Bundled into
@@ -255,15 +266,18 @@ pub enum GtkCommand {
         op: BrowserOp,
         ack: oneshot::Sender<Result<BrowserActionResult, String>>,
     },
-    /// Split a target pane and put a brand-new browser pane in the
-    /// new sibling. `target_pane = None` means "use the focused
-    /// pane"; the dispatcher resolves it on the GTK side. Returns
-    /// the new browser pane's id.
+    /// Open a browser surface "next to" the source pane. cmux's policy
+    /// (mirrored here): if the source pane already has a browser leaf
+    /// to its right, append a new tab to that pane instead of creating
+    /// a new split. Otherwise split the source pane in the requested
+    /// direction (typically Vertical = right) and put a fresh browser
+    /// pane in the new sibling. `target_pane = None` means "use the
+    /// focused pane"; the dispatcher resolves it on the GTK side.
     BrowserOpenSplit {
         target_pane: Option<PaneId>,
         url: String,
         direction: SplitDirection,
-        ack: oneshot::Sender<Result<PaneId, String>>,
+        ack: oneshot::Sender<Result<BrowserOpenOutcome, String>>,
     },
     /// Inject a list of cookies into the WebKit cookie manager.
     InjectCookies {

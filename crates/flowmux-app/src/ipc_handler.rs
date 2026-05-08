@@ -126,7 +126,10 @@ impl Handler for GuiHandler {
                         })
                         .await;
                     match rx.await {
-                        Ok(Ok(pane)) => Response::BrowserPaneOpened { pane },
+                        Ok(Ok(outcome)) => Response::BrowserPaneOpened {
+                            pane: outcome.pane,
+                            placement_strategy: outcome.placement_strategy,
+                        },
                         Ok(Err(e)) => Response::Error(RpcError::Internal(e)),
                         Err(_) => Response::Error(RpcError::Internal("bridge closed".into())),
                     }

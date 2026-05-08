@@ -719,6 +719,24 @@ impl StateStore {
         Some(surface_id)
     }
 
+    /// Walk every workspace's pane tree looking for a browser leaf
+    /// that lives on the right side of `from`. cmux's
+    /// `preferredBrowserTargetPane` policy: a `flowmux browser open`
+    /// invoked from a terminal pane reuses an existing right-sibling
+    /// browser pane instead of creating a new split. Returns the
+    /// browser leaf's `PaneId` when found.
+    pub async fn find_right_sibling_browser_leaf(&self, from: PaneId) -> Option<PaneId> {
+        let s = self.inner.lock().await;
+        for ws in s.workspaces.iter() {
+            for surface in ws.surfaces.iter() {
+                if let Some(p) = surface.root_pane.find_right_sibling_browser_leaf(from) {
+                    return Some(p);
+                }
+            }
+        }
+        None
+    }
+
     pub async fn add_browser_surface_to_pane(
         &self,
         pane: PaneId,
@@ -2903,5 +2921,112 @@ mod tests {
         let ws = store.get_workspace(ws_id).await.unwrap();
         assert_eq!(ws.name, "elsewhere");
         assert_eq!(ws.display_title(), "elsewhere");
+    }
+
+    // ----- right-sibling browser reuse (Phase 2) ----------------------
+
+    /// Workspace with a single terminal pane → no right sibling exists,
+    /// so `find_right_sibling_browser_leaf` must return `None`. This is
+    /// the "first call" leg of the reuse-vs-split decision.
+    #[tokio::test]
+    async fn right_sibling_lookup_returns_none_for_unsplit_workspace() {
+        let store = StateStore::new_lazy(State::default());
+        let ws_id = store
+            .create_workspace(Some("one".into()), std::path::PathBuf::from("/tmp/one"))
+            .await;
+        let term = first_pane(&store.get_workspace(ws_id).await.unwrap());
+
+        assert_eq!(store.find_right_sibling_browser_leaf(term).await, None);
+    }
+
+    /// After `flowmux browser open` once, the workspace looks like
+    /// `term | browser`. The next call from the *terminal* pane must
+    /// detect the browser as its right sibling.
+    #[tokio::test]
+    async fn right_sibling_lookup_finds_existing_browser_pane() {
+        let store = StateStore::new_lazy(State::default());
+        let ws_id = store
+            .create_workspace(Some("one".into()), std::path::PathBuf::from("/tmp/one"))
+            .await;
+        let term = first_pane(&store.get_workspace(ws_id).await.unwrap());
+
+        let (_, browser_pane) = store
+            .split_pane_with_browser(term, SplitDirection::Vertical, "https://x".into())
+            .await
+            .expect("split should succeed");
+
+        let found = store.find_right_sibling_browser_leaf(term).await;
+        assert_eq!(found, Some(browser_pane));
+    }
+
+    /// Two-call scenario: first call hits split path, second call hits
+    /// reuse path and adds a tab to the existing browser leaf.
+    #[tokio::test]
+    async fn two_browser_open_calls_first_splits_then_reuses_right_sibling() {
+        let store = StateStore::new_lazy(State::default());
+        let ws_id = store
+            .create_workspace(Some("one".into()), std::path::PathBuf::from("/tmp/one"))
+            .await;
+        let term = first_pane(&store.get_workspace(ws_id).await.unwrap());
+
+        // First call: no right sibling → split path.
+        assert!(store.find_right_sibling_browser_leaf(term).await.is_none());
+        let (_, browser_pane) = store
+            .split_pane_with_browser(term, SplitDirection::Vertical, "https://a".into())
+            .await
+            .unwrap();
+
+        // Second call: reuse path. Daemon would call
+        // add_browser_surface_to_pane on the right-sibling leaf.
+        let reuse = store
+            .find_right_sibling_browser_leaf(term)
+            .await
+            .expect("right sibling must exist after first split");
+        assert_eq!(reuse, browser_pane);
+
+        let added = store
+            .add_browser_surface_to_pane(reuse, "https://b".into())
+            .await;
+        assert!(added.is_some(), "second URL should append a tab");
+
+        // The browser pane now hosts two surface tabs (initial + new).
+        let ws = store.get_workspace(ws_id).await.unwrap();
+        let leaf_tabs = ws.surfaces[0]
+            .root_pane
+            .find_right_sibling_browser_leaf(term)
+            .and_then(|p| {
+                fn count_tabs(node: &Pane, target: PaneId) -> Option<usize> {
+                    match node {
+                        Pane::Leaf { id, content } if *id == target => match content {
+                            PaneContent::Tabs { surfaces, .. } => Some(surfaces.len()),
+                            _ => None,
+                        },
+                        Pane::Leaf { .. } => None,
+                        Pane::Split { first, second, .. } => {
+                            count_tabs(first, target).or_else(|| count_tabs(second, target))
+                        }
+                    }
+                }
+                count_tabs(&ws.surfaces[0].root_pane, p)
+            });
+        assert_eq!(leaf_tabs, Some(2));
+    }
+
+    /// Horizontal split (split_down) does not place the browser to the
+    /// right — so even though we created one, reuse must not pick it.
+    #[tokio::test]
+    async fn right_sibling_lookup_ignores_horizontally_split_browser() {
+        let store = StateStore::new_lazy(State::default());
+        let ws_id = store
+            .create_workspace(Some("one".into()), std::path::PathBuf::from("/tmp/one"))
+            .await;
+        let term = first_pane(&store.get_workspace(ws_id).await.unwrap());
+
+        let _ = store
+            .split_pane_with_browser(term, SplitDirection::Horizontal, "https://x".into())
+            .await
+            .unwrap();
+
+        assert!(store.find_right_sibling_browser_leaf(term).await.is_none());
     }
 }
