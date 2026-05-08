@@ -246,6 +246,139 @@ impl PaneRegistry {
     }
 }
 
+/// [`split_pane_incremental`]의 결과.
+pub enum IncrementalSplitOutcome {
+    /// 성공. target이 이미 다른 split 안에 있었으므로 stack 자식은 그대로다.
+    /// 호출자가 surfaces map을 갱신할 필요 없음.
+    SucceededNested,
+    /// 성공. target이 워크스페이스 stack의 직속 자식이었으므로 stack
+    /// 자식이 새 `gtk::Paned`로 교체됐다. 호출자는 surfaces map을
+    /// 이 새 widget으로 갱신해야 다음 rerender / drop_workspace 경로가
+    /// 정상 동작한다.
+    SucceededRoot { new_root: gtk::Widget },
+    /// incremental 경로 실패. 호출자가 안전하게 rerender_workspace로 폴백
+    /// 해야 한다 (registry에 target이 없거나 부모 컨테이너가 비정상).
+    Failed,
+}
+
+/// 같은 워크스페이스 안의 다른 pane을 그대로 유지한 채 `target_pane`만
+/// 새 split으로 감싼다. flowmux-core::Pane::split_leaf와 동일한 의미 —
+/// `target_pane`의 PaneId는 보존되어 새 split의 첫 번째 자식으로 남고,
+/// `new_pane_id`로 식별되는 새 sibling이 두 번째 자식으로 추가된다.
+///
+/// 이 incremental 경로의 핵심은 target pane의 `gtk::Frame`을 그대로
+/// 재사용한다는 것 — 다른 pane의 VTE 셸 세션과 탭브라우저 navigate
+/// 상태가 rerender 없이 살아남는다. 호출 전에 daemon쪽 split_pane이
+/// 이미 실행돼 트리 모양은 결정돼 있어야 한다.
+///
+/// `parent_stack_name`은 target frame이 stack 직속 자식일 때 같은
+/// 이름으로 다시 add_named 하기 위해 호출자가 알려준다 (워크스페이스 id).
+pub fn split_pane_incremental(
+    workspace: WorkspaceId,
+    target_pane: PaneId,
+    new_pane_id: PaneId,
+    direction: SplitDirection,
+    ratio: f32,
+    new_content: PaneContent,
+    new_cwd: Option<std::path::PathBuf>,
+    parent_stack_name: &str,
+    callbacks: &PaneCallbacks,
+    registry: Rc<RefCell<PaneRegistry>>,
+    theme: Arc<ResolvedTheme>,
+) -> IncrementalSplitOutcome {
+    let Some(target_frame) = registry.borrow().pane_frame(target_pane) else {
+        return IncrementalSplitOutcome::Failed;
+    };
+    let Some(parent) = target_frame.parent() else {
+        return IncrementalSplitOutcome::Failed;
+    };
+
+    // 부모 컨테이너 종류 + target가 어느 슬롯에 있었는지를 detach 전에 기록.
+    enum Slot {
+        PanedStart(gtk::Paned),
+        PanedEnd(gtk::Paned),
+        Stack(gtk::Stack),
+    }
+    let slot = if let Some(p) = parent.downcast_ref::<gtk::Paned>() {
+        if p.start_child().as_ref() == Some(&target_frame) {
+            Slot::PanedStart(p.clone())
+        } else if p.end_child().as_ref() == Some(&target_frame) {
+            Slot::PanedEnd(p.clone())
+        } else {
+            return IncrementalSplitOutcome::Failed;
+        }
+    } else if let Some(s) = parent.downcast_ref::<gtk::Stack>() {
+        Slot::Stack(s.clone())
+    } else {
+        return IncrementalSplitOutcome::Failed;
+    };
+
+    // target frame을 부모에서 떼어 낸다. set_*_child(None)은 이전 자식의
+    // unparent를 자동으로 처리한다.
+    match &slot {
+        Slot::PanedStart(p) => p.set_start_child(gtk::Widget::NONE),
+        Slot::PanedEnd(p) => p.set_end_child(gtk::Widget::NONE),
+        Slot::Stack(s) => s.remove(&target_frame),
+    }
+
+    // 새 sibling pane 위젯 빌드. cwd / argv는 새 sibling용 — target은
+    // 이미 build 끝나 있는 frame을 그대로 쓰므로 영향 없다.
+    let new_sibling = build_leaf_pane(
+        workspace,
+        new_pane_id,
+        &new_content,
+        Vec::new(),
+        new_cwd,
+        callbacks,
+        registry.clone(),
+        theme.clone(),
+    );
+
+    let orient = match direction {
+        SplitDirection::Horizontal => gtk::Orientation::Vertical,
+        SplitDirection::Vertical => gtk::Orientation::Horizontal,
+    };
+    let paned = gtk::Paned::new(orient);
+    paned.set_hexpand(true);
+    paned.set_vexpand(true);
+    paned.set_start_child(Some(&target_frame));
+    paned.set_end_child(Some(&new_sibling));
+    paned.set_resize_start_child(true);
+    paned.set_resize_end_child(true);
+    paned.set_shrink_start_child(false);
+    paned.set_shrink_end_child(false);
+    paned.connect_realize(move |p| {
+        let total = match p.orientation() {
+            gtk::Orientation::Horizontal => p.width(),
+            _ => p.height(),
+        };
+        if total > 0 {
+            p.set_position((total as f32 * ratio) as i32);
+        }
+    });
+
+    let paned_widget: gtk::Widget = paned.upcast();
+
+    // 빈 슬롯에 새 Paned를 다시 끼워 넣는다.
+    match slot {
+        Slot::PanedStart(p) => {
+            p.set_start_child(Some(&paned_widget));
+            IncrementalSplitOutcome::SucceededNested
+        }
+        Slot::PanedEnd(p) => {
+            p.set_end_child(Some(&paned_widget));
+            IncrementalSplitOutcome::SucceededNested
+        }
+        Slot::Stack(s) => {
+            s.add_named(&paned_widget, Some(parent_stack_name));
+            s.set_visible_child_name(parent_stack_name);
+            IncrementalSplitOutcome::SucceededRoot {
+                new_root: paned_widget,
+            }
+        }
+    }
+}
+
 pub fn build_surface(
     workspace: WorkspaceId,
     surface: &Surface,

@@ -639,6 +639,20 @@ impl Pane {
         }
     }
 
+    /// `target` 으로 식별되는 leaf의 [`PaneContent`] 클론을 반환한다.
+    /// 같은 트리 안에 매칭되는 leaf가 없거나 target가 split 노드면
+    /// `None`. incremental split 경로가 새로 생긴 sibling pane의 초기
+    /// 컨텐츠(터미널 / 탭브라우저)를 GTK 위젯으로 빌드할 때 쓴다.
+    pub fn find_leaf_content(&self, target: PaneId) -> Option<PaneContent> {
+        match self {
+            Pane::Leaf { id, content } if *id == target => Some(content.clone()),
+            Pane::Leaf { .. } => None,
+            Pane::Split { first, second, .. } => first
+                .find_leaf_content(target)
+                .or_else(|| second.find_leaf_content(target)),
+        }
+    }
+
     pub fn first_leaf_id(&self) -> Option<PaneId> {
         match self {
             Pane::Leaf { id, .. } => Some(*id),
@@ -1231,6 +1245,141 @@ mod tests {
         };
         assert!(pane.find_surface(PaneId::new(), SurfaceId::new()).is_none());
         assert!(pane.find_surface(pane_id, SurfaceId::new()).is_none());
+    }
+
+    #[test]
+    fn find_leaf_content_returns_clone_for_matching_leaf() {
+        let leaf = PaneId::new();
+        let tree = Pane::Leaf {
+            id: leaf,
+            content: PaneContent::tabbed_terminal("solo", None),
+        };
+        let content = tree.find_leaf_content(leaf).expect("leaf must match");
+        let PaneContent::Tabs { surfaces, .. } = content else {
+            panic!("expected tabbed content")
+        };
+        assert_eq!(surfaces[0].title, "solo");
+
+        // 다른 PaneId는 None.
+        assert!(tree.find_leaf_content(PaneId::new()).is_none());
+    }
+
+    #[test]
+    fn find_leaf_content_walks_split_tree() {
+        let l = PaneId::new();
+        let r = PaneId::new();
+        let tree = Pane::Split {
+            id: PaneId::new(),
+            direction: SplitDirection::Vertical,
+            ratio: 0.5,
+            first: Box::new(Pane::Leaf {
+                id: l,
+                content: PaneContent::tabbed_terminal("left", None),
+            }),
+            second: Box::new(Pane::Leaf {
+                id: r,
+                content: PaneContent::tabbed_browser("Docs", "https://r.test".into()),
+            }),
+        };
+        let PaneContent::Tabs { surfaces, .. } = tree.find_leaf_content(l).unwrap() else {
+            panic!("expected tabs")
+        };
+        assert_eq!(surfaces[0].title, "left");
+        let PaneContent::Tabs { surfaces, .. } = tree.find_leaf_content(r).unwrap() else {
+            panic!("expected tabs")
+        };
+        assert_eq!(surfaces[0].title, "Docs");
+
+        // split 자체의 PaneId는 leaf가 아니므로 None.
+        let split_id = match &tree {
+            Pane::Split { id, .. } => *id,
+            _ => unreachable!(),
+        };
+        assert!(tree.find_leaf_content(split_id).is_none());
+    }
+
+    #[test]
+    fn split_leaf_preserves_target_pane_id_and_creates_fresh_sibling() {
+        // incremental split의 핵심 가정 — 분할 후 target의 PaneId는
+        // 그대로 유지되고, sibling은 새 PaneId를 받는다. 이 시나리오가
+        // 깨지면 GTK 측 PaneRegistry::pane_frame(target_pane) 조회가
+        // 빗나가 다른 pane을 통째로 rebuild하는 회귀가 발생한다.
+        let target = PaneId::new();
+        let mut tree = Pane::Leaf {
+            id: target,
+            content: PaneContent::tabbed_terminal("orig", Some("/tmp/orig".into())),
+        };
+        let new_pane = tree
+            .split_leaf(
+                target,
+                SplitDirection::Vertical,
+                0.5,
+                PaneContent::tabbed_terminal("fresh", Some("/tmp/orig".into())),
+            )
+            .expect("split must succeed");
+        assert_ne!(new_pane, target);
+
+        let mut leaves = Vec::new();
+        tree.for_each_leaf(|id| leaves.push(id));
+        assert!(leaves.contains(&target));
+        assert!(leaves.contains(&new_pane));
+
+        // target의 컨텐츠는 원래대로, new_pane는 fresh 컨텐츠.
+        let target_content = tree.find_leaf_content(target).unwrap();
+        let new_content = tree.find_leaf_content(new_pane).unwrap();
+        let (PaneContent::Tabs { surfaces: t_surfs, .. }, PaneContent::Tabs { surfaces: n_surfs, .. }) =
+            (&target_content, &new_content)
+        else {
+            panic!("expected tabbed content for both")
+        };
+        assert_eq!(t_surfs[0].title, "orig");
+        assert_eq!(n_surfs[0].title, "fresh");
+    }
+
+    #[test]
+    fn split_leaf_inside_existing_split_preserves_neighbor_pane_id() {
+        // 이미 split 트리 안에 있는 한 pane을 다시 split해도, 같은 split
+        // 안의 다른 sibling pane의 PaneId는 그대로다. GTK 측에서 sibling의
+        // gtk::Frame을 그대로 이어 갈 수 있음을 보장.
+        let l = PaneId::new();
+        let r = PaneId::new();
+        let mut tree = Pane::Split {
+            id: PaneId::new(),
+            direction: SplitDirection::Vertical,
+            ratio: 0.5,
+            first: Box::new(Pane::Leaf {
+                id: l,
+                content: PaneContent::tabbed_terminal("L", None),
+            }),
+            second: Box::new(Pane::Leaf {
+                id: r,
+                content: PaneContent::tabbed_terminal("R", None),
+            }),
+        };
+
+        let new_under_l = tree
+            .split_leaf(
+                l,
+                SplitDirection::Horizontal,
+                0.5,
+                PaneContent::tabbed_terminal("L2", None),
+            )
+            .unwrap();
+
+        // r 은 그대로 leaf 로 유지.
+        assert!(matches!(
+            tree.find_leaf_content(r),
+            Some(PaneContent::Tabs { .. })
+        ));
+        // l 도 새 split의 일원으로 살아남고, l 자체의 PaneId는 보존.
+        assert!(matches!(
+            tree.find_leaf_content(l),
+            Some(PaneContent::Tabs { .. })
+        ));
+        // 새 sibling 등록.
+        assert!(tree.find_leaf_content(new_under_l).is_some());
+        assert_ne!(new_under_l, l);
+        assert_ne!(new_under_l, r);
     }
 
     #[test]

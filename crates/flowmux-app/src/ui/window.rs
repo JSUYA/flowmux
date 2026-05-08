@@ -9,9 +9,12 @@ use crate::notifications::{NotificationEntry, NotificationLog};
 use crate::theme::ResolvedTheme;
 use crate::ui::sidebar::Sidebar;
 use crate::ui::terminal_pane::PaneCallbacks;
-use crate::ui::workspace_view::{attach_surface_to_pane, build_surface, PaneRegistry};
+use crate::ui::workspace_view::{
+    attach_surface_to_pane, build_surface, split_pane_incremental, IncrementalSplitOutcome,
+    PaneRegistry,
+};
 use adw::prelude::*;
-use flowmux_core::{PaneId, SurfaceId, Workspace, WorkspaceId};
+use flowmux_core::{PaneId, SplitDirection, SurfaceId, Workspace, WorkspaceId};
 use flowmux_daemon::StateStore;
 use gtk::glib;
 use std::cell::{Cell, RefCell};
@@ -210,6 +213,72 @@ impl WindowController {
         drop(surfaces);
         self.sidebar.select_workspace(ws.id);
         self.focus_first_leaf_of(ws);
+    }
+
+    /// daemon 측 split이 끝난 뒤 GTK 위젯 트리를 갱신한다. 가능한 경우엔
+    /// `target_pane`의 `gtk::Frame`을 그대로 새 `gtk::Paned`에 끼워 넣어
+    /// 같은 워크스페이스의 다른 pane(셸 세션 / 탭브라우저 navigate 상태)을
+    /// 초기화하지 않는다. 실패하면(예: registry에 target이 없거나 부모
+    /// 컨테이너가 비정상) 안전하게 [`Self::rerender_workspace`]로 폴백.
+    async fn apply_split_incremental_or_rerender(
+        &self,
+        ws_id: WorkspaceId,
+        target_pane: PaneId,
+        new_pane: PaneId,
+        direction: SplitDirection,
+    ) {
+        let Some(ws) = self.store.get_workspace(ws_id).await else {
+            return;
+        };
+
+        // 새 sibling pane의 PaneContent / cwd를 post-split 트리에서 찾는다.
+        // daemon::StateStore::split_pane이 0.5 ratio + tabbed_terminal로
+        // 만들었으므로 같은 값을 GTK 측에서도 사용한다.
+        let new_content = ws
+            .surfaces
+            .iter()
+            .find_map(|s| s.root_pane.find_leaf_content(new_pane));
+        let Some(new_content) = new_content else {
+            self.rerender_workspace(&ws);
+            return;
+        };
+
+        // 새 터미널의 fallback cwd — surface 컨텐츠 안 cwd가 우선이고
+        // 이 값은 legacy / 빈 상태 fallback 용이라 워크스페이스 root_dir로
+        // 충분.
+        let new_cwd = Some(ws.root_dir.clone());
+
+        let stack_name = ws.id.to_string();
+        let outcome = split_pane_incremental(
+            ws.id,
+            target_pane,
+            new_pane,
+            direction,
+            0.5,
+            new_content,
+            new_cwd,
+            &stack_name,
+            &self.callbacks,
+            self.pane_registry.clone(),
+            self.theme.clone(),
+        );
+
+        match outcome {
+            IncrementalSplitOutcome::SucceededRoot { new_root } => {
+                // target가 stack의 root였다면 surfaces 추적 맵을 새 위젯으로
+                // 갱신해 다음 drop_workspace / rerender 시 옛 widget을
+                // 헛되이 stack에서 찾지 않도록 한다.
+                self.surfaces.borrow_mut().insert(ws.id, new_root);
+                self.refresh_window_title().await;
+            }
+            IncrementalSplitOutcome::SucceededNested => {
+                self.refresh_window_title().await;
+            }
+            IncrementalSplitOutcome::Failed => {
+                self.rerender_workspace(&ws);
+                self.refresh_window_title().await;
+            }
+        }
     }
 
     /// 새로 만들어진 surface를 가능한 한 incremental하게 붙인다.
@@ -460,11 +529,12 @@ impl WindowController {
             } => {
                 match self.store.split_pane(pane, direction).await {
                     Some((ws_id, new_pane)) => {
-                        if let Some(ws) = self.store.get_workspace(ws_id).await {
-                            self.rerender_workspace(&ws);
-                        }
-                        // Focus the freshly-created pane, not whichever
-                        // first-leaf rerender_workspace defaulted to.
+                        self.apply_split_incremental_or_rerender(
+                            ws_id, pane, new_pane, direction,
+                        )
+                        .await;
+                        // 새 pane으로 키보드 포커스를 옮긴다 — incremental
+                        // 경로든 rerender 폴백 경로든 동일하게 동작.
                         let registry = self.pane_registry.clone();
                         glib::idle_add_local_once(move || {
                             let r = registry.borrow();
