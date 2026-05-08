@@ -2186,6 +2186,128 @@ mod tests {
         );
     }
 
+    /// 회귀 테스트: bash가 매 프롬프트마다 OSC 7(cwd) + OSC 0/2(`user@host:
+    /// /path` 형태의 윈도우 타이틀)를 같이 쏘는데, OSC 0/2가 cwd 기반
+    /// 폴더 라벨을 덮어쓰면 안 된다. 대신 cwd 변경에 맞춰 탭 이름과
+    /// 윈도우 타이틀이 함께 폴더 이름으로 업데이트되어야 한다. vi/codex
+    /// 같은 외부 프로그램 타이틀은 그대로 들어와야 한다.
+    #[gtk::test]
+    async fn terminal_cwd_change_updates_tab_and_window_title_and_ignores_shell_ps1_echo() {
+        adw::init().expect("libadwaita should initialize in GTK test");
+        // $HOME 영향을 피하기 위해 /tmp 아래의 절대 경로 사용 — 셸 PS1
+        // 매칭은 절대경로 형태("user@host: /tmp/...")만으로 충분히 검증.
+        let initial = std::env::temp_dir().join("flowmux-ui-cwd-flow-one");
+        let next = std::env::temp_dir().join("flowmux-ui-cwd-flow-two");
+        std::fs::create_dir_all(&initial).unwrap();
+        std::fs::create_dir_all(&next).unwrap();
+
+        let store = StateStore::new_lazy(State::default());
+        let ws_id = store
+            .create_workspace(Some("ui".into()), initial.clone())
+            .await;
+        let ws = store.get_workspace(ws_id).await.unwrap();
+        let pane = ws.surfaces[0].root_pane.first_leaf_id().unwrap();
+        let surface = ws.surfaces[0].root_pane.active_surface_id(pane).unwrap();
+
+        let (bridge, _rx) = Bridge::new();
+        let app = adw::Application::builder()
+            .application_id("com.flowmux.App.UiTest.CwdFlow")
+            .build();
+        app.register(None::<&gtk::gio::Cancellable>).unwrap();
+        let controller = WindowController::new(
+            &app,
+            store.clone(),
+            Arc::new(ResolvedTheme::load()),
+            bridge,
+            gtk::CssProvider::new(),
+        );
+        controller.render_workspace(&ws);
+        controller.focused_pane.set(Some(pane));
+        controller.dispatch(GtkCommand::RefreshWindowTitle).await;
+
+        // 초기: 탭/윈도우 타이틀이 워크스페이스 root 폴더 이름.
+        let initial_title = store.surface_title(pane, surface).await.unwrap();
+        assert_eq!(initial_title, "flowmux-ui-cwd-fl...");
+        assert_eq!(
+            controller.window.title().map(|s| s.to_string()),
+            Some(format!("flowmux - {initial_title}"))
+        );
+
+        // 사용자가 `cd flowmux-ui-cwd-flow-two` — bash의 경우 PROMPT_COMMAND
+        // (OSC 7 cwd)가 PS1 확장(OSC 0/2 윈도우 타이틀)보다 먼저 emit
+        // 된다. 같은 순서로 dispatch.
+        controller
+            .dispatch(GtkCommand::TerminalCwdChanged {
+                pane,
+                surface,
+                cwd: next.clone(),
+            })
+            .await;
+        assert_eq!(
+            store.surface_title(pane, surface).await.as_deref(),
+            Some("flowmux-ui-cwd-fl..."),
+            "OSC 7으로 cwd가 바뀌면 탭 라벨이 새 폴더 이름으로 업데이트",
+        );
+        assert_eq!(
+            controller.window.title().map(|s| s.to_string()),
+            Some("flowmux - flowmux-ui-cwd-fl...".into()),
+            "윈도우 타이틀도 새 탭 이름을 따라간다",
+        );
+
+        // bash가 같은 프롬프트에 이어서 OSC 0/2(`user@host: /new/path`)도
+        // emit — cwd가 이미 갱신된 상태이므로 PS1 echo로 인식되어
+        // 무시되어야 한다. 회귀의 핵심: 이 단계에서 라벨이 PS1 형태로
+        // 굳어 버리면 안 된다.
+        controller
+            .dispatch(GtkCommand::TerminalTitleChanged {
+                pane,
+                surface,
+                title: format!("junsu@host: {}", next.display()),
+            })
+            .await;
+        assert_eq!(
+            store.surface_title(pane, surface).await.as_deref(),
+            Some("flowmux-ui-cwd-fl..."),
+            "셸 PS1 OSC 0/2는 cwd 기반 라벨을 덮어쓰지 않아야 한다",
+        );
+        assert_eq!(
+            controller.window.title().map(|s| s.to_string()),
+            Some("flowmux - flowmux-ui-cwd-fl...".into()),
+        );
+
+        // cd 없이 bash가 또 한 번 프롬프트를 그릴 때(공백 엔터 등) 같은
+        // PS1 echo가 다시 와도 (debian_chroot prefix + 공백 없는 변형)
+        // 동일하게 무시되어야 한다.
+        controller
+            .dispatch(GtkCommand::TerminalTitleChanged {
+                pane,
+                surface,
+                title: format!("(jammy)junsu@host:{}", next.display()),
+            })
+            .await;
+        assert_eq!(
+            store.surface_title(pane, surface).await.as_deref(),
+            Some("flowmux-ui-cwd-fl...")
+        );
+
+        // 외부 프로그램 타이틀(vi 등)은 정상 반영 — 탭/윈도우 모두 갱신.
+        controller
+            .dispatch(GtkCommand::TerminalTitleChanged {
+                pane,
+                surface,
+                title: "vim src/main.rs".into(),
+            })
+            .await;
+        assert_eq!(
+            store.surface_title(pane, surface).await.as_deref(),
+            Some("vim src/main.rs"),
+        );
+        assert_eq!(
+            controller.window.title().map(|s| s.to_string()).as_deref(),
+            Some("flowmux - vim src/main.rs"),
+        );
+    }
+
     /// 새 탭이 추가(NewSurface)되면 그 탭이 active로 잡혀 윈도우
     /// 제목도 새 탭 이름으로 갱신된다. 기존 활성 탭 이름을 유지하면
     /// 안 된다.

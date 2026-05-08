@@ -24,6 +24,59 @@ pub fn terminal_tab_title_for_cwd(cwd: Option<&Path>) -> String {
     truncate_tab_title(&folder)
 }
 
+/// 터미널 surface가 받은 OSC 0/2 타이틀이 셸의 PS1 윈도우 타이틀
+/// (cwd를 그대로 에코한 형태)인지 판별한다. true이면 호출자는
+/// 그 타이틀을 무시하고 cwd 기반 폴더 이름을 유지해야 한다.
+///
+/// 인식 패턴:
+/// * 타이틀이 cwd 절대경로 자체와 동일 (`/tmp/foo`)
+/// * 타이틀이 `<prefix>:[ ]<cwd>` 로 끝나고 prefix 끝이 `:`
+///   (bash 기본 `\u@\h: \w`, debian_chroot 변형 등) — `<cwd>`는
+///   절대경로 또는 `$HOME`을 `~`로 축약한 형태.
+///
+/// vi/codex/claude/tmux 같이 셸 외부 프로그램이 보내는 타이틀
+/// (`vi src/main.rs`, `tmux: 0:bash*` 등)은 위 구조에 맞지 않으므로
+/// 통과한다. 호출자는 PS1 에코는 버리고 프로그램 타이틀은 받는다.
+pub fn title_is_shell_cwd_echo(title: &str, cwd: &Path, home: Option<&Path>) -> bool {
+    let title = title.trim_end();
+    if title.is_empty() {
+        return false;
+    }
+    let cwd_str = cwd.to_string_lossy();
+    if matches_trailing_path_after_colon(title, cwd_str.as_ref()) {
+        return true;
+    }
+    if let Some(home) = home {
+        let home_str = home.to_string_lossy();
+        if let Some(rel) = cwd_str.strip_prefix(home_str.as_ref()) {
+            let tilde_form = if rel.is_empty() {
+                "~".to_string()
+            } else if rel.starts_with('/') {
+                format!("~{}", rel)
+            } else {
+                return false;
+            };
+            if matches_trailing_path_after_colon(title, &tilde_form) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn matches_trailing_path_after_colon(title: &str, path: &str) -> bool {
+    if title == path {
+        return true;
+    }
+    let Some(prefix) = title.strip_suffix(path) else {
+        return false;
+    };
+    // bash 기본 PS1은 `:`와 path 사이에 공백을 넣는다(`\u@\h: \w`).
+    // 옛날식이나 zsh 일부 테마는 공백 없이 붙이기도 한다(`\u@\h:\w`).
+    let prefix = prefix.trim_end_matches(' ');
+    prefix.ends_with(':')
+}
+
 fn truncate_tab_title(title: &str) -> String {
     if title.chars().count() <= TERMINAL_TAB_TITLE_MAX_CHARS {
         return title.to_string();
@@ -486,6 +539,21 @@ impl Pane {
                     {
                         if surface.title_locked || surface.title == new_title {
                             return false;
+                        }
+                        // OSC 0/2가 사실은 셸 PS1의 cwd 에코이면 버린다.
+                        // 그렇지 않으면 cwd가 바뀔 때마다 셸이 매 프롬프트
+                        // 마다 보내는 `user@host: /path` 가 폴더 이름을
+                        // 덮어써 탭 라벨/윈도우 타이틀이 PS1 형태로 굳어
+                        // 버린다. flowmux-app 측 터미널 cwd-notify가 별도로
+                        // `terminal_tab_title_for_cwd`를 통해 폴더 이름을
+                        // 다시 set_surface_cwd로 반영하므로 그 흐름만 살리면
+                        // 충분하다. vi/codex/claude/tmux 같은 외부 프로그램
+                        // 타이틀은 PS1 패턴에 안 걸리므로 그대로 통과.
+                        if let SurfaceKind::Terminal { cwd: Some(cwd), .. } = &surface.kind {
+                            let home = std::env::var_os("HOME").map(PathBuf::from);
+                            if title_is_shell_cwd_echo(&new_title, cwd, home.as_deref()) {
+                                return false;
+                            }
                         }
                         surface.title = new_title;
                         return true;
@@ -1290,6 +1358,141 @@ mod tests {
         assert!(pane.rename_surface(pane_id, surface_id, "MyName".into()));
         assert!(!pane.set_surface_title_auto(pane_id, surface_id, "Other Page".into()));
         assert_eq!(pane.surface_title(pane_id, surface_id), Some("MyName"));
+    }
+
+    #[test]
+    fn title_is_shell_cwd_echo_recognizes_bash_default_ps1() {
+        let cwd = Path::new("/tmp/flowmux-shell-echo-test");
+        // bash 기본 `\u@\h: \w` (절대경로 표시).
+        assert!(title_is_shell_cwd_echo(
+            "junsu@host: /tmp/flowmux-shell-echo-test",
+            cwd,
+            None,
+        ));
+        // 공백 없이 `\u@\h:\w`.
+        assert!(title_is_shell_cwd_echo(
+            "junsu@host:/tmp/flowmux-shell-echo-test",
+            cwd,
+            None,
+        ));
+        // debian_chroot prefix 변형.
+        assert!(title_is_shell_cwd_echo(
+            "(jammy)junsu@host: /tmp/flowmux-shell-echo-test",
+            cwd,
+            None,
+        ));
+        // 호스트만 prefix.
+        assert!(title_is_shell_cwd_echo(
+            "host: /tmp/flowmux-shell-echo-test",
+            cwd,
+            None,
+        ));
+        // path 자체만 (PROMPT가 path만 emit하는 테마).
+        assert!(title_is_shell_cwd_echo(
+            "/tmp/flowmux-shell-echo-test",
+            cwd,
+            None,
+        ));
+    }
+
+    #[test]
+    fn title_is_shell_cwd_echo_recognizes_tilde_form() {
+        let home = Path::new("/home/junsu");
+        let cwd = Path::new("/home/junsu/dev/os");
+        // bash `\w`는 $HOME을 `~`로 축약.
+        assert!(title_is_shell_cwd_echo(
+            "junsu@host: ~/dev/os",
+            cwd,
+            Some(home),
+        ));
+        // home 자체 (cwd == $HOME → ~).
+        assert!(title_is_shell_cwd_echo(
+            "junsu@host: ~",
+            Path::new("/home/junsu"),
+            Some(home),
+        ));
+        // home 정보가 없으면 tilde 매칭은 안 되지만 절대경로 매칭은 여전.
+        assert!(!title_is_shell_cwd_echo(
+            "junsu@host: ~/dev/os",
+            cwd,
+            None,
+        ));
+    }
+
+    #[test]
+    fn title_is_shell_cwd_echo_passes_program_titles() {
+        let cwd = Path::new("/tmp/flowmux-shell-echo-test");
+        // vi/codex/claude/tmux 같은 외부 프로그램이 보내는 타이틀은 PS1
+        // 패턴(`prefix:[ ]<cwd>`)에 안 걸린다.
+        assert!(!title_is_shell_cwd_echo(
+            "vim src/main.rs",
+            cwd,
+            None,
+        ));
+        assert!(!title_is_shell_cwd_echo(
+            "tmux: 0:bash*",
+            cwd,
+            None,
+        ));
+        assert!(!title_is_shell_cwd_echo(
+            "claude — Anthropic",
+            cwd,
+            None,
+        ));
+        // cwd 안의 파일을 여는 vim도 통과해야 한다 — prefix가 `:`로
+        // 끝나지 않으므로.
+        assert!(!title_is_shell_cwd_echo(
+            "vim /tmp/flowmux-shell-echo-test",
+            cwd,
+            None,
+        ));
+        // 빈 / whitespace는 echo로 오인하지 않는다 (호출자가 이미 검사
+        // 하지만 helper 단독 호출 안전성 유지).
+        assert!(!title_is_shell_cwd_echo("", cwd, None));
+        assert!(!title_is_shell_cwd_echo("   ", cwd, None));
+    }
+
+    #[test]
+    fn set_surface_title_auto_drops_shell_ps1_echo_on_terminal() {
+        // 회귀 방지: 셸이 매 프롬프트마다 OSC 0/2로 보내는 PS1
+        // 형태(`user@host: /path`)가 cwd 기반 폴더 이름 라벨을
+        // 덮어 쓰지 않도록 한다. flowmux-app 측 cwd-notify 플로우가
+        // set_surface_cwd로 폴더 이름을 별도로 반영하므로 OSC 0/2
+        // 에코는 무시하는 것이 정답.
+        let pane_id = PaneId::new();
+        let cwd = PathBuf::from("/tmp/flowmux-shell-echo-test");
+        let mut pane = Pane::Leaf {
+            id: pane_id,
+            content: PaneContent::tabbed_terminal("flowmux-shell-...", Some(cwd.clone())),
+        };
+        let surface_id = pane.active_surface_id(pane_id).unwrap();
+
+        // PS1 echo 들 — 모두 무시되어야 한다 (반환 false, title 그대로).
+        assert!(!pane.set_surface_title_auto(
+            pane_id,
+            surface_id,
+            "junsu@host: /tmp/flowmux-shell-echo-test".into(),
+        ));
+        assert!(!pane.set_surface_title_auto(
+            pane_id,
+            surface_id,
+            "(jammy)junsu@host:/tmp/flowmux-shell-echo-test".into(),
+        ));
+        assert_eq!(
+            pane.surface_title(pane_id, surface_id),
+            Some("flowmux-shell-...")
+        );
+
+        // 외부 프로그램 타이틀(vi 등)은 정상적으로 반영된다.
+        assert!(pane.set_surface_title_auto(
+            pane_id,
+            surface_id,
+            "vim src/main.rs".into(),
+        ));
+        assert_eq!(
+            pane.surface_title(pane_id, surface_id),
+            Some("vim src/main.rs")
+        );
     }
 
     #[test]
