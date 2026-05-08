@@ -522,13 +522,22 @@ mod tests {
         ));
     }
 
+    /// Serialize every test that reads/writes FLOWMUX_PANE_ID — cargo
+    /// runs tests in parallel within a single binary, and they share
+    /// process-global env. Without this lock, a `set_var` from one
+    /// test races a `remove_var` from another and one of them sees
+    /// the wrong value.
+    fn flowmux_pane_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        use std::sync::{Mutex, OnceLock};
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+    }
+
     #[test]
     fn browser_open_no_flags_defaults_to_right_split() {
-        // Ensure the env fallback does not leak from a parent test run —
-        // cargo runs tests in the same process, so a prior test that set
-        // FLOWMUX_PANE_ID would otherwise change the expected target_pane.
-        // SAFETY: tests in this module are single-threaded for this var
-        // (we re-set it in the dedicated env-fallback test below).
+        let _g = flowmux_pane_env_lock();
         unsafe {
             std::env::remove_var("FLOWMUX_PANE_ID");
         }
@@ -551,11 +560,9 @@ mod tests {
 
     #[test]
     fn browser_open_picks_target_pane_from_flowmux_pane_id_env() {
+        let _g = flowmux_pane_env_lock();
         let pane = PaneId::new();
         let pane_str = pane.to_string();
-        // SAFETY: this test reads/writes a process-global env var. cargo
-        // serializes by default within a binary's test harness, and the
-        // var is removed at the end of the test to keep neighbours clean.
         unsafe {
             std::env::set_var("FLOWMUX_PANE_ID", &pane_str);
         }
@@ -579,6 +586,7 @@ mod tests {
 
     #[test]
     fn browser_open_ignores_invalid_flowmux_pane_id_env() {
+        let _g = flowmux_pane_env_lock();
         unsafe {
             std::env::set_var("FLOWMUX_PANE_ID", "not-a-uuid");
         }
