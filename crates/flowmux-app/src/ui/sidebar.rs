@@ -20,7 +20,7 @@
 
 use crate::bridge::{Bridge, GtkCommand};
 use crate::notifications::{NotificationEntry, NotificationLog};
-use flowmux_core::{NotificationLevel, PrState, Workspace, WorkspaceId};
+use flowmux_core::{NotificationLevel, Pane, PaneContent, PrState, SurfaceKind, Workspace, WorkspaceId};
 use gtk::prelude::*;
 use std::cell::RefCell;
 use std::collections::HashSet;
@@ -712,13 +712,113 @@ fn build_meta_column(ws: &Workspace) -> gtk::Box {
 
 /// Build the second line: "<last-folder>" or "<last-folder> / <branch>".
 fn subtitle_for(ws: &Workspace) -> String {
-    let last_folder = ws
-        .root_dir
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or_else(|| ws.root_dir.to_str().unwrap_or(""));
+    // 활성 터미널의 현재 cwd 폴더명을 우선 사용 — 사용자가 cd로
+    // 폴더를 이동하면 사이드 패널 부제도 즉시 따라간다. 활성 터미널이
+    // 없거나(브라우저 탭만 있는 pane) cwd 정보가 없으면 워크스페이스
+    // root_dir로 폴백.
+    let last_folder = active_terminal_folder(ws).unwrap_or_else(|| {
+        ws.root_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_else(|| ws.root_dir.to_str().unwrap_or(""))
+            .to_string()
+    });
     match ws.git.as_ref() {
         Some(g) => format!("{last_folder} / {}", g.branch),
-        None => last_folder.to_string(),
+        None => last_folder,
+    }
+}
+
+/// 워크스페이스의 첫 번째 surface 트리에서 활성 터미널 surface를 찾아
+/// 그 cwd의 폴더명을 돌려준다. 단일 pane 워크스페이스에서는 사용자가
+/// 보고 있는 그 터미널의 cwd가, split 트리라면 첫(좌상단) leaf의 활성
+/// 터미널 cwd가 후보. 활성 surface가 브라우저거나 cwd가 없으면 None.
+fn active_terminal_folder(ws: &Workspace) -> Option<String> {
+    let pane = ws.surfaces.first()?.root_pane.clone();
+    walk_first_active_terminal_cwd(&pane)
+}
+
+fn walk_first_active_terminal_cwd(pane: &Pane) -> Option<String> {
+    match pane {
+        Pane::Leaf { content, .. } => match content {
+            PaneContent::Tabs { active, surfaces } => {
+                let s = surfaces
+                    .iter()
+                    .find(|s| s.id == *active)
+                    .or_else(|| surfaces.first())?;
+                if let SurfaceKind::Terminal { cwd: Some(cwd), .. } = &s.kind {
+                    cwd.file_name()
+                        .and_then(|n| n.to_str())
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.to_string())
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        },
+        Pane::Split { first, .. } => walk_first_active_terminal_cwd(first),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flowmux_core::{Pane, PaneContent, PaneId, PaneSurface, Surface, SurfaceId, SurfaceKind};
+    use std::path::PathBuf;
+
+    fn ws_with_active_terminal_cwd(cwd: Option<PathBuf>) -> Workspace {
+        let surface = PaneSurface::terminal("auto", cwd.clone());
+        let surface_id = surface.id;
+        Workspace {
+            id: WorkspaceId::new(),
+            name: "auto".into(),
+            custom_title: None,
+            root_dir: PathBuf::from("/tmp/origin"),
+            git: None,
+            listening_ports: vec![],
+            surfaces: vec![Surface {
+                id: SurfaceId::new(),
+                kind: SurfaceKind::Terminal {
+                    shell: None,
+                    cwd: cwd.clone(),
+                },
+                title: "main".into(),
+                root_pane: Pane::Leaf {
+                    id: PaneId::new(),
+                    content: PaneContent::Tabs {
+                        active: surface_id,
+                        surfaces: vec![surface],
+                    },
+                },
+            }],
+            color: None,
+        }
+    }
+
+    #[test]
+    fn subtitle_uses_active_terminal_cwd_folder_when_available() {
+        let ws = ws_with_active_terminal_cwd(Some(PathBuf::from("/home/u/dev")));
+        // 서브타이틀은 root_dir("origin")이 아니라 활성 터미널의 cwd
+        // 폴더명("dev")을 우선해야 한다.
+        assert_eq!(subtitle_for(&ws), "dev");
+    }
+
+    #[test]
+    fn subtitle_falls_back_to_root_dir_when_no_terminal_cwd() {
+        let ws = ws_with_active_terminal_cwd(None);
+        // 활성 터미널이 cwd를 모르면 root_dir 폴더명("origin")으로 폴백.
+        assert_eq!(subtitle_for(&ws), "origin");
+    }
+
+    #[test]
+    fn subtitle_appends_branch_when_workspace_has_git_info() {
+        let mut ws = ws_with_active_terminal_cwd(Some(PathBuf::from("/home/u/dev")));
+        ws.git = Some(flowmux_core::GitInfo {
+            branch: "main".into(),
+            remote_url: None,
+            linked_pr: None,
+        });
+        assert_eq!(subtitle_for(&ws), "dev / main");
     }
 }

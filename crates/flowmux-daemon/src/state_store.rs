@@ -462,6 +462,11 @@ impl StateStore {
                 }
             }
             if hit {
+                // OSC 0/2 등 외부 신호로 들어온 title은 truncate 되지
+                // 않은 원본이므로 그대로 ws.name에 복사한다 (탭 라벨에
+                // 쓰이는 surface.title은 15자에서 잘리지만 사이드 패널
+                // 라벨은 ellipsize로 동적 잘림이 가능해 원본을 보존하는
+                // 게 맞다).
                 if workspace_should_sync_to_surface(ws, surface_id) && ws.name != title {
                     ws.name = title.clone();
                 }
@@ -751,13 +756,16 @@ impl StateStore {
             if hit {
                 // 활성 탭이 바뀌면 single-pane 워크스페이스의 자동
                 // 결정값(`name`)도 새 활성 탭 라벨로 따라간다 — cmux의
-                // single-panel auto-sync 룰을 탭 전환에도 그대로 적용.
+                // single-panel auto-sync 룰을 탭 전환에도 적용. surface.title
+                // 이 truncated일 수 있어 workspace_name_from_surface로
+                // 원본 길이 라벨을 추출해 사용한다.
                 if workspace_should_sync_to_surface(ws, surface_id) {
-                    if let Some(active_title) =
-                        ws.surfaces[0].root_pane.surface_title(pane, surface_id)
+                    if let Some(surface) = ws.surfaces[0].root_pane.find_surface(pane, surface_id)
                     {
-                        if ws.name != active_title {
-                            ws.name = active_title.to_string();
+                        if let Some(new_name) = workspace_name_from_surface(&surface) {
+                            if ws.name != new_name {
+                                ws.name = new_name;
+                            }
                         }
                     }
                 }
@@ -823,6 +831,36 @@ impl StateStore {
     }
 }
 
+/// 워크스페이스 자동 결정값(`name`)으로 쓸 수 있는 surface의 "원본"
+/// 라벨을 돌려준다. surface.title은 탭 표시용으로 15자에서 잘리는
+/// 경우가 있어 그대로 ws.name에 복사하면 사이드 패널 라벨에 잘린
+/// 텍스트가 남는다 (DynamicGenerati... 같은 회귀). 그래서:
+///   * 사용자가 명시적으로 rename 해서 `title_locked == true`거나 OSC
+///     0/2로 들어와 있는 라벨이라면 surface.title 자체가 원본이라
+///     그대로 사용.
+///   * 그렇지 않은 터미널 surface는 cwd 폴더명을 풀(full) 길이로 다시
+///     계산해 사용. cwd가 없으면 None.
+///   * 브라우저 surface는 surface.title이 페이지 제목이라 그대로 사용.
+fn workspace_name_from_surface(surface: &PaneSurface) -> Option<String> {
+    if surface.title_locked {
+        return Some(surface.title.clone());
+    }
+    match &surface.kind {
+        SurfaceKind::Terminal { cwd, .. } => {
+            // cwd가 있으면 원본 폴더명, 없으면 surface.title fallback.
+            if let Some(cwd) = cwd.as_ref() {
+                if let Some(folder) = cwd.file_name().and_then(|n| n.to_str()) {
+                    if !folder.is_empty() {
+                        return Some(folder.to_string());
+                    }
+                }
+            }
+            Some(surface.title.clone())
+        }
+        SurfaceKind::Browser { .. } => Some(surface.title.clone()),
+    }
+}
+
 /// 워크스페이스에 split이 없고(단일 Leaf), `surface_id`가 그 leaf의
 /// 활성 탭이라면 `true`. 이 조건이 맞을 때만 surface auto-title이
 /// 워크스페이스의 자동 결정값(`name`)으로 함께 동기화된다 — cmux의
@@ -858,15 +896,21 @@ fn update_surface_cwd_in_state(
             }
         }
         if hit {
-            // cwd 변경으로 surface 라벨이 새 폴더명으로 갱신됐을 수 있다.
-            // single-pane 워크스페이스라면 같은 폴더명이 워크스페이스의
-            // 자동 결정값(`name`)으로도 따라가도록 동기화한다 — surface의
-            // 새 title을 직접 읽어 와 사용한다.
+            // cwd 변경으로 surface 라벨이 폴더명으로 갱신됐을 수 있다.
+            // single-pane 워크스페이스라면 워크스페이스의 자동 결정값
+            // (`name`)도 같이 따라간다 — 이때 surface.title을 그대로
+            // 복사하면 안 된다(탭 라벨용으로 15자에서 truncate되어
+            // "DynamicGenerati..." 같은 잘린 값이 ws.name에 박히는 회귀).
+            // cwd 자체에서 폴더명을 직접 뽑아 사이드 패널이 ellipsize로
+            // 동적으로 잘릴 수 있도록 원본 길이로 저장한다.
             if workspace_should_sync_to_surface(ws, surface_id) {
-                if let Some(active_title) = ws.surfaces[0].root_pane.surface_title(pane, surface_id)
+                if let Some(folder) = cwd
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .filter(|s| !s.is_empty())
                 {
-                    if ws.name != active_title {
-                        ws.name = active_title.to_string();
+                    if ws.name != folder {
+                        ws.name = folder.to_string();
                     }
                 }
             }
@@ -2786,6 +2830,57 @@ mod tests {
         // active 전환 시점의 두 번째 surface 라벨은 cwd 폴더명("sub")이라
         // ws.name도 "sub"로 따라가야 한다.
         assert_eq!(ws.name, "sub");
+    }
+
+    /// 회귀 방지: cwd 폴더명이 15자를 넘는 경우에도 워크스페이스
+    /// `name`은 truncated 라벨("Long...") 대신 원본 길이 그대로
+    /// 저장되어야 한다 — 사이드 패널 라벨은 자체 ellipsize로 동적
+    /// 잘림이 가능해 원본을 보존하는 게 옳다.
+    #[tokio::test]
+    async fn cwd_sync_preserves_full_folder_name_without_truncation() {
+        // 처음에는 짧은 폴더에서 시작 — create_workspace가 같은 cwd로
+        // surface를 만들기 때문에 set_surface_cwd가 no-op이 되지 않게
+        // 시작점은 짧은 cwd로 잡고 긴 폴더로 cd한 시나리오를 본다.
+        let store = StateStore::new_lazy(State::default());
+        let ws_id = store
+            .create_workspace(Some("auto".into()), std::path::PathBuf::from("/tmp/auto"))
+            .await;
+        let ws = store.get_workspace(ws_id).await.unwrap();
+        let pane = first_pane(&ws);
+        let active = first_pane_active_surface(&ws);
+
+        let long_dir = std::path::PathBuf::from("/tmp/DynamicGenerativeUI");
+        store.update_surface_cwd(pane, active, long_dir).await;
+        let ws = store.get_workspace(ws_id).await.unwrap();
+        // surface.title은 탭 표시용으로 truncated 될 수 있지만,
+        // ws.name은 원본 폴더명 19자 그대로.
+        assert_eq!(ws.name, "DynamicGenerativeUI");
+
+        // 더 긴 이름으로 다시 cd → 같은 룰.
+        let dir2 = std::path::PathBuf::from("/tmp/AnotherLongFolderNameForTest");
+        store.update_surface_cwd(pane, active, dir2).await;
+        let ws = store.get_workspace(ws_id).await.unwrap();
+        assert_eq!(ws.name, "AnotherLongFolderNameForTest");
+    }
+
+    /// 회귀 방지: OSC 0/2로 들어온 긴 타이틀도 ws.name에는 truncate
+    /// 없이 그대로 저장된다.
+    #[tokio::test]
+    async fn auto_title_sync_preserves_full_osc_title_without_truncation() {
+        let store = StateStore::new_lazy(State::default());
+        let ws_id = store
+            .create_workspace(Some("auto".into()), std::path::PathBuf::from("/tmp/auto"))
+            .await;
+        let ws = store.get_workspace(ws_id).await.unwrap();
+        let pane = first_pane(&ws);
+        let active = first_pane_active_surface(&ws);
+
+        let long = "Claude Code — long descriptive program title".to_string();
+        store
+            .update_surface_auto_title(pane, active, long.clone())
+            .await;
+        let ws = store.get_workspace(ws_id).await.unwrap();
+        assert_eq!(ws.name, long);
     }
 
     /// cwd 변경(폴더 이동)도 single-pane 워크스페이스의 name 동기화 대상.
