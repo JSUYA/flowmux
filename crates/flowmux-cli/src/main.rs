@@ -13,6 +13,8 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::str::FromStr;
 
+mod agent;
+
 /// Read `FLOWMUX_PANE_ID` (set by `flowmux-app` at PTY spawn time) and parse
 /// it as a `PaneId`. Returns `None` if the env var is missing or invalid.
 /// Used as a fallback when the user does not pass an explicit `--pane`/
@@ -37,6 +39,12 @@ struct Cli {
     /// XDG runtime path. `FLOWMUX_SOCKET` is accepted as a legacy alias.
     #[arg(long, env = "FLOWMUX_SOCKET_PATH")]
     socket: Option<PathBuf>,
+
+    /// Print responses as a single-line JSON object instead of the
+    /// default human-readable indented form. Mirrors cmux's `--json`
+    /// flag — easier to parse from agent scripts.
+    #[arg(long, global = true)]
+    json: bool,
 
     #[command(subcommand)]
     cmd: Cmd,
@@ -185,6 +193,45 @@ enum Cmd {
         #[command(subcommand)]
         op: ThemeOp,
     },
+
+    /// Make the flowmux-browser SKILL discoverable to local agents
+    /// (Claude Code, OpenCode, Codex CLI). Run after every `flowmux`
+    /// install / upgrade to re-sync the on-disk skill files.
+    Agent {
+        #[command(subcommand)]
+        op: AgentOp,
+    },
+}
+
+#[derive(Subcommand)]
+enum AgentOp {
+    /// Mirror the embedded SKILL.md into each supported agent's
+    /// user-level location. Idempotent: a no-op when the file is
+    /// already up to date. Fails on existing-but-different files
+    /// unless `--force` is set.
+    Install {
+        /// Limit installation to one agent. Repeat the flag to pick
+        /// multiple. Omit to install for all known agents.
+        #[arg(long, value_parser = ["claude-code", "opencode", "codex"])]
+        agent: Vec<String>,
+        /// Overwrite drifted on-disk files instead of erroring.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Report whether each agent's expected file is present and
+    /// matches the bundled SKILL. Exit code is 0 only when every
+    /// checked target is `ok`.
+    Doctor {
+        #[arg(long, value_parser = ["claude-code", "opencode", "codex"])]
+        agent: Vec<String>,
+    },
+    /// Remove the flowmux-browser SKILL files from each agent's
+    /// user-level location. The agent's top-level dir is left
+    /// untouched.
+    Uninstall {
+        #[arg(long, value_parser = ["claude-code", "opencode", "codex"])]
+        agent: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -235,6 +282,7 @@ async fn main() -> anyhow::Result<()> {
             }
             return Ok(());
         }
+        Cmd::Agent { op } => return run_agent_op(op, cli.json),
         _ => {}
     }
 
@@ -250,9 +298,10 @@ async fn main() -> anyhow::Result<()> {
         return notify_stream(&client, pane).await;
     }
 
+    let json_mode = cli.json;
     let req = build_request(cli.cmd)?;
     let resp = client.call(req).await?;
-    print_response(&resp)?;
+    print_response(&resp, json_mode)?;
     Ok(())
 }
 
@@ -394,7 +443,105 @@ fn build_request(cmd: Cmd) -> anyhow::Result<Request> {
         },
         Cmd::ListBrowsers => unreachable!("handled before request build"),
         Cmd::Theme { .. } => unreachable!("handled before request build"),
+        Cmd::Agent { .. } => unreachable!("handled before request build"),
     })
+}
+
+fn run_agent_op(op: &AgentOp, json: bool) -> anyhow::Result<()> {
+    let home = agent::resolved_home()?;
+    let codex_home = agent::resolved_codex_home();
+
+    let parse_targets = |slugs: &[String]| -> anyhow::Result<Vec<agent::Target>> {
+        if slugs.is_empty() {
+            Ok(agent::Target::ALL.to_vec())
+        } else {
+            slugs
+                .iter()
+                .map(|s| {
+                    agent::Target::from_slug(s)
+                        .ok_or_else(|| anyhow::anyhow!("unknown agent: {s}"))
+                })
+                .collect()
+        }
+    };
+
+    match op {
+        AgentOp::Install { agent: slugs, force } => {
+            let targets = parse_targets(slugs)?;
+            let outcomes = agent::install_all(&targets, &home, codex_home.as_deref(), *force)?;
+            if json {
+                let body = outcomes
+                    .iter()
+                    .map(|(t, p, o)| {
+                        serde_json::json!({
+                            "agent": t.slug(),
+                            "path": p.display().to_string(),
+                            "outcome": match o {
+                                agent::InstallOutcome::Written => "written",
+                                agent::InstallOutcome::AlreadyUpToDate => "already_up_to_date",
+                            },
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                println!("{}", serde_json::to_string(&body)?);
+            } else {
+                for (t, p, o) in &outcomes {
+                    let label = match o {
+                        agent::InstallOutcome::Written => "wrote   ",
+                        agent::InstallOutcome::AlreadyUpToDate => "up-to-date",
+                    };
+                    println!("{label}  {:12}  {}", t.slug(), p.display());
+                }
+            }
+            Ok(())
+        }
+        AgentOp::Doctor { agent: slugs } => {
+            let targets = parse_targets(slugs)?;
+            let report = agent::doctor_all(&targets, &home, codex_home.as_deref());
+            let any_bad = report
+                .iter()
+                .any(|e| !matches!(e.status, agent::DoctorStatus::Ok));
+            if json {
+                let body = report
+                    .iter()
+                    .map(|e| {
+                        serde_json::json!({
+                            "agent": e.target.slug(),
+                            "path": e.path.display().to_string(),
+                            "status": e.status.label(),
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                println!("{}", serde_json::to_string(&body)?);
+            } else {
+                for entry in &report {
+                    println!(
+                        "{:9}  {:12}  {}",
+                        entry.status.label(),
+                        entry.target.slug(),
+                        entry.path.display()
+                    );
+                }
+            }
+            if any_bad {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
+        AgentOp::Uninstall { agent: slugs } => {
+            let targets = parse_targets(slugs)?;
+            for t in targets {
+                let path = t.resolved_install_path(&home, codex_home.as_deref());
+                let outcome = agent::uninstall_one(&path)?;
+                let label = match outcome {
+                    agent::UninstallOutcome::Removed => "removed",
+                    agent::UninstallOutcome::AlreadyAbsent => "absent ",
+                };
+                println!("{label}  {:12}  {}", t.slug(), path.display());
+            }
+            Ok(())
+        }
+    }
 }
 
 fn run_theme_op(op: &ThemeOp) -> anyhow::Result<()> {
@@ -427,8 +574,15 @@ fn parse_level(s: &str) -> NotificationLevel {
     }
 }
 
-fn print_response(r: &Response) -> anyhow::Result<()> {
-    println!("{}", serde_json::to_string_pretty(r)?);
+fn print_response(r: &Response, json_mode: bool) -> anyhow::Result<()> {
+    let s = if json_mode {
+        // Single-line JSON — easier to parse from agent scripts
+        // (`jq -r .pane` etc.). Mirrors cmux's `--json` shape.
+        serde_json::to_string(r)?
+    } else {
+        serde_json::to_string_pretty(r)?
+    };
+    println!("{s}");
     Ok(())
 }
 
