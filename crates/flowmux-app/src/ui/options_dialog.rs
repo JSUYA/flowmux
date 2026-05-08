@@ -1,25 +1,26 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! 사이드 패널 좌하단 옵션 버튼이 띄우는 모달 다이얼로그.
+//! Modal dialog opened by the options button in the side-panel footer.
 //!
-//! 세 항목을 노출한다:
+//! It exposes:
 //!
-//! * 전체 줌 배율 (10..=200% SpinButton)
-//! * 새 탭브라우저 기본 웹뷰 엔진 (DropDown: WebKit / Chrome / Firefox)
-//! * 포커스된 pane의 1px 테두리 색 (ColorDialogButton, 기본 연한 노란색)
+//! * Global zoom percentage (10..=200% SpinButton)
+//! * Default web view engine for new browser tabs (DropDown: WebKit / Chrome / Firefox)
+//! * Focused-pane 1px border color (ColorDialogButton, default pale yellow)
 //!
-//! [확인] / [취소] 버튼으로 닫는다. [확인] 시에만 `on_apply`가 호출되며,
-//! 다이얼로그는 자기 자신이 닫는다 (호출 측은 콜백만 처리).
+//! OK / Cancel close the dialog. `on_apply` is called only on OK, and the
+//! dialog closes itself so the caller only handles the callback.
 //!
-//! 레이어링: 이 모듈은 GTK 위젯만 다룬다. 옵션을 디스크에 저장하거나
-//! VTE/WebView에 줌을 적용하는 책임은 [`crate::ui::window`]가 진다.
-//! 다이얼로그는 사용자의 의도(`Options`)만 콜백으로 돌려준다.
+//! Layering: this module only owns GTK widgets. Saving options to disk and
+//! applying zoom to VTE/WebView are handled by [`crate::ui::window`]. The
+//! dialog returns the user's intended [`Options`] through the callback.
 
 use adw::prelude::*;
-use flowmux_config::options::{BrowserEngine, Options, ZOOM_MAX, ZOOM_MIN};
+use flowmux_config::options::{
+    BrowserEngine, Options, FOCUS_BORDER_OPACITY_MAX, FOCUS_BORDER_OPACITY_MIN, ZOOM_MAX, ZOOM_MIN,
+};
 
-/// 모달로 옵션 다이얼로그를 띄운다. 사용자가 [확인]을 누르면
-/// `on_apply`가 새 [`Options`]로 호출된다. [취소]를 누르거나 창을
-/// 닫으면 콜백은 호출되지 않는다.
+/// Present the modal options dialog. If the user clicks OK, `on_apply` is
+/// called with the new [`Options`]. Cancel or window close does not call back.
 pub fn present(
     parent: &adw::ApplicationWindow,
     current: Options,
@@ -29,8 +30,8 @@ pub fn present(
     dialog.present();
 }
 
-/// 다이얼로그 위젯 트리만 만든다 — 단위 테스트가 위젯 상태를
-/// 검사할 수 있도록 `present` 호출 없이 분리.
+/// Build only the dialog widget tree so tests can inspect widget state
+/// without calling `present`.
 fn build_dialog(
     parent: &adw::ApplicationWindow,
     current: &Options,
@@ -41,15 +42,15 @@ fn build_dialog(
         .modal(true)
         .default_width(440)
         .default_height(220)
-        .title("옵션")
+        .title("Options")
         .build();
 
     let header = adw::HeaderBar::new();
     header.set_show_start_title_buttons(false);
     header.set_show_end_title_buttons(false);
 
-    let cancel_btn = gtk::Button::with_label("취소");
-    let ok_btn = gtk::Button::with_label("확인");
+    let cancel_btn = gtk::Button::with_label("Cancel");
+    let ok_btn = gtk::Button::with_label("OK");
     ok_btn.add_css_class("suggested-action");
     header.pack_start(&cancel_btn);
     header.pack_end(&ok_btn);
@@ -57,26 +58,40 @@ fn build_dialog(
     let zoom_spin = build_zoom_spin(current.zoom_percent);
     let engine_drop = build_engine_drop(&current.default_browser_engine);
     let focus_color_btn = build_focus_color_button(current.focus_border_color_or_default());
+    let opacity_widgets = build_focus_opacity_row(current.focus_border_opacity);
 
     let body = gtk::Box::new(gtk::Orientation::Vertical, 12);
     body.set_margin_top(16);
     body.set_margin_bottom(16);
     body.set_margin_start(20);
     body.set_margin_end(20);
-    body.append(&row("전체 줌 (%)", &zoom_spin));
-    body.append(&row("브라우저 웹뷰", &engine_drop));
-    body.append(&row("포커스 테두리 색", &focus_color_btn));
+    body.append(&row("Global zoom (%)", &zoom_spin));
+    body.append(&row("Browser web view", &engine_drop));
+    body.append(&row("Focus border color", &focus_color_btn));
+    body.append(&row("Focus border opacity (%)", &opacity_widgets.row));
 
     let hint = gtk::Label::new(Some(
-        "선택한 라벨은 새 탭브라우저의 쿠키/세션 디렉토리를 격리합니다 \
-         (모든 라벨이 WebKitGTK 엔진으로 그려집니다). 이미 열려 있는 \
-         탭브라우저는 그대로 유지됩니다.",
+        "The selected label isolates the cookie/session directory for new \
+         browser tabs. All labels currently render through WebKitGTK. \
+         Already-open browser tabs are unchanged.",
     ));
     hint.set_wrap(true);
     hint.set_max_width_chars(46);
     hint.add_css_class("dim-label");
     hint.set_xalign(0.0);
     body.append(&hint);
+
+    // Bottom-most "Reset" button. Clicking it applies Options::default()
+    // through the same on_apply path the OK button uses, so the caller
+    // takes care of persisting the defaults and reloading the CSS — the
+    // dialog itself just closes.
+    let reset_btn = gtk::Button::with_label("Reset to defaults");
+    reset_btn.add_css_class("destructive-action");
+    reset_btn.set_halign(gtk::Align::End);
+    let reset_row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    reset_row.set_margin_top(4);
+    reset_row.append(&reset_btn);
+    body.append(&reset_row);
 
     let outer = gtk::Box::new(gtk::Orientation::Vertical, 0);
     outer.append(&header);
@@ -87,15 +102,30 @@ fn build_dialog(
         let dialog = dialog.clone();
         cancel_btn.connect_clicked(move |_| dialog.close());
     }
+    let on_apply = std::rc::Rc::new(on_apply);
     {
         let dialog = dialog.clone();
         let zoom_spin = zoom_spin.clone();
         let engine_drop = engine_drop.clone();
         let focus_color_btn = focus_color_btn.clone();
-        let on_apply = std::rc::Rc::new(on_apply);
+        let opacity_spin = opacity_widgets.spin.clone();
+        let on_apply = on_apply.clone();
         ok_btn.connect_clicked(move |_| {
-            let opts = collect_options(&zoom_spin, &engine_drop, &focus_color_btn);
+            let opts = collect_options(
+                &zoom_spin,
+                &engine_drop,
+                &focus_color_btn,
+                &opacity_spin,
+            );
             (on_apply)(opts);
+            dialog.close();
+        });
+    }
+    {
+        let dialog = dialog.clone();
+        let on_apply = on_apply.clone();
+        reset_btn.connect_clicked(move |_| {
+            (on_apply)(Options::default());
             dialog.close();
         });
     }
@@ -114,9 +144,9 @@ fn row(label_text: &str, value_widget: &impl IsA<gtk::Widget>) -> gtk::Box {
     row
 }
 
-/// 10..=200% SpinButton. 1% 단위, 키보드/마우스 휠로도 조정 가능,
-/// 사용자가 직접 텍스트로 입력해 범위를 벗어나면 [`Options::clamp_zoom`]
-/// 가 [확인] 시점에 잘라낸다.
+/// 10..=200% SpinButton. It steps by 1% and supports keyboard or mouse-wheel
+/// changes. If direct text entry goes out of range, [`Options::clamp_zoom`]
+/// clamps it when OK is clicked.
 fn build_zoom_spin(initial: u16) -> gtk::SpinButton {
     let initial = Options::clamp_zoom(initial);
     let adj = gtk::Adjustment::new(
@@ -135,9 +165,8 @@ fn build_zoom_spin(initial: u16) -> gtk::SpinButton {
     spin
 }
 
-/// WebKit / Chrome / Firefox 셋 중 하나를 고르는 DropDown. Custom
-/// 엔진은 이번 단계에서는 노출하지 않는다 (`Options`에는 직렬화
-/// 가능 — 추후 확장 시 활성화).
+/// DropDown for WebKit / Chrome / Firefox. Custom engines are serializable in
+/// `Options` but not exposed in this UI step.
 fn build_engine_drop(initial: &BrowserEngine) -> gtk::DropDown {
     let labels: Vec<String> = engine_options().iter().map(|e| e.label()).collect();
     let label_refs: Vec<&str> = labels.iter().map(|s| s.as_str()).collect();
@@ -147,14 +176,15 @@ fn build_engine_drop(initial: &BrowserEngine) -> gtk::DropDown {
     drop
 }
 
-/// 다이얼로그 위젯에서 사용자 의도를 다시 [`Options`]로 모아낸다.
-/// SpinButton 값이 직접 타이핑으로 범위를 살짝 넘었을 가능성이 있어
-/// `clamp_zoom`으로 한 번 더 보정한다. 포커스 색은 [`color_button_hex`]
-/// 가 GdkRGBA → `#rrggbb` 6-자리 hex로 정규화해 돌려준다.
+/// Collect the user's intent from dialog widgets into [`Options`]. SpinButton
+/// values may be out of range due to direct text entry, so clamp zoom and
+/// opacity again. [`color_button_hex`] normalizes the focus color from GdkRGBA
+/// to six-digit `#rrggbb`.
 fn collect_options(
     spin: &gtk::SpinButton,
     drop: &gtk::DropDown,
     focus_color: &gtk::ColorDialogButton,
+    opacity_spin: &gtk::SpinButton,
 ) -> Options {
     let zoom = Options::clamp_zoom(spin.value_as_int().max(0) as u16);
     let engine = engine_options()
@@ -162,15 +192,19 @@ fn collect_options(
         .cloned()
         .unwrap_or(BrowserEngine::Webkit);
     let color_hex = color_button_hex(focus_color);
+    let opacity = Options::clamp_focus_border_opacity(
+        opacity_spin.value_as_int().clamp(0, 255) as u8,
+    );
     Options {
         zoom_percent: zoom,
         default_browser_engine: engine,
         focus_border_color: color_hex,
+        focus_border_opacity: opacity,
     }
 }
 
-/// gtk::ColorDialogButton의 현재 RGBA를 `#rrggbb` 형식으로 직렬화.
-/// 알파 채널은 무시(테두리에는 투명도가 의미 없음).
+/// Serialize the current gtk::ColorDialogButton RGBA as `#rrggbb`.
+/// The alpha channel is ignored because opacity has its own option.
 fn color_button_hex(button: &gtk::ColorDialogButton) -> String {
     let rgba = button.rgba();
     let r = (rgba.red().clamp(0.0, 1.0) * 255.0).round() as u8;
@@ -179,8 +213,51 @@ fn color_button_hex(button: &gtk::ColorDialogButton) -> String {
     format!("#{:02x}{:02x}{:02x}", r, g, b)
 }
 
-/// `#rrggbb` (또는 다른 hex 형식)을 GdkRGBA로 파싱해 ColorDialogButton에
-/// 미리 채운다. 파싱 실패 시 기본 연한 노란색으로 fallback.
+/// Widgets for focus border opacity (%). The slider and SpinButton share the
+/// same [`gtk::Adjustment`], so dragging the slider updates the number and
+/// direct numeric input moves the slider. Append `row` to the dialog body and
+/// read `spin` from `collect_options` when OK is clicked.
+struct FocusOpacityRow {
+    row: gtk::Box,
+    spin: gtk::SpinButton,
+}
+
+fn build_focus_opacity_row(initial: u8) -> FocusOpacityRow {
+    let initial = Options::clamp_focus_border_opacity(initial);
+    let adj = gtk::Adjustment::new(
+        initial as f64,
+        FOCUS_BORDER_OPACITY_MIN as f64,
+        FOCUS_BORDER_OPACITY_MAX as f64,
+        1.0,
+        10.0,
+        0.0,
+    );
+
+    let scale = gtk::Scale::new(gtk::Orientation::Horizontal, Some(&adj));
+    scale.set_hexpand(true);
+    scale.set_draw_value(false);
+    scale.set_round_digits(0);
+    // Small markers at 0 / 50 / 100 so the user can gauge position quickly.
+    scale.add_mark(0.0, gtk::PositionType::Bottom, None);
+    scale.add_mark(50.0, gtk::PositionType::Bottom, None);
+    scale.add_mark(FOCUS_BORDER_OPACITY_MAX as f64, gtk::PositionType::Bottom, None);
+
+    let spin = gtk::SpinButton::new(Some(&adj), 1.0, 0);
+    spin.set_numeric(true);
+    spin.set_snap_to_ticks(true);
+    spin.set_value(initial as f64);
+    spin.set_width_chars(4);
+
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    row.set_hexpand(true);
+    row.append(&scale);
+    row.append(&spin);
+
+    FocusOpacityRow { row, spin }
+}
+
+/// Parse `#rrggbb` or another hex form as GdkRGBA and seed the
+/// ColorDialogButton. Fall back to the default pale yellow on parse failure.
 fn build_focus_color_button(initial_hex: &str) -> gtk::ColorDialogButton {
     let dialog = gtk::ColorDialog::new();
     dialog.set_with_alpha(false);
@@ -193,8 +270,8 @@ fn build_focus_color_button(initial_hex: &str) -> gtk::ColorDialogButton {
     button
 }
 
-/// DropDown에 노출되는 빌트인 엔진 순서. 직렬화에는 [`BrowserEngine`]
-/// 자체가 그대로 사용되므로 이 배열 순서는 UI 표시용일 뿐이다.
+/// Built-in engine order exposed in the DropDown. Serialization uses
+/// [`BrowserEngine`] itself, so this array only controls UI display order.
 fn engine_options() -> [BrowserEngine; 3] {
     [
         BrowserEngine::Webkit,
@@ -236,5 +313,31 @@ mod tests {
         assert_eq!(engine_index_of(&BrowserEngine::Webkit), 0);
         assert_eq!(engine_index_of(&BrowserEngine::Chrome), 1);
         assert_eq!(engine_index_of(&BrowserEngine::Firefox), 2);
+    }
+
+    /// GTK init is needed to verify that the slider and SpinButton share the
+    /// same Adjustment. Headless environments skip this; when GTK starts, the
+    /// test checks that the built widgets move together.
+    #[test]
+    fn focus_opacity_row_widgets_share_adjustment_and_clamp_initial() {
+        if gtk::init().is_err() {
+            return;
+        }
+        // Out-of-range initial values clamp the spin button to 100.
+        let widgets = build_focus_opacity_row(250);
+        assert_eq!(widgets.spin.value_as_int(), 100);
+
+        // Changing the spin value updates the scale through the shared adjustment.
+        widgets.spin.set_value(42.0);
+        let scale = widgets
+            .row
+            .first_child()
+            .and_then(|w| w.downcast::<gtk::Scale>().ok())
+            .expect("first child should be the Scale");
+        assert!((scale.value() - 42.0).abs() < f64::EPSILON);
+
+        // Changing the scale value updates the spin button as well.
+        scale.set_value(7.0);
+        assert_eq!(widgets.spin.value_as_int(), 7);
     }
 }

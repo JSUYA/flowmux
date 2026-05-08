@@ -1,43 +1,50 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! flowmux 사용자 옵션 (전체 줌 + 새 탭브라우저 기본 웹뷰 엔진).
+//! flowmux user options: global zoom and default web view engine for new
+//! browser tabs.
 //!
-//! 저장 위치: `$XDG_CONFIG_HOME/flowmux/options.json`. 모든 필드는
-//! `#[serde(default)]`이라 사용자가 일부만 적어둬도 안전하게 로드된다.
+//! Stored at `$XDG_CONFIG_HOME/flowmux/options.json`. All fields use
+//! `#[serde(default)]`, so partial user files load safely.
 //!
-//! 줌은 정수 % (10..=200)이고, [`Options::zoom_factor`]가 GTK/VTE/
-//! WebView가 받는 0.1..=2.0 배율을 돌려준다. 웹뷰 엔진은 옵션을
-//! 바꿔도 이미 띄워진 탭브라우저에는 영향이 없고, 다음에 새로
-//! 만드는 탭브라우저부터 사용된다.
+//! Zoom is an integer percentage (10..=200), and [`Options::zoom_factor`]
+//! returns the 0.1..=2.0 scale accepted by GTK/VTE/WebView. Changing the web
+//! view engine option does not affect existing browser tabs; it applies only
+//! to newly created browser tabs.
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-/// 줌 % 하한.
+/// Minimum zoom percentage.
 pub const ZOOM_MIN: u16 = 10;
-/// 줌 % 상한.
+/// Maximum zoom percentage.
 pub const ZOOM_MAX: u16 = 200;
-/// 줌 % 기본값.
+/// Default zoom percentage.
 pub const ZOOM_DEFAULT: u16 = 100;
 
-/// 포커스된 pane의 1px 테두리 기본 색 — 연한 노란색 (Champagne).
-/// 어두운 / 밝은 테마 양쪽에서 충분히 보이면서도 cmux와 다른 느낌의
-/// "은은한 강조"가 되도록 골랐다.
+/// Default 1px border color for the focused pane: pale yellow (Champagne).
+/// Chosen to stay visible on both dark and light themes while keeping the
+/// highlight subtle and distinct from cmux.
 pub const FOCUS_BORDER_COLOR_DEFAULT: &str = "#fff4b3";
 
-/// 새 탭브라우저를 만들 때 쓸 웹뷰 엔진. 현 단계에서는 모두
-/// WebKitGTK로 fallback되며, 외부 엔진 spawn 분기는 다음 단계
-/// 작업이다 — 그래도 사용자가 고른 값을 옵션 파일에 기록해 둬
-/// 향후 연결만 하면 된다.
+/// Focus border opacity (`0..=100` %). 100 = fully opaque, 0 = fully transparent.
+/// The default is 50% so the focus highlight is visible without dominating the
+/// surrounding pane chrome on first launch.
+pub const FOCUS_BORDER_OPACITY_MIN: u8 = 0;
+pub const FOCUS_BORDER_OPACITY_MAX: u8 = 100;
+pub const FOCUS_BORDER_OPACITY_DEFAULT: u8 = 50;
+
+/// Web view engine to use for new browser tabs. At this stage every variant
+/// falls back to WebKitGTK; external engine spawning is a later step. The
+/// selected value is still persisted so the future wiring can use it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum BrowserEngine {
-    /// In-pane WebKitGTK (기본).
+    /// In-pane WebKitGTK (default).
     Webkit,
-    /// Chromium 계열.
+    /// Chromium family.
     Chrome,
-    /// Firefox 계열.
+    /// Firefox family.
     Firefox,
-    /// 사용자 정의 외부 엔진.
+    /// User-defined external engine.
     Custom { name: String },
 }
 
@@ -48,7 +55,7 @@ impl Default for BrowserEngine {
 }
 
 impl BrowserEngine {
-    /// 옵션 다이얼로그 / 디버그 로그용 사람-읽기 라벨.
+    /// Human-readable label for the options dialog and debug logs.
     pub fn label(&self) -> String {
         match self {
             Self::Webkit => "WebKit".into(),
@@ -64,7 +71,7 @@ impl BrowserEngine {
         }
     }
 
-    /// 드롭박스에 보일 빌트인 항목 순서.
+    /// Built-in item order shown in the drop-down.
     pub fn builtin_order() -> [Self; 3] {
         [Self::Webkit, Self::Chrome, Self::Firefox]
     }
@@ -76,12 +83,16 @@ pub struct Options {
     pub zoom_percent: u16,
     #[serde(default)]
     pub default_browser_engine: BrowserEngine,
-    /// 포커스된 pane의 1px 테두리 색 (CSS 형식, 보통 `#rrggbb`).
-    /// 사용자가 옵션 다이얼로그의 컬러 버튼으로 고른 색이 그대로
-    /// 저장되며, 깨졌거나 비어 있으면 [`FOCUS_BORDER_COLOR_DEFAULT`]
-    /// 로 fallback한다.
+    /// Focused-pane 1px border color in CSS form, usually `#rrggbb`.
+    /// The color selected from the options dialog is stored as-is; invalid or
+    /// empty values fall back to [`FOCUS_BORDER_COLOR_DEFAULT`].
     #[serde(default = "default_focus_color")]
     pub focus_border_color: String,
+    /// Focus border opacity (%: `0..=100`). 100 is opaque, 0 is transparent.
+    /// Selected by the options dialog slider; out-of-range values are clamped
+    /// by [`Options::clamp_focus_border_opacity`].
+    #[serde(default = "default_focus_border_opacity")]
+    pub focus_border_opacity: u8,
 }
 
 fn default_zoom() -> u16 {
@@ -92,42 +103,47 @@ fn default_focus_color() -> String {
     FOCUS_BORDER_COLOR_DEFAULT.to_string()
 }
 
+fn default_focus_border_opacity() -> u8 {
+    FOCUS_BORDER_OPACITY_DEFAULT
+}
+
 impl Default for Options {
     fn default() -> Self {
         Self {
             zoom_percent: ZOOM_DEFAULT,
             default_browser_engine: BrowserEngine::default(),
             focus_border_color: default_focus_color(),
+            focus_border_opacity: default_focus_border_opacity(),
         }
     }
 }
 
 impl Options {
-    /// `[ZOOM_MIN, ZOOM_MAX]`로 잘라낸 % 값.
+    /// Percentage clamped to `[ZOOM_MIN, ZOOM_MAX]`.
     pub fn clamp_zoom(p: u16) -> u16 {
         p.clamp(ZOOM_MIN, ZOOM_MAX)
     }
 
-    /// VTE `set_font_scale`, WebView `set_zoom_level`에 그대로 넘길
-    /// 0.1..=2.0 배율.
+    /// Scale in 0.1..=2.0 form for VTE `set_font_scale` and WebView
+    /// `set_zoom_level`.
     pub fn zoom_factor(&self) -> f64 {
         Self::clamp_zoom(self.zoom_percent) as f64 / 100.0
     }
 
-    /// `with_zoom_percent(120)` 식으로 빌더 패턴 — 즉시 clamp.
+    /// Builder-style setter such as `with_zoom_percent(120)`, clamped immediately.
     pub fn with_zoom_percent(mut self, p: u16) -> Self {
         self.zoom_percent = Self::clamp_zoom(p);
         self
     }
 
-    /// 새 탭브라우저용 기본 엔진 교체.
+    /// Replace the default engine for new browser tabs.
     pub fn with_engine(mut self, engine: BrowserEngine) -> Self {
         self.default_browser_engine = engine;
         self
     }
 
-    /// 포커스 테두리 색을 새 값으로. 유효하지 않으면(빈 문자열 /
-    /// `#`이 없거나 hex가 아님) 기본 색으로 되돌린다.
+    /// Set a new focus border color. Invalid values, including empty strings,
+    /// missing `#`, or non-hex content, fall back to the default color.
     pub fn with_focus_border_color(mut self, color: impl Into<String>) -> Self {
         let color = color.into();
         self.focus_border_color = if is_valid_hex_color(&color) {
@@ -138,7 +154,7 @@ impl Options {
         self
     }
 
-    /// load 시점의 sanitize에 쓰이는 동일 검증.
+    /// Same validation used during load-time sanitization.
     pub fn focus_border_color_or_default(&self) -> &str {
         if is_valid_hex_color(&self.focus_border_color) {
             &self.focus_border_color
@@ -146,12 +162,28 @@ impl Options {
             FOCUS_BORDER_COLOR_DEFAULT
         }
     }
+
+    /// Focus border opacity percentage clamped to 0..=100.
+    pub fn clamp_focus_border_opacity(p: u8) -> u8 {
+        p.clamp(FOCUS_BORDER_OPACITY_MIN, FOCUS_BORDER_OPACITY_MAX)
+    }
+
+    /// Alpha value in 0.0..=1.0 form for CSS rgba().
+    pub fn focus_border_alpha(&self) -> f32 {
+        Self::clamp_focus_border_opacity(self.focus_border_opacity) as f32 / 100.0
+    }
+
+    /// Builder-style setter, clamped immediately.
+    pub fn with_focus_border_opacity(mut self, p: u8) -> Self {
+        self.focus_border_opacity = Self::clamp_focus_border_opacity(p);
+        self
+    }
 }
 
-/// CSS 색 문자열로 사용 가능한 hex 형식인지 검사. 허용:
+/// Check whether a string is an allowed hex CSS color form:
 ///   `#rgb` / `#rgba` / `#rrggbb` / `#rrggbbaa`
-/// 그 외 형식(rgba(), 색 이름)은 옵션 파일에 들어와도 fallback 되도록
-/// 보수적으로 거절한다.
+/// Other forms, such as rgba() or color names, are rejected conservatively so
+/// option files fall back to the default.
 pub fn is_valid_hex_color(s: &str) -> bool {
     let Some(body) = s.strip_prefix('#') else {
         return false;
@@ -159,14 +191,14 @@ pub fn is_valid_hex_color(s: &str) -> bool {
     matches!(body.len(), 3 | 4 | 6 | 8) && body.chars().all(|c| c.is_ascii_hexdigit())
 }
 
-/// `$XDG_CONFIG_HOME/flowmux/options.json` 경로. XDG dir 미해결이면
-/// `None`.
+/// Path to `$XDG_CONFIG_HOME/flowmux/options.json`, or `None` when the XDG dir
+/// cannot be resolved.
 pub fn options_path() -> Option<PathBuf> {
     crate::paths::config_dir().map(|d| d.join("options.json"))
 }
 
-/// 옵션 파일이 있으면 읽어 [`Options`]를 만들고, 없거나 깨졌으면
-/// 기본값. zoom은 항상 clamp된 상태로 반환.
+/// Load [`Options`] from the options file. Missing or corrupt files return
+/// defaults. Zoom is always returned clamped.
 pub fn load() -> Options {
     let Some(path) = options_path() else {
         return Options::default();
@@ -186,11 +218,12 @@ pub fn load() -> Options {
     Options {
         zoom_percent: Options::clamp_zoom(opts.zoom_percent),
         focus_border_color,
+        focus_border_opacity: Options::clamp_focus_border_opacity(opts.focus_border_opacity),
         ..opts
     }
 }
 
-/// 옵션을 `options.json`에 직렬화. 부모 디렉터리가 없으면 만든다.
+/// Serialize options to `options.json`, creating the parent directory if needed.
 pub fn save(opts: &Options) -> std::io::Result<()> {
     let path = options_path()
         .ok_or_else(|| std::io::Error::other("XDG config dir unavailable"))?;
@@ -431,6 +464,83 @@ mod tests {
             save(&opts).unwrap();
             let back = load();
             assert_eq!(back.focus_border_color, "#0bd968");
+        });
+    }
+
+    // ===== focus_border_opacity =====
+
+    #[test]
+    fn default_focus_border_opacity_is_half() {
+        // First-run default is 50% so the highlight is visible without
+        // overpowering surrounding pane chrome.
+        assert_eq!(
+            Options::default().focus_border_opacity,
+            FOCUS_BORDER_OPACITY_DEFAULT
+        );
+        assert_eq!(FOCUS_BORDER_OPACITY_DEFAULT, 50);
+        assert!((Options::default().focus_border_alpha() - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn clamp_focus_border_opacity_keeps_value_inside_range() {
+        // u8 cannot be below 0, but values above 100 are clamped.
+        assert_eq!(Options::clamp_focus_border_opacity(0), 0);
+        assert_eq!(Options::clamp_focus_border_opacity(100), 100);
+        assert_eq!(Options::clamp_focus_border_opacity(101), 100);
+        assert_eq!(Options::clamp_focus_border_opacity(255), 100);
+    }
+
+    #[test]
+    fn focus_border_alpha_is_percent_over_one_hundred() {
+        let opts = Options::default().with_focus_border_opacity(50);
+        assert!((opts.focus_border_alpha() - 0.5).abs() < 1e-6);
+        let opts = Options::default().with_focus_border_opacity(0);
+        assert!(opts.focus_border_alpha().abs() < 1e-6);
+    }
+
+    #[test]
+    fn with_focus_border_opacity_clamps_immediately() {
+        let opts = Options::default().with_focus_border_opacity(200);
+        assert_eq!(opts.focus_border_opacity, 100);
+    }
+
+    #[test]
+    fn options_load_clamps_out_of_range_opacity() {
+        with_xdg(|root| {
+            let path = root.join("flowmux").join("options.json");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(
+                &path,
+                r##"{"zoom_percent": 100, "default_browser_engine": {"kind": "webkit"}, "focus_border_color": "#fff4b3", "focus_border_opacity": 250}"##,
+            )
+            .unwrap();
+            let opts = load();
+            assert_eq!(opts.focus_border_opacity, 100);
+        });
+    }
+
+    #[test]
+    fn options_load_falls_back_to_default_opacity_when_field_missing() {
+        with_xdg(|root| {
+            let path = root.join("flowmux").join("options.json");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(
+                &path,
+                r##"{"zoom_percent": 100, "default_browser_engine": {"kind": "webkit"}, "focus_border_color": "#fff4b3"}"##,
+            )
+            .unwrap();
+            let opts = load();
+            assert_eq!(opts.focus_border_opacity, FOCUS_BORDER_OPACITY_DEFAULT);
+        });
+    }
+
+    #[test]
+    fn options_save_then_load_preserves_opacity() {
+        with_xdg(|_| {
+            let opts = Options::default().with_focus_border_opacity(35);
+            save(&opts).unwrap();
+            let back = load();
+            assert_eq!(back.focus_border_opacity, 35);
         });
     }
 }
