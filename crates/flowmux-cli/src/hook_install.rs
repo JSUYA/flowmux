@@ -13,7 +13,7 @@
 //! - **Claude Code** — `~/.claude/settings.json` `hooks.{Stop,Notification}`.
 //! - **Codex CLI**   — `~/.codex/hooks.json` `Stop`, plus
 //!                     `~/.codex/config.toml` `[features] codex_hooks = true`.
-//! - **OpenCode**    — `~/.config/opencode/plugins/flowmux-session.js`
+//! - **OpenCode**    — `~/.config/opencode/plugins/flowmux-session.mjs`
 //!                     plus `opencode.json` `plugin` entry.
 
 use anyhow::{anyhow, Context, Result};
@@ -362,7 +362,10 @@ fn install_opencode(flowmux_bin: &str) -> Result<HookInstallReport> {
     let plugin_dir = home.join("plugins");
     fs::create_dir_all(&plugin_dir)
         .with_context(|| format!("create {}", plugin_dir.display()))?;
-    let plugin_path = plugin_dir.join("flowmux-session.js");
+    // Older flowmux installs wrote a CommonJS `.js` plugin; OpenCode
+    // 1.14+ refuses to load it. Purge it so re-running setup is enough.
+    let _ = fs::remove_file(plugin_dir.join("flowmux-session.js"));
+    let plugin_path = plugin_dir.join("flowmux-session.mjs");
     let plugin_src = opencode_plugin_source(flowmux_bin);
     if !plugin_path.exists()
         || fs::read_to_string(&plugin_path).ok().as_deref() != Some(plugin_src.as_str())
@@ -385,7 +388,7 @@ fn uninstall_opencode() -> Result<HookInstallReport> {
         Some(h) if h.exists() => h,
         _ => return Ok(skipped(HookTarget::OpenCode)),
     };
-    let plugin_path = home.join("plugins").join("flowmux-session.js");
+    let plugin_path = home.join("plugins").join("flowmux-session.mjs");
     let _ = fs::remove_file(&plugin_path);
 
     let opencode_json = home.join("opencode.json");
@@ -412,20 +415,24 @@ fn uninstall_opencode() -> Result<HookInstallReport> {
 }
 
 fn opencode_plugin_source(flowmux_bin: &str) -> String {
-    // OpenCode plugins are CommonJS-style modules exporting an async
-    // factory. We hook only `event` (lifecycle bus) — `session.idle`
-    // is the closest equivalent of Claude's `Stop`.
+    // OpenCode 1.14+ plugins are ESM modules exporting one factory per
+    // surface. The factory returns a `Hooks` object whose `event`
+    // callback receives every SSE-style lifecycle event; we just spawn
+    // the matching `flowmux hooks opencode <event>` command for the
+    // ones we care about.
     format!(
         r#"// {marker}
 // Auto-installed by `flowmux hooks setup`. Do not hand-edit; rerun the
 // command instead. Removing this file is safe — flowmux just stops
 // surfacing OpenCode lifecycle events to the bell popover.
 
-const {{ spawn }} = require("node:child_process");
+import {{ spawn }} from "node:child_process";
+
+const FLOWMUX_BIN = {bin_literal};
 
 function fireFlowmuxHook(event) {{
   try {{
-    spawn({bin_literal}, ["hooks", "opencode", event], {{
+    spawn(FLOWMUX_BIN, ["hooks", "opencode", event], {{
       stdio: "ignore",
       detached: true,
     }}).unref();
@@ -434,12 +441,15 @@ function fireFlowmuxHook(event) {{
   }}
 }}
 
-module.exports = async ({{ event }}) => {{
-  if (!event || typeof event.subscribe !== "function") return {{}};
-  event.subscribe("session.idle", () => fireFlowmuxHook("stop"));
-  event.subscribe("session.error", () => fireFlowmuxHook("notification"));
-  return {{}};
-}};
+export const server = async () => ({{
+  event: async ({{ event }}) => {{
+    if (!event || typeof event.type !== "string") return;
+    if (event.type === "session.idle") fireFlowmuxHook("stop");
+    else if (event.type === "session.error") fireFlowmuxHook("notification");
+  }},
+}});
+
+export default {{ server }};
 "#,
         marker = FLOWMUX_OPENCODE_PLUGIN_MARKER,
         bin_literal = serde_json::to_string(flowmux_bin).unwrap_or_else(|_| "\"flowmux\"".into()),
@@ -458,13 +468,21 @@ fn register_opencode_plugin(path: &Path, plugin_name: &str) -> Result<()> {
         *plugins = json!([]);
     }
     let arr = plugins.as_array_mut().unwrap();
+    // Drop any stale `.js` registration from a previous install before
+    // re-adding the canonical `.mjs` reference. OpenCode 1.14+ requires
+    // ESM, so the `.js` form is no longer loadable.
+    arr.retain(|v| {
+        v.as_str()
+            .map(|s| !(s.contains(plugin_name) && s.ends_with(".js")))
+            .unwrap_or(true)
+    });
     let already = arr
         .iter()
         .any(|v| v.as_str().map(|s| s.contains(plugin_name)).unwrap_or(false));
     if !already {
-        arr.push(Value::String(format!("file://./plugins/{plugin_name}.js")));
-        write_json(path, &root)?;
+        arr.push(Value::String(format!("file://./plugins/{plugin_name}.mjs")));
     }
+    write_json(path, &root)?;
     Ok(())
 }
 
@@ -700,10 +718,23 @@ codex_hooks = true
         let v: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         let plugins = v["plugin"].as_array().unwrap();
         assert_eq!(plugins.len(), 1);
-        assert!(plugins[0]
-            .as_str()
-            .unwrap()
-            .contains("flowmux-session"));
+        let entry = plugins[0].as_str().unwrap();
+        assert!(entry.contains("flowmux-session"));
+        assert!(entry.ends_with(".mjs"), "must use ESM extension: {entry}");
+    }
+
+    #[test]
+    fn opencode_register_plugin_replaces_stale_js_with_mjs() {
+        let dir = tmp();
+        let path = dir.path().join("opencode.json");
+        // Simulate the previous flowmux install which used .js.
+        let initial = json!({ "plugin": ["file://./plugins/flowmux-session.js"] });
+        write_json(&path, &initial).unwrap();
+        register_opencode_plugin(&path, "flowmux-session").unwrap();
+        let v: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let plugins = v["plugin"].as_array().unwrap();
+        assert_eq!(plugins.len(), 1);
+        assert!(plugins[0].as_str().unwrap().ends_with(".mjs"));
     }
 
     #[test]
@@ -725,6 +756,9 @@ codex_hooks = true
         assert!(src.contains(FLOWMUX_OPENCODE_PLUGIN_MARKER));
         assert!(src.contains("/usr/local/bin/flowmux"));
         assert!(src.contains("session.idle"));
+        // Must be an ESM module so OpenCode 1.14+ loads it.
+        assert!(src.contains("import"));
+        assert!(src.contains("export const server"));
     }
 
     #[test]
