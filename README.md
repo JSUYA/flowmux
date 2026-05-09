@@ -1,10 +1,14 @@
+
+<div align="center">
+  
 # FlowMux
+![icon](resources/icons/flowmux-180.png)
 
-**Agent Workflow Multiplexer** — *Go with the agents' flow.*
+**Agent Workflow Multiplexer Terminal** — *Go with the agents' flow.*
 
-<img width="1426" height="926" alt="Screenshot from 2026-05-09 12-06-58" src="https://github.com/user-attachments/assets/5f452957-32c7-4439-aada-06a0e8c6d5c7" />
+<img width="860"  alt="Screenshot from 2026-05-09 12-06-58" src="https://github.com/user-attachments/assets/5f452957-32c7-4439-aada-06a0e8c6d5c7" />
 
-
+</div>
 
 ### A cmux-inspired terminal for AI agent workflows, browser control, and task signals.
 
