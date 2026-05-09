@@ -62,6 +62,11 @@ enum Cmd {
     },
 
     /// Send a desktop notification attached to a pane.
+    ///
+    /// When `--pane` is omitted the daemon picks up `FLOWMUX_PANE_ID`
+    /// from the calling PTY (set by flowmux-app at spawn time), so
+    /// hooks running inside a flowmux pane can omit the flag and still
+    /// have the click-through routed to the right pane.
     Notify {
         #[arg(long)]
         pane: Option<PaneId>,
@@ -70,6 +75,25 @@ enum Cmd {
         #[arg(long, default_value = "info", value_parser = ["info", "attention", "error"])]
         level: String,
         body: String,
+    },
+
+    /// Friendly helper for AI-agent hooks (Claude Code, OpenCode,
+    /// Codex). Fires an `AttentionNeeded` toast titled with the agent
+    /// name so flowmux's bell popover and the OS notification both say
+    /// "Claude is ready" without the caller having to spell every flag.
+    /// Like `Notify`, falls back to `FLOWMUX_PANE_ID` when `--pane` is
+    /// omitted, so it works as a one-liner from a hook script.
+    NotifyComplete {
+        /// Agent name. Used as the title prefix and exposed to the
+        /// router as a category, e.g. "Claude", "Codex", "OpenCode".
+        #[arg(long)]
+        agent: String,
+        /// Optional message — defaults to "task complete".
+        #[arg(long)]
+        message: Option<String>,
+        /// Override the source pane (otherwise FLOWMUX_PANE_ID).
+        #[arg(long)]
+        pane: Option<PaneId>,
     },
 
     /// Split a pane.
@@ -363,11 +387,24 @@ fn build_request(cmd: Cmd) -> anyhow::Result<Request> {
             level,
             body,
         } => Request::Notify {
-            pane,
+            pane: pane.or_else(pane_from_env),
             title,
             body,
             level: parse_level(&level),
         },
+        Cmd::NotifyComplete {
+            agent,
+            message,
+            pane,
+        } => {
+            let body = message.unwrap_or_else(|| "task complete".to_string());
+            Request::Notify {
+                pane: pane.or_else(pane_from_env),
+                title: format!("{agent} ready"),
+                body,
+                level: NotificationLevel::AttentionNeeded,
+            }
+        }
         Cmd::Split { pane, right, down } => {
             let direction = if down {
                 SplitDirection::Horizontal
@@ -970,6 +1007,224 @@ mod tests {
             req,
             Request::BrowserAttr { pane: got, target, name }
                 if got == pane && target == "link" && name == "href"
+        ));
+    }
+
+    // -- Notification CLI surface --------------------------------------
+    //
+    // 5 variants per feature, each provoking one realistic mistake the
+    // user might make from a hook script.
+
+    #[test]
+    fn notify_with_explicit_pane_passes_it_through_even_when_env_set() {
+        let _g = flowmux_pane_env_lock();
+        let env_pane = PaneId::new();
+        let arg_pane = PaneId::new();
+        unsafe {
+            std::env::set_var("FLOWMUX_PANE_ID", env_pane.to_string());
+        }
+        let req = build_request(Cmd::Notify {
+            pane: Some(arg_pane),
+            title: "Build".into(),
+            level: "info".into(),
+            body: "ok".into(),
+        })
+        .unwrap();
+        unsafe {
+            std::env::remove_var("FLOWMUX_PANE_ID");
+        }
+        // Explicit --pane wins. Env is only a fallback.
+        assert!(matches!(
+            req,
+            Request::Notify { pane: Some(got), .. } if got == arg_pane
+        ));
+    }
+
+    #[test]
+    fn notify_falls_back_to_flowmux_pane_id_env() {
+        let _g = flowmux_pane_env_lock();
+        let pane = PaneId::new();
+        unsafe {
+            std::env::set_var("FLOWMUX_PANE_ID", pane.to_string());
+        }
+        let req = build_request(Cmd::Notify {
+            pane: None,
+            title: "Build".into(),
+            level: "attention".into(),
+            body: "ready".into(),
+        })
+        .unwrap();
+        unsafe {
+            std::env::remove_var("FLOWMUX_PANE_ID");
+        }
+        assert!(matches!(
+            req,
+            Request::Notify { pane: Some(got), level: NotificationLevel::AttentionNeeded, .. }
+                if got == pane
+        ));
+    }
+
+    #[test]
+    fn notify_with_no_pane_and_no_env_yields_global_notification() {
+        let _g = flowmux_pane_env_lock();
+        unsafe {
+            std::env::remove_var("FLOWMUX_PANE_ID");
+        }
+        let req = build_request(Cmd::Notify {
+            pane: None,
+            title: "Build".into(),
+            level: "info".into(),
+            body: "ok".into(),
+        })
+        .unwrap();
+        assert!(matches!(req, Request::Notify { pane: None, .. }));
+    }
+
+    #[test]
+    fn notify_ignores_invalid_flowmux_pane_id_env_instead_of_panicking() {
+        let _g = flowmux_pane_env_lock();
+        unsafe {
+            std::env::set_var("FLOWMUX_PANE_ID", "not-a-uuid");
+        }
+        let req = build_request(Cmd::Notify {
+            pane: None,
+            title: "Build".into(),
+            level: "info".into(),
+            body: "ok".into(),
+        })
+        .unwrap();
+        unsafe {
+            std::env::remove_var("FLOWMUX_PANE_ID");
+        }
+        // Bad env should not crash; fall back to None and let the
+        // daemon fire a global toast.
+        assert!(matches!(req, Request::Notify { pane: None, .. }));
+    }
+
+    #[test]
+    fn notify_unknown_level_string_falls_back_to_info_not_panic() {
+        // parse_level is documented to default unknown strings to Info.
+        // A clap value_parser already rejects unknown strings at the
+        // CLI boundary, but the inner parse_level should still be
+        // defensive — if a future caller passes "warn" they get Info.
+        assert_eq!(parse_level("warn"), NotificationLevel::Info);
+        assert_eq!(parse_level(""), NotificationLevel::Info);
+        assert_eq!(parse_level("ATTENTION"), NotificationLevel::Info); // case-sensitive on purpose
+    }
+
+    // -- NotifyComplete (claude / opencode / codex hook helper) ---------
+
+    #[test]
+    fn notify_complete_default_message_uses_attention_level() {
+        let _g = flowmux_pane_env_lock();
+        unsafe {
+            std::env::remove_var("FLOWMUX_PANE_ID");
+        }
+        let req = build_request(Cmd::NotifyComplete {
+            agent: "Claude".into(),
+            message: None,
+            pane: None,
+        })
+        .unwrap();
+        assert!(matches!(
+            req,
+            Request::Notify {
+                pane: None,
+                level: NotificationLevel::AttentionNeeded,
+                ..
+            }
+        ));
+        if let Request::Notify { title, body, .. } = req {
+            assert!(title.contains("Claude"), "title carries agent: {title}");
+            assert_eq!(body, "task complete");
+        }
+    }
+
+    #[test]
+    fn notify_complete_passes_explicit_message_verbatim() {
+        let _g = flowmux_pane_env_lock();
+        unsafe {
+            std::env::remove_var("FLOWMUX_PANE_ID");
+        }
+        let req = build_request(Cmd::NotifyComplete {
+            agent: "Codex".into(),
+            message: Some("waiting for approval".into()),
+            pane: None,
+        })
+        .unwrap();
+        if let Request::Notify { body, .. } = req {
+            assert_eq!(body, "waiting for approval");
+        } else {
+            panic!("expected Notify");
+        }
+    }
+
+    #[test]
+    fn notify_complete_picks_pane_from_env_for_focus_routing() {
+        let _g = flowmux_pane_env_lock();
+        let pane = PaneId::new();
+        unsafe {
+            std::env::set_var("FLOWMUX_PANE_ID", pane.to_string());
+        }
+        let req = build_request(Cmd::NotifyComplete {
+            agent: "OpenCode".into(),
+            message: None,
+            pane: None,
+        })
+        .unwrap();
+        unsafe {
+            std::env::remove_var("FLOWMUX_PANE_ID");
+        }
+        assert!(matches!(
+            req,
+            Request::Notify { pane: Some(got), .. } if got == pane
+        ));
+    }
+
+    #[test]
+    fn notify_complete_explicit_pane_overrides_env() {
+        let _g = flowmux_pane_env_lock();
+        let env_pane = PaneId::new();
+        let arg_pane = PaneId::new();
+        unsafe {
+            std::env::set_var("FLOWMUX_PANE_ID", env_pane.to_string());
+        }
+        let req = build_request(Cmd::NotifyComplete {
+            agent: "claude".into(),
+            message: Some("hi".into()),
+            pane: Some(arg_pane),
+        })
+        .unwrap();
+        unsafe {
+            std::env::remove_var("FLOWMUX_PANE_ID");
+        }
+        assert!(matches!(
+            req,
+            Request::Notify { pane: Some(got), .. } if got == arg_pane
+        ));
+    }
+
+    #[test]
+    fn notify_complete_handles_empty_agent_string_without_panic() {
+        // A buggy hook might forget to substitute the agent name. The
+        // CLI should still produce a Notify (the resulting title is
+        // useless but the toast is harmless), not crash mid-pipeline.
+        let _g = flowmux_pane_env_lock();
+        unsafe {
+            std::env::remove_var("FLOWMUX_PANE_ID");
+        }
+        let req = build_request(Cmd::NotifyComplete {
+            agent: String::new(),
+            message: None,
+            pane: None,
+        })
+        .unwrap();
+        assert!(matches!(
+            req,
+            Request::Notify {
+                level: NotificationLevel::AttentionNeeded,
+                ..
+            }
         ));
     }
 }
