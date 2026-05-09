@@ -46,19 +46,6 @@ window so multiple sessions don't bleed into each other.
 - `Alt` + arrow keys navigate between sibling panes, scoped to the active
   workspace; closing a pane preserves the keyboard focus and the other
   panes' PTY children.
-- Single-pane workspaces auto-sync their sidebar name with the running
-  tab title.
-- Closing a workspace asks for confirmation; multiple flowmux windows
-  can run side by side, each on its own IPC socket and notification stream.
-
-### Terminals
-- vte-2.91-gtk4 backend by default, with an experimental libghostty
-  backend selectable per surface.
-- `~/.config/ghostty/config` is read for fonts and colours so existing
-  Ghostty users keep their styling.
-- Every PTY child receives `FLOWMUX_PANE_ID`, `FLOWMUX_WORKSPACE_ID`,
-  `FLOWMUX_SOCKET_PATH`, and friends, so tools running inside the pane
-  can call back into flowmux without any flags.
 
 ### In-app browser
 - WebKitGTK 6.0 surface that sits in the pane tree as a *browser tab*,
