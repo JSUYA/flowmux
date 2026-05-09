@@ -66,6 +66,10 @@ window so multiple sessions don't bleed into each other.
   workspace lands back on the right pane.
 - `claude-teams` opens a workspace pre-split into several panes, each
   running its own Claude instance.
+- `flowmux doctor` shows whether each agent is wired correctly and
+  `flowmux fix` re-installs the pieces that are missing — handy after
+  installing an agent that wasn't on the host when flowmux was first
+  set up.
 
 ### Scripting & automation
 - The `flowmux` command line covers the same surface the GUI exposes:
@@ -155,6 +159,38 @@ For day-to-day development you can skip the install step:
 cargo run -p flowmux           # debug GUI
 cargo check --workspace        # type-check everything
 ```
+
+## Verify & repair
+
+flowmux integrates with several things on your host — AI-agent SKILL
+files, agent lifecycle hooks, the in-app browser data dir, host
+browsers visible to the cookie importer, and the flowmux daemon
+socket. Two commands keep the whole picture in one place:
+
+```bash
+flowmux doctor   # read-only audit; exits non-zero if anything needs fixing
+flowmux fix      # re-install / refresh anything `doctor` flagged
+```
+
+`doctor` prints one row per check with a coloured status badge — green
+`ok`, red `fix`, yellow `warn`, plain `info`. Pipe it (`flowmux
+doctor | …`) or set `NO_COLOR=1` to disable colour for log files and
+CI. Run it whenever you want to know "is everything wired?":
+
+- **after `flowmux` install or upgrade** — the SKILL/hook payloads
+  ship inside the binary, so a fresh build may need to re-sync the
+  on-disk copies.
+- **after installing Claude Code, Codex, or OpenCode for the first
+  time** — agents installed *after* flowmux are detected on the next
+  `doctor` run; `fix` then wires them up.
+- **when the bell popover or desktop notifications stop arriving**
+  from one agent — a row tagged `fix` (missing/drifted hook entry) is
+  almost always the cause.
+
+`fix` is idempotent: rows that are already `ok` are no-ops, agents
+whose home directory is missing are skipped, and re-running it never
+clobbers a hand-edited entry that doesn't carry the flowmux marker.
+Add `--json` to either command for machine-readable output.
 
 ## License
 
