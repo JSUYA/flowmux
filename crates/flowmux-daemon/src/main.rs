@@ -22,10 +22,18 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Release builds stay quiet — only ERROR events surface so a
+    // packaged binary doesn't spam journald with info/debug noise.
+    // `FLOWMUX_LOG` still overrides for users debugging in prod.
+    let default_filter = if cfg!(debug_assertions) {
+        "info,flowmux=debug"
+    } else {
+        "error"
+    };
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_env("FLOWMUX_LOG")
-                .unwrap_or_else(|_| "info,flowmux=debug".into()),
+                .unwrap_or_else(|_| default_filter.into()),
         )
         .init();
 

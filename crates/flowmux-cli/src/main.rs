@@ -384,10 +384,18 @@ enum WorkspaceOp {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Release builds stay quiet — only ERROR events surface so the
+    // CLI never spams agent hooks (Claude/Codex/OpenCode) with info
+    // chatter on stderr. `FLOWMUX_LOG` still overrides for debugging.
+    let default_filter = if cfg!(debug_assertions) {
+        "warn,flowmux=info"
+    } else {
+        "error"
+    };
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_env("FLOWMUX_LOG")
-                .unwrap_or_else(|_| "warn,flowmux=info".into()),
+                .unwrap_or_else(|_| default_filter.into()),
         )
         .init();
 
