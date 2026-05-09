@@ -38,69 +38,46 @@ window so multiple sessions don't bleed into each other.
 ## Features
 
 ### Workspaces & panes
-- Each side-panel item is a workspace with its own recursive pane tree —
-  split a pane horizontally or vertically and mix terminal tabs with
-  browser tabs in the same pane.
-- `Alt` + arrow keys navigate between sibling panes, scoped to the active
-  workspace; closing a pane preserves the keyboard focus and the other
-  panes' PTY children.
+- Side-panel workspaces keep several tasks side by side, and each one
+  can be split into as many panes as you need.
+- Terminal tabs and browser tabs share the same pane tree, and you can
+  jump between panes from the keyboard.
 
 ### In-app browser
-- WebKitGTK 6.0 surface that sits in the pane tree as a *browser tab*,
-  not a popup window.
-- Scriptable from the CLI or IPC: `browser snapshot` returns an a11y
-  tree with stable `eN` ref tokens; `click` / `fill` / `select` / `type`
-  / `press` / `scroll`, plus `is-visible` / `is-enabled` / `is-checked`
-  / `count` / `text` / `value` / `attr` operate on those refs.
-- `import-cookies --from {firefox,chrome,chromium,brave,edge,arc}` pulls
-  the host browser's session into the in-app jar (libsecret + sqlite).
-- An `AGENTS.md` ships at the repo root so AI agents that follow the
-  AGENTS.md convention prefer the in-app browser over Playwright,
-  Puppeteer, or a system Chromium.
+- A browser tab lives inside flowmux next to your terminals — no need
+  to open a separate Chromium just to view or interact with a page.
+- AI agents in a neighbouring pane can drive that browser directly:
+  snapshot the page, click, type, scroll, and read state back.
+- Import an existing session from Firefox, Chrome, Chromium, Brave,
+  Edge, or Arc so you stay logged in to the sites you already use.
 
 ### Notifications
-- OSC 9 / OSC 99 / OSC 777 detection in any PTY, plus a streaming
-  variant (`flowmux notify-stream`) for piping log files through.
-- Desktop delivery via `org.freedesktop.Notifications` over zbus.
-- Routing is surface-aware: a notification fired by the currently
-  focused surface is suppressed, and clicking the bell popover jumps
-  back to the source pane.
-- Workspaces tint when they have unread attention and clear the tint
-  when activated, whether by click or programmatically.
+- "Task complete" and "needs attention" signals from a terminal turn
+  into native desktop notifications.
+- Each notification is routed to the workspace that fired it, stays
+  quiet while you are already looking at that pane, and the sidebar
+  highlights workspaces that need your attention.
 
 ### AI agent integration
-- `flowmux hooks setup` registers Claude Code, Codex, and OpenCode
-  lifecycle hooks so `Stop` / `Notification` / `SessionStart` /
-  `SessionEnd` / `PreToolUse` / `PromptSubmit` events flow into the
-  flowmux notification system.
-- `flowmux notify-complete --agent <Claude|Codex|OpenCode>` is a
-  one-liner helper for hook scripts; it falls back to `FLOWMUX_PANE_ID`
-  so it works without flags.
-- Agent session ids are persisted with workspace state, so a workspace
-  restored at startup still resolves its agent panes.
-- `flowmux claude-teams --count N` opens a workspace pre-split into N
-  panes, each running `claude`, mirroring cmux's `claude-teams`.
-- `flowmux agent install` mirrors the bundled flowmux-browser SKILL
-  into each agent's user-level skills directory; `flowmux agent doctor`
-  reports drift.
+- Claude Code, Codex, and OpenCode are wired up out of the box, so
+  completion, approval, and error events surface as notifications you
+  actually see.
+- Agent sessions are remembered across restarts, so a resumed
+  workspace lands back on the right pane.
+- `claude-teams` opens a workspace pre-split into several panes, each
+  running its own Claude instance.
 
-### CLI surface
-- `flowmuxctl` is the underlying CLI; the `flowmux` GUI binary forwards
-  subcommands to it, so `flowmux browser open ...` and `flowmuxctl
-  browser open ...` are equivalent.
-- All target arguments accept a bare uuid, `pane:<uuid>`, or
-  `surface:<uuid>`; `--json` emits machine-readable output for scripts
-  and agents.
-- Coverage: workspace, split, send-keys, browser (full automation
-  surface), ssh, notify / notify-complete / notify-stream, theme,
-  hooks, agent.
+### Scripting & automation
+- The `flowmux` command line covers the same surface the GUI exposes:
+  open workspaces, split panes, drive the in-app browser, send
+  notifications, manage themes.
+- Commands can return JSON, so shell scripts and agents can consume
+  the results directly.
 
-### Config & state
-- `cmux.json` is read unchanged for custom commands.
-- Workspace / pane / surface state lives under
-  `$XDG_DATA_HOME/flowmux/` and survives restarts.
-- Themes load from `$XDG_CONFIG_HOME/flowmux/theme`; `flowmux theme
-  import <file>` copies one in.
+### Config & persistence
+- Reads `cmux.json` for custom commands and picks up your Ghostty
+  fonts and colours from `~/.config/ghostty/config`.
+- Workspaces, panes, and themes are remembered between launches.
 
 ## Layout
 
