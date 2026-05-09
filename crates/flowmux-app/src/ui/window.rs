@@ -99,12 +99,7 @@ impl WindowController {
                 let _ = rx.await;
             });
         };
-        let sidebar = Sidebar::new(
-            on_select,
-            on_close,
-            bridge.clone(),
-            notifications.clone(),
-        );
+        let sidebar = Sidebar::new(on_select, on_close, bridge.clone(), notifications.clone());
 
         let pane_registry: Rc<RefCell<PaneRegistry>> =
             Rc::new(RefCell::new(PaneRegistry::default()));
@@ -147,7 +142,11 @@ impl WindowController {
         // Restore saved window size/maximized state, otherwise default to 1280x800.
         let stored_window = store.window_layout_blocking();
         let (default_w, default_h, was_maximized) = match &stored_window {
-            Some(layout) => (layout.width.max(320), layout.height.max(240), layout.maximized),
+            Some(layout) => (
+                layout.width.max(320),
+                layout.height.max(240),
+                layout.maximized,
+            ),
             None => (1280, 800, false),
         };
         let window = adw::ApplicationWindow::builder()
@@ -192,7 +191,9 @@ impl WindowController {
                 let status = adw::StatusPage::builder()
                     .icon_name("utilities-terminal-symbolic")
                     .title("flowmux")
-                    .description("No workspaces yet — open one with: flowmux workspace new --root .")
+                    .description(
+                        "No workspaces yet — open one with: flowmux workspace new --root .",
+                    )
                     .build();
                 self.stack.add_named(&status, Some("__empty"));
             }
@@ -269,11 +270,7 @@ impl WindowController {
         };
 
         // Pick the sibling: the child of `paned` that isn't `frame`.
-        let sibling = if paned
-            .start_child()
-            .map(|w| w == frame)
-            .unwrap_or(false)
-        {
+        let sibling = if paned.start_child().map(|w| w == frame).unwrap_or(false) {
             paned.end_child()
         } else {
             paned.start_child()
@@ -411,11 +408,11 @@ impl WindowController {
         // 2. Fall back to the workspace's first leaf in the daemon-side tree.
         let target = match target {
             Some(t) => Some(t),
-            None => self
-                .store
-                .get_workspace(ws_id)
-                .await
-                .and_then(|ws| ws.surfaces.first().and_then(|s| s.root_pane.first_leaf_id())),
+            None => self.store.get_workspace(ws_id).await.and_then(|ws| {
+                ws.surfaces
+                    .first()
+                    .and_then(|s| s.root_pane.first_leaf_id())
+            }),
         };
         let Some(target) = target else { return };
 
@@ -528,11 +525,11 @@ impl WindowController {
     }
 
     /// Attach a newly created surface incrementally whenever possible.
-///
+    ///
     /// Old behavior: call rerender_workspace, rebuild the entire workspace
     /// widget, and lose browser navigation state plus terminal shell sessions in
     /// other panes.
-///
+    ///
     /// New behavior: append only to the target pane's tab bar / stack. If the
     /// pane is not rendered yet, for example because another workspace is
     /// visible, or the registry cannot find handles, safely fall back to a full
@@ -662,7 +659,7 @@ impl WindowController {
     }
 
     /// Single entry point for recomputing workspace label and subtitles.
-///
+    ///
     /// Design:
     ///   * Side-panel main label = active surface title from MRU[0], the most
     ///     recently focused pane. Use the original OSC title when present;
@@ -672,7 +669,7 @@ impl WindowController {
     ///     therefore the 3 subtitle lines.
     ///   * If `custom_title` is locked, the user label takes display priority
     ///     and only ws.name, the automatic value, is updated in the background.
-///
+    ///
     /// Updates both store and side panel. The daemon setter is idempotent so
     /// repeated calls for the same ws_id, such as cwd polling, only mark disk
     /// dirty and rebuild GTK when values actually change.
@@ -690,10 +687,11 @@ impl WindowController {
             .unwrap_or_default();
         // If MRU is empty, fall back to the workspace's first leaf. This happens
         // during initial render before anything has focus.
-        let head_pane = mru
-            .first()
-            .copied()
-            .or_else(|| ws.surfaces.first().and_then(|s| s.root_pane.first_leaf_id()));
+        let head_pane = mru.first().copied().or_else(|| {
+            ws.surfaces
+                .first()
+                .and_then(|s| s.root_pane.first_leaf_id())
+        });
 
         if let Some(head_pane) = head_pane {
             if let Some(new_name) = focused_surface_full_title(&ws, head_pane) {
@@ -815,8 +813,7 @@ impl WindowController {
         // All pane split ratios.
         let ratios = self.pane_registry.borrow().split_ratios();
         for (split_id, ratio) in ratios {
-            self.store
-                .set_pane_split_ratio_blocking(split_id, ratio);
+            self.store.set_pane_split_ratio_blocking(split_id, ratio);
         }
     }
 
@@ -971,10 +968,8 @@ impl WindowController {
             } => {
                 match self.store.split_pane(pane, direction).await {
                     Some((ws_id, new_pane)) => {
-                        self.apply_split_incremental_or_rerender(
-                            ws_id, pane, new_pane, direction,
-                        )
-                        .await;
+                        self.apply_split_incremental_or_rerender(ws_id, pane, new_pane, direction)
+                            .await;
                         // Move keyboard focus to the new pane for both the
                         // incremental path and rerender fallback. Also handle
                         // browser splits from BrowserOpenSplit so web_view receives focus.
@@ -1059,10 +1054,8 @@ impl WindowController {
                 // and immediately load_uri's it, so no extra navigate command is
                 // needed. If surface creation fails, for example because the pane
                 // disappeared right after the click, ignore it quietly.
-                if let Some((ws_id, surface_id)) = self
-                    .store
-                    .add_browser_surface_to_pane(pane, url)
-                    .await
+                if let Some((ws_id, surface_id)) =
+                    self.store.add_browser_surface_to_pane(pane, url).await
                 {
                     self.attach_or_rerender_surface(ws_id, pane, surface_id)
                         .await;
@@ -1187,9 +1180,11 @@ impl WindowController {
                     .reorder_surface_in_pane(pane, surface, target_index)
                     .await;
                 if store_result.is_some() {
-                    self.pane_registry
-                        .borrow_mut()
-                        .reorder_surface_widget(pane, surface, target_index);
+                    self.pane_registry.borrow_mut().reorder_surface_widget(
+                        pane,
+                        surface,
+                        target_index,
+                    );
                     tracing::info!(%pane, %surface, target_index, "ReorderSurface applied");
                 } else {
                     tracing::warn!(
@@ -1321,11 +1316,7 @@ impl WindowController {
                     // Match cmux prefill behavior: start from custom_title when
                     // present so the user can edit it, otherwise show the current
                     // automatic name (`name`).
-                    let prefill = ws
-                        .custom_title
-                        .as_deref()
-                        .unwrap_or(&ws.name)
-                        .to_string();
+                    let prefill = ws.custom_title.as_deref().unwrap_or(&ws.name).to_string();
                     show_rename_dialog(&self.window, id, &prefill, self.bridge.clone());
                 }
             }
@@ -1495,35 +1486,30 @@ impl WindowController {
                         let refs = browser.refs.clone();
                         let scope = browser.ref_scope;
                         let cell = std::cell::Cell::new(Some(ack));
-                        browser.evaluate_js(
-                            flowmux_browser::scripts::SNAPSHOT_JS,
-                            move |result| {
-                                if let Some(ack) = cell.take() {
-                                    let mapped = match result {
-                                        Ok(s) => {
-                                            update_ref_store_from_snapshot(&refs, scope, &s);
-                                            Ok(BrowserActionResult::String(s))
-                                        }
-                                        Err(e) => Err(e),
-                                    };
-                                    let _ = ack.send(mapped);
-                                }
-                            },
-                        );
-                    }
-                    BrowserOp::Click { target } => {
-                        match resolve_ref(&browser, &target) {
-                            Ok(sel) => run_browser_js(
-                                &browser,
-                                &flowmux_browser::scripts::click_by_selector(&sel),
-                                ack,
-                                true,
-                            ),
-                            Err(e) => {
-                                let _ = ack.send(Err(e));
+                        browser.evaluate_js(flowmux_browser::scripts::SNAPSHOT_JS, move |result| {
+                            if let Some(ack) = cell.take() {
+                                let mapped = match result {
+                                    Ok(s) => {
+                                        update_ref_store_from_snapshot(&refs, scope, &s);
+                                        Ok(BrowserActionResult::String(s))
+                                    }
+                                    Err(e) => Err(e),
+                                };
+                                let _ = ack.send(mapped);
                             }
-                        }
+                        });
                     }
+                    BrowserOp::Click { target } => match resolve_ref(&browser, &target) {
+                        Ok(sel) => run_browser_js(
+                            &browser,
+                            &flowmux_browser::scripts::click_by_selector(&sel),
+                            ack,
+                            true,
+                        ),
+                        Err(e) => {
+                            let _ = ack.send(Err(e));
+                        }
+                    },
                     BrowserOp::Fill { target, value } => match resolve_ref(&browser, &target) {
                         Ok(sel) => run_browser_js(
                             &browser,
@@ -1725,8 +1711,7 @@ impl WindowController {
                 // append a new tab there instead of creating a new
                 // split. Falls back to a fresh vertical split when no
                 // such right sibling exists.
-                if let Some(reuse_target) =
-                    self.store.find_right_sibling_browser_leaf(target).await
+                if let Some(reuse_target) = self.store.find_right_sibling_browser_leaf(target).await
                 {
                     match self
                         .store
@@ -1741,16 +1726,11 @@ impl WindowController {
                             // state. Falling back to rerender_workspace
                             // here would kill claude/codex running in the
                             // caller's terminal (regression #pane-reset).
-                            self.attach_or_rerender_surface(
-                                workspace,
-                                reuse_target,
-                                surface_id,
-                            )
-                            .await;
+                            self.attach_or_rerender_surface(workspace, reuse_target, surface_id)
+                                .await;
                             let _ = ack.send(Ok(BrowserOpenOutcome {
                                 pane: reuse_target,
-                                placement_strategy:
-                                    PlacementStrategy::ReuseRightSibling,
+                                placement_strategy: PlacementStrategy::ReuseRightSibling,
                             }));
                             return;
                         }
@@ -1879,6 +1859,11 @@ impl WindowController {
             self.stack.set_visible_child_name(&id.to_string());
         }
         self.sidebar.select_workspace(id);
+        // Programmatic activation paths (notification click, Alt+
+        // number, focus shortcut) bypass the row-activated callback
+        // that would otherwise drop the attention tint, so we clear it
+        // here too.
+        self.sidebar.clear_attention(id);
         self.store.set_active_workspace(Some(id)).await;
         if let Some(ws) = self.store.get_workspace(id).await {
             self.focus_first_leaf_of(&ws);
@@ -1904,7 +1889,10 @@ impl WindowController {
 /// surface.title as the original value. Otherwise, for terminals, extract the
 /// cwd folder name at full length because surface.title may be truncated to 15
 /// characters for tab display.
-fn focused_surface_full_title(ws: &flowmux_core::Workspace, focused_pane: PaneId) -> Option<String> {
+fn focused_surface_full_title(
+    ws: &flowmux_core::Workspace,
+    focused_pane: PaneId,
+) -> Option<String> {
     use flowmux_core::SurfaceKind;
     let active = ws
         .surfaces
@@ -1939,11 +1927,7 @@ fn focused_surface_full_title(ws: &flowmux_core::Workspace, focused_pane: PaneId
 ///   * Active browser tabs use `Browser-{tab name}`.
 /// Result length never exceeds `cap`. If MRU is empty or short, DFS over tree
 /// leaves left-first to keep side-panel subtitles populated.
-fn collect_subtitle_lines(
-    ws: &flowmux_core::Workspace,
-    mru: &[PaneId],
-    cap: usize,
-) -> Vec<String> {
+fn collect_subtitle_lines(ws: &flowmux_core::Workspace, mru: &[PaneId], cap: usize) -> Vec<String> {
     use flowmux_core::SurfaceKind;
     let Some(root) = ws.surfaces.first().map(|s| &s.root_pane) else {
         return Vec::new();
@@ -2304,11 +2288,7 @@ fn register_workspace_actions(
                 let Some(window) = window_weak.upgrade() else {
                     return;
                 };
-                let prefill = ws
-                    .custom_title
-                    .as_deref()
-                    .unwrap_or(&ws.name)
-                    .to_string();
+                let prefill = ws.custom_title.as_deref().unwrap_or(&ws.name).to_string();
                 show_rename_dialog(&window, id, &prefill, bridge);
             });
         })
@@ -2642,14 +2622,13 @@ mod tests {
             .application_id("com.flowmux.App.UiTest")
             .build();
         app.register(None::<&gtk::gio::Cancellable>).unwrap();
-        let controller =
-            WindowController::new(
-                &app,
-                store.clone(),
-                Arc::new(ResolvedTheme::load()),
-                bridge,
-                gtk::CssProvider::new(),
-            );
+        let controller = WindowController::new(
+            &app,
+            store.clone(),
+            Arc::new(ResolvedTheme::load()),
+            bridge,
+            gtk::CssProvider::new(),
+        );
 
         controller.render_workspace(&ws);
         assert_eq!(
@@ -2758,9 +2737,7 @@ mod tests {
 
         // Initial state with no focus falls back to plain "flowmux".
         controller.focused_pane.set(None);
-        controller
-            .dispatch(GtkCommand::RefreshWindowTitle)
-            .await;
+        controller.dispatch(GtkCommand::RefreshWindowTitle).await;
         assert_eq!(
             controller.window.title().map(|s| s.to_string()).as_deref(),
             Some("flowmux")
@@ -2769,9 +2746,7 @@ mod tests {
         // With focus, the title becomes "flowmux - {tab name}".
         let expected_tab_name = store.surface_title(pane, surface).await.unwrap();
         controller.focused_pane.set(Some(pane));
-        controller
-            .dispatch(GtkCommand::RefreshWindowTitle)
-            .await;
+        controller.dispatch(GtkCommand::RefreshWindowTitle).await;
         assert_eq!(
             controller.window.title().map(|s| s.to_string()),
             Some(format!("flowmux - {expected_tab_name}"))
@@ -3165,9 +3140,7 @@ mod tests {
 
         // dispatch creates a new terminal surface itself, attaches it, and then
         // calls refresh_window_title.
-        controller
-            .dispatch(GtkCommand::NewSurface { pane })
-            .await;
+        controller.dispatch(GtkCommand::NewSurface { pane }).await;
 
         let title_now = controller.window.title().map(|s| s.to_string());
         assert!(title_now.is_some());
@@ -3464,9 +3437,7 @@ mod tests {
         let cwd = std::env::temp_dir().join("flowmux-program-title-poll");
         std::fs::create_dir_all(&cwd).unwrap();
         let store = StateStore::new_lazy(State::default());
-        let ws_id = store
-            .create_workspace(Some("ui".into()), cwd.clone())
-            .await;
+        let ws_id = store.create_workspace(Some("ui".into()), cwd.clone()).await;
         let ws = store.get_workspace(ws_id).await.unwrap();
         let pane = ws.surfaces[0].root_pane.first_leaf_id().unwrap();
         let surface = ws.surfaces[0].root_pane.active_surface_id(pane).unwrap();
@@ -3569,10 +3540,8 @@ mod tests {
         controller.render_workspace(&ws_b);
 
         let r = controller.pane_registry.borrow();
-        let in_a: std::collections::HashSet<_> =
-            r.pane_ids_in_workspace(ws_a_id).collect();
-        let in_b: std::collections::HashSet<_> =
-            r.pane_ids_in_workspace(ws_b_id).collect();
+        let in_a: std::collections::HashSet<_> = r.pane_ids_in_workspace(ws_a_id).collect();
+        let in_b: std::collections::HashSet<_> = r.pane_ids_in_workspace(ws_b_id).collect();
 
         assert!(in_a.contains(&pane_a));
         assert!(
@@ -3711,8 +3680,7 @@ mod tests {
             Some(ws_b_id),
             "Alt+arrow source pane should belong to ws_b",
         );
-        let in_b: std::collections::HashSet<_> =
-            r.pane_ids_in_workspace(ws_b_id).collect();
+        let in_b: std::collections::HashSet<_> = r.pane_ids_in_workspace(ws_b_id).collect();
         assert!(in_b.contains(&pane_b));
         assert!(!in_b.contains(&pane_a));
     }
@@ -3728,16 +3696,16 @@ mod tests {
             ".../dev/os/flowmux"
         );
         // Exactly 3 components -> unchanged.
-        assert_eq!(shorten_cwd_path(Path::new("/dev/os/flowmux")), "/dev/os/flowmux");
+        assert_eq!(
+            shorten_cwd_path(Path::new("/dev/os/flowmux")),
+            "/dev/os/flowmux"
+        );
         // 2 components -> unchanged.
         assert_eq!(shorten_cwd_path(Path::new("/home/junsu")), "/home/junsu");
         // Single component / root.
         assert_eq!(shorten_cwd_path(Path::new("/tmp")), "/tmp");
         // Deeper paths still keep the last 3.
-        assert_eq!(
-            shorten_cwd_path(Path::new("/a/b/c/d/e/f/g")),
-            ".../e/f/g"
-        );
+        assert_eq!(shorten_cwd_path(Path::new("/a/b/c/d/e/f/g")), ".../e/f/g");
     }
 
     #[test]
@@ -3919,9 +3887,7 @@ mod tests {
     /// leaf, only the currently active tab kind is considered.
     #[test]
     fn collect_subtitle_lines_uses_browser_prefix_for_browser_panes() {
-        use flowmux_core::{
-            Pane, PaneContent, PaneSurface, Surface, SurfaceId, SurfaceKind,
-        };
+        use flowmux_core::{Pane, PaneContent, PaneSurface, Surface, SurfaceId, SurfaceKind};
         let pane_id = PaneId::new();
         let term_surface = PaneSurface::terminal("dev", Some(std::path::PathBuf::from("/tmp/dev")));
         let browser_surface =
@@ -3980,10 +3946,7 @@ mod tests {
         let ws_id = store.create_workspace(None, root.clone()).await;
         let ws = store.get_workspace(ws_id).await.unwrap();
         let pane_a = ws.surfaces[0].root_pane.first_leaf_id().unwrap();
-        let surface_a = ws.surfaces[0]
-            .root_pane
-            .active_surface_id(pane_a)
-            .unwrap();
+        let surface_a = ws.surfaces[0].root_pane.active_surface_id(pane_a).unwrap();
 
         let (bridge, _rx) = Bridge::new();
         let app = adw::Application::builder()
@@ -4033,7 +3996,10 @@ mod tests {
             .await;
         {
             let ws = store.get_workspace(ws_id).await.unwrap();
-            assert_eq!(ws.name, "projectA", "ws.name reflects the new folder after cd");
+            assert_eq!(
+                ws.name, "projectA",
+                "ws.name reflects the new folder after cd"
+            );
             assert_eq!(
                 ws.display_title(),
                 "projectA",
@@ -4076,7 +4042,10 @@ mod tests {
                 "MyName",
                 "custom name stays visible after cd",
             );
-            assert_eq!(ws.name, "projectB", "automatic name keeps tracking folder names");
+            assert_eq!(
+                ws.name, "projectB",
+                "automatic name keeps tracking folder names"
+            );
         }
         let subs = controller.sidebar.cached_subtitles(ws_id).unwrap();
         assert_eq!(
@@ -4115,7 +4084,11 @@ mod tests {
             );
         }
         let subs = controller.sidebar.cached_subtitles(ws_id).unwrap();
-        assert_eq!(subs.len(), 2, "two split panes with focus history -> two subtitles");
+        assert_eq!(
+            subs.len(),
+            2,
+            "two split panes with focus history -> two subtitles"
+        );
         assert_eq!(
             subs[0], ".../flowmux-scn/dev/projectC",
             "MRU[0] = newly focused pane_b",
@@ -4160,7 +4133,10 @@ mod tests {
             3,
             "three split panes with each focused once -> three subtitles",
         );
-        assert_eq!(subs[0], ".../flowmux-scn/dev/projectD", "MRU[0]=C just focused");
+        assert_eq!(
+            subs[0], ".../flowmux-scn/dev/projectD",
+            "MRU[0]=C just focused"
+        );
         assert_eq!(subs[1], ".../flowmux-scn/dev/projectB", "MRU[1]=A");
         assert_eq!(subs[2], ".../flowmux-scn/dev/projectC", "MRU[2]=B");
 
@@ -4169,7 +4145,11 @@ mod tests {
             .dispatch(GtkCommand::PaneFocused { pane: pane_a })
             .await;
         let subs = controller.sidebar.cached_subtitles(ws_id).unwrap();
-        assert_eq!(subs.len(), 3, "refocusing an existing MRU pane keeps length");
+        assert_eq!(
+            subs.len(),
+            3,
+            "refocusing an existing MRU pane keeps length"
+        );
         assert_eq!(subs[0], ".../flowmux-scn/dev/projectB", "MRU head = pane_a");
         assert_eq!(subs[1], ".../flowmux-scn/dev/projectD", "MRU[1] = pane_c");
         assert_eq!(subs[2], ".../flowmux-scn/dev/projectC", "MRU[2] = pane_b");
@@ -4298,7 +4278,9 @@ mod tests {
         // left pane's frame, not the old paned (the old paned was
         // unparented). `surfaces` map carries that pointer.
         let surfaces = controller.surfaces.borrow();
-        let top = surfaces.get(&ws_id).expect("surfaces map has workspace widget");
+        let top = surfaces
+            .get(&ws_id)
+            .expect("surfaces map has workspace widget");
         let left_frame = controller
             .pane_registry
             .borrow()
@@ -4314,10 +4296,16 @@ mod tests {
         let ws_after = store.get_workspace(ws_id).await.unwrap();
         let leaf_count = {
             let mut leaves = Vec::new();
-            ws_after.surfaces[0].root_pane.for_each_leaf(|id| leaves.push(id));
+            ws_after.surfaces[0]
+                .root_pane
+                .for_each_leaf(|id| leaves.push(id));
             leaves
         };
-        assert_eq!(leaf_count, vec![left], "store collapsed the split correctly");
+        assert_eq!(
+            leaf_count,
+            vec![left],
+            "store collapsed the split correctly"
+        );
     }
 
     /// Regression: closing the split sibling must keep the surviving pane's
@@ -4579,9 +4567,7 @@ mod tests {
             .pane_registry
             .borrow()
             .active_terminal(pane_b)
-            .expect(
-                "regression: pane B vanished from registry after closing inner sibling C",
-            )
+            .expect("regression: pane B vanished from registry after closing inner sibling C")
             .widget
             .clone();
         let a_frame_after_close = controller
@@ -4614,11 +4600,9 @@ mod tests {
         // Daemon-side state must agree: tree collapsed to two leaves [A, B].
         let ws_after = store.get_workspace(ws_id).await.unwrap();
         let mut leaves: std::collections::HashSet<PaneId> = std::collections::HashSet::new();
-        ws_after.surfaces[0]
-            .root_pane
-            .for_each_leaf(|id| {
-                leaves.insert(id);
-            });
+        ws_after.surfaces[0].root_pane.for_each_leaf(|id| {
+            leaves.insert(id);
+        });
         let expected: std::collections::HashSet<PaneId> = [pane_a, pane_b].into_iter().collect();
         assert_eq!(
             leaves, expected,
@@ -4723,7 +4707,11 @@ mod tests {
             "regression: closing the focused pane in a nested split must hand focus to the previous MRU pane (B), not leave focused_pane stuck on the removed C"
         );
         assert!(
-            controller.pane_registry.borrow().pane_frame(pane_c).is_none(),
+            controller
+                .pane_registry
+                .borrow()
+                .pane_frame(pane_c)
+                .is_none(),
             "closed pane C should be forgotten by the registry"
         );
     }

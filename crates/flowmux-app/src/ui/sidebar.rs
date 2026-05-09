@@ -287,7 +287,9 @@ impl Sidebar {
     }
 
     /// Tint a workspace row to flag that an agent finished there.
-    /// Cleared automatically when the user selects the row.
+    /// Cleared automatically when the user selects the row, and also
+    /// when [`Self::clear_attention`] is called from a programmatic
+    /// activation path (notification click, Alt+number, etc.).
     pub fn mark_attention(&self, id: WorkspaceId) {
         if self.attentions.borrow_mut().insert(id) {
             if let Some((_, row)) = self
@@ -298,6 +300,25 @@ impl Sidebar {
                 .cloned()
             {
                 row.add_css_class("flowmux-attention");
+            }
+        }
+    }
+
+    /// Drop the attention tint on `id` if present. Programmatic
+    /// activation paths (notification click, Alt+number, focus
+    /// shortcuts) call this so the row stops glowing once the user
+    /// has been brought to the workspace, even when they did not
+    /// click the side-panel row themselves.
+    pub fn clear_attention(&self, id: WorkspaceId) {
+        if self.attentions.borrow_mut().remove(&id) {
+            if let Some((_, row)) = self
+                .rows
+                .borrow()
+                .iter()
+                .find(|(wid, _)| *wid == id)
+                .cloned()
+            {
+                row.remove_css_class("flowmux-attention");
             }
         }
     }
@@ -319,12 +340,11 @@ impl Sidebar {
         // Refresh the popover content if it happens to be visible so
         // the new entry shows immediately.
         if self.bell_popover.is_visible() {
-            self.bell_popover
-                .set_child(Some(&render_notification_list(
-                    &self.notifications,
-                    self.bridge.clone(),
-                    self.bell_popover.clone(),
-                )));
+            self.bell_popover.set_child(Some(&render_notification_list(
+                &self.notifications,
+                self.bridge.clone(),
+                self.bell_popover.clone(),
+            )));
         }
     }
 }
@@ -885,12 +905,7 @@ mod tests {
             let _ = row_widget(&ws, &lines, on_close.clone(), bridge.clone());
         }
         // Even with 4 lines, build_meta_column truncates to 3 via take(3).
-        let four = vec![
-            "a".into(),
-            "b".into(),
-            "c".into(),
-            "d-overflow".into(),
-        ];
+        let four = vec!["a".into(), "b".into(), "c".into(), "d-overflow".into()];
         let _ = row_widget(&ws, &four, on_close, bridge);
     }
 }
