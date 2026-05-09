@@ -90,6 +90,8 @@ fn main() -> anyhow::Result<()> {
     let rx_for_activate = rx.clone();
     let bridge_for_activate = bridge.clone();
     app.connect_activate(move |app| {
+        gtk::Window::set_default_icon_name(APP_ID);
+
         // Resolve the visual theme once per activation so a config edit
         // picks up after the user re-launches.
         let theme = std::sync::Arc::new(theme::ResolvedTheme::load());

@@ -154,6 +154,7 @@ impl WindowController {
             .application(app)
             .default_width(default_w)
             .default_height(default_h)
+            .icon_name(crate::APP_ID)
             .title("flowmux")
             .build();
         window.set_content(Some(&toolbar));
