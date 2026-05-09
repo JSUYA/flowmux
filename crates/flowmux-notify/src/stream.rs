@@ -132,4 +132,46 @@ mod tests {
         // A CSI sequence (\x1b[31m) should not produce OSC events.
         assert!(collect(b"\x1b[31mred\x1b[0m").is_empty());
     }
+
+    // -- variant scenarios ---------------------------------------------
+
+    #[test]
+    fn back_to_back_osc_sequences_emit_in_order() {
+        let s = b"\x1b]9;a\x07\x1b]9;b\x07";
+        assert_eq!(collect(s), vec!["9;a", "9;b"]);
+    }
+
+    #[test]
+    fn st_terminator_inside_payload_takes_precedence_over_loose_esc() {
+        // Real iTerm2 OSC 9 from Claude Code can include literal ESC
+        // escapes mid-body if the title was logged with ANSI sequences.
+        // We treat ESC \\ as ST exclusively; a stray ESC followed by
+        // anything else is folded back into the body.
+        let s = b"\x1b]9;part1\x1bXpart2\x1b\\";
+        assert_eq!(collect(s), vec!["9;part1\x1bXpart2"]);
+    }
+
+    #[test]
+    fn multibyte_unicode_payload_round_trips() {
+        // utf-8 emoji + Korean + Chinese.
+        let s = "\x1b]9;클로드 完了 ✅\x07".as_bytes();
+        assert_eq!(collect(s), vec!["9;클로드 完了 ✅"]);
+    }
+
+    #[test]
+    fn drops_unterminated_osc_at_end_of_stream() {
+        // Provokes the error path: the child never wrote BEL/ST. The
+        // extractor must not emit a partial event.
+        let s = b"\x1b]9;never finished";
+        assert!(collect(s).is_empty());
+    }
+
+    #[test]
+    fn esc_followed_by_non_open_bracket_returns_to_ground() {
+        // The stream contains an ESC that is not part of any OSC
+        // (e.g. a CSI). The extractor must reset cleanly so a later
+        // proper OSC still parses.
+        let s = b"\x1b[2J\x1b]9;ok\x07";
+        assert_eq!(collect(s), vec!["9;ok"]);
+    }
 }

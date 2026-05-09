@@ -116,4 +116,48 @@ mod tests {
     fn unknown_osc_returns_none() {
         assert!(parse_osc("4;0;rgb:11/22/33").is_none());
     }
+
+    // -- 5 variant scenarios per agent + 1 error provoke ------------
+
+    #[test]
+    fn osc_9_recognizes_claude_style_completion_messages() {
+        let n = parse_osc("9;Claude finished — review the diff").unwrap();
+        assert_eq!(n.title, "Terminal");
+        assert_eq!(n.body, "Claude finished — review the diff");
+        assert_eq!(n.level, NotificationLevel::Info);
+    }
+
+    #[test]
+    fn osc_9_promotes_attention_when_body_says_waiting() {
+        let n = parse_osc("9;Codex is waiting for your review").unwrap();
+        assert_eq!(n.level, NotificationLevel::AttentionNeeded);
+    }
+
+    #[test]
+    fn osc_99_with_empty_options_field_still_parses_body() {
+        let n = parse_osc("99;;OpenCode ready").unwrap();
+        assert_eq!(n.body, "OpenCode ready");
+    }
+
+    #[test]
+    fn osc_777_without_body_still_parses_summary() {
+        let n = parse_osc("777;notify;Claude").unwrap();
+        assert_eq!(n.title, "Claude");
+        assert_eq!(n.body, "");
+        assert_eq!(n.level, NotificationLevel::Info);
+    }
+
+    #[test]
+    fn osc_777_non_notify_kind_returns_none() {
+        // urxvt OSC 777 also carries other kinds (e.g. iconBeep). They
+        // are not desktop notifications and must not be promoted.
+        assert!(parse_osc("777;iconBeep;something").is_none());
+    }
+
+    #[test]
+    fn missing_semicolon_returns_none_instead_of_panicking() {
+        // Provoke malformed OSC: a bare code with no separator.
+        assert!(parse_osc("9").is_none());
+        assert!(parse_osc("").is_none());
+    }
 }
