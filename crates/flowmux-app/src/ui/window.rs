@@ -363,6 +363,72 @@ impl WindowController {
         self.pane_registry.borrow_mut().forget_pane(removed);
     }
 
+    /// After a pane has been removed, hand keyboard focus to a sibling so the
+    /// user can keep typing without clicking back into a terminal. Only acts
+    /// when the removed pane *was* the focused one — closing an unfocused pane
+    /// (e.g. clicking another pane's X-button while typing in this one) must
+    /// leave focus alone.
+    ///
+    /// Successor selection, in order:
+    /// 1. The most recently focused pane that still exists in this workspace
+    ///    (the MRU head after removing `removed`). This matches what the user
+    ///    most likely thinks of as "the previous pane".
+    /// 2. The workspace's first leaf as a defensive fallback when MRU is empty
+    ///    (e.g. the user closed a pane before any focus event was recorded).
+    ///
+    /// `grab_focus` is deferred to the next idle so the surviving sibling has
+    /// a chance to be reparented and realized first; the existing
+    /// `EventControllerFocus` then fires `on_focus`, which updates
+    /// `focused_pane` and re-pushes the new front of MRU.
+    async fn focus_after_close(&self, ws_id: WorkspaceId, removed: PaneId) {
+        let was_focused = self.focused_pane.get() == Some(removed);
+
+        // Always evict the closed pane from MRU so a later focus_after_close
+        // can't pick a dead PaneId.
+        {
+            let mut mru = self.focus_mru.borrow_mut();
+            if let Some(q) = mru.get_mut(&ws_id) {
+                q.retain(|p| *p != removed);
+            }
+        }
+
+        if !was_focused {
+            return;
+        }
+
+        // 1. MRU head, only if its frame is still registered.
+        let mru_head = self
+            .focus_mru
+            .borrow()
+            .get(&ws_id)
+            .and_then(|q| q.front().copied());
+        let target = match mru_head {
+            Some(p) if self.pane_registry.borrow().pane_frame(p).is_some() => Some(p),
+            _ => None,
+        };
+
+        // 2. Fall back to the workspace's first leaf in the daemon-side tree.
+        let target = match target {
+            Some(t) => Some(t),
+            None => self
+                .store
+                .get_workspace(ws_id)
+                .await
+                .and_then(|ws| ws.surfaces.first().and_then(|s| s.root_pane.first_leaf_id())),
+        };
+        let Some(target) = target else { return };
+
+        let registry = self.pane_registry.clone();
+        glib::idle_add_local_once(move || {
+            let r = registry.borrow();
+            if let Some(term) = r.active_terminal(target) {
+                term.widget.grab_focus();
+            } else if let Some(browser) = r.active_browser(target) {
+                browser.web_view.grab_focus();
+            }
+        });
+    }
+
     pub fn rerender_workspace(&self, ws: &Workspace) {
         self.sidebar.upsert(ws);
         let name = ws.id.to_string();
@@ -919,6 +985,7 @@ impl WindowController {
                     // that destroyed claude/codex sessions on close.
                     self.apply_close_pane_incremental_or_rerender(workspace, pane)
                         .await;
+                    self.focus_after_close(workspace, pane).await;
                     let _ = ack.send(Ok(()));
                 }
                 Some(flowmux_daemon::CloseOutcome::SurfaceRemoved { workspace }) => {
@@ -4525,6 +4592,191 @@ mod tests {
         assert_eq!(
             leaves, expected,
             "store should have collapsed the inner split to {{A, B}}"
+        );
+    }
+
+    /// Regression: closing the currently focused pane (X-button on its tab,
+    /// or Alt+W) used to leave `focused_pane` pointing at the now-removed
+    /// PaneId, so the user lost keyboard focus entirely. Subsequent
+    /// `Alt+arrow` calls then fell back to "no pane focused, focus the first
+    /// leaf" instead of moving relative to where the user was.
+    ///
+    /// Expected behaviour: focus jumps to the most recently focused pane
+    /// that still exists — i.e. the MRU head after we drop the closed pane.
+    /// We exercise the nested-split shape the user actually reported
+    /// (`A | (B / C)` — two levels of `gtk::Paned`) because in the flat
+    /// side-by-side shape GTK's own "find a new focus child" pass on a
+    /// `gtk::Stack` swap accidentally hides the bug; it is the
+    /// grand-paned `set_*_child` slot replacement that does NOT auto-
+    /// hand focus to the surviving sibling, so an explicit handoff is
+    /// required there.
+    #[gtk::test]
+    async fn closing_focused_pane_in_nested_split_moves_focus_to_previous_pane() {
+        adw::init().expect("libadwaita should initialize in GTK test");
+        let root = std::env::temp_dir().join("flowmux-ui-close-focus-prev-nested");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = StateStore::new_lazy(State::default());
+        let ws_id = store
+            .create_workspace(Some("ui".into()), root.clone())
+            .await;
+        let ws = store.get_workspace(ws_id).await.unwrap();
+        let pane_a = ws.surfaces[0].root_pane.first_leaf_id().unwrap();
+
+        let (bridge, _rx) = Bridge::new();
+        let app = adw::Application::builder()
+            .application_id("com.flowmux.App.UiTest.CloseFocusedPrevNested")
+            .build();
+        app.register(None::<&gtk::gio::Cancellable>).unwrap();
+        let controller = WindowController::new(
+            &app,
+            store.clone(),
+            Arc::new(ResolvedTheme::load()),
+            bridge,
+            gtk::CssProvider::new(),
+        );
+        controller.render_workspace(&ws);
+
+        // First split: A | B (vertical → side-by-side at the workspace root).
+        let (_, pane_b) = store
+            .split_pane(pane_a, SplitDirection::Vertical)
+            .await
+            .expect("first split should succeed");
+        controller
+            .apply_split_incremental_or_rerender(ws_id, pane_a, pane_b, SplitDirection::Vertical)
+            .await;
+
+        // Second split: B / C (horizontal → top/bottom inside the right slot).
+        // Tree shape: Split{ Leaf(A), Split{ Leaf(B), Leaf(C) } }. Closing C
+        // collapses the inner gtk::Paned via grand_paned.set_end_child(B), which
+        // is the path that did not auto-transfer focus.
+        let (_, pane_c) = store
+            .split_pane(pane_b, SplitDirection::Horizontal)
+            .await
+            .expect("second split should succeed");
+        controller
+            .apply_split_incremental_or_rerender(ws_id, pane_b, pane_c, SplitDirection::Horizontal)
+            .await;
+
+        // Reproduce the user's focus history so MRU = [C, B, A] (C is current,
+        // B was previous). Closing the focused pane C should hand focus back to B.
+        for p in [pane_a, pane_b, pane_c] {
+            controller.focused_pane.set(Some(p));
+            controller
+                .dispatch(GtkCommand::PaneFocused { pane: p })
+                .await;
+        }
+        assert_eq!(controller.focused_pane.get(), Some(pane_c));
+
+        // Close the focused pane C (X-button on its tab, or Alt+W).
+        let (ack_tx, ack_rx) = oneshot::channel();
+        controller
+            .dispatch(GtkCommand::CloseFocused {
+                pane: pane_c,
+                ack: ack_tx,
+            })
+            .await;
+        ack_rx.await.unwrap().unwrap();
+
+        // grab_focus from focus_after_close runs inside an idle handler. Pump
+        // one idle via a oneshot so the on_focus callback (wired through
+        // EventControllerFocus) has a chance to update focused_pane.
+        let (idle_tx, idle_rx) = oneshot::channel();
+        glib::idle_add_local_once(move || {
+            let _ = idle_tx.send(());
+        });
+        let _ = idle_rx.await;
+
+        assert_eq!(
+            controller.focused_pane.get(),
+            Some(pane_b),
+            "regression: closing the focused pane in a nested split must hand focus to the previous MRU pane (B), not leave focused_pane stuck on the removed C"
+        );
+        assert!(
+            controller.pane_registry.borrow().pane_frame(pane_c).is_none(),
+            "closed pane C should be forgotten by the registry"
+        );
+    }
+
+    /// Regression-companion: closing a *non-focused* pane must not steal
+    /// focus from whichever pane the user is actually typing in. This pins
+    /// the contract that `focus_after_close` is a no-op when the closed
+    /// pane wasn't the focused one — without it, an over-eager "always
+    /// pick MRU head" would hijack focus on every X-button click.
+    ///
+    /// We use the same nested-split shape as the focused-close test so the
+    /// close path actually exercises grand_paned slot replacement (the only
+    /// path where focus_after_close can disagree with GTK's own focus
+    /// chain handling).
+    #[gtk::test]
+    async fn closing_unfocused_pane_in_nested_split_keeps_focus_where_it_was() {
+        adw::init().expect("libadwaita should initialize in GTK test");
+        let root = std::env::temp_dir().join("flowmux-ui-close-unfocused-keep-nested");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = StateStore::new_lazy(State::default());
+        let ws_id = store
+            .create_workspace(Some("ui".into()), root.clone())
+            .await;
+        let ws = store.get_workspace(ws_id).await.unwrap();
+        let pane_a = ws.surfaces[0].root_pane.first_leaf_id().unwrap();
+
+        let (bridge, _rx) = Bridge::new();
+        let app = adw::Application::builder()
+            .application_id("com.flowmux.App.UiTest.CloseUnfocusedKeepNested")
+            .build();
+        app.register(None::<&gtk::gio::Cancellable>).unwrap();
+        let controller = WindowController::new(
+            &app,
+            store.clone(),
+            Arc::new(ResolvedTheme::load()),
+            bridge,
+            gtk::CssProvider::new(),
+        );
+        controller.render_workspace(&ws);
+
+        let (_, pane_b) = store
+            .split_pane(pane_a, SplitDirection::Vertical)
+            .await
+            .expect("first split should succeed");
+        controller
+            .apply_split_incremental_or_rerender(ws_id, pane_a, pane_b, SplitDirection::Vertical)
+            .await;
+        let (_, pane_c) = store
+            .split_pane(pane_b, SplitDirection::Horizontal)
+            .await
+            .expect("second split should succeed");
+        controller
+            .apply_split_incremental_or_rerender(ws_id, pane_b, pane_c, SplitDirection::Horizontal)
+            .await;
+
+        // Focus order: C → B → A, so MRU = [A, B, C] and the user is typing
+        // in A. Closing the unfocused pane C must leave A still focused.
+        for p in [pane_c, pane_b, pane_a] {
+            controller.focused_pane.set(Some(p));
+            controller
+                .dispatch(GtkCommand::PaneFocused { pane: p })
+                .await;
+        }
+        assert_eq!(controller.focused_pane.get(), Some(pane_a));
+
+        let (ack_tx, ack_rx) = oneshot::channel();
+        controller
+            .dispatch(GtkCommand::CloseFocused {
+                pane: pane_c,
+                ack: ack_tx,
+            })
+            .await;
+        ack_rx.await.unwrap().unwrap();
+
+        let (idle_tx, idle_rx) = oneshot::channel();
+        glib::idle_add_local_once(move || {
+            let _ = idle_tx.send(());
+        });
+        let _ = idle_rx.await;
+
+        assert_eq!(
+            controller.focused_pane.get(),
+            Some(pane_a),
+            "closing an unfocused pane must not steal focus from the pane the user is typing in"
         );
     }
 }
