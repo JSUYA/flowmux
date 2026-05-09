@@ -21,8 +21,7 @@ notice is preserved:
 flowmux does not redistribute cmux source code; it independently
 reimplements observable behavior described in cmux's public
 documentation (README, cmux.com/docs, CHANGELOG, configuration schemas)
-for Linux desktop environments. See docs/UPSTREAM.md for the upstream
-tracking policy and docs/upstream-mapping/ for the per-feature mapping.
+for Linux desktop environments.
 
 Trademarks
 ----------
