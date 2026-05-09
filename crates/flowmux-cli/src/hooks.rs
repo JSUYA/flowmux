@@ -19,10 +19,14 @@ use flowmux_ipc::{
     client::Client,
     protocol::{Request, Response},
 };
-use serde::Deserialize;
-use std::io::Read;
+use serde::{de::DeserializeOwned, Deserialize};
+use std::io::{IsTerminal, Read};
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::time::Duration;
+
+const HOOK_CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
+const HOOK_NOTIFY_TIMEOUT: Duration = Duration::from_millis(750);
 
 /// Subset of an agent hook payload that flowmux cares about. Reused
 /// across Claude/Codex/OpenCode because their JSON shapes overlap on
@@ -53,30 +57,37 @@ pub struct ClaudeHookInput {
 /// Empty stdin / parse failures degrade to a default payload so the
 /// user still gets a generic toast even when the hook glue is broken.
 pub fn read_claude_hook_input() -> ClaudeHookInput {
-    let mut buf = String::new();
-    let _ = std::io::stdin()
-        .lock()
-        .take(1024 * 1024)
-        .read_to_string(&mut buf);
-    if buf.trim().is_empty() {
+    let stdin = std::io::stdin();
+    if stdin.is_terminal() {
         return ClaudeHookInput::default();
     }
-    serde_json::from_str(&buf).unwrap_or_default()
+    read_hook_input(stdin.lock())
+}
+
+fn read_hook_input<R: Read>(reader: R) -> ClaudeHookInput {
+    let mut buf = String::new();
+    let _ = reader.take(1024 * 1024).read_to_string(&mut buf);
+    parse_hook_payload(&buf).unwrap_or_default()
+}
+
+fn parse_hook_payload<T: DeserializeOwned>(payload: &str) -> Option<T> {
+    if payload.trim().is_empty() {
+        return None;
+    }
+    serde_json::from_str(payload).ok()
 }
 
 /// Codex's `notify` config spawns the program with the JSON event
-/// payload as the LAST positional argument (Claude's hook system uses
-/// stdin instead). Try the positional path first; fall back to stdin
-/// if `extra_args` is empty.
+/// payload as the LAST positional argument. Do not fall back to stdin:
+/// Codex can invoke `notify` with the terminal attached, and blocking
+/// on that PTY makes Codex report "timeout waiting for child process to exit".
 pub fn read_codex_hook_input(extra_args: &[String]) -> ClaudeHookInput {
     if let Some(payload) = extra_args.last() {
-        if !payload.trim().is_empty() {
-            if let Ok(parsed) = serde_json::from_str::<ClaudeHookInput>(payload) {
-                return parsed;
-            }
+        if let Some(parsed) = parse_hook_payload(payload) {
+            return parsed;
         }
     }
-    read_claude_hook_input()
+    ClaudeHookInput::default()
 }
 
 /// Resolve `FLOWMUX_PANE_ID` from the env (set by `flowmux` at PTY
@@ -160,8 +171,21 @@ pub fn build_notification_notify(
 /// loudly — Claude/OpenCode/Codex propagate non-zero exits to the
 /// agent and surface them to the user as a hook error.
 pub async fn send_best_effort(client: &Client, req: Request) {
-    if let Ok(Response::Error(e)) = client.call(req).await {
-        tracing::debug!(?e, "hook notify rejected by daemon");
+    send_best_effort_with_timeout(client, req, HOOK_NOTIFY_TIMEOUT).await;
+}
+
+async fn send_best_effort_with_timeout(client: &Client, req: Request, timeout: Duration) {
+    match tokio::time::timeout(timeout, client.call(req)).await {
+        Ok(Ok(Response::Error(e))) => {
+            tracing::debug!(?e, "hook notify rejected by daemon");
+        }
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => {
+            tracing::debug!(error = %e, "hook notify failed");
+        }
+        Err(_) => {
+            tracing::debug!(?timeout, "hook notify timed out");
+        }
     }
 }
 
@@ -170,16 +194,23 @@ pub async fn send_best_effort(client: &Client, req: Request) {
 /// unreachable so a hook on a host without flowmux running is a
 /// silent no-op rather than a visible error.
 pub async fn connect_daemon(socket: Option<PathBuf>) -> Option<Client> {
+    connect_daemon_with_timeout(socket, HOOK_CONNECT_TIMEOUT).await
+}
+
+async fn connect_daemon_with_timeout(socket: Option<PathBuf>, timeout: Duration) -> Option<Client> {
     let socket = socket
         .or_else(|| std::env::var_os("FLOWMUX_SOCKET_PATH").map(PathBuf::from))
         .or_else(|| std::env::var_os("FLOWMUX_SOCKET").map(PathBuf::from))
         .unwrap_or_else(flowmux_config::paths::runtime_socket);
-    match Client::connect(&socket)
-        .await
-        .with_context(|| format!("connect daemon at {}", socket.display()))
-    {
-        Ok(c) => Some(c),
+    match tokio::time::timeout(timeout, Client::connect(&socket)).await {
+        Ok(Ok(c)) => Some(c),
+        Ok(Err(e)) => {
+            let e = e.context(format!("connect daemon at {}", socket.display()));
+            tracing::debug!(error = %e, "hook: daemon not reachable, skipping notify");
+            None
+        }
         Err(e) => {
+            let e = anyhow::anyhow!("timed out after {:?}", e);
             tracing::debug!(error = %e, "hook: daemon not reachable, skipping notify");
             None
         }
@@ -209,6 +240,33 @@ mod tests {
     fn shorten_empty_input_yields_empty_string() {
         assert_eq!(shorten_body("", 100), "");
         assert_eq!(shorten_body("   \n\n  \t  ", 100), "");
+    }
+
+    #[test]
+    fn read_hook_input_parses_stdin_payloads_for_claude_style_hooks() {
+        let parsed = read_hook_input(r#"{ "message": "approval needed" }"#.as_bytes());
+        assert_eq!(parsed.message.as_deref(), Some("approval needed"));
+    }
+
+    #[test]
+    fn read_codex_hook_input_parses_last_positional_payload() {
+        let args = vec![
+            "--ignored".to_string(),
+            r#"{ "last-assistant-message": "changed 2 files" }"#.to_string(),
+        ];
+        let parsed = read_codex_hook_input(&args);
+        assert_eq!(
+            parsed.last_assistant_message.as_deref(),
+            Some("changed 2 files")
+        );
+    }
+
+    #[test]
+    fn read_codex_hook_input_defaults_without_stdin_fallback() {
+        let parsed = read_codex_hook_input(&[]);
+        assert!(parsed.session_id.is_none());
+        assert!(parsed.message.is_none());
+        assert!(parsed.last_assistant_message.is_none());
     }
 
     #[test]
@@ -297,5 +355,30 @@ mod tests {
         let parsed: ClaudeHookInput = serde_json::from_str("{}").unwrap();
         assert!(parsed.hook_event_name.is_none());
         assert!(parsed.session_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn send_best_effort_times_out_when_daemon_keeps_request_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("flowmux.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (r, _w) = stream.into_split();
+            let mut reader = tokio::io::BufReader::new(r);
+            let mut line = String::new();
+            let _ = tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut line).await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+
+        let client = Client::connect(&socket).await.unwrap();
+        let start = std::time::Instant::now();
+        send_best_effort_with_timeout(&client, Request::Ping, Duration::from_millis(25)).await;
+        assert!(
+            start.elapsed() < Duration::from_millis(150),
+            "hook notify should return promptly when the daemon does not answer"
+        );
+        server.abort();
     }
 }
