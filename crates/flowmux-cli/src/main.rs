@@ -14,6 +14,8 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 mod agent;
+mod hook_install;
+mod hooks;
 
 /// Read `FLOWMUX_PANE_ID` (set by `flowmux-app` at PTY spawn time) and parse
 /// it as a `PaneId`. Returns `None` if the env var is missing or invalid.
@@ -225,6 +227,16 @@ enum Cmd {
         #[command(subcommand)]
         op: AgentOp,
     },
+
+    /// Hook glue between agent CLIs and flowmux's notification system.
+    /// `flowmux hooks setup` registers entries with each supported
+    /// agent so its lifecycle events route into flowmux. The other
+    /// subcommands are invoked by the agents themselves at runtime
+    /// (Claude Code's `Stop` hook, Codex's `hooks.json` `Stop`, etc).
+    Hooks {
+        #[command(subcommand)]
+        op: HooksOp,
+    },
 }
 
 #[derive(Subcommand)]
@@ -272,6 +284,78 @@ enum ThemeOp {
 }
 
 #[derive(Subcommand)]
+enum HooksOp {
+    /// Install / refresh hook entries for every supported agent. Run
+    /// once after `flowmux` is installed; safe to re-run after agent
+    /// upgrades. Skips agents whose home directory is missing.
+    Setup {
+        /// Limit installation to specific agents. Omit to do all.
+        #[arg(long, value_parser = ["claude", "codex", "opencode"])]
+        agent: Vec<String>,
+        /// Path of the `flowmux` binary that the installed hook
+        /// commands should invoke. Defaults to the current `flowmux`
+        /// binary on PATH (resolved at install time).
+        #[arg(long)]
+        flowmux_bin: Option<String>,
+    },
+    /// Remove flowmux's hook entries from every supported agent.
+    Uninstall {
+        #[arg(long, value_parser = ["claude", "codex", "opencode"])]
+        agent: Vec<String>,
+    },
+    /// Print which agent config files flowmux currently owns hook
+    /// entries in.
+    Doctor,
+
+    /// Claude Code lifecycle hook handler. Invoked by Claude Code via
+    /// `~/.claude/settings.json` `hooks.<event>` after `flowmux hooks
+    /// setup`. Reads stdin JSON, fires a desktop notification.
+    Claude {
+        #[command(subcommand)]
+        event: ClaudeHookEvent,
+    },
+    /// Codex CLI lifecycle hook handler. Invoked by Codex via
+    /// `~/.codex/hooks.json`.
+    Codex {
+        #[command(subcommand)]
+        event: AgentHookEvent,
+    },
+    /// OpenCode lifecycle hook handler. Invoked by the OpenCode
+    /// `flowmux-session` plugin after `flowmux hooks setup`.
+    Opencode {
+        #[command(subcommand)]
+        event: AgentHookEvent,
+    },
+}
+
+#[derive(Subcommand)]
+enum ClaudeHookEvent {
+    /// Claude has finished a turn / its agent loop is idle.
+    Stop,
+    /// Claude needs the user (permission prompt, plan summary, …).
+    Notification,
+    /// New session started — used to associate a session id with the
+    /// current PTY so future events can resolve back to a pane.
+    SessionStart,
+    /// Session ended — clear the cached session→pane association.
+    SessionEnd,
+    /// Claude is about to call a tool; flowmux currently no-ops.
+    PreToolUse,
+    /// User submitted a prompt; flowmux currently no-ops.
+    PromptSubmit,
+}
+
+#[derive(Subcommand)]
+enum AgentHookEvent {
+    /// Generic "agent finished" event.
+    Stop,
+    /// Generic "agent needs attention" event.
+    Notification,
+    /// Generic "session started".
+    SessionStart,
+}
+
+#[derive(Subcommand)]
 enum WorkspaceOp {
     /// Create a new workspace rooted at `--root` (defaults to cwd).
     New {
@@ -307,6 +391,10 @@ async fn main() -> anyhow::Result<()> {
             return Ok(());
         }
         Cmd::Agent { op } => return run_agent_op(op, cli.json),
+        // `Hooks` runtime handlers (Claude / Codex / Opencode events)
+        // talk to the daemon themselves; `Hooks::Setup`, `Uninstall`,
+        // and `Doctor` are pure file edits with no daemon round-trip.
+        Cmd::Hooks { op } => return run_hooks_op(op, cli.socket.clone()).await,
         _ => {}
     }
 
@@ -481,7 +569,160 @@ fn build_request(cmd: Cmd) -> anyhow::Result<Request> {
         Cmd::ListBrowsers => unreachable!("handled before request build"),
         Cmd::Theme { .. } => unreachable!("handled before request build"),
         Cmd::Agent { .. } => unreachable!("handled before request build"),
+        Cmd::Hooks { .. } => unreachable!("handled before request build"),
     })
+}
+
+/// Dispatch every `flowmux hooks <op>` invocation. Setup/Doctor/Uninstall
+/// only touch user config files and never need the daemon. The runtime
+/// hook events (Claude/Codex/Opencode) talk to the daemon themselves.
+async fn run_hooks_op(op: &HooksOp, socket: Option<PathBuf>) -> anyhow::Result<()> {
+    use hook_install::{HookInstallStatus, HookTarget};
+    match op {
+        HooksOp::Setup { agent, flowmux_bin } => {
+            let bin = flowmux_bin
+                .clone()
+                .or_else(resolve_self_bin)
+                .unwrap_or_else(|| "flowmux".to_string());
+            let targets = parse_hook_targets(agent)?;
+            for t in targets {
+                match hook_install::install(t, &bin) {
+                    Ok(report) => print_hook_report(&report),
+                    Err(e) => println!("{:8}  error: {e:#}", t.slug()),
+                }
+            }
+            Ok(())
+        }
+        HooksOp::Uninstall { agent } => {
+            let targets = parse_hook_targets(agent)?;
+            for t in targets {
+                match hook_install::uninstall(t) {
+                    Ok(report) => print_hook_report(&report),
+                    Err(e) => println!("{:8}  error: {e:#}", t.slug()),
+                }
+            }
+            Ok(())
+        }
+        HooksOp::Doctor => {
+            for t in HookTarget::ALL {
+                let label = match t {
+                    HookTarget::Claude => "claude",
+                    HookTarget::Codex => "codex",
+                    HookTarget::OpenCode => "opencode",
+                };
+                println!("{label:8}  (run `flowmux hooks setup` to install)");
+            }
+            // Doctor is intentionally minimal today; cmux's full doctor
+            // walks each marker and reports drift, which we can add
+            // once we have real-world drift to debug.
+            let _ = HookInstallStatus::Installed;
+            Ok(())
+        }
+        HooksOp::Claude { event } => run_claude_hook_event(event, socket).await,
+        HooksOp::Codex { event } => {
+            run_generic_agent_hook_event("Codex", event, socket).await
+        }
+        HooksOp::Opencode { event } => {
+            run_generic_agent_hook_event("OpenCode", event, socket).await
+        }
+    }
+}
+
+fn parse_hook_targets(agents: &[String]) -> anyhow::Result<Vec<hook_install::HookTarget>> {
+    if agents.is_empty() {
+        return Ok(hook_install::HookTarget::ALL.to_vec());
+    }
+    agents
+        .iter()
+        .map(|s| {
+            hook_install::HookTarget::from_slug(s)
+                .ok_or_else(|| anyhow::anyhow!("unknown hook target: {s}"))
+        })
+        .collect()
+}
+
+fn print_hook_report(report: &hook_install::HookInstallReport) {
+    let label = report.target.slug();
+    match &report.status {
+        hook_install::HookInstallStatus::Installed if report.touched_paths.is_empty() => {
+            println!("{label:8}  ok");
+        }
+        hook_install::HookInstallStatus::Installed => {
+            for p in &report.touched_paths {
+                println!("{label:8}  wrote  {}", p.display());
+            }
+        }
+        hook_install::HookInstallStatus::Skipped => {
+            println!("{label:8}  skipped (agent not installed)");
+        }
+    }
+}
+
+/// Best-effort discovery of the running `flowmux` binary path so the
+/// command lines we drop into `~/.claude/settings.json` etc. survive
+/// when the user has multiple `flowmux` builds on PATH.
+fn resolve_self_bin() -> Option<String> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.canonicalize().ok())
+        .and_then(|p| p.to_str().map(|s| s.to_string()))
+}
+
+async fn run_claude_hook_event(
+    event: &ClaudeHookEvent,
+    socket: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    use hooks::*;
+    let input = read_claude_hook_input();
+    let pane = pane_from_env();
+    let req = match event {
+        ClaudeHookEvent::Stop => {
+            let body = input.last_assistant_message.as_deref();
+            build_stop_notify("Claude", body, pane)
+        }
+        ClaudeHookEvent::Notification => {
+            let msg = input.message.as_deref();
+            build_notification_notify("Claude", msg, pane)
+        }
+        // The remaining events are tracked by cmux as stateful
+        // (session→workspace mapping, status flips). flowmux's first
+        // notification cut keeps them as no-ops so the user gets the
+        // same "ready" toast regardless of which Claude version they
+        // run, without growing a stateful session store yet.
+        ClaudeHookEvent::SessionStart
+        | ClaudeHookEvent::SessionEnd
+        | ClaudeHookEvent::PreToolUse
+        | ClaudeHookEvent::PromptSubmit => return Ok(()),
+    };
+    if let Some(client) = hooks::connect_daemon(socket).await {
+        hooks::send_best_effort(&client, req).await;
+    }
+    Ok(())
+}
+
+async fn run_generic_agent_hook_event(
+    agent: &str,
+    event: &AgentHookEvent,
+    socket: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    use hooks::*;
+    let input = read_claude_hook_input();
+    let pane = pane_from_env();
+    let req = match event {
+        AgentHookEvent::Stop => {
+            let body = input.last_assistant_message.as_deref();
+            build_stop_notify(agent, body, pane)
+        }
+        AgentHookEvent::Notification => {
+            let msg = input.message.as_deref();
+            build_notification_notify(agent, msg, pane)
+        }
+        AgentHookEvent::SessionStart => return Ok(()),
+    };
+    if let Some(client) = hooks::connect_daemon(socket).await {
+        hooks::send_best_effort(&client, req).await;
+    }
+    Ok(())
 }
 
 fn run_agent_op(op: &AgentOp, json: bool) -> anyhow::Result<()> {

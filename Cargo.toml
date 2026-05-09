@@ -49,6 +49,9 @@ dirs = "5"
 # Notifications / D-Bus
 zbus = { version = "4", default-features = false, features = ["tokio"] }
 
+# TOML editing (Codex `~/.codex/config.toml`).
+toml_edit = { version = "0.22", features = ["display"] }
+
 # Workspace-internal
 flowmux-core = { path = "crates/flowmux-core" }
 flowmux-config = { path = "crates/flowmux-config" }
