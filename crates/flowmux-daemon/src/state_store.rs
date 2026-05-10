@@ -11,6 +11,7 @@ use flowmux_core::{
     RemoveOutcome, SplitDirection, Surface, SurfaceId, SurfaceKind, Workspace, WorkspaceId,
 };
 use flowmux_state::{State, WindowLayout};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, Notify};
@@ -44,6 +45,11 @@ pub enum CloseOutcome {
 pub struct StateStore {
     inner: Arc<Mutex<State>>,
     dirty: Arc<Notify>,
+    /// When false, all on-disk persistence is skipped — the store
+    /// behaves as a pure in-memory cache. Used by additional flowmux
+    /// windows that did not win the per-host `state.json` lock and so
+    /// must not race the lock-owning instance.
+    persist: Arc<AtomicBool>,
 }
 
 impl StateStore {
@@ -55,6 +61,7 @@ impl StateStore {
         let store = Self {
             inner: Arc::new(Mutex::new(initial)),
             dirty: Arc::new(Notify::new()),
+            persist: Arc::new(AtomicBool::new(true)),
         };
         let bg = store.clone();
         tokio::spawn(async move { bg.persist_loop().await });
@@ -73,11 +80,34 @@ impl StateStore {
         let store = Self {
             inner: Arc::new(Mutex::new(initial)),
             dirty: Arc::new(Notify::new()),
+            persist: Arc::new(AtomicBool::new(true)),
         };
         if normalized {
             store.mark_dirty();
         }
         store
+    }
+
+    /// Same as [`new_lazy`], but the resulting store will never write
+    /// to disk. Used by additional flowmux GUI windows that do not own
+    /// the per-host `state.json` lock; their workspaces live and die
+    /// with the window so they cannot stomp on the lock owner's file.
+    pub fn new_lazy_ephemeral(initial: State) -> Self {
+        let mut initial = initial;
+        // Still normalize so any in-memory invariants the daemon
+        // depends on hold, but do not flip the dirty bit — there is
+        // nobody to flush to.
+        let _ = normalize_state(&mut initial);
+        Self {
+            inner: Arc::new(Mutex::new(initial)),
+            dirty: Arc::new(Notify::new()),
+            persist: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// True when this store is allowed to write to `state.json`.
+    pub fn persist_enabled(&self) -> bool {
+        self.persist.load(Ordering::Acquire)
     }
 
     /// Spawn the persist loop on `handle`. Pair with [`new_lazy`].
@@ -853,6 +883,12 @@ impl StateStore {
             self.dirty.notified().await;
             // Coalesce a flurry of mutations into a single write.
             tokio::time::sleep(Duration::from_millis(250)).await;
+            // Ephemeral stores still observe the dirty bit so callers
+            // do not need to special-case mutation paths, but they
+            // never reach the disk.
+            if !self.persist_enabled() {
+                continue;
+            }
             let snap = self.snapshot().await;
             match flowmux_state::save(&snap) {
                 Ok(()) => info!(workspaces = snap.workspaces.len(), "state persisted"),
@@ -862,11 +898,17 @@ impl StateStore {
     }
 
     pub async fn save_now(&self) -> Result<(), flowmux_state::StateError> {
+        if !self.persist_enabled() {
+            return Ok(());
+        }
         let snap = self.snapshot().await;
         flowmux_state::save(&snap)
     }
 
     pub fn save_now_blocking(&self) -> Result<(), flowmux_state::StateError> {
+        if !self.persist_enabled() {
+            return Ok(());
+        }
         let snap = self.inner.blocking_lock().clone();
         flowmux_state::save(&snap)
     }
@@ -2838,6 +2880,40 @@ mod tests {
                 count_tabs(&ws.surfaces[0].root_pane, p)
             });
         assert_eq!(leaf_tabs, Some(2));
+    }
+
+    #[tokio::test]
+    async fn ephemeral_store_reports_persistence_disabled() {
+        let store = StateStore::new_lazy_ephemeral(State::default());
+        assert!(
+            !store.persist_enabled(),
+            "ephemeral stores must not persist to disk"
+        );
+        // save_now is a no-op on ephemeral stores: it returns Ok
+        // without touching the on-disk state.json shared by the
+        // lock-owning instance.
+        assert!(store.save_now().await.is_ok());
+        assert!(store.save_now_blocking().is_ok());
+
+        let normal = StateStore::new_lazy(State::default());
+        assert!(
+            normal.persist_enabled(),
+            "default constructor should persist"
+        );
+    }
+
+    /// An ephemeral store still accepts mutations and lets them flow
+    /// through `mark_dirty` so the rest of the daemon code path stays
+    /// uniform — only the disk write is suppressed.
+    #[tokio::test]
+    async fn ephemeral_store_accepts_mutations_in_memory() {
+        let store = StateStore::new_lazy_ephemeral(State::default());
+        let id = store
+            .create_workspace(Some("ghost".into()), std::path::PathBuf::from("/tmp/ghost"))
+            .await;
+        let snap = store.snapshot().await;
+        assert_eq!(snap.workspaces.len(), 1);
+        assert_eq!(snap.workspaces[0].id, id);
     }
 
     /// Horizontal split (split_down) does not place the browser to the

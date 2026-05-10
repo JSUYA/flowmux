@@ -15,7 +15,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 pub mod agent_sessions;
+pub mod instance_lock;
 pub use agent_sessions::AgentSessionStore;
+pub use instance_lock::{try_acquire_state_lock, InstanceLock};
 
 pub const SCHEMA_VERSION: u32 = 1;
 
