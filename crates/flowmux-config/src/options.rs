@@ -32,6 +32,12 @@ pub const FOCUS_BORDER_OPACITY_MIN: u8 = 0;
 pub const FOCUS_BORDER_OPACITY_MAX: u8 = 100;
 pub const FOCUS_BORDER_OPACITY_DEFAULT: u8 = 50;
 
+/// Default for [`Options::persist_browser_session`]. The user expectation
+/// modeled after every mainstream browser is that signing into a site once
+/// and quitting flowmux still leaves the user signed in on the next launch,
+/// so the option ships enabled.
+pub const PERSIST_BROWSER_SESSION_DEFAULT: bool = true;
+
 /// Web view engine to use for new browser tabs. At this stage every variant
 /// falls back to WebKitGTK; external engine spawning is a later step. The
 /// selected value is still persisted so the future wiring can use it.
@@ -93,6 +99,13 @@ pub struct Options {
     /// by [`Options::clamp_focus_border_opacity`].
     #[serde(default = "default_focus_border_opacity")]
     pub focus_border_opacity: u8,
+    /// When true, browser tabs persist cookies, localStorage, IndexedDB, and
+    /// related site data across flowmux restarts so logins and other site
+    /// state survive a quit/relaunch. When false, the WebKit network session
+    /// is built ephemerally and every launch starts signed-out.
+    /// Default: [`PERSIST_BROWSER_SESSION_DEFAULT`] (`true`).
+    #[serde(default = "default_persist_browser_session")]
+    pub persist_browser_session: bool,
 }
 
 fn default_zoom() -> u16 {
@@ -107,6 +120,10 @@ fn default_focus_border_opacity() -> u8 {
     FOCUS_BORDER_OPACITY_DEFAULT
 }
 
+fn default_persist_browser_session() -> bool {
+    PERSIST_BROWSER_SESSION_DEFAULT
+}
+
 impl Default for Options {
     fn default() -> Self {
         Self {
@@ -114,6 +131,7 @@ impl Default for Options {
             default_browser_engine: BrowserEngine::default(),
             focus_border_color: default_focus_color(),
             focus_border_opacity: default_focus_border_opacity(),
+            persist_browser_session: default_persist_browser_session(),
         }
     }
 }
@@ -176,6 +194,12 @@ impl Options {
     /// Builder-style setter, clamped immediately.
     pub fn with_focus_border_opacity(mut self, p: u8) -> Self {
         self.focus_border_opacity = Self::clamp_focus_border_opacity(p);
+        self
+    }
+
+    /// Builder-style setter for the browser-session persistence flag.
+    pub fn with_persist_browser_session(mut self, persist: bool) -> Self {
+        self.persist_browser_session = persist;
         self
     }
 }
@@ -542,5 +566,76 @@ mod tests {
             let back = load();
             assert_eq!(back.focus_border_opacity, 35);
         });
+    }
+
+    // ===== persist_browser_session =====
+
+    #[test]
+    fn default_persist_browser_session_is_true() {
+        // The user expectation modeled after every mainstream browser is to
+        // stay signed in across quit/relaunch, so the option ships enabled.
+        assert!(Options::default().persist_browser_session);
+        assert!(PERSIST_BROWSER_SESSION_DEFAULT);
+    }
+
+    #[test]
+    fn with_persist_browser_session_sets_flag() {
+        let opts = Options::default().with_persist_browser_session(false);
+        assert!(!opts.persist_browser_session);
+        let opts = opts.with_persist_browser_session(true);
+        assert!(opts.persist_browser_session);
+    }
+
+    #[test]
+    fn options_load_falls_back_to_default_persist_when_field_missing() {
+        with_xdg(|root| {
+            let path = root.join("flowmux").join("options.json");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            // Older option files predate the new flag — load() must still
+            // return a sane default rather than failing or silently disabling
+            // session persistence.
+            std::fs::write(
+                &path,
+                r##"{"zoom_percent": 100, "default_browser_engine": {"kind": "webkit"}, "focus_border_color": "#fff4b3", "focus_border_opacity": 50}"##,
+            )
+            .unwrap();
+            let opts = load();
+            assert!(opts.persist_browser_session);
+        });
+    }
+
+    #[test]
+    fn options_save_then_load_preserves_persist_browser_session_false() {
+        with_xdg(|_| {
+            let opts = Options::default().with_persist_browser_session(false);
+            save(&opts).unwrap();
+            let back = load();
+            assert!(!back.persist_browser_session);
+        });
+    }
+
+    #[test]
+    fn options_save_then_load_preserves_persist_browser_session_true() {
+        with_xdg(|_| {
+            let opts = Options::default().with_persist_browser_session(true);
+            save(&opts).unwrap();
+            let back = load();
+            assert!(back.persist_browser_session);
+        });
+    }
+
+    #[test]
+    fn empty_object_deserializes_persist_browser_session_default() {
+        let opts: Options = serde_json::from_str("{}").unwrap();
+        assert!(opts.persist_browser_session);
+    }
+
+    #[test]
+    fn explicit_false_persist_browser_session_round_trips_via_serde() {
+        let opts = Options::default().with_persist_browser_session(false);
+        let s = serde_json::to_string(&opts).unwrap();
+        assert!(s.contains("\"persist_browser_session\":false"));
+        let back: Options = serde_json::from_str(&s).unwrap();
+        assert_eq!(opts, back);
     }
 }

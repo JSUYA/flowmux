@@ -6,6 +6,9 @@
 //! * Global zoom percentage (10..=200% SpinButton)
 //! * Default web view engine for new browser tabs (DropDown: WebKit / Chrome / Firefox)
 //! * Focused-pane 1px border color (ColorDialogButton, default pale yellow)
+//! * Browser session persistence toggle (CheckButton, default checked) —
+//!   keeps cookies / localStorage / IndexedDB across flowmux restarts so
+//!   site logins survive a quit/relaunch.
 //!
 //! OK / Cancel close the dialog. `on_apply` is called only on OK, and the
 //! dialog closes itself so the caller only handles the callback.
@@ -59,6 +62,7 @@ fn build_dialog(
     let engine_drop = build_engine_drop(&current.default_browser_engine);
     let focus_color_btn = build_focus_color_button(current.focus_border_color_or_default());
     let opacity_widgets = build_focus_opacity_row(current.focus_border_opacity);
+    let persist_check = build_persist_check(current.persist_browser_session);
 
     let body = gtk::Box::new(gtk::Orientation::Vertical, 12);
     body.set_margin_top(16);
@@ -69,6 +73,7 @@ fn build_dialog(
     body.append(&row("Browser web view", &engine_drop));
     body.append(&row("Focus border color", &focus_color_btn));
     body.append(&row("Focus border opacity (%)", &opacity_widgets.row));
+    body.append(&row("Keep browser session data", &persist_check));
 
     let hint = gtk::Label::new(Some(
         "The selected label isolates the cookie/session directory for new \
@@ -112,9 +117,16 @@ fn build_dialog(
         let engine_drop = engine_drop.clone();
         let focus_color_btn = focus_color_btn.clone();
         let opacity_spin = opacity_widgets.spin.clone();
+        let persist_check = persist_check.clone();
         let on_apply = on_apply.clone();
         ok_btn.connect_clicked(move |_| {
-            let opts = collect_options(&zoom_spin, &engine_drop, &focus_color_btn, &opacity_spin);
+            let opts = collect_options(
+                &zoom_spin,
+                &engine_drop,
+                &focus_color_btn,
+                &opacity_spin,
+                &persist_check,
+            );
             (on_apply)(opts);
             dialog.close();
         });
@@ -152,14 +164,51 @@ fn show_about_popup(parent: &impl IsA<gtk::Widget>) {
 }
 
 fn about_body() -> String {
+    about_body_with_version(&about_version())
+}
+
+fn about_body_with_version(version: &str) -> String {
     format!(
         "FlowMux - Agent Workflow Multiplexer Terminal\n\n\
          FlowMux was inspired by the cmux (macOS) project.\n\n\
          Maintained by JSUYA (Junsu Choi).\n\
          <a href=\"https://github.com/JSUYA/flowmux\">https://github.com/JSUYA/flowmux</a>\n\n\
          Version: v{}",
-        env!("CARGO_PKG_VERSION")
+        version
     )
+}
+
+fn about_version() -> String {
+    installed_package_version().unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string())
+}
+
+fn installed_package_version() -> Option<String> {
+    let output = std::process::Command::new("dpkg-query")
+        .args(["-W", "-f=${Version}", "flowmux"])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let raw = String::from_utf8(output.stdout).ok()?;
+    clean_installed_version(&raw)
+}
+
+fn clean_installed_version(raw: &str) -> Option<String> {
+    let version = raw.trim();
+    if version.is_empty() || version.contains('\n') {
+        return None;
+    }
+    if !version.chars().all(is_safe_version_char) {
+        return None;
+    }
+    Some(version.to_string())
+}
+
+fn is_safe_version_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '+' | '~' | ':')
 }
 
 fn row(label_text: &str, value_widget: &impl IsA<gtk::Widget>) -> gtk::Box {
@@ -214,6 +263,7 @@ fn collect_options(
     drop: &gtk::DropDown,
     focus_color: &gtk::ColorDialogButton,
     opacity_spin: &gtk::SpinButton,
+    persist_check: &gtk::CheckButton,
 ) -> Options {
     let zoom = Options::clamp_zoom(spin.value_as_int().max(0) as u16);
     let engine = engine_options()
@@ -228,6 +278,7 @@ fn collect_options(
         default_browser_engine: engine,
         focus_border_color: color_hex,
         focus_border_opacity: opacity,
+        persist_browser_session: persist_check.is_active(),
     }
 }
 
@@ -286,6 +337,16 @@ fn build_focus_opacity_row(initial: u8) -> FocusOpacityRow {
     row.append(&spin);
 
     FocusOpacityRow { row, spin }
+}
+
+/// CheckButton seeded with the current persistence flag. New browser tabs
+/// pick up the saved value through [`Options::persist_browser_session`];
+/// already-open browser tabs keep their existing NetworkSession (matching
+/// the dropdown engine option above).
+fn build_persist_check(initial: bool) -> gtk::CheckButton {
+    let check = gtk::CheckButton::with_label("Persist cookies, sign-ins, and site data");
+    check.set_active(initial);
+    check
 }
 
 /// Parse `#rrggbb` or another hex form as GdkRGBA and seed the
@@ -349,14 +410,70 @@ mod tests {
 
     #[test]
     fn about_body_contains_requested_copy() {
-        let body = about_body();
+        let body = about_body_with_version("9.8.7-6");
         assert!(body.contains("FlowMux - Agent Workflow Multiplexer Terminal"));
         assert!(body.contains("FlowMux was inspired by the cmux (macOS) project."));
         assert!(body.contains("Maintained by JSUYA (Junsu Choi)."));
         assert!(body.contains(
             "<a href=\"https://github.com/JSUYA/flowmux\">https://github.com/JSUYA/flowmux</a>"
         ));
-        assert!(body.ends_with(concat!("Version: v", env!("CARGO_PKG_VERSION"))));
+        assert!(body.ends_with("Version: v9.8.7-6"));
+    }
+
+    #[test]
+    fn clean_installed_version_accepts_debian_versions() {
+        assert_eq!(
+            clean_installed_version(" 1:0.1.0-2+ubuntu~24.04 \n"),
+            Some("1:0.1.0-2+ubuntu~24.04".into())
+        );
+    }
+
+    #[test]
+    fn clean_installed_version_rejects_empty_multiline_or_markup() {
+        assert_eq!(clean_installed_version(""), None);
+        assert_eq!(clean_installed_version("1.2.3\n4.5.6"), None);
+        assert_eq!(clean_installed_version("<b>1.2.3</b>"), None);
+    }
+
+    /// The persistence checkbox should reflect the seeded value so the
+    /// dialog opens in the correct state when the user reviews their
+    /// existing options. Headless environments without a display skip the
+    /// assertion; when GTK init succeeds, the active state must match.
+    #[test]
+    fn persist_check_reflects_initial_value() {
+        if gtk::init().is_err() {
+            return;
+        }
+        let check_on = build_persist_check(true);
+        assert!(check_on.is_active());
+        let check_off = build_persist_check(false);
+        assert!(!check_off.is_active());
+    }
+
+    /// `collect_options` must round-trip the checkbox state into the
+    /// returned [`Options`]. We seed each widget with a known value and
+    /// confirm the collected options match — including the new
+    /// `persist_browser_session` flag — so a regression that drops the
+    /// flag from `collect_options` would fail loudly.
+    #[test]
+    fn collect_options_round_trips_persist_browser_session() {
+        if gtk::init().is_err() {
+            return;
+        }
+        let zoom = build_zoom_spin(120);
+        let engine = build_engine_drop(&BrowserEngine::Firefox);
+        let focus_color = build_focus_color_button("#abcdef");
+        let opacity = build_focus_opacity_row(40);
+        let persist_off = build_persist_check(false);
+        let opts = collect_options(&zoom, &engine, &focus_color, &opacity.spin, &persist_off);
+        assert_eq!(opts.zoom_percent, 120);
+        assert_eq!(opts.default_browser_engine, BrowserEngine::Firefox);
+        assert_eq!(opts.focus_border_opacity, 40);
+        assert!(!opts.persist_browser_session);
+
+        let persist_on = build_persist_check(true);
+        let opts = collect_options(&zoom, &engine, &focus_color, &opacity.spin, &persist_on);
+        assert!(opts.persist_browser_session);
     }
 
     /// GTK init is needed to verify that the slider and SpinButton share the

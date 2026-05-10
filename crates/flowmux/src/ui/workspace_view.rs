@@ -1141,6 +1141,7 @@ fn build_panel(
                 initial_url.as_deref(),
                 callbacks.clone(),
                 opts.default_browser_engine.clone(),
+                opts.persist_browser_session,
             );
             // Apply the zoom option to the new browser tab immediately so
             // widgets created before apply_zoom still start in sync.

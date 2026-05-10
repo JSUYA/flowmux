@@ -840,9 +840,7 @@ impl WindowController {
         };
         let dialog = adw::AlertDialog::new(
             Some("Close workspace?"),
-            Some(&format!(
-                "“{title}” will be closed and every terminal/browser tab inside it will be terminated. This cannot be undone."
-            )),
+            Some(&format!("This will close “{title}” and stop its tabs.")),
         );
         dialog.add_response("cancel", "Cancel");
         dialog.add_response("close", "Close");
@@ -899,7 +897,9 @@ impl WindowController {
         source_pane: Option<PaneId>,
         source_surface: Option<SurfaceId>,
     ) -> bool {
-        let Some(pane) = source_pane else { return false };
+        let Some(pane) = source_pane else {
+            return false;
+        };
         if !self.window.is_active() {
             return false;
         }
@@ -1077,36 +1077,36 @@ impl WindowController {
                     }
                 }
                 match self.store.close_pane(pane).await {
-                None => {
-                    let _ = ack.send(Err(format!("pane not found: {pane}")));
-                }
-                Some(flowmux_daemon::CloseOutcome::PaneRemoved { workspace }) => {
-                    // Incremental collapse: keep every other pane's
-                    // widget instance (and therefore every running
-                    // PTY shell + browser nav state) intact. This
-                    // path replaces the prior `rerender_workspace`
-                    // that destroyed claude/codex sessions on close.
-                    self.apply_close_pane_incremental_or_rerender(workspace, pane)
-                        .await;
-                    self.focus_after_close(workspace, pane).await;
-                    let _ = ack.send(Ok(()));
-                }
-                Some(flowmux_daemon::CloseOutcome::SurfaceRemoved { workspace }) => {
-                    // close_pane removed the entire surface (workspace-
-                    // level tab) but the workspace still has at least
-                    // one other surface. Drop the registry pane entry
-                    // and rerender — surface switching is rare and
-                    // not in the user's reset complaint scope.
-                    if let Some(ws) = self.store.get_workspace(workspace).await {
-                        self.rerender_workspace(&ws);
+                    None => {
+                        let _ = ack.send(Err(format!("pane not found: {pane}")));
                     }
-                    let _ = ack.send(Ok(()));
-                }
-                Some(flowmux_daemon::CloseOutcome::WorkspaceRemoved { workspace }) => {
-                    self.drop_workspace(workspace);
-                    self.activate_active_or_show_empty().await;
-                    let _ = ack.send(Ok(()));
-                }
+                    Some(flowmux_daemon::CloseOutcome::PaneRemoved { workspace }) => {
+                        // Incremental collapse: keep every other pane's
+                        // widget instance (and therefore every running
+                        // PTY shell + browser nav state) intact. This
+                        // path replaces the prior `rerender_workspace`
+                        // that destroyed claude/codex sessions on close.
+                        self.apply_close_pane_incremental_or_rerender(workspace, pane)
+                            .await;
+                        self.focus_after_close(workspace, pane).await;
+                        let _ = ack.send(Ok(()));
+                    }
+                    Some(flowmux_daemon::CloseOutcome::SurfaceRemoved { workspace }) => {
+                        // close_pane removed the entire surface (workspace-
+                        // level tab) but the workspace still has at least
+                        // one other surface. Drop the registry pane entry
+                        // and rerender — surface switching is rare and
+                        // not in the user's reset complaint scope.
+                        if let Some(ws) = self.store.get_workspace(workspace).await {
+                            self.rerender_workspace(&ws);
+                        }
+                        let _ = ack.send(Ok(()));
+                    }
+                    Some(flowmux_daemon::CloseOutcome::WorkspaceRemoved { workspace }) => {
+                        self.drop_workspace(workspace);
+                        self.activate_active_or_show_empty().await;
+                        let _ = ack.send(Ok(()));
+                    }
                 }
             }
             GtkCommand::FocusDirection { from, dir } => match from {

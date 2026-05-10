@@ -53,6 +53,7 @@ impl BrowserPane {
         initial_url: Option<&str>,
         callbacks: PaneCallbacks,
         engine: BrowserEngine,
+        persist_session: bool,
     ) -> Self {
         // BrowserEngine labels affect only WebsiteDataStore isolation, matching
         // upstream cmux. Every tab renders through the same WebKitGTK engine.
@@ -61,6 +62,7 @@ impl BrowserPane {
         tracing::debug!(
             engine = ?engine,
             profile = ?profile,
+            persist_session,
             "creating browser pane (WebKitGTK + profile-isolated NetworkSession)"
         );
         // Idempotent WebKit sandbox bypass. main.rs sets the same env var,
@@ -75,7 +77,7 @@ impl BrowserPane {
         // default session and persists in the standard system location. Other
         // profiles live under `$XDG_DATA_HOME/flowmux/browser/<slug>/` so cookies
         // and localStorage do not mix inside one flowmux instance.
-        let network_session = build_network_session(&profile);
+        let network_session = build_network_session(&profile, persist_session);
         let web_view = webkit6::WebView::builder()
             .network_session(&network_session)
             // Some environments inherited muted=true from GtkWindow and muted
@@ -351,30 +353,167 @@ fn engine_to_profile(engine: &BrowserEngine) -> BrowserProfile {
 
 /// Build and return a profile-specific [`webkit6::NetworkSession`].
 ///
-/// * [`BrowserProfile::Default`] reuses the system-managed global default
-///   session, sharing the cookie pool with other running flowmux instances in
-///   the same spirit as cmux's sharedProcessPool.
-/// * Other profiles create persistent NetworkSession data + cache directories
-///   under `$XDG_DATA_HOME/flowmux/browser/<slug>/`. If directory creation fails,
-///   warn and fall back to the global default session so pages still load.
-fn build_network_session(profile: &BrowserProfile) -> webkit6::NetworkSession {
-    match profile {
-        BrowserProfile::Default => webkit6::NetworkSession::default()
-            .unwrap_or_else(|| webkit6::NetworkSession::new(None, None)),
-        other => match other.data_dir() {
-            Ok(dir) => {
-                let dir_str = dir.to_string_lossy().into_owned();
-                webkit6::NetworkSession::new(Some(&dir_str), Some(&dir_str))
-            }
-            Err(e) => {
-                tracing::warn!(
-                    profile = ?profile,
-                    error = %e,
-                    "browser profile data dir unavailable, falling back to default session"
-                );
-                webkit6::NetworkSession::default()
-                    .unwrap_or_else(|| webkit6::NetworkSession::new(None, None))
-            }
-        },
+/// `persist_session` controls whether site state survives a flowmux restart:
+///
+/// * `true` — every profile (including [`BrowserProfile::Default`]) writes
+///   into `$XDG_DATA_HOME/flowmux/browser/<slug>/` and the session's
+///   `CookieManager` is wired to a sqlite file under that directory via
+///   [`set_cookie_persistent_storage`]. WebKitGTK does not enable cookie
+///   persistence for a fresh session by default, so the explicit call is
+///   what makes login cookies survive a quit/relaunch — without it, only
+///   localStorage / IndexedDB persisted, which is why most logins were
+///   forgotten.
+/// * `false` — return [`webkit6::NetworkSession::new_ephemeral`] regardless
+///   of profile, so cookies, localStorage, IndexedDB, and cache all live
+///   in memory and are dropped on quit.
+///
+/// If a persistent profile's data dir cannot be created, fall back to the
+/// global default session so pages still load (with a warning).
+fn build_network_session(
+    profile: &BrowserProfile,
+    persist_session: bool,
+) -> webkit6::NetworkSession {
+    if !persist_session {
+        tracing::debug!(
+            profile = ?profile,
+            "browser session persistence disabled — using ephemeral NetworkSession"
+        );
+        return webkit6::NetworkSession::new_ephemeral();
+    }
+
+    match profile.data_dir() {
+        Ok(dir) => {
+            let dir_str = dir.to_string_lossy().into_owned();
+            let session = webkit6::NetworkSession::new(Some(&dir_str), Some(&dir_str));
+            set_cookie_persistent_storage(&session, &dir);
+            session
+        }
+        Err(e) => {
+            tracing::warn!(
+                profile = ?profile,
+                error = %e,
+                "browser profile data dir unavailable, falling back to default session"
+            );
+            webkit6::NetworkSession::default()
+                .unwrap_or_else(|| webkit6::NetworkSession::new(None, None))
+        }
+    }
+}
+
+/// Wire the session's [`webkit6::CookieManager`] to a sqlite file at
+/// [`cookies_sqlite_path`]. WebKitGTK's [`CookieManager`] keeps cookies
+/// in memory until this is called, which is the root cause of the "I had
+/// to log in again after restarting flowmux" report — cookies were the only
+/// piece of site state not persisted by [`webkit6::NetworkSession::new`].
+///
+/// Logs a warning and leaves cookies in-memory if the manager is missing
+/// (should never happen for a freshly created persistent session).
+fn set_cookie_persistent_storage(session: &webkit6::NetworkSession, data_dir: &std::path::Path) {
+    match session.cookie_manager() {
+        Some(cm) => {
+            let cookies_path = cookies_sqlite_path(data_dir);
+            let cookies_str = cookies_path.to_string_lossy().into_owned();
+            cm.set_persistent_storage(&cookies_str, webkit6::CookiePersistentStorage::Sqlite);
+        }
+        None => {
+            tracing::warn!(
+                data_dir = %data_dir.display(),
+                "NetworkSession has no CookieManager — cookies will not persist"
+            );
+        }
+    }
+}
+
+/// `<data_dir>/cookies.sqlite` — the file flowmux hands to
+/// [`webkit6::CookieManager::set_persistent_storage`] when session
+/// persistence is enabled. Kept as a pure helper so the path layout can be
+/// asserted without spinning up WebKit.
+pub(crate) fn cookies_sqlite_path(data_dir: &std::path::Path) -> std::path::PathBuf {
+    data_dir.join("cookies.sqlite")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn engine_to_profile_maps_each_builtin_to_its_data_slot() {
+        // The Webkit label uses the shared default slot so every flowmux
+        // tab sees the same cookies; the import labels each get their own
+        // slot so credentials from a Firefox/Chrome import don't bleed into
+        // the default profile.
+        assert_eq!(
+            engine_to_profile(&BrowserEngine::Webkit),
+            BrowserProfile::Default
+        );
+        assert_eq!(
+            engine_to_profile(&BrowserEngine::Chrome),
+            BrowserProfile::ChromeImport
+        );
+        assert_eq!(
+            engine_to_profile(&BrowserEngine::Firefox),
+            BrowserProfile::FirefoxImport
+        );
+        assert_eq!(
+            engine_to_profile(&BrowserEngine::Custom { name: "Brave".into() }),
+            BrowserProfile::Custom { name: "Brave".into() }
+        );
+    }
+
+    #[test]
+    fn cookies_sqlite_path_is_under_profile_data_dir() {
+        // The file must sit directly inside the profile data dir so it stays
+        // colocated with the rest of the WebKit storage WebKit places there.
+        // If this file ever moves, an existing user's persisted cookies stop
+        // being picked up — assert the layout explicitly.
+        let dir = std::path::PathBuf::from("/tmp/flowmux-test-profile");
+        let path = cookies_sqlite_path(&dir);
+        assert_eq!(path, dir.join("cookies.sqlite"));
+        assert!(path.starts_with(&dir));
+        assert_eq!(
+            path.file_name().and_then(|n| n.to_str()),
+            Some("cookies.sqlite")
+        );
+    }
+
+    #[test]
+    fn normalize_uri_blank_input_returns_about_blank() {
+        assert_eq!(normalize_uri(""), "about:blank");
+        assert_eq!(normalize_uri("   "), "about:blank");
+    }
+
+    #[test]
+    fn normalize_uri_preserves_explicit_schemes() {
+        for raw in [
+            "http://example.com",
+            "https://example.com/path",
+            "about:blank",
+            "file:///tmp/x.html",
+        ] {
+            assert_eq!(normalize_uri(raw), raw);
+        }
+    }
+
+    #[test]
+    fn normalize_uri_promotes_localhost_to_http() {
+        assert_eq!(normalize_uri("localhost:3000"), "http://localhost:3000");
+        assert_eq!(normalize_uri("127.0.0.1:8080"), "http://127.0.0.1:8080");
+    }
+
+    #[test]
+    fn normalize_uri_promotes_dotted_host_to_https() {
+        assert_eq!(normalize_uri("example.com"), "https://example.com");
+        assert_eq!(
+            normalize_uri("docs.gtk.org/gtk4/"),
+            "https://docs.gtk.org/gtk4/"
+        );
+    }
+
+    #[test]
+    fn normalize_uri_falls_back_to_search() {
+        assert_eq!(
+            normalize_uri("hello world"),
+            "https://duckduckgo.com/?q=hello+world"
+        );
     }
 }
