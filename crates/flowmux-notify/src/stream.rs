@@ -11,6 +11,12 @@
 //! `bell-event` / OSC signal directly. We use this for the libghostty
 //! backend and for piping `flowmux notify` output through stdin.
 
+/// Maximum OSC payload size we will buffer. Real OSC 9 / OSC 777 messages
+/// from agent CLIs are well under 4 KiB; capping the buffer keeps a
+/// terminal that streams a never-terminated OSC from driving the extractor's
+/// memory unbounded.
+pub const MAX_OSC_PAYLOAD: usize = 64 * 1024;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
     /// Outside any escape sequence.
@@ -21,20 +27,37 @@ enum State {
     Osc,
     /// Inside ESC `]` payload after seeing ESC (looking for `\` to terminate).
     OscEsc,
+    /// OSC payload exceeded [`MAX_OSC_PAYLOAD`]; we silently consume bytes
+    /// until the sequence terminator (BEL or ST) and drop the partial
+    /// payload. Without this, a misbehaving peer could grow `buf` until
+    /// the host runs out of memory.
+    OscOverflow,
+    /// In overflow recovery and the previous byte was ESC; if the next byte
+    /// is `\\` this is an ST terminator and the sequence ends.
+    OscOverflowEsc,
 }
 
 pub struct OscExtractor<F: FnMut(&str)> {
     state: State,
     buf: Vec<u8>,
     on_osc: F,
+    max_payload: usize,
 }
 
 impl<F: FnMut(&str)> OscExtractor<F> {
     pub fn new(on_osc: F) -> Self {
+        Self::with_capacity(on_osc, MAX_OSC_PAYLOAD)
+    }
+
+    /// Construct an extractor with a custom payload cap. Used in tests so
+    /// the overflow branch can be exercised without allocating MiBs of
+    /// fixture bytes.
+    pub fn with_capacity(on_osc: F, max_payload: usize) -> Self {
         Self {
             state: State::Ground,
             buf: Vec::with_capacity(64),
             on_osc,
+            max_payload,
         }
     }
 
@@ -49,6 +72,15 @@ impl<F: FnMut(&str)> OscExtractor<F> {
             (self.on_osc)(s);
         }
         self.buf.clear();
+    }
+
+    fn push_or_overflow(&mut self, b: u8) {
+        if self.buf.len() >= self.max_payload {
+            self.buf.clear();
+            self.state = State::OscOverflow;
+            return;
+        }
+        self.buf.push(b);
     }
 
     fn step(&mut self, b: u8) {
@@ -76,7 +108,7 @@ impl<F: FnMut(&str)> OscExtractor<F> {
                     self.state = State::OscEsc;
                 }
                 // Drop control chars except in payload to keep utf8 valid.
-                _ => self.buf.push(b),
+                _ => self.push_or_overflow(b),
             },
             State::OscEsc => {
                 if b == b'\\' {
@@ -85,9 +117,32 @@ impl<F: FnMut(&str)> OscExtractor<F> {
                     self.state = State::Ground;
                 } else {
                     // Spurious ESC inside payload; treat as data.
-                    self.buf.push(0x1B);
-                    self.buf.push(b);
-                    self.state = State::Osc;
+                    self.push_or_overflow(0x1B);
+                    self.push_or_overflow(b);
+                    if self.state != State::OscOverflow {
+                        self.state = State::Osc;
+                    }
+                }
+            }
+            State::OscOverflow => match b {
+                0x07 /* BEL */ => {
+                    // Sequence terminated; drop the oversized payload and
+                    // resume normal parsing.
+                    self.state = State::Ground;
+                }
+                0x1B /* ESC */ => {
+                    // Could be ST: stay in overflow but watch for `\`.
+                    // Reuse OscEsc-with-overflow semantics inline via a
+                    // sentinel: ESC followed by `\` ends the sequence.
+                    self.state = State::OscOverflowEsc;
+                }
+                _ => {}
+            },
+            State::OscOverflowEsc => {
+                if b == b'\\' {
+                    self.state = State::Ground;
+                } else {
+                    self.state = State::OscOverflow;
                 }
             }
         }
@@ -164,6 +219,64 @@ mod tests {
         // extractor must not emit a partial event.
         let s = b"\x1b]9;never finished";
         assert!(collect(s).is_empty());
+    }
+
+    #[test]
+    fn oversized_payload_is_dropped_without_unbounded_growth() {
+        // Drive the extractor with an OSC payload far longer than the cap.
+        // We must (a) not emit the partial payload, (b) recover cleanly so
+        // the next properly-sized OSC parses, (c) not retain any byte after
+        // recovery completes.
+        let mut out = vec![];
+        let final_buf_len;
+        {
+            let mut x = OscExtractor::with_capacity(|s| out.push(s.to_string()), 16);
+            x.feed(b"\x1b]9;");
+            // 1 KiB of payload, no terminator.
+            let payload = vec![b'A'; 1024];
+            x.feed(&payload);
+            // Now terminate the sequence: the partial payload must be dropped.
+            x.feed(b"\x07");
+            // A normal sequence afterward must still parse.
+            x.feed(b"\x1b]9;ok\x07");
+            final_buf_len = x.buf.len();
+        }
+        assert_eq!(out, vec!["9;ok".to_string()]);
+        assert!(final_buf_len <= 16);
+    }
+
+    #[test]
+    fn oversized_payload_recovers_via_st_terminator() {
+        let mut out = vec![];
+        {
+            let mut x = OscExtractor::with_capacity(|s| out.push(s.to_string()), 32);
+            x.feed(b"\x1b]9;");
+            // Far above the cap.
+            let payload = vec![b'B'; 256];
+            x.feed(&payload);
+            // ST terminator instead of BEL.
+            x.feed(b"\x1b\\");
+            // A small follow-up sequence that fits within the cap.
+            x.feed(b"\x1b]9;recovered\x07");
+        }
+        assert_eq!(out, vec!["9;recovered".to_string()]);
+    }
+
+    #[test]
+    fn back_to_back_overflows_recover_independently() {
+        let mut out = vec![];
+        {
+            let mut x = OscExtractor::with_capacity(|s| out.push(s.to_string()), 32);
+            // Two oversized OSC sequences, each properly terminated.
+            for _ in 0..2 {
+                x.feed(b"\x1b]9;");
+                x.feed(&vec![b'X'; 256]);
+                x.feed(b"\x07");
+            }
+            // Then a small one that should still parse (well under 32 bytes).
+            x.feed(b"\x1b]9;tiny\x07");
+        }
+        assert_eq!(out, vec!["9;tiny".to_string()]);
     }
 
     #[test]
