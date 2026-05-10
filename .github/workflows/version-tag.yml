@@ -1,0 +1,105 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+name: Version Tag
+
+# Watch the workspace version in Cargo.toml. Whenever a push to main bumps
+# `[workspace.package].version`, create a matching `vX.Y.Z` annotated tag
+# and dispatch the existing Release workflow against that tag — so the
+# release notes, .deb, and tarball are generated automatically without
+# anyone having to remember to push the tag by hand.
+#
+# The workflow is idempotent: if `vX.Y.Z` already exists (because a
+# previous run created it, or because the push touched Cargo.toml without
+# actually changing the version), the run logs and exits with no side
+# effects.
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - Cargo.toml
+  workflow_dispatch:
+
+permissions:
+  # `contents: write` to push the new annotated tag.
+  # `actions:  write` to dispatch the Release workflow against that tag —
+  # the default GITHUB_TOKEN does not trigger downstream workflows via the
+  # `push: tags` event (intentional GitHub safety guard), so we trigger it
+  # explicitly with `gh workflow run`.
+  contents: write
+  actions: write
+
+jobs:
+  tag-and-release:
+    name: Tag and release on workspace version bump
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Read [workspace.package].version
+        id: ver
+        run: |
+          set -euo pipefail
+          # Cargo.toml has many `version =` keys, but only the workspace
+          # package version sits at the top of a line ("^version ="); every
+          # dependency entry is inline like `serde = { version = "1", ... }`,
+          # which never starts with `version`. So the first `^version =`
+          # match is the authoritative workspace version.
+          version=$(grep -E '^version[[:space:]]*=' Cargo.toml \
+            | head -n1 \
+            | sed -E 's/^version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/')
+          if [ -z "$version" ]; then
+            echo "::error file=Cargo.toml::Could not read [workspace.package].version from Cargo.toml"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+          echo "Read workspace version: $version"
+
+      - name: Check if tag already exists
+        id: existing
+        run: |
+          set -euo pipefail
+          tag="${{ steps.ver.outputs.tag }}"
+          # Local check is cheap; the remote check is authoritative and
+          # covers the case where the tag was created elsewhere since the
+          # last fetch on this runner.
+          if git rev-parse --verify "refs/tags/$tag" >/dev/null 2>&1 \
+            || git ls-remote --tags --exit-code origin "$tag" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Tag $tag already exists — nothing to do."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "Tag $tag is new — will create and dispatch release."
+          fi
+
+      - name: Configure git identity
+        if: steps.existing.outputs.exists == 'false'
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+      - name: Create and push annotated tag
+        if: steps.existing.outputs.exists == 'false'
+        run: |
+          set -euo pipefail
+          tag="${{ steps.ver.outputs.tag }}"
+          git tag -a "$tag" -m "Release $tag"
+          git push origin "$tag"
+
+      - name: Dispatch Release workflow
+        if: steps.existing.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="${{ steps.ver.outputs.tag }}"
+          gh workflow run release.yml \
+            --repo "${{ github.repository }}" \
+            --ref "$tag" \
+            -f tag="$tag"
+          echo "Dispatched release workflow for $tag."
