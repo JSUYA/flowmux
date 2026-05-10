@@ -281,6 +281,15 @@ pub enum GtkCommand {
     CloseDesktopNotifications {
         desktop_ids: Vec<u32>,
     },
+    /// Re-publish the current `unread_count()` to the dock via the
+    /// `com.canonical.Unity.LauncherEntry::Update` D-Bus signal so
+    /// the dock badge stays in lockstep with notifications the user
+    /// has actually acknowledged. Sent after every notification state
+    /// change (push, mark read, sweep, workspace activation) because
+    /// closing FDO toasts alone is not always enough — Ubuntu Dock /
+    /// Dash-to-Dock track the count via this Unity signal, not the
+    /// FDO message tray.
+    RefreshLauncherBadge,
     /// User clicked a row in the bell popover. Mark the entry read,
     /// activate its workspace (if known), and grab focus on the source
     /// pane (if known). Mirrors cmux's `openNotification → focusTab`.

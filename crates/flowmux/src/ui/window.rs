@@ -7,7 +7,7 @@ use crate::bridge::{
     Bridge, BrowserActionResult, BrowserOp, BrowserOpenOutcome, FocusDir, GtkCommand, WsNav,
 };
 use crate::keybindings::FocusedPane;
-use crate::notifications::NotificationStore;
+use crate::notifications::{NotificationStore, SetDesktopIdResult};
 use crate::theme::ResolvedTheme;
 use crate::ui::sidebar::Sidebar;
 use crate::ui::terminal_pane::PaneCallbacks;
@@ -1504,49 +1504,44 @@ impl WindowController {
                         self.sidebar.mark_attention(ws_id);
                     }
                 }
+                self.refresh_launcher_badge();
                 let _ = ack.send(Some(entry_id));
             }
             GtkCommand::SetNotificationDesktopId { id, desktop_id } => {
-                self.notifications.set_desktop_id(id, desktop_id);
+                // The daemon's `Notify` reply may race the user's read
+                // gesture: by the time the desktop_id arrives, the user
+                // may already have opened the bell popover or activated
+                // the source workspace, in which case the previous
+                // sweep had nothing to close. Detect that here and fire
+                // a one-off close so the FDO toast does not linger and
+                // the dock badge stays in sync.
+                match self.notifications.set_desktop_id(id, desktop_id) {
+                    SetDesktopIdResult::Stale => {
+                        self.close_desktop_notifications(vec![desktop_id]);
+                        self.refresh_launcher_badge();
+                    }
+                    SetDesktopIdResult::Stored | SetDesktopIdResult::Unknown => {}
+                }
             }
             GtkCommand::CloseDesktopNotifications { desktop_ids } => {
-                // Close the matching FDO toasts so GNOME / KDE drop
-                // them from the notification center and the dock /
-                // launcher badge counter shrinks. We connect lazily
-                // and reuse the same `DesktopNotifier` across calls so
-                // the per-popover-open path doesn't re-handshake DBus.
-                if desktop_ids.is_empty() {
-                    return;
-                }
-                let notifier_cell = self.notifier.clone();
-                glib::MainContext::default().spawn_local(async move {
-                    let mut guard = notifier_cell.borrow_mut();
-                    if guard.is_none() {
-                        match flowmux_notify::DesktopNotifier::connect().await {
-                            Ok(n) => *guard = Some(n),
-                            Err(e) => {
-                                tracing::debug!(
-                                    error = %e,
-                                    "could not connect to FDO notifications for close"
-                                );
-                                return;
-                            }
-                        }
-                    }
-                    let n = guard.as_ref().expect("notifier just connected");
-                    for did in desktop_ids {
-                        if let Err(e) = n.close(did).await {
-                            tracing::debug!(error = %e, did, "close notification failed");
-                        }
-                    }
-                });
+                self.close_desktop_notifications(desktop_ids);
+                self.refresh_launcher_badge();
+            }
+            GtkCommand::RefreshLauncherBadge => {
+                self.refresh_launcher_badge();
             }
             GtkCommand::OpenNotification { id } => {
                 let Some(entry) = self.notifications.find(id) else {
                     tracing::debug!(%id, "open notification: id not found");
                     return;
                 };
-                self.notifications.mark_read(id);
+                let did = entry.desktop_id;
+                if self.notifications.mark_read(id) {
+                    if let Some(did) = did {
+                        self.close_desktop_notifications(vec![did]);
+                    }
+                    self.refresh_launcher_badge();
+                }
                 if let Some(ws_id) = entry.workspace {
                     self.activate_workspace(ws_id).await;
                 }
@@ -2055,10 +2050,85 @@ impl WindowController {
         // that would otherwise drop the attention tint, so we clear it
         // here too.
         self.sidebar.clear_attention(id);
+        // The user has now seen the workspace, so any notifications it
+        // produced are acknowledged. Flip them to read, close their
+        // matching FDO toasts so GNOME / KDE drop them from the
+        // notification center, and re-publish unread_count() to the
+        // dock so the badge shrinks accordingly. Without this the
+        // dock badge counted notifications the user already addressed
+        // by switching to the workspace (matching the cmux/macOS dock
+        // behavior the user expects from agent toasts).
+        let to_close = self.notifications.mark_workspace_read(id);
+        if !to_close.is_empty() {
+            self.close_desktop_notifications(to_close);
+        }
+        self.refresh_launcher_badge();
         self.store.set_active_workspace(Some(id)).await;
         if let Some(ws) = self.store.get_workspace(id).await {
             self.focus_first_leaf_of(&ws);
         }
+    }
+
+    /// Connect (lazily) to the FDO notifications service and ask it to
+    /// close the given `desktop_id`s. Used by the bell popover sweep,
+    /// the workspace-activation sweep, the OpenNotification click, and
+    /// the late-arriving SetNotificationDesktopId race fix.
+    fn close_desktop_notifications(&self, desktop_ids: Vec<u32>) {
+        if desktop_ids.is_empty() {
+            return;
+        }
+        let notifier_cell = self.notifier.clone();
+        glib::MainContext::default().spawn_local(async move {
+            let mut guard = notifier_cell.borrow_mut();
+            if guard.is_none() {
+                match flowmux_notify::DesktopNotifier::connect().await {
+                    Ok(n) => *guard = Some(n),
+                    Err(e) => {
+                        tracing::debug!(
+                            error = %e,
+                            "could not connect to FDO notifications for close"
+                        );
+                        return;
+                    }
+                }
+            }
+            let n = guard.as_ref().expect("notifier just connected");
+            for did in desktop_ids {
+                if let Err(e) = n.close(did).await {
+                    tracing::debug!(error = %e, did, "close notification failed");
+                }
+            }
+        });
+    }
+
+    /// Publish the current unread-notification count to the dock via
+    /// `com.canonical.Unity.LauncherEntry::Update`. Closing FDO toasts
+    /// alone is not always enough — Ubuntu Dock / Dash-to-Dock derive
+    /// the badge from this Unity signal, so we have to drive it
+    /// explicitly whenever `NotificationStore` state changes.
+    fn refresh_launcher_badge(&self) {
+        let count = self.notifications.unread_count() as i64;
+        let notifier_cell = self.notifier.clone();
+        glib::MainContext::default().spawn_local(async move {
+            let mut guard = notifier_cell.borrow_mut();
+            if guard.is_none() {
+                match flowmux_notify::DesktopNotifier::connect().await {
+                    Ok(n) => *guard = Some(n),
+                    Err(e) => {
+                        tracing::debug!(
+                            error = %e,
+                            "could not connect to FDO notifications for launcher badge"
+                        );
+                        return;
+                    }
+                }
+            }
+            let n = guard.as_ref().expect("notifier just connected");
+            let app_uri = format!("application://{}.desktop", crate::APP_ID);
+            if let Err(e) = n.update_launcher_count(&app_uri, count).await {
+                tracing::debug!(error = %e, count, "launcher entry update failed");
+            }
+        });
     }
 
     pub async fn restore_from_store(&self) {

@@ -120,10 +120,26 @@ impl NotificationStore {
     /// IPC handler calls this after the daemon returns
     /// `Response::Notified` so the popover can later ask the daemon to
     /// dismiss the toast when the user reads it inside flowmux.
-    pub fn set_desktop_id(&self, id: NotificationId, desktop_id: u32) {
+    ///
+    /// Returns [`SetDesktopIdResult`] so the caller can detect the IPC
+    /// race where the user already swept the entry to read (by opening
+    /// the bell popover or activating the source workspace) before the
+    /// daemon's `Notify` reply arrived. In that case
+    /// `mark_all_unread_read` / `mark_workspace_read` had no
+    /// `desktop_id` to return, so the toast would otherwise stay alive
+    /// in the notification center and the dock badge would not shrink.
+    pub fn set_desktop_id(&self, id: NotificationId, desktop_id: u32) -> SetDesktopIdResult {
         let mut entries = self.inner.borrow_mut();
-        if let Some(e) = entries.iter_mut().find(|e| e.id == id) {
-            e.desktop_id = Some(desktop_id);
+        match entries.iter_mut().find(|e| e.id == id) {
+            Some(e) => {
+                e.desktop_id = Some(desktop_id);
+                if e.read {
+                    SetDesktopIdResult::Stale
+                } else {
+                    SetDesktopIdResult::Stored
+                }
+            }
+            None => SetDesktopIdResult::Unknown,
         }
     }
 
@@ -147,6 +163,29 @@ impl NotificationStore {
         closed
     }
 
+    /// Mark every unread entry whose source `workspace` matches `ws` as
+    /// read and return their `desktop_id`s. Used by the side-panel row
+    /// activation path so that selecting a workspace also acknowledges
+    /// the notifications it produced — the dock badge then drops by
+    /// exactly the count of acknowledged entries instead of staying
+    /// pinned to the cumulative total.
+    ///
+    /// Entries with `workspace = None` (global notifications) are
+    /// untouched; only the bell popover sweep clears those.
+    pub fn mark_workspace_read(&self, ws: WorkspaceId) -> Vec<u32> {
+        let mut entries = self.inner.borrow_mut();
+        let mut closed = Vec::new();
+        for e in entries.iter_mut() {
+            if !e.read && e.workspace == Some(ws) {
+                e.read = true;
+                if let Some(did) = e.desktop_id {
+                    closed.push(did);
+                }
+            }
+        }
+        closed
+    }
+
     pub fn find(&self, id: NotificationId) -> Option<NotificationEntry> {
         self.inner.borrow().iter().find(|e| e.id == id).cloned()
     }
@@ -157,12 +196,33 @@ impl NotificationStore {
         self.inner.borrow().iter().cloned().collect()
     }
 
-    /// Number of unread entries. Currently used by tests; kept public so
-    /// the sidebar can show a future count badge without a second pass.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Number of unread entries. Drives the OS dock-badge count via
+    /// `DesktopNotifier::update_launcher_count` — every state change
+    /// (`push`, `mark_read`, `mark_workspace_read`,
+    /// `mark_all_unread_read`) should be followed by re-emitting this
+    /// number so the dock reflects only notifications the user has
+    /// not yet acknowledged.
     pub fn unread_count(&self) -> usize {
         self.inner.borrow().iter().filter(|e| !e.read).count()
     }
+}
+
+/// Outcome of [`NotificationStore::set_desktop_id`]. Lets the IPC
+/// dispatcher react to the case where the user marked the entry read
+/// (popover open / workspace activation) before the daemon's `Notify`
+/// reply arrived — in that case the dock badge would otherwise stay
+/// inflated forever.
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetDesktopIdResult {
+    /// Entry was unread; `desktop_id` is now stored and will flow
+    /// through the next `mark_*_read` sweep.
+    Stored,
+    /// Entry was already marked read by the time the desktop id
+    /// arrived. Caller should immediately close the FDO toast.
+    Stale,
+    /// Entry id was unknown (aged out under the cap). Safe to ignore.
+    Unknown,
 }
 
 #[cfg(test)]
@@ -336,7 +396,7 @@ mod tests {
             None,
             None,
         );
-        s.set_desktop_id(id, 42);
+        assert_eq!(s.set_desktop_id(id, 42), SetDesktopIdResult::Stored);
         assert_eq!(s.find(id).unwrap().desktop_id, Some(42));
     }
 
@@ -345,8 +405,34 @@ mod tests {
         let s = store();
         // No panic, no insert — just silently ignored. Mirrors the
         // mark_read contract for entries that aged out under the cap.
-        s.set_desktop_id(NotificationId::new(), 7);
+        assert_eq!(
+            s.set_desktop_id(NotificationId::new(), 7),
+            SetDesktopIdResult::Unknown
+        );
         assert_eq!(s.entries().len(), 0);
+    }
+
+    #[test]
+    fn set_desktop_id_after_mark_read_reports_stale_so_caller_can_close() {
+        // Simulates the IPC race: the user opened the popover and
+        // mark_all_unread_read flipped the entry to read before the
+        // daemon's `Notify` reply (which carries the desktop_id) made
+        // it back to the GUI. Without Stale, the FDO toast would never
+        // be closed and the dock badge would stay inflated.
+        let s = store();
+        let id = s.push(
+            "Claude".into(),
+            "ready".into(),
+            NotificationLevel::AttentionNeeded,
+            None,
+            None,
+            None,
+        );
+        // Sweep first (no desktop_id yet → empty vec).
+        assert!(s.mark_all_unread_read().is_empty());
+        // Late-arriving desktop id should report Stale.
+        assert_eq!(s.set_desktop_id(id, 99), SetDesktopIdResult::Stale);
+        assert_eq!(s.find(id).unwrap().desktop_id, Some(99));
     }
 
     #[test]
@@ -379,8 +465,8 @@ mod tests {
         // Entry `a` carries no desktop_id (e.g. toast was suppressed),
         // so it should be marked read but NOT show up in the close
         // list. `b` and `c` should both round-trip their ids.
-        s.set_desktop_id(b, 11);
-        s.set_desktop_id(c, 22);
+        let _ = s.set_desktop_id(b, 11);
+        let _ = s.set_desktop_id(c, 22);
         // Pre-mark `b` as already read so the loop must skip it and
         // not double-emit its desktop_id.
         s.mark_read(b);
@@ -392,6 +478,76 @@ mod tests {
         // `a` still has no desktop_id but is now read.
         assert!(s.find(a).unwrap().read);
         assert!(s.find(c).unwrap().read);
+    }
+
+    #[test]
+    fn mark_workspace_read_only_flips_unread_entries_for_that_workspace() {
+        let s = store();
+        let ws_a = WorkspaceId::new();
+        let ws_b = WorkspaceId::new();
+        let a1 = s.push(
+            "claude".into(),
+            "step 1".into(),
+            NotificationLevel::AttentionNeeded,
+            None,
+            None,
+            Some(ws_a),
+        );
+        let a2 = s.push(
+            "claude".into(),
+            "step 2".into(),
+            NotificationLevel::AttentionNeeded,
+            None,
+            None,
+            Some(ws_a),
+        );
+        let b1 = s.push(
+            "codex".into(),
+            "step 1".into(),
+            NotificationLevel::AttentionNeeded,
+            None,
+            None,
+            Some(ws_b),
+        );
+        let global = s.push(
+            "ready".into(),
+            "global".into(),
+            NotificationLevel::Info,
+            None,
+            None,
+            None,
+        );
+        let _ = s.set_desktop_id(a1, 11);
+        let _ = s.set_desktop_id(a2, 12);
+        let _ = s.set_desktop_id(b1, 21);
+        // ws_a sweep: only a1 / a2 close, b1 + global stay unread.
+        let closed = s.mark_workspace_read(ws_a);
+        assert_eq!(closed, vec![11, 12]);
+        assert!(s.find(a1).unwrap().read);
+        assert!(s.find(a2).unwrap().read);
+        assert!(!s.find(b1).unwrap().read);
+        assert!(!s.find(global).unwrap().read);
+        assert_eq!(s.unread_count(), 2);
+        // Repeat sweep is a no-op; nothing left to close for ws_a.
+        assert!(s.mark_workspace_read(ws_a).is_empty());
+    }
+
+    #[test]
+    fn mark_workspace_read_skips_entries_with_no_workspace() {
+        let s = store();
+        let ws = WorkspaceId::new();
+        let _global = s.push(
+            "info".into(),
+            "global".into(),
+            NotificationLevel::Info,
+            None,
+            None,
+            None,
+        );
+        // Activating a workspace must never collaterally clear global
+        // notifications — only the bell popover sweep does that.
+        assert!(s.mark_workspace_read(ws).is_empty());
+        assert_eq!(s.unread_count(), 1);
     }
 
     #[test]
@@ -408,7 +564,7 @@ mod tests {
             None,
             None,
         );
-        s.set_desktop_id(id, 99);
+        assert_eq!(s.set_desktop_id(id, 99), SetDesktopIdResult::Stored);
         assert_eq!(s.mark_all_unread_read(), vec![99]);
         assert!(s.mark_all_unread_read().is_empty());
     }

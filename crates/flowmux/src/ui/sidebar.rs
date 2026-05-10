@@ -139,16 +139,23 @@ impl Sidebar {
             // window dispatcher can close them. Without that close,
             // GNOME / KDE keep the entries in the notification center
             // and the dock badge counter never decreases.
+            //
+            // Always send a follow-up RefreshLauncherBadge even when
+            // `desktop_ids` is empty: an entry whose desktop_id has
+            // not yet arrived from the daemon (IPC race) still flipped
+            // to read here, so the unread count we publish to the
+            // Unity LauncherEntry signal must shrink regardless.
             let desktop_ids = store_for_show.mark_all_unread_read();
-            if !desktop_ids.is_empty() {
-                let bridge = bridge_for_close.clone();
-                gtk::glib::MainContext::default().spawn_local(async move {
+            let bridge = bridge_for_close.clone();
+            gtk::glib::MainContext::default().spawn_local(async move {
+                if !desktop_ids.is_empty() {
                     let _ = bridge
                         .tx
                         .send(GtkCommand::CloseDesktopNotifications { desktop_ids })
                         .await;
-                });
-            }
+                }
+                let _ = bridge.tx.send(GtkCommand::RefreshLauncherBadge).await;
+            });
             popover_for_show.set_child(Some(&render_notification_list(
                 &store_for_show,
                 bridge_for_rows.clone(),
@@ -667,6 +674,7 @@ fn row_widget(
     let close_btn = gtk::Button::from_icon_name("window-close-symbolic");
     close_btn.add_css_class("flat");
     close_btn.add_css_class("circular");
+    close_btn.add_css_class("flowmux-sidebar-close");
     close_btn.set_tooltip_text(Some("Close tab"));
     close_btn.set_valign(gtk::Align::Center);
     close_btn.set_opacity(0.0);
