@@ -40,10 +40,10 @@ pub const BINDINGS: &[(&str, &[&str])] = &[
     ("win.focus-up", &["<Alt>Up"]),
     ("win.focus-down", &["<Alt>Down"]),
     ("win.close-surface", &["<Alt>w"]),
-    // Tab navigation. The bare Tab key is reserved for the terminal
-    // (shell completion etc.). Shift+Tab cycles pane-local terminal /
-    // browser tabs; Ctrl+Tab cycles the left workspace list.
-    ("win.next-surface", &["<Shift>Tab", "<Shift>ISO_Left_Tab"]),
+    // Tab navigation. Bare Tab and Shift+Tab are reserved for the terminal
+    // (shell completion, agent shortcuts, etc.). Ctrl+Tab cycles the left
+    // workspace list.
+    ("win.next-surface", &[]),
     ("win.prev-surface", &[]),
     ("win.next-workspace", &["<Ctrl>Tab"]),
     (
@@ -458,14 +458,11 @@ mod tests {
     }
 
     #[test]
-    fn shift_tab_cycles_pane_local_surface_not_workspace() {
-        assert_eq!(
-            accels("win.next-surface"),
-            &["<Shift>Tab", "<Shift>ISO_Left_Tab"]
-        );
+    fn shift_tab_is_reserved_for_terminal_and_agents() {
+        assert!(accels("win.next-surface").is_empty());
         assert!(!accels("win.next-workspace")
             .iter()
-            .any(|accel| accel.contains("<Shift>Tab") || accel.contains("<Shift>ISO_Left_Tab")));
+            .any(|accel| *accel == "<Shift>Tab" || *accel == "<Shift>ISO_Left_Tab"));
     }
 
     #[test]

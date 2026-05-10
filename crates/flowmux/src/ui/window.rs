@@ -1160,8 +1160,8 @@ impl WindowController {
                     // side-panel name and subtitles.
                     self.sync_workspace_label(ws_id).await;
                 }
-                // After a surface is activated through any path, click,
-                // Shift+Tab cycle, IPC, and so on, move keyboard focus to the
+                // After a surface is activated through click, IPC, or another
+                // path, move keyboard focus to the
                 // newly active widget: the terminal's vte::Terminal or the
                 // browser's WebView. That lets typing go to the new tab's shell
                 // or page and keeps Tab as shell completion instead of tab-bar
