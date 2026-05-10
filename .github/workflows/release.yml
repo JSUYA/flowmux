@@ -109,6 +109,18 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      # Full history + tags are required so the release-notes step can diff
+      # this tag against the previous v* tag and produce a categorized
+      # commit list. fetch-depth: 0 pulls the whole graph, and fetch-tags
+      # ensures local tag refs are present even when this run was triggered
+      # via workflow_dispatch.
+      - name: Checkout (full history)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
+          fetch-tags: true
+
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
@@ -121,6 +133,113 @@ jobs:
           ref="${{ inputs.tag || github.ref_name }}"
           echo "tag=$ref" >> "$GITHUB_OUTPUT"
 
+      - name: Resolve previous tag
+        id: prev
+        run: |
+          set -euo pipefail
+          tag="${{ steps.ver.outputs.tag }}"
+          # Pick the highest v* tag that isn't this one. Sorting by
+          # version:refname keeps SemVer ordering correct (0.1.10 > 0.1.9),
+          # which `--sort=-creatordate` would not.
+          prev=$(git tag --list 'v*' --sort=-version:refname \
+            | grep -vFx "$tag" \
+            | head -n1 || true)
+          echo "tag=$prev" >> "$GITHUB_OUTPUT"
+          if [ -n "$prev" ]; then
+            echo "Previous tag: $prev"
+          else
+            echo "No previous tag — treating as initial release."
+          fi
+
+      - name: Build release notes
+        id: notes
+        env:
+          PREV_TAG: ${{ steps.prev.outputs.tag }}
+          TAG: ${{ steps.ver.outputs.tag }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          python3 <<'PY' > RELEASE_NOTES.md
+          import os, re, subprocess
+
+          prev = os.environ.get("PREV_TAG", "")
+          tag  = os.environ["TAG"]
+          repo = os.environ["REPO"]
+
+          # When there's no previous tag (very first release), include the
+          # whole reachable history. Otherwise diff against the predecessor.
+          rev_range = f"{prev}..{tag}" if prev else tag
+          log = subprocess.check_output(
+              ["git", "log", "--no-merges", "--pretty=format:%h%x09%s", rev_range],
+              text=True,
+          ).strip()
+
+          # Conventional Commits buckets, ordered as they should appear in
+          # the release body. The leading regex strips the type/scope so the
+          # printed line reads as a plain bullet.
+          categories = [
+              ("Features",      re.compile(r"^feat(\([^)]+\))?!?:\s*", re.I)),
+              ("Bug fixes",     re.compile(r"^fix(\([^)]+\))?!?:\s*",  re.I)),
+              ("Performance",   re.compile(r"^perf(\([^)]+\))?!?:\s*", re.I)),
+              ("Refactoring",   re.compile(r"^refactor(\([^)]+\))?!?:\s*", re.I)),
+              ("Documentation", re.compile(r"^docs(\([^)]+\))?!?:\s*", re.I)),
+              ("CI / Build",    re.compile(r"^(ci|build|chore)(\([^)]+\))?!?:\s*", re.I)),
+              ("Tests",         re.compile(r"^test(\([^)]+\))?!?:\s*", re.I)),
+          ]
+          buckets = {name: [] for name, _ in categories}
+          others  = []
+
+          for line in log.splitlines():
+              if not line:
+                  continue
+              sha, subject = line.split("\t", 1)
+              for name, pat in categories:
+                  if pat.match(subject):
+                      buckets[name].append((sha, subject))
+                      break
+              else:
+                  others.append((sha, subject))
+
+          out = []
+
+          # Highlights: top feat: subjects (capped) with the type prefix
+          # stripped so they read as plain user-facing summaries.
+          highlight_strip = re.compile(r"^[a-z]+(\([^)]+\))?!?:\s*", re.I)
+          features = buckets["Features"]
+          if features:
+              out.append("## Highlights")
+              for sha, subject in features[:5]:
+                  out.append(f"- {highlight_strip.sub('', subject)}")
+              out.append("")
+
+          out.append("## What's Changed")
+          out.append("")
+          for name, _ in categories:
+              items = buckets[name]
+              if not items:
+                  continue
+              out.append(f"### {name}")
+              for sha, subject in items:
+                  out.append(f"- {subject} ({sha})")
+              out.append("")
+          if others:
+              out.append("### Other")
+              for sha, subject in others:
+                  out.append(f"- {subject} ({sha})")
+              out.append("")
+
+          if prev:
+              out.append(f"**Full Changelog**: https://github.com/{repo}/compare/{prev}...{tag}")
+          else:
+              out.append("_Initial release — full history included above._")
+
+          print("\n".join(out).rstrip() + "\n")
+          PY
+
+          echo "===== RELEASE_NOTES.md ====="
+          cat RELEASE_NOTES.md
+          echo "============================"
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -128,7 +247,11 @@ jobs:
           name: ${{ steps.ver.outputs.tag }}
           draft: false
           prerelease: ${{ contains(steps.ver.outputs.tag, '-') }}
-          generate_release_notes: true
+          # Custom body built from the commit log; we deliberately turn off
+          # the GitHub auto-generated PR section because the project pushes
+          # directly to main, so the auto section would duplicate the same
+          # commits without the conventional-commits grouping.
+          body_path: RELEASE_NOTES.md
           files: |
             dist/*.tar.gz
             dist/*.tar.gz.sha256
