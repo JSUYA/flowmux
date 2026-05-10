@@ -71,17 +71,6 @@ window so multiple sessions don't bleed into each other.
   installing an agent that wasn't on the host when flowmux was first
   set up.
 
-### Scripting & automation
-- The `flowmux` command line covers the same surface the GUI exposes:
-  open workspaces, split panes, drive the in-app browser, send
-  notifications, manage themes.
-- Commands can return JSON, so shell scripts and agents can consume
-  the results directly.
-
-### Config & persistence
-- Reads `cmux.json` for custom commands and picks up your Ghostty
-  fonts and colours from `~/.config/ghostty/config`.
-- Workspaces, panes, and themes are remembered between launches.
 
 ## Layout
 
