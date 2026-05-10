@@ -26,6 +26,29 @@ use ui::{spawn_dispatch_loop, WindowController};
 
 const APP_ID: &str = "com.flowmux.App";
 
+/// Compile-time guard: the GApplication `application_id`, the FDO
+/// `desktop-entry` hint, and the LauncherEntry `app_uri` must all key
+/// off the same `.desktop` basename so the dock can correlate the
+/// notification with our launcher icon. If they drift, GNOME Shell
+/// closes the toast on a different app id than the badge tracker
+/// watches and the dock dot survives every "mark read" sweep.
+const _: () = {
+    let lhs = APP_ID.as_bytes();
+    let rhs = flowmux_notify::DESKTOP_FILE_BASENAME.as_bytes();
+    assert!(
+        lhs.len() == rhs.len(),
+        "APP_ID and flowmux_notify::DESKTOP_FILE_BASENAME must match the installed .desktop basename"
+    );
+    let mut i = 0;
+    while i < lhs.len() {
+        assert!(
+            lhs[i] == rhs[i],
+            "APP_ID and flowmux_notify::DESKTOP_FILE_BASENAME must match the installed .desktop basename"
+        );
+        i += 1;
+    }
+};
+
 fn main() -> anyhow::Result<()> {
     if delegate_to_cli_if_needed()? {
         return Ok(());
@@ -131,6 +154,16 @@ fn main() -> anyhow::Result<()> {
     let store_for_activate = store.clone();
     let rx_for_activate = rx.clone();
     let bridge_for_activate = bridge.clone();
+    // The GTK main thread is not a Tokio worker, but every D-Bus path
+    // dispatched from there (FDO toast close, dock launcher badge
+    // republish) goes through `zbus` with the `tokio` feature, which
+    // needs an active runtime context for every `await`. Hand the
+    // controller a clone of the runtime handle so it can `enter()` it
+    // from inside `glib::spawn_local`. Without this, every D-Bus
+    // `await` panics with "no reactor running", the panic is swallowed
+    // by GLib's task wrapper, and the dock badge / notification close
+    // path silently never runs.
+    let tokio_handle_for_activate = rt.handle().clone();
     app.connect_activate(move |app| {
         gtk::Window::set_default_icon_name(APP_ID);
 
@@ -169,6 +202,7 @@ fn main() -> anyhow::Result<()> {
             theme,
             bridge_for_activate.clone(),
             provider,
+            Some(tokio_handle_for_activate.clone()),
         );
         keybindings::install_actions(
             &controller.window,

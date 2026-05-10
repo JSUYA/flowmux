@@ -61,6 +61,28 @@ pub struct WindowController {
     /// reused thereafter. Lives on the GTK main thread (the GUI is
     /// single-threaded) so a `Rc<RefCell<…>>` is enough.
     notifier: Rc<RefCell<Option<flowmux_notify::DesktopNotifier>>>,
+    /// Set while a launcher-badge publish task is in flight on the main
+    /// context. Combined with `badge_dirty` it serializes overlapping
+    /// `refresh_launcher_badge` calls so the *last* state of
+    /// `NotificationStore` always wins — without it two concurrent
+    /// `spawn_local` tasks could publish their counts out of order and
+    /// leave the dock badge stuck on a stale value.
+    badge_publisher_busy: Rc<Cell<bool>>,
+    /// Set when a refresh request arrived while another publish task was
+    /// already running. The in-flight task drains it after each publish
+    /// and republishes the latest `unread_count()` until the flag stays
+    /// false — guaranteeing the dock badge converges to the freshest
+    /// state regardless of `spawn_local` scheduling order.
+    badge_dirty: Rc<Cell<bool>>,
+    /// Handle to the Tokio runtime so D-Bus calls dispatched from
+    /// `glib::spawn_local` can enter the runtime before they `await`.
+    /// `zbus` (with the `tokio` feature) calls `Handle::current()` to
+    /// pick a reactor; without an active runtime context every
+    /// `update_launcher_count`, `close`, and `send` panics, the panic
+    /// is swallowed by GLib's task wrapper, and the dock badge / FDO
+    /// toast never updates. Captured from `tokio::runtime::Handle` at
+    /// controller construction so every D-Bus path can `enter()` it.
+    tokio_handle: Option<tokio::runtime::Handle>,
 }
 
 impl WindowController {
@@ -70,6 +92,7 @@ impl WindowController {
         theme: Arc<ResolvedTheme>,
         bridge: Bridge,
         css_provider: gtk::CssProvider,
+        tokio_handle: Option<tokio::runtime::Handle>,
     ) -> Self {
         let focused_pane: FocusedPane = Rc::new(Cell::new(None));
         let notifications = NotificationStore::new();
@@ -193,6 +216,9 @@ impl WindowController {
             clipboard_toast,
             focus_mru: Rc::new(RefCell::new(HashMap::new())),
             notifier: Rc::new(RefCell::new(None)),
+            badge_publisher_busy: Rc::new(Cell::new(false)),
+            badge_dirty: Rc::new(Cell::new(false)),
+            tokio_handle,
         };
         controller.install_state_flush_on_close();
         controller.install_cwd_polling_fallback();
@@ -2108,7 +2134,17 @@ impl WindowController {
             return;
         }
         let notifier_cell = self.notifier.clone();
+        let handle = self.tokio_handle.clone();
         glib::MainContext::default().spawn_local(async move {
+            // `zbus` (tokio feature) needs an active Tokio runtime
+            // context for every `await`. The GTK main thread is not a
+            // Tokio worker, so without this guard the first `.await`
+            // panics with "no reactor running"; the panic is swallowed
+            // by GLib's task wrapper and the FDO toast never closes,
+            // leaving the OS notification center inflated and the dock
+            // badge stuck. The guard lives for the entire async block,
+            // covering connect + every `close().await`.
+            let _enter = handle.as_ref().map(|h| h.enter());
             let Some(notifier) = ensure_desktop_notifier(&notifier_cell).await else {
                 return;
             };
@@ -2125,16 +2161,75 @@ impl WindowController {
     /// alone is not always enough — Ubuntu Dock / Dash-to-Dock derive
     /// the badge from this Unity signal, so we have to drive it
     /// explicitly whenever `NotificationStore` state changes.
+    ///
+    /// Two refresh calls are coalesced and serialized: an in-flight
+    /// publish task races with later state changes (a fresh
+    /// `AddNotification` that grew `unread_count()`, or a
+    /// `mark_workspace_read` sweep that shrank it), and `spawn_local`
+    /// gives no FIFO guarantee across awaits. Without coalescing the
+    /// older count could land *after* the newer one and leave the dock
+    /// badge stuck — exactly the "badge stays on 2 even after I clicked
+    /// the workspace" symptom this guards against. The single in-flight
+    /// task republishes until `badge_dirty` stays false, so the dock
+    /// converges to the freshest `unread_count()` regardless of how
+    /// many overlapping callers fired the refresh.
     fn refresh_launcher_badge(&self) {
-        let count = self.notifications.unread_count() as i64;
+        if self.badge_publisher_busy.get() {
+            // Another spawn_local is already publishing. Just signal it
+            // to republish once it finishes its current await — the
+            // store will be re-read after the in-flight publish so the
+            // latest count wins without us starting a racing task.
+            self.badge_dirty.set(true);
+            return;
+        }
+        self.badge_publisher_busy.set(true);
+        self.badge_dirty.set(false);
         let notifier_cell = self.notifier.clone();
+        let store = self.notifications.clone();
+        let busy = self.badge_publisher_busy.clone();
+        let dirty = self.badge_dirty.clone();
+        let handle = self.tokio_handle.clone();
         glib::MainContext::default().spawn_local(async move {
-            let Some(notifier) = ensure_desktop_notifier(&notifier_cell).await else {
-                return;
-            };
-            let app_uri = format!("application://{}.desktop", crate::APP_ID);
-            if let Err(e) = notifier.update_launcher_count(&app_uri, count).await {
-                tracing::debug!(error = %e, count, "launcher entry update failed");
+            // See `close_desktop_notifications`: zbus's tokio executor
+            // needs an active runtime context across every `await`.
+            // Without it, `update_launcher_count` panics inside
+            // `spawn_local` and the dock badge never updates. Holding
+            // the enter guard for the whole async block (including the
+            // republish loop) keeps the runtime in scope.
+            let _enter = handle.as_ref().map(|h| h.enter());
+            // Drive the dock association through the same constant the
+            // FDO `desktop-entry` hint uses; if the two ever drift the
+            // launcher badge and the message-tray dot land on different
+            // app icons and the user sees a stuck badge after ack.
+            let app_uri = format!(
+                "application://{}.desktop",
+                flowmux_notify::DESKTOP_FILE_BASENAME
+            );
+            loop {
+                let Some(notifier) = ensure_desktop_notifier(&notifier_cell).await else {
+                    // No notifier available (no D-Bus, headless test).
+                    // Drop the dirty flag too so the next refresh starts
+                    // a fresh task instead of inheriting our stale
+                    // pending-bit, which would otherwise spin forever
+                    // on a republish loop that never connects.
+                    dirty.set(false);
+                    busy.set(false);
+                    return;
+                };
+                // Re-read *after* the connect await: any sweep that
+                // landed while we were suspended is reflected here, and
+                // the publish below will carry the freshest value.
+                let count = store.unread_count() as i64;
+                if let Err(e) = notifier.update_launcher_count(&app_uri, count).await {
+                    tracing::debug!(error = %e, count, "launcher entry update failed");
+                }
+                if !dirty.get() {
+                    busy.set(false);
+                    return;
+                }
+                // A refresh request arrived during publish — loop and
+                // republish with the now-current unread_count.
+                dirty.set(false);
             }
         });
     }
@@ -2990,6 +3085,7 @@ mod tests {
             Arc::new(ResolvedTheme::load()),
             bridge,
             gtk::CssProvider::new(),
+            None,
         );
 
         controller.render_workspace(&ws);
@@ -3094,6 +3190,7 @@ mod tests {
             Arc::new(ResolvedTheme::load()),
             bridge,
             gtk::CssProvider::new(),
+            None,
         );
         controller.render_workspace(&ws);
 
@@ -3162,6 +3259,7 @@ mod tests {
             Arc::new(ResolvedTheme::load()),
             bridge,
             gtk::CssProvider::new(),
+            None,
         );
 
         controller
@@ -3220,6 +3318,7 @@ mod tests {
             Arc::new(ResolvedTheme::load()),
             bridge,
             gtk::CssProvider::new(),
+            None,
         );
 
         // A: title_locked=false -> updated.
@@ -3291,6 +3390,7 @@ mod tests {
             Arc::new(ResolvedTheme::load()),
             bridge,
             gtk::CssProvider::new(),
+            None,
         );
 
         // 1. Normal OSC 2 -> tab label updates.
@@ -3381,6 +3481,7 @@ mod tests {
             Arc::new(ResolvedTheme::load()),
             bridge,
             gtk::CssProvider::new(),
+            None,
         );
         controller.render_workspace(&ws);
         controller.focused_pane.set(Some(pane));
@@ -3494,6 +3595,7 @@ mod tests {
             Arc::new(ResolvedTheme::load()),
             bridge,
             gtk::CssProvider::new(),
+            None,
         );
         controller.render_workspace(&ws);
         controller.focused_pane.set(Some(pane));
@@ -3553,6 +3655,7 @@ mod tests {
             Arc::new(ResolvedTheme::load()),
             bridge,
             gtk::CssProvider::new(),
+            None,
         );
         let ws = store.get_workspace(ws_id).await.unwrap();
         controller.render_workspace(&ws);
@@ -3620,6 +3723,7 @@ mod tests {
             Arc::new(ResolvedTheme::load()),
             bridge,
             gtk::CssProvider::new(),
+            None,
         );
         let ws = store.get_workspace(ws_id).await.unwrap();
         controller.render_workspace(&ws);
@@ -3746,6 +3850,7 @@ mod tests {
             Arc::new(ResolvedTheme::load()),
             bridge,
             gtk::CssProvider::new(),
+            None,
         );
         controller.render_workspace(&ws);
         controller.focused_pane.set(Some(pane));
@@ -3815,6 +3920,7 @@ mod tests {
             Arc::new(ResolvedTheme::load()),
             bridge,
             gtk::CssProvider::new(),
+            None,
         );
         controller.render_workspace(&ws);
         controller.focused_pane.set(Some(pane));
@@ -3897,6 +4003,7 @@ mod tests {
             Arc::new(ResolvedTheme::load()),
             bridge,
             gtk::CssProvider::new(),
+            None,
         );
         controller.render_workspace(&ws_a);
         controller.render_workspace(&ws_b);
@@ -3944,6 +4051,7 @@ mod tests {
             Arc::new(ResolvedTheme::load()),
             bridge,
             gtk::CssProvider::new(),
+            None,
         );
         controller.render_workspace(&ws);
         // Reproduce a state where the user clicked a workspace but no pane is focused yet.
@@ -4007,6 +4115,7 @@ mod tests {
             Arc::new(ResolvedTheme::load()),
             bridge,
             gtk::CssProvider::new(),
+            None,
         );
         controller.render_workspace(&ws_a);
         controller.render_workspace(&ws_b);
@@ -4321,6 +4430,7 @@ mod tests {
             Arc::new(ResolvedTheme::load()),
             bridge,
             gtk::CssProvider::new(),
+            None,
         );
         controller.render_workspace(&ws);
 
@@ -4577,6 +4687,7 @@ mod tests {
             Arc::new(ResolvedTheme::load()),
             bridge,
             gtk::CssProvider::new(),
+            None,
         );
         controller.render_workspace(&ws);
 
@@ -4701,6 +4812,7 @@ mod tests {
             Arc::new(ResolvedTheme::load()),
             bridge,
             gtk::CssProvider::new(),
+            None,
         );
         controller.render_workspace(&ws);
 
@@ -4839,6 +4951,7 @@ mod tests {
             Arc::new(ResolvedTheme::load()),
             bridge,
             gtk::CssProvider::new(),
+            None,
         );
         controller.render_workspace(&ws);
 
@@ -5010,6 +5123,7 @@ mod tests {
             Arc::new(ResolvedTheme::load()),
             bridge,
             gtk::CssProvider::new(),
+            None,
         );
         controller.render_workspace(&ws);
 
@@ -5111,6 +5225,7 @@ mod tests {
             Arc::new(ResolvedTheme::load()),
             bridge,
             gtk::CssProvider::new(),
+            None,
         );
         controller.render_workspace(&ws);
 
@@ -5195,6 +5310,7 @@ mod tests {
             Arc::new(ResolvedTheme::load()),
             bridge,
             gtk::CssProvider::new(),
+            None,
         );
         controller.render_workspace(&ws);
 
@@ -5262,15 +5378,25 @@ mod tests {
         );
     }
 
-    /// Build a controller wired to a fresh workspace with one pane,
-    /// returning the ids needed to push notifications. Inline so the
-    /// trash-button tests below do not depend on helpers that may be
-    /// absent from any given branch.
-    async fn build_notif_test_controller(
+    // ===== Dock-badge / unread sweep scenarios =====
+    //
+    // The dock badge is driven by `NotificationStore::unread_count()` —
+    // every dispatcher path that flips an entry to read must leave
+    // `unread_count()` at the value the launcher should publish next.
+    // The tests below exercise the full dispatch loop (`AddNotification`,
+    // `ActivateWorkspace`, `SetNotificationDesktopId`,
+    // `CloseDesktopNotifications`) for the scenarios that historically
+    // left the dock badge stuck on a stale value: rapid push + activate
+    // sequences, multi-workspace isolation, repeat activation, global
+    // notifications, and late desktop-id races.
+
+    /// Helper: build a controller with a single workspace and return
+    /// `(controller, ws_id, pane_id)`.
+    async fn build_single_workspace_controller(
         app_id: &str,
     ) -> (WindowController, WorkspaceId, PaneId) {
         adw::init().expect("libadwaita should initialize in GTK test");
-        let root = std::env::temp_dir().join(format!("flowmux-notif-trash-{app_id}"));
+        let root = std::env::temp_dir().join(format!("flowmux-badge-{app_id}"));
         std::fs::create_dir_all(&root).unwrap();
         let store = StateStore::new_lazy(State::default());
         let ws_id = store.create_workspace(Some("ws".into()), root).await;
@@ -5287,38 +5413,311 @@ mod tests {
             Arc::new(ResolvedTheme::load()),
             bridge,
             gtk::CssProvider::new(),
+            None,
         );
         controller.render_workspace(&ws);
         store.set_active_workspace(Some(ws_id)).await;
         (controller, ws_id, pane)
     }
 
-    /// Push a notification through the dispatcher (same path the IPC
-    /// handler takes). Returns the entry id; suppressed pushes (when
-    /// the source pane is already focused) panic so tests catch the
-    /// unexpected suppression rather than hide it as a None.
-    async fn push_notif(
+    /// Push a notification through the same `GtkCommand::AddNotification`
+    /// path the IPC handler uses, returning the entry id (or `None` when
+    /// the controller suppressed the toast).
+    async fn push_notification(
         controller: &WindowController,
-        pane: PaneId,
-        workspace: WorkspaceId,
+        pane: Option<PaneId>,
+        workspace: Option<WorkspaceId>,
         title: &str,
-    ) -> flowmux_core::NotificationId {
+    ) -> Option<flowmux_core::NotificationId> {
         let (ack_tx, ack_rx) = oneshot::channel();
         controller
             .dispatch(GtkCommand::AddNotification {
-                pane: Some(pane),
+                pane,
                 surface: None,
-                workspace: Some(workspace),
+                workspace,
                 title: title.into(),
                 body: String::new(),
                 level: flowmux_core::NotificationLevel::AttentionNeeded,
                 ack: ack_tx,
             })
             .await;
-        ack_rx
+        ack_rx.await.unwrap()
+    }
+
+    /// Two notifications arriving on a workspace, then the user clicks
+    /// that workspace in the side panel. After the dispatch sequence
+    /// the store must report `unread_count() == 0` — that is the value
+    /// the dock receives, so this is the regression guard against the
+    /// "badge stays on 2" symptom.
+    #[gtk::test]
+    async fn workspace_activation_sweeps_all_unread_for_that_workspace() {
+        let (controller, ws_id, pane) =
+            build_single_workspace_controller("com.flowmux.App.UiTest.BadgeSweep").await;
+        // Window is inactive in tests (no compositor focus), so
+        // `is_source_focused` returns false and the toast is recorded.
+        let id_a = push_notification(&controller, Some(pane), Some(ws_id), "a")
             .await
-            .unwrap()
-            .expect("push must record an entry — window is inactive in tests so suppression should not trigger")
+            .expect("first push must record an entry");
+        let id_b = push_notification(&controller, Some(pane), Some(ws_id), "b")
+            .await
+            .expect("second push must record an entry");
+        assert_eq!(
+            controller.notifications.unread_count(),
+            2,
+            "two AttentionNeeded notifications must inflate unread_count to 2",
+        );
+
+        // Side-panel click goes through `GtkCommand::ActivateWorkspace`.
+        controller
+            .dispatch(GtkCommand::ActivateWorkspace { id: ws_id })
+            .await;
+
+        assert_eq!(
+            controller.notifications.unread_count(),
+            0,
+            "activating the source workspace must drain unread_count to 0 — the dock badge would otherwise stay pinned on the old total",
+        );
+        assert!(
+            controller.notifications.find(id_a).unwrap().read,
+            "entry a should be marked read after workspace activation"
+        );
+        assert!(
+            controller.notifications.find(id_b).unwrap().read,
+            "entry b should be marked read after workspace activation"
+        );
+    }
+
+    /// Reactivating an already-active workspace must be a safe no-op for
+    /// the badge: nothing to sweep, `unread_count()` already at 0.
+    #[gtk::test]
+    async fn repeat_workspace_activation_is_idempotent_for_unread_count() {
+        let (controller, ws_id, pane) =
+            build_single_workspace_controller("com.flowmux.App.UiTest.BadgeRepeat").await;
+        push_notification(&controller, Some(pane), Some(ws_id), "a").await;
+        controller
+            .dispatch(GtkCommand::ActivateWorkspace { id: ws_id })
+            .await;
+        assert_eq!(controller.notifications.unread_count(), 0);
+        // A second activation on the same workspace must not reintroduce
+        // unread state, panic, or otherwise disturb the dock count.
+        controller
+            .dispatch(GtkCommand::ActivateWorkspace { id: ws_id })
+            .await;
+        assert_eq!(
+            controller.notifications.unread_count(),
+            0,
+            "re-activating the same workspace must keep unread_count at 0",
+        );
+    }
+
+    /// Two workspaces, alarms on each. Activating one must only sweep
+    /// that workspace's entries — the other workspace's count stays.
+    #[gtk::test]
+    async fn activating_one_workspace_does_not_sweep_other_workspaces() {
+        adw::init().expect("libadwaita should initialize in GTK test");
+        let root_a = std::env::temp_dir().join("flowmux-badge-iso-a");
+        let root_b = std::env::temp_dir().join("flowmux-badge-iso-b");
+        std::fs::create_dir_all(&root_a).unwrap();
+        std::fs::create_dir_all(&root_b).unwrap();
+        let store = StateStore::new_lazy(State::default());
+        let ws_a_id = store.create_workspace(Some("a".into()), root_a).await;
+        let ws_b_id = store.create_workspace(Some("b".into()), root_b).await;
+        let ws_a = store.get_workspace(ws_a_id).await.unwrap();
+        let ws_b = store.get_workspace(ws_b_id).await.unwrap();
+        let pane_a = ws_a.surfaces[0].root_pane.first_leaf_id().unwrap();
+        let pane_b = ws_b.surfaces[0].root_pane.first_leaf_id().unwrap();
+
+        let (bridge, _rx) = Bridge::new();
+        let app = adw::Application::builder()
+            .application_id("com.flowmux.App.UiTest.BadgeMultiWs")
+            .build();
+        app.register(None::<&gtk::gio::Cancellable>).unwrap();
+        let controller = WindowController::new(
+            &app,
+            store.clone(),
+            Arc::new(ResolvedTheme::load()),
+            bridge,
+            gtk::CssProvider::new(),
+            None,
+        );
+        controller.render_workspace(&ws_a);
+        controller.render_workspace(&ws_b);
+        store.set_active_workspace(Some(ws_a_id)).await;
+
+        push_notification(&controller, Some(pane_a), Some(ws_a_id), "a1").await;
+        push_notification(&controller, Some(pane_a), Some(ws_a_id), "a2").await;
+        push_notification(&controller, Some(pane_b), Some(ws_b_id), "b1").await;
+        assert_eq!(controller.notifications.unread_count(), 3);
+
+        controller
+            .dispatch(GtkCommand::ActivateWorkspace { id: ws_a_id })
+            .await;
+        assert_eq!(
+            controller.notifications.unread_count(),
+            1,
+            "activating ws_a must only sweep ws_a's two entries; ws_b's entry stays unread",
+        );
+
+        controller
+            .dispatch(GtkCommand::ActivateWorkspace { id: ws_b_id })
+            .await;
+        assert_eq!(
+            controller.notifications.unread_count(),
+            0,
+            "after activating both workspaces in turn, every unread entry should be drained",
+        );
+    }
+
+    /// Global notifications (`workspace = None`) must not be swept by a
+    /// workspace activation. This is by design — they are only cleared
+    /// when the bell popover opens — so the test guards us against
+    /// accidentally widening the sweep and silencing global toasts.
+    /// `RefreshLauncherBadge` after the activation, however, must run so
+    /// the dock count reflects the still-unread global entry.
+    #[gtk::test]
+    async fn workspace_activation_leaves_global_notifications_untouched() {
+        let (controller, ws_id, pane) =
+            build_single_workspace_controller("com.flowmux.App.UiTest.BadgeGlobal").await;
+        // Workspace-bound entry — should be swept.
+        push_notification(&controller, Some(pane), Some(ws_id), "ws").await;
+        // Global entry (no pane, no workspace).
+        let global_id = push_notification(&controller, None, None, "global")
+            .await
+            .expect("global push must record an entry");
+        assert_eq!(controller.notifications.unread_count(), 2);
+
+        controller
+            .dispatch(GtkCommand::ActivateWorkspace { id: ws_id })
+            .await;
+
+        assert_eq!(
+            controller.notifications.unread_count(),
+            1,
+            "the global entry must remain unread after a workspace activation",
+        );
+        assert!(
+            !controller.notifications.find(global_id).unwrap().read,
+            "global entry must stay unread until the bell popover sweeps it",
+        );
+    }
+
+    /// Late-arriving `SetNotificationDesktopId` (the daemon's `Notify`
+    /// reply lands after the user already activated the source
+    /// workspace) must (1) detect the staleness via `SetDesktopIdResult`
+    /// and (2) leave `unread_count()` at the same value as before — the
+    /// entry was already read, so the badge should not regress.
+    #[gtk::test]
+    async fn late_set_desktop_id_after_workspace_sweep_keeps_unread_count_stable() {
+        let (controller, ws_id, pane) =
+            build_single_workspace_controller("com.flowmux.App.UiTest.BadgeLateRace").await;
+        let id = push_notification(&controller, Some(pane), Some(ws_id), "a")
+            .await
+            .expect("push must record an entry");
+
+        // User activates the workspace before the daemon's reply lands.
+        controller
+            .dispatch(GtkCommand::ActivateWorkspace { id: ws_id })
+            .await;
+        assert_eq!(controller.notifications.unread_count(), 0);
+
+        // Late reply: the daemon hands us the desktop_id now. The store
+        // must report Stale (already read) and the dispatcher must fire
+        // the close + refresh — `unread_count` already 0 stays at 0.
+        controller
+            .dispatch(GtkCommand::SetNotificationDesktopId {
+                id,
+                desktop_id: 4242,
+            })
+            .await;
+
+        assert_eq!(
+            controller.notifications.unread_count(),
+            0,
+            "late desktop_id arriving after a sweep must not re-inflate the badge",
+        );
+        assert_eq!(
+            controller.notifications.find(id).unwrap().desktop_id,
+            Some(4242),
+            "even though the entry is already read, the late desktop_id should still be recorded so any subsequent close path has it",
+        );
+    }
+
+    /// Rapid sequence — push → push → activate — through the dispatcher,
+    /// mirroring the user-visible bug ("two notifications arrive, I
+    /// click the workspace, badge stays on 2"). The store is the source
+    /// of truth for what the dock badge will publish, so after the
+    /// dispatch sequence `unread_count()` must be 0. A follow-up
+    /// activation must remain a no-op and not regress the count.
+    ///
+    /// Note: the publish task itself (`refresh_launcher_badge`) is
+    /// scheduled via `glib::MainContext::default().spawn_local` and
+    /// short-circuits in headless tests because the FDO daemon is not
+    /// reachable; we deliberately do not assert on the
+    /// `badge_publisher_busy` / `badge_dirty` internals here because
+    /// they are timing-dependent on when the GLib main context schedules
+    /// the spawned future. The user-visible invariant is the store
+    /// state, which is what the dock would receive next.
+    #[gtk::test]
+    async fn rapid_push_push_activate_sequence_drains_unread_to_zero() {
+        let (controller, ws_id, pane) =
+            build_single_workspace_controller("com.flowmux.App.UiTest.BadgeRapid").await;
+
+        // Two AddNotification commands followed immediately by
+        // ActivateWorkspace — the same dispatch order the IPC handler
+        // and side-panel click handler produce in production.
+        push_notification(&controller, Some(pane), Some(ws_id), "a").await;
+        push_notification(&controller, Some(pane), Some(ws_id), "b").await;
+        controller
+            .dispatch(GtkCommand::ActivateWorkspace { id: ws_id })
+            .await;
+
+        assert_eq!(
+            controller.notifications.unread_count(),
+            0,
+            "rapid push+push+activate must end with an empty unread set",
+        );
+
+        // Following no-op activation must keep things at 0 even though
+        // the previous publisher task may still be running in the
+        // background (no D-Bus in tests, so connect fails and the task
+        // exits gracefully).
+        controller
+            .dispatch(GtkCommand::ActivateWorkspace { id: ws_id })
+            .await;
+        assert_eq!(controller.notifications.unread_count(), 0);
+    }
+
+    /// Notification with `pane = Some(...)` but `workspace = None` (the
+    /// IPC handler couldn't resolve a workspace for the pane — e.g.
+    /// pane closed between firing the toast and store lookup) must not
+    /// be swept by a workspace activation. The bell popover sweep is
+    /// still the only path that drains it. This guards against a
+    /// regression where a pane-with-no-workspace entry would otherwise
+    /// silently keep the dock badge inflated.
+    #[gtk::test]
+    async fn workspace_activation_does_not_sweep_pane_entries_without_workspace() {
+        let (controller, ws_id, pane) =
+            build_single_workspace_controller("com.flowmux.App.UiTest.BadgeOrphanPane").await;
+        // Orphan: pane is set but workspace was unresolved by the IPC
+        // handler. mark_workspace_read keys off the workspace field, so
+        // this entry remains stuck until the bell popover sweep.
+        let orphan = push_notification(&controller, Some(pane), None, "orphan")
+            .await
+            .expect("push must record an entry");
+        push_notification(&controller, Some(pane), Some(ws_id), "ws").await;
+
+        controller
+            .dispatch(GtkCommand::ActivateWorkspace { id: ws_id })
+            .await;
+        assert_eq!(
+            controller.notifications.unread_count(),
+            1,
+            "the workspace-bound entry was swept but the orphan must remain",
+        );
+        assert!(
+            !controller.notifications.find(orphan).unwrap().read,
+            "orphan entry must stay unread after a workspace sweep",
+        );
     }
 
     /// Trash button on a bell-popover row dispatches
@@ -5330,11 +5729,19 @@ mod tests {
     /// from the popover list while leaving every other entry alone.
     #[gtk::test]
     async fn delete_notification_dispatch_removes_only_targeted_unread_entry() {
-        let (controller, ws_id, pane) =
-            build_notif_test_controller("com.flowmux.App.UiTest.NotifTrashRemovesUnread").await;
-        let id_a = push_notif(&controller, pane, ws_id, "a").await;
-        let id_b = push_notif(&controller, pane, ws_id, "b").await;
-        let id_c = push_notif(&controller, pane, ws_id, "c").await;
+        let (controller, ws_id, pane) = build_single_workspace_controller(
+            "com.flowmux.App.UiTest.NotifTrashRemovesUnread",
+        )
+        .await;
+        let id_a = push_notification(&controller, Some(pane), Some(ws_id), "a")
+            .await
+            .expect("first push must record an entry");
+        let id_b = push_notification(&controller, Some(pane), Some(ws_id), "b")
+            .await
+            .expect("second push must record an entry");
+        let id_c = push_notification(&controller, Some(pane), Some(ws_id), "c")
+            .await
+            .expect("third push must record an entry");
         assert_eq!(controller.notifications.unread_count(), 3);
 
         // Trash on the middle entry — same dispatch the bell-popover
@@ -5379,8 +5786,10 @@ mod tests {
     #[gtk::test]
     async fn delete_notification_dispatch_on_read_entry_keeps_unread_count() {
         let (controller, ws_id, pane) =
-            build_notif_test_controller("com.flowmux.App.UiTest.NotifTrashRemovesRead").await;
-        let id = push_notif(&controller, pane, ws_id, "old").await;
+            build_single_workspace_controller("com.flowmux.App.UiTest.NotifTrashRemovesRead").await;
+        let id = push_notification(&controller, Some(pane), Some(ws_id), "old")
+            .await
+            .expect("push must record an entry");
         // Mark it read directly so we can isolate the read-branch
         // delete from the workspace-sweep path.
         controller.notifications.mark_read(id);
@@ -5408,9 +5817,11 @@ mod tests {
     /// so a future refactor that removes it surfaces here.
     #[gtk::test]
     async fn delete_notification_dispatch_on_unknown_id_is_safe_noop() {
-        let (controller, ws_id, pane) =
-            build_notif_test_controller("com.flowmux.App.UiTest.NotifTrashUnknownIsNoop").await;
-        push_notif(&controller, pane, ws_id, "kept").await;
+        let (controller, ws_id, pane) = build_single_workspace_controller(
+            "com.flowmux.App.UiTest.NotifTrashUnknownIsNoop",
+        )
+        .await;
+        push_notification(&controller, Some(pane), Some(ws_id), "kept").await;
         let unread_before = controller.notifications.unread_count();
         let count_before = controller.notifications.entries().len();
 
@@ -5430,5 +5841,527 @@ mod tests {
             unread_before,
             "Unknown id must not change unread_count"
         );
+    }
+
+    // ---------------------------------------------------------------
+    // Scenario tests for the bell-popover open path
+    // ---------------------------------------------------------------
+    //
+    // The Sidebar wires `bell_popover.connect_show` to:
+    //
+    //   1. `notifications.mark_all_unread_read()` — synchronous flip.
+    //   2. dispatch `CloseDesktopNotifications { ids }` if non-empty.
+    //   3. dispatch `RefreshLauncherBadge`.
+    //
+    // We exercise the same three-step sequence here so the dispatch arms
+    // get covered without driving real GTK signals from a headless test.
+
+    /// One AttentionNeeded notification arrives. The user opens the bell
+    /// popover. The popover-open sequence (mark_all_unread_read +
+    /// CloseDesktopNotifications + RefreshLauncherBadge) must drain
+    /// `unread_count()` to 0 and surface the matching desktop_id so the
+    /// dispatcher would close the FDO toast.
+    ///
+    /// This pins the user-visible regression: a single notification, the
+    /// user taps the bell, the dock badge does not go down. The store
+    /// is the source of truth for what we re-publish, so verifying it
+    /// drains to 0 here is equivalent to verifying the next
+    /// `update_launcher_count` call would carry `count = 0`.
+    #[gtk::test]
+    async fn popover_open_sequence_drains_single_notification_to_zero() {
+        let (controller, ws_id, pane) = build_single_workspace_controller(
+            "com.flowmux.App.UiTest.PopoverOpenSingle",
+        )
+        .await;
+        let id = push_notification(&controller, Some(pane), Some(ws_id), "alarm")
+            .await
+            .expect("push must record an entry");
+        // Daemon's Notify reply: attach the FDO id the same way the IPC
+        // handler does in production.
+        controller
+            .dispatch(GtkCommand::SetNotificationDesktopId {
+                id,
+                desktop_id: 9001,
+            })
+            .await;
+        assert_eq!(controller.notifications.unread_count(), 1);
+
+        // Replicate Sidebar::connect_show step (1): the synchronous
+        // mark-read sweep that runs on the GTK thread when the user
+        // pops the bell.
+        let to_close = controller.notifications.mark_all_unread_read();
+        assert_eq!(
+            to_close,
+            vec![9001],
+            "the popover sweep must surface the desktop_id so the dispatcher \
+             can close the FDO toast in lockstep with marking the entry read",
+        );
+        // Step (2): the dispatcher closes the toast on the FDO daemon.
+        controller
+            .dispatch(GtkCommand::CloseDesktopNotifications {
+                desktop_ids: to_close,
+            })
+            .await;
+        // Step (3): refresh re-publishes the unread count to the dock.
+        controller
+            .dispatch(GtkCommand::RefreshLauncherBadge)
+            .await;
+
+        assert_eq!(
+            controller.notifications.unread_count(),
+            0,
+            "after the popover open sequence, unread_count must be 0 — \
+             this is the value the next LauncherEntry signal carries to the dock",
+        );
+        assert!(
+            controller.notifications.find(id).unwrap().read,
+            "the entry must be marked read so a re-render of the popover \
+             dims the row instead of leaving it bold",
+        );
+    }
+
+    /// User opens the bell popover before the daemon's `Notify` reply
+    /// has carried the desktop_id back. `mark_all_unread_read` returns
+    /// an empty vec (no FDO ids known yet), but the entry is still
+    /// flipped to read. Dispatching `RefreshLauncherBadge` alone must
+    /// be enough to drain the badge — no `CloseDesktopNotifications`
+    /// roundtrip happens because there is no id to close.
+    ///
+    /// Then the late `SetNotificationDesktopId` arrives. The store
+    /// reports `Stale` and the dispatcher fires the close + refresh on
+    /// its own. The ENTIRE story must end with `unread_count() = 0`.
+    #[gtk::test]
+    async fn popover_open_then_late_desktop_id_still_drains_badge() {
+        let (controller, ws_id, pane) = build_single_workspace_controller(
+            "com.flowmux.App.UiTest.PopoverLateRace",
+        )
+        .await;
+        let id = push_notification(&controller, Some(pane), Some(ws_id), "alarm")
+            .await
+            .expect("push must record an entry");
+        assert_eq!(controller.notifications.unread_count(), 1);
+
+        // User pops the bell BEFORE the Notify reply lands → no
+        // desktop_id available in the sweep.
+        let to_close = controller.notifications.mark_all_unread_read();
+        assert!(
+            to_close.is_empty(),
+            "no desktop_id was attached yet; the sweep must return an empty list \
+             so the dispatcher does not send a CloseDesktopNotifications no-op",
+        );
+        controller
+            .dispatch(GtkCommand::RefreshLauncherBadge)
+            .await;
+        assert_eq!(controller.notifications.unread_count(), 0);
+
+        // Daemon's reply arrives. set_desktop_id reports Stale; the
+        // dispatcher closes the toast and refreshes the badge.
+        controller
+            .dispatch(GtkCommand::SetNotificationDesktopId {
+                id,
+                desktop_id: 4242,
+            })
+            .await;
+        assert_eq!(
+            controller.notifications.unread_count(),
+            0,
+            "the late desktop_id must not re-inflate unread_count — \
+             the entry was already read by the popover sweep",
+        );
+        assert_eq!(
+            controller.notifications.find(id).unwrap().desktop_id,
+            Some(4242),
+            "the late desktop_id must still be recorded so any subsequent close \
+             path (e.g. an explicit DeleteNotification) has it",
+        );
+    }
+
+    /// Bell popover open while three notifications are already
+    /// unread — two with desktop_ids attached and one whose Notify
+    /// reply is in-flight. The sweep must close the two known toasts
+    /// and the badge must drain to 0; the in-flight third entry
+    /// reaches the dispatcher later as `Stale`.
+    #[gtk::test]
+    async fn popover_open_with_partial_desktop_ids_still_clears_badge() {
+        let (controller, ws_id, pane) = build_single_workspace_controller(
+            "com.flowmux.App.UiTest.PopoverPartial",
+        )
+        .await;
+        let a = push_notification(&controller, Some(pane), Some(ws_id), "a")
+            .await
+            .expect("push a");
+        let b = push_notification(&controller, Some(pane), Some(ws_id), "b")
+            .await
+            .expect("push b");
+        let c = push_notification(&controller, Some(pane), Some(ws_id), "c")
+            .await
+            .expect("push c");
+        // Two of the three have already been mapped to FDO ids; c is
+        // still waiting for the daemon's Notify reply.
+        controller
+            .dispatch(GtkCommand::SetNotificationDesktopId {
+                id: a,
+                desktop_id: 11,
+            })
+            .await;
+        controller
+            .dispatch(GtkCommand::SetNotificationDesktopId {
+                id: b,
+                desktop_id: 22,
+            })
+            .await;
+
+        let mut to_close = controller.notifications.mark_all_unread_read();
+        // Order is insertion order; sort defensively in case the
+        // implementation later reorders so this test still pins the
+        // contents rather than the ordering.
+        to_close.sort();
+        assert_eq!(to_close, vec![11, 22]);
+        controller
+            .dispatch(GtkCommand::CloseDesktopNotifications {
+                desktop_ids: to_close,
+            })
+            .await;
+        controller
+            .dispatch(GtkCommand::RefreshLauncherBadge)
+            .await;
+        assert_eq!(controller.notifications.unread_count(), 0);
+
+        // Late reply for c → Stale → dispatcher closes 33 and refreshes.
+        controller
+            .dispatch(GtkCommand::SetNotificationDesktopId {
+                id: c,
+                desktop_id: 33,
+            })
+            .await;
+        assert_eq!(controller.notifications.unread_count(), 0);
+    }
+
+    // ---------------------------------------------------------------
+    // Stress: hammer the dispatcher with many notifications and
+    // overlapping ack gestures, then assert the final invariants.
+    // ---------------------------------------------------------------
+    //
+    // The dispatcher is single-threaded (GTK main loop), so "stress" is
+    // about depth of state transitions, not parallelism. We push enough
+    // entries to exercise the MAX_RETAINED ring, interleave acks and
+    // late desktop-id replies, and finally verify:
+    //
+    //   * `unread_count()` matches the manually-counted unread entries.
+    //   * Every `read` entry is consistent with what the sweeps did.
+    //   * No entry id is duplicated or lost.
+    //   * The dispatcher coalesces overlapping `RefreshLauncherBadge`
+    //     bursts without panicking and the store ends in a sane state.
+
+    /// Push 200 notifications (the MAX_RETAINED cap) interleaved with
+    /// SetNotificationDesktopId and periodic workspace-activation
+    /// sweeps. After the final activation the badge must be at 0 and
+    /// every entry whose desktop_id was attached before the sweep must
+    /// be marked read.
+    #[gtk::test]
+    async fn stress_many_notifications_with_periodic_sweeps_drains_to_zero() {
+        let (controller, ws_id, pane) = build_single_workspace_controller(
+            "com.flowmux.App.UiTest.StressManyNotif",
+        )
+        .await;
+        const TOTAL: usize = 200;
+        let mut ids = Vec::with_capacity(TOTAL);
+        for i in 0..TOTAL {
+            let id = push_notification(
+                &controller,
+                Some(pane),
+                Some(ws_id),
+                &format!("evt-{i}"),
+            )
+            .await
+            .expect("push must record an entry");
+            ids.push(id);
+            // Simulate the daemon's Notify reply for a subset of pushes
+            // (mimicking real-world timing where some replies overtake
+            // others).
+            if i % 3 == 0 {
+                controller
+                    .dispatch(GtkCommand::SetNotificationDesktopId {
+                        id,
+                        desktop_id: (i as u32) + 1,
+                    })
+                    .await;
+            }
+            // Every 50 entries, sweep the workspace as if the user
+            // checked it. The sweep must converge unread_count to the
+            // count of entries pushed AFTER this sweep (none yet, since
+            // we sweep on the boundary and nothing else has pushed).
+            if (i + 1) % 50 == 0 {
+                controller
+                    .dispatch(GtkCommand::ActivateWorkspace { id: ws_id })
+                    .await;
+                assert_eq!(
+                    controller.notifications.unread_count(),
+                    0,
+                    "after sweep at i={i}, unread_count must be 0 — every entry up to here \
+                     is workspace-bound and ActivateWorkspace flips them all to read",
+                );
+            }
+        }
+
+        // Final state: every push has been ack'd through the periodic
+        // ActivateWorkspace sweeps, but the very last sweep happened at
+        // i = 199 (when (199+1) % 50 == 0), so unread_count is 0.
+        assert_eq!(
+            controller.notifications.unread_count(),
+            0,
+            "after the stress sequence ends on a sweep boundary, unread_count must be 0",
+        );
+
+        // The total entry count is capped at MAX_RETAINED (200). The
+        // first push is at index 0, the last at TOTAL-1; with TOTAL ==
+        // MAX_RETAINED we expect exactly TOTAL entries to survive.
+        let entries = controller.notifications.entries();
+        assert_eq!(
+            entries.len(),
+            TOTAL,
+            "MAX_RETAINED == TOTAL here, so every entry survives the ring buffer; \
+             a future change to MAX_RETAINED must update this test in lockstep",
+        );
+        // Every surviving entry must be marked read after the final
+        // sweep.
+        assert!(
+            entries.iter().all(|e| e.read),
+            "every entry was inside ws_id and got swept by an ActivateWorkspace, \
+             so they must all be read",
+        );
+    }
+
+    /// Stress the popover-open path: push a batch, open the popover,
+    /// push another batch, open again, and so on. After every popover
+    /// open the badge must be at 0 (because the sweep flipped every
+    /// unread entry); pushes between opens must inflate it again. This
+    /// pins the symptom "the bell popover sweep does not drop the
+    /// badge" against batch arrival patterns.
+    #[gtk::test]
+    async fn stress_popover_open_drains_badge_across_repeated_batches() {
+        let (controller, ws_id, pane) = build_single_workspace_controller(
+            "com.flowmux.App.UiTest.StressPopoverBatches",
+        )
+        .await;
+        const BATCHES: usize = 10;
+        const PER_BATCH: usize = 20;
+        for batch in 0..BATCHES {
+            for i in 0..PER_BATCH {
+                let id = push_notification(
+                    &controller,
+                    Some(pane),
+                    Some(ws_id),
+                    &format!("b{batch}-i{i}"),
+                )
+                .await
+                .expect("push must record an entry");
+                // Map every other entry's desktop_id to mimic the
+                // partial-replies regime.
+                if i % 2 == 0 {
+                    controller
+                        .dispatch(GtkCommand::SetNotificationDesktopId {
+                            id,
+                            desktop_id: (batch * PER_BATCH + i) as u32 + 1,
+                        })
+                        .await;
+                }
+            }
+            assert_eq!(
+                controller.notifications.unread_count(),
+                PER_BATCH,
+                "before the popover sweep at batch {batch}, every entry from this batch is unread",
+            );
+            // Simulate the popover-open sequence end-to-end.
+            let to_close = controller.notifications.mark_all_unread_read();
+            controller
+                .dispatch(GtkCommand::CloseDesktopNotifications {
+                    desktop_ids: to_close,
+                })
+                .await;
+            controller
+                .dispatch(GtkCommand::RefreshLauncherBadge)
+                .await;
+            assert_eq!(
+                controller.notifications.unread_count(),
+                0,
+                "after the popover sweep at batch {batch}, the badge must drain to 0 — \
+                 even when half the entries had no desktop_id attached yet",
+            );
+        }
+        // Final: every entry should be marked read.
+        let entries = controller.notifications.entries();
+        assert!(
+            entries.iter().all(|e| e.read),
+            "every push should have been swept by one of the popover opens",
+        );
+    }
+
+    /// Adversarial scenario: mix every ack channel concurrently to
+    /// surface any state drift between the in-store flip and the
+    /// dispatcher's badge republish path. Pushes, workspace
+    /// activations, popover sweeps, late `SetNotificationDesktopId`s,
+    /// and trash-button deletes are all interleaved. The invariant
+    /// after each step is that `unread_count()` equals the number of
+    /// entries with `read == false` actually in the store — no entry
+    /// can be "ghost unread" or "ghost read".
+    #[gtk::test]
+    async fn stress_mixed_ack_channels_keep_unread_count_in_sync_with_entries() {
+        let (controller, ws_id, pane) = build_single_workspace_controller(
+            "com.flowmux.App.UiTest.StressMixedAcks",
+        )
+        .await;
+
+        // The check we run after every dispatched command — the unread
+        // count exposed to the dock must match the actual unread set.
+        let assert_invariant = |label: &str| {
+            let store_count = controller.notifications.unread_count();
+            let actual_unread = controller
+                .notifications
+                .entries()
+                .into_iter()
+                .filter(|e| !e.read)
+                .count();
+            assert_eq!(
+                store_count, actual_unread,
+                "[{label}] unread_count() {store_count} drifted from the entries-with-read-false count {actual_unread}; \
+                 the dock badge would publish the wrong number",
+            );
+        };
+
+        // Sequence a deliberately interleaved set of dispatches.
+        let mut pushed = Vec::new();
+        for i in 0usize..30 {
+            let id =
+                push_notification(&controller, Some(pane), Some(ws_id), &format!("x{i}"))
+                    .await
+                    .expect("push");
+            pushed.push(id);
+            assert_invariant(&format!("after push {i}"));
+
+            match i % 5 {
+                0 => {
+                    // Late desktop_id on an older entry.
+                    if let Some(old) = pushed.get(i.saturating_sub(3)).copied() {
+                        controller
+                            .dispatch(GtkCommand::SetNotificationDesktopId {
+                                id: old,
+                                desktop_id: i as u32 * 100,
+                            })
+                            .await;
+                        assert_invariant(&format!("after set_desktop_id at i={i}"));
+                    }
+                }
+                1 => {
+                    // ActivateWorkspace mid-stream — sweeps everything
+                    // pushed so far that targets this workspace.
+                    controller
+                        .dispatch(GtkCommand::ActivateWorkspace { id: ws_id })
+                        .await;
+                    assert_eq!(
+                        controller.notifications.unread_count(),
+                        0,
+                        "after ActivateWorkspace at i={i}, every workspace-bound entry up to here must be read",
+                    );
+                    assert_invariant(&format!("after activate at i={i}"));
+                }
+                2 => {
+                    // Popover open sweep mid-stream.
+                    let ids = controller.notifications.mark_all_unread_read();
+                    controller
+                        .dispatch(GtkCommand::CloseDesktopNotifications {
+                            desktop_ids: ids,
+                        })
+                        .await;
+                    controller
+                        .dispatch(GtkCommand::RefreshLauncherBadge)
+                        .await;
+                    assert_invariant(&format!("after popover sweep at i={i}"));
+                }
+                3 => {
+                    // Trash an existing entry (the per-row delete).
+                    if let Some(victim) = pushed.first().copied() {
+                        controller
+                            .dispatch(GtkCommand::DeleteNotification { id: victim })
+                            .await;
+                        pushed.retain(|id| *id != victim);
+                        assert_invariant(&format!("after delete at i={i}"));
+                    }
+                }
+                _ => {
+                    // Bare RefreshLauncherBadge — just exercise the
+                    // coalescing path with no state change.
+                    controller
+                        .dispatch(GtkCommand::RefreshLauncherBadge)
+                        .await;
+                    assert_invariant(&format!("after bare refresh at i={i}"));
+                }
+            }
+        }
+
+        // Final converge: explicit ack of everything that's left, via
+        // the workspace sweep, then the popover sweep so global / orphan
+        // entries (none here, but the call must be a safe no-op) drain.
+        controller
+            .dispatch(GtkCommand::ActivateWorkspace { id: ws_id })
+            .await;
+        let leftover = controller.notifications.mark_all_unread_read();
+        controller
+            .dispatch(GtkCommand::CloseDesktopNotifications {
+                desktop_ids: leftover,
+            })
+            .await;
+        controller
+            .dispatch(GtkCommand::RefreshLauncherBadge)
+            .await;
+        assert_eq!(
+            controller.notifications.unread_count(),
+            0,
+            "after the final ack chain, every surviving entry must be read so \
+             the dock badge reads 0 — this is the user-visible contract",
+        );
+        assert_invariant("at end");
+    }
+
+    /// Burst of `RefreshLauncherBadge` commands queued back-to-back
+    /// must not panic, hang, or leave the busy/dirty serialization
+    /// flags wedged. The publisher coalesces overlapping refreshes; if
+    /// it ever loses track of `badge_dirty`, the dock would freeze on a
+    /// stale count under bursty traffic. We can't observe the actual
+    /// LauncherEntry signal in tests (no D-Bus) but we can pin that
+    /// every dispatch returns cleanly and the in-store count never
+    /// drifts from the computed unread set.
+    #[gtk::test]
+    async fn stress_refresh_burst_is_safely_coalesced() {
+        let (controller, ws_id, pane) = build_single_workspace_controller(
+            "com.flowmux.App.UiTest.StressRefreshBurst",
+        )
+        .await;
+        push_notification(&controller, Some(pane), Some(ws_id), "x").await;
+        // 100 back-to-back refresh commands. The publisher's internal
+        // busy/dirty flag must coalesce these into "publish at most a
+        // small fixed number of times" — but we don't peek at the
+        // flags here; we only check the dispatcher itself stays sane.
+        for _ in 0..100 {
+            controller
+                .dispatch(GtkCommand::RefreshLauncherBadge)
+                .await;
+        }
+        assert_eq!(
+            controller.notifications.unread_count(),
+            1,
+            "no refresh command should ever mutate the store; the count must remain 1",
+        );
+        // Now ack and burst again — the publisher must not get stuck
+        // on the previous batch.
+        controller
+            .dispatch(GtkCommand::ActivateWorkspace { id: ws_id })
+            .await;
+        for _ in 0..100 {
+            controller
+                .dispatch(GtkCommand::RefreshLauncherBadge)
+                .await;
+        }
+        assert_eq!(controller.notifications.unread_count(), 0);
     }
 }

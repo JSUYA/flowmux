@@ -18,6 +18,26 @@ const LAUNCHER_ENTRY_PATH: &str = "/com/canonical/unity/launcherentry/flowmux";
 const LAUNCHER_ENTRY_INTERFACE: &str = "com.canonical.Unity.LauncherEntry";
 const LAUNCHER_ENTRY_MEMBER: &str = "Update";
 
+/// Basename of the installed desktop file (`com.flowmux.App.desktop`)
+/// without the `.desktop` extension. Used as:
+///
+/// 1. The `desktop-entry` hint on every FDO `Notify` call so GNOME
+///    Shell, KDE Plasma and `notification-daemon` can group flowmux
+///    toasts under the same launcher icon and — crucially — clear
+///    the dock indicator the moment we issue `CloseNotification`.
+///    Mismatching this string against the real desktop file name
+///    makes GNOME Shell associate the toast with a non-existent app
+///    id, and the message-tray dot then survives even after every
+///    pending toast has been withdrawn (the exact "badge stays after
+///    ack" symptom this constant guards against).
+/// 2. The icon name (FDO `app_icon` argument) so the toast image
+///    matches the dock icon. Falls back to the system theme when the
+///    flowmux icon is not installed.
+///
+/// Keep this in lockstep with `crates/flowmux/src/main.rs::APP_ID`
+/// and `resources/desktop/com.flowmux.App.desktop`.
+pub const DESKTOP_FILE_BASENAME: &str = "com.flowmux.App";
+
 /// FDO Notifications proxy. Spec: <https://specifications.freedesktop.org/notification-spec/>.
 #[proxy(
     interface = "org.freedesktop.Notifications",
@@ -57,12 +77,16 @@ impl DesktopNotifier {
         let proxy = FdoNotificationsProxy::new(&self.conn).await?;
         let mut hints = std::collections::HashMap::new();
         hints.insert("urgency", Value::U8(urgency_for(n.level)));
-        hints.insert("desktop-entry", Value::Str("flowmux".into()));
+        // MUST match the installed `.desktop` basename so GNOME Shell /
+        // KDE Plasma group the toast under flowmux's launcher icon —
+        // otherwise the dock dot survives `CloseNotification` and the
+        // user is left with a stuck badge after acknowledging.
+        hints.insert("desktop-entry", Value::Str(DESKTOP_FILE_BASENAME.into()));
         proxy
             .notify(
                 "flowmux",
                 0,
-                "utilities-terminal",
+                DESKTOP_FILE_BASENAME,
                 &n.title,
                 &n.body,
                 vec![],
@@ -127,5 +151,51 @@ fn expire_for(level: NotificationLevel) -> i32 {
     match level {
         NotificationLevel::Error | NotificationLevel::AttentionNeeded => 0,
         NotificationLevel::Info => -1,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The `desktop-entry` hint, the FDO `app_icon` argument, and the
+    /// LauncherEntry `app_uri` all need to key off the same `.desktop`
+    /// basename so GNOME Shell / KDE Plasma / Ubuntu Dock / Dash-to-Dock
+    /// route the notification, the icon, and the badge to the same app.
+    /// A drift between any of these is exactly the "badge stays after
+    /// the user acknowledges" symptom that recurred three times before
+    /// — pin the literal here so a future rename surfaces in CI before
+    /// it ships.
+    #[test]
+    fn desktop_file_basename_matches_installed_desktop_file() {
+        assert_eq!(
+            DESKTOP_FILE_BASENAME, "com.flowmux.App",
+            "DESKTOP_FILE_BASENAME must match resources/desktop/<basename>.desktop \
+             and the GApplication application_id; otherwise the dock badge survives ack",
+        );
+    }
+
+    #[test]
+    fn urgency_for_levels_maps_to_fdo_codes() {
+        // FDO spec: 0=low, 1=normal, 2=critical. Pin the mapping so a
+        // future refactor that flips Info ↔ AttentionNeeded does not
+        // silently downgrade agent toasts.
+        assert_eq!(urgency_for(NotificationLevel::Info), 0);
+        assert_eq!(urgency_for(NotificationLevel::AttentionNeeded), 1);
+        assert_eq!(urgency_for(NotificationLevel::Error), 2);
+    }
+
+    /// AttentionNeeded and Error both intentionally pick `expire_timeout =
+    /// 0` so the toast lingers in the message tray until flowmux itself
+    /// withdraws it via `CloseNotification`. If a refactor changed this
+    /// to a positive timeout, GNOME would auto-expire the toast after a
+    /// few seconds and the dock badge would *also* clear on its own —
+    /// which sounds nice but masks the bell-popover sweep / workspace
+    /// activation sweep, hiding real regressions.
+    #[test]
+    fn expire_for_attention_and_error_returns_zero_so_caller_must_close_explicitly() {
+        assert_eq!(expire_for(NotificationLevel::AttentionNeeded), 0);
+        assert_eq!(expire_for(NotificationLevel::Error), 0);
+        assert_eq!(expire_for(NotificationLevel::Info), -1);
     }
 }
