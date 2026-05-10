@@ -56,6 +56,11 @@ pub struct WindowController {
     /// the head through third panes, shortened to the last 3 folders with a
     /// "..." prefix. Updated on focus moves within a workspace.
     focus_mru: Rc<RefCell<HashMap<WorkspaceId, std::collections::VecDeque<PaneId>>>>,
+    /// FDO notification client used to close (withdraw) toasts when the
+    /// user opens the bell popover. Connected lazily on first close and
+    /// reused thereafter. Lives on the GTK main thread (the GUI is
+    /// single-threaded) so a `Rc<RefCell<…>>` is enough.
+    notifier: Rc<RefCell<Option<flowmux_notify::DesktopNotifier>>>,
 }
 
 impl WindowController {
@@ -187,6 +192,7 @@ impl WindowController {
             css_provider,
             clipboard_toast,
             focus_mru: Rc::new(RefCell::new(HashMap::new())),
+            notifier: Rc::new(RefCell::new(None)),
         };
         controller.install_state_flush_on_close();
         controller.install_cwd_polling_fallback();
@@ -1488,10 +1494,11 @@ impl WindowController {
                         ?surface,
                         "notification suppressed: source pane+surface already focused"
                     );
-                    let _ = ack.send(false);
+                    let _ = ack.send(None);
                     return;
                 }
-                self.notifications
+                let entry_id = self
+                    .notifications
                     .push(title, body, level, pane, surface, workspace);
                 self.sidebar.bump_notification_badge();
                 if matches!(level, flowmux_core::NotificationLevel::AttentionNeeded) {
@@ -1499,7 +1506,42 @@ impl WindowController {
                         self.sidebar.mark_attention(ws_id);
                     }
                 }
-                let _ = ack.send(true);
+                let _ = ack.send(Some(entry_id));
+            }
+            GtkCommand::SetNotificationDesktopId { id, desktop_id } => {
+                self.notifications.set_desktop_id(id, desktop_id);
+            }
+            GtkCommand::CloseDesktopNotifications { desktop_ids } => {
+                // Close the matching FDO toasts so GNOME / KDE drop
+                // them from the notification center and the dock /
+                // launcher badge counter shrinks. We connect lazily
+                // and reuse the same `DesktopNotifier` across calls so
+                // the per-popover-open path doesn't re-handshake DBus.
+                if desktop_ids.is_empty() {
+                    return;
+                }
+                let notifier_cell = self.notifier.clone();
+                glib::MainContext::default().spawn_local(async move {
+                    let mut guard = notifier_cell.borrow_mut();
+                    if guard.is_none() {
+                        match flowmux_notify::DesktopNotifier::connect().await {
+                            Ok(n) => *guard = Some(n),
+                            Err(e) => {
+                                tracing::debug!(
+                                    error = %e,
+                                    "could not connect to FDO notifications for close"
+                                );
+                                return;
+                            }
+                        }
+                    }
+                    let n = guard.as_ref().expect("notifier just connected");
+                    for did in desktop_ids {
+                        if let Err(e) = n.close(did).await {
+                            tracing::debug!(error = %e, did, "close notification failed");
+                        }
+                    }
+                });
             }
             GtkCommand::OpenNotification { id } => {
                 let Some(entry) = self.notifications.find(id) else {

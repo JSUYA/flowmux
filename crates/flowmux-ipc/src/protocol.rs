@@ -244,6 +244,18 @@ pub enum Request {
         source: String,
         domain: Option<String>,
     },
+
+    /// Close (withdraw) a desktop notification previously emitted by
+    /// flowmux. The `desktop_id` is the value the FDO notification
+    /// daemon returned from `Notify` — flowmux echoes it back via
+    /// `Response::Notified` so the GUI can later ask the daemon to
+    /// dismiss the entry once the user reads it through the in-app
+    /// bell popover. Without this, `AttentionNeeded` toasts (sent with
+    /// `expire_timeout = 0`) accumulate in the OS notification center
+    /// and inflate the dock badge counter.
+    CloseDesktopNotification {
+        desktop_id: u32,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -285,6 +297,15 @@ pub enum Response {
     /// previous session was recorded for this `(agent, surface)`.
     AgentSession {
         session_id: Option<String>,
+    },
+    /// Reply to `Request::Notify`. Carries the FDO desktop notification
+    /// id the daemon assigned, so the GUI can later issue
+    /// `Request::CloseDesktopNotification` to drop the badge once the
+    /// user reads it inside flowmux. `None` means no desktop toast was
+    /// actually sent (the FDO daemon was unreachable, or the toast was
+    /// suppressed).
+    Notified {
+        desktop_id: Option<u32>,
     },
     Error(RpcError),
 }

@@ -128,13 +128,27 @@ impl Sidebar {
 
         let store_for_show = notifications.clone();
         let bridge_for_rows = bridge.clone();
+        let bridge_for_close = bridge.clone();
         let popover_for_show = bell_popover.clone();
         let bell_for_show = bell_button.clone();
         bell_popover.connect_show(move |_| {
-            // Render fresh contents on every open. Rows handle their own
-            // click → OpenNotification dispatch; opening the popover
-            // does NOT mark entries read so the routing target is still
-            // recognizable as fresh until the user actually clicks it.
+            // Opening the bell popover is the user's "I read these"
+            // gesture: flip every unread entry to read so the rows
+            // render dimmed, and forward the FDO desktop ids of the
+            // toasts that were actually delivered to the OS so the
+            // window dispatcher can close them. Without that close,
+            // GNOME / KDE keep the entries in the notification center
+            // and the dock badge counter never decreases.
+            let desktop_ids = store_for_show.mark_all_unread_read();
+            if !desktop_ids.is_empty() {
+                let bridge = bridge_for_close.clone();
+                gtk::glib::MainContext::default().spawn_local(async move {
+                    let _ = bridge
+                        .tx
+                        .send(GtkCommand::CloseDesktopNotifications { desktop_ids })
+                        .await;
+                });
+            }
             popover_for_show.set_child(Some(&render_notification_list(
                 &store_for_show,
                 bridge_for_rows.clone(),

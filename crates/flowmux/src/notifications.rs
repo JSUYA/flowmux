@@ -44,6 +44,14 @@ pub struct NotificationEntry {
     /// reached the GUI thread. Without it we cannot route clicks back to
     /// the right side-panel row.
     pub workspace: Option<WorkspaceId>,
+    /// FDO `org.freedesktop.Notifications.Notify` id returned by the
+    /// notification daemon when the desktop toast was sent. Stored so
+    /// that — once the user reads this entry inside the bell popover —
+    /// flowmux can issue `CloseNotification(desktop_id)` to the FDO
+    /// daemon and shrink the GNOME / KDE dock badge accordingly.
+    /// `None` when the toast was suppressed (e.g. source pane already
+    /// focused) or when the FDO daemon was unreachable.
+    pub desktop_id: Option<u32>,
 }
 
 /// Thread-local notification store backing the sidebar bell popover and
@@ -90,6 +98,7 @@ impl NotificationStore {
             pane,
             surface,
             workspace,
+            desktop_id: None,
         });
         id
     }
@@ -105,6 +114,37 @@ impl NotificationStore {
             }
         }
         false
+    }
+
+    /// Record the FDO desktop notification id assigned to `id`. The
+    /// IPC handler calls this after the daemon returns
+    /// `Response::Notified` so the popover can later ask the daemon to
+    /// dismiss the toast when the user reads it inside flowmux.
+    pub fn set_desktop_id(&self, id: NotificationId, desktop_id: u32) {
+        let mut entries = self.inner.borrow_mut();
+        if let Some(e) = entries.iter_mut().find(|e| e.id == id) {
+            e.desktop_id = Some(desktop_id);
+        }
+    }
+
+    /// Flip every unread entry to `read = true` and return the
+    /// `desktop_id` of each one that previously carried a desktop
+    /// notification. The caller is expected to forward those ids to
+    /// `Request::CloseDesktopNotification` so the FDO notification
+    /// center clears them out. Returns an empty vec when nothing
+    /// changed — handy for skipping a no-op IPC roundtrip.
+    pub fn mark_all_unread_read(&self) -> Vec<u32> {
+        let mut entries = self.inner.borrow_mut();
+        let mut closed = Vec::new();
+        for e in entries.iter_mut() {
+            if !e.read {
+                e.read = true;
+                if let Some(did) = e.desktop_id {
+                    closed.push(did);
+                }
+            }
+        }
+        closed
     }
 
     pub fn find(&self, id: NotificationId) -> Option<NotificationEntry> {
@@ -283,6 +323,94 @@ mod tests {
         );
         assert_ne!(a, b);
         assert_eq!(s.entries().len(), 2);
+    }
+
+    #[test]
+    fn set_desktop_id_attaches_fdo_id_to_existing_entry() {
+        let s = store();
+        let id = s.push(
+            "Claude".into(),
+            "ready".into(),
+            NotificationLevel::AttentionNeeded,
+            None,
+            None,
+            None,
+        );
+        s.set_desktop_id(id, 42);
+        assert_eq!(s.find(id).unwrap().desktop_id, Some(42));
+    }
+
+    #[test]
+    fn set_desktop_id_for_unknown_id_is_safe_noop() {
+        let s = store();
+        // No panic, no insert — just silently ignored. Mirrors the
+        // mark_read contract for entries that aged out under the cap.
+        s.set_desktop_id(NotificationId::new(), 7);
+        assert_eq!(s.entries().len(), 0);
+    }
+
+    #[test]
+    fn mark_all_unread_read_flips_unread_and_returns_their_desktop_ids() {
+        let s = store();
+        let a = s.push(
+            "a".into(),
+            "".into(),
+            NotificationLevel::AttentionNeeded,
+            None,
+            None,
+            None,
+        );
+        let b = s.push(
+            "b".into(),
+            "".into(),
+            NotificationLevel::AttentionNeeded,
+            None,
+            None,
+            None,
+        );
+        let c = s.push(
+            "c".into(),
+            "".into(),
+            NotificationLevel::AttentionNeeded,
+            None,
+            None,
+            None,
+        );
+        // Entry `a` carries no desktop_id (e.g. toast was suppressed),
+        // so it should be marked read but NOT show up in the close
+        // list. `b` and `c` should both round-trip their ids.
+        s.set_desktop_id(b, 11);
+        s.set_desktop_id(c, 22);
+        // Pre-mark `b` as already read so the loop must skip it and
+        // not double-emit its desktop_id.
+        s.mark_read(b);
+        let to_close = s.mark_all_unread_read();
+        assert_eq!(s.unread_count(), 0);
+        // Order follows insertion order; only the previously-unread
+        // ones with a desktop_id should appear.
+        assert_eq!(to_close, vec![22]);
+        // `a` still has no desktop_id but is now read.
+        assert!(s.find(a).unwrap().read);
+        assert!(s.find(c).unwrap().read);
+    }
+
+    #[test]
+    fn mark_all_unread_read_returns_empty_when_nothing_changed() {
+        let s = store();
+        // No entries → empty list, no panic.
+        assert!(s.mark_all_unread_read().is_empty());
+        // Insert and mark read; second sweep is a no-op.
+        let id = s.push(
+            "x".into(),
+            "".into(),
+            NotificationLevel::Info,
+            None,
+            None,
+            None,
+        );
+        s.set_desktop_id(id, 99);
+        assert_eq!(s.mark_all_unread_read(), vec![99]);
+        assert!(s.mark_all_unread_read().is_empty());
     }
 
     #[test]

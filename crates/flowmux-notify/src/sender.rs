@@ -27,6 +27,8 @@ trait FdoNotifications {
         hints: std::collections::HashMap<&str, Value<'_>>,
         expire_timeout: i32,
     ) -> zbus::Result<u32>;
+
+    fn close_notification(&self, id: u32) -> zbus::Result<()>;
 }
 
 pub struct DesktopNotifier {
@@ -57,6 +59,17 @@ impl DesktopNotifier {
                 expire_for(n.level),
             )
             .await
+    }
+
+    /// Tell the FDO notification daemon to close (and silently
+    /// withdraw) the notification with `desktop_id`. We use this to
+    /// drop dock/launcher counters once the user has acknowledged the
+    /// alert in flowmux's own bell popover — without it, AttentionNeeded
+    /// toasts (which we send with `expire_timeout = 0`) would otherwise
+    /// linger forever in the GNOME / KDE notification center.
+    pub async fn close(&self, desktop_id: u32) -> zbus::Result<()> {
+        let proxy = FdoNotificationsProxy::new(&self.conn).await?;
+        proxy.close_notification(desktop_id).await
     }
 }
 

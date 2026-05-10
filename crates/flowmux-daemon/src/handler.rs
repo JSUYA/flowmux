@@ -91,10 +91,26 @@ impl Handler for DaemonHandler {
                         created_at: chrono::Utc::now(),
                         read: false,
                     };
+                    let mut desktop_id: Option<u32> = None;
                     if let Some(guard) = self.ensure_notifier().await {
                         if let Some(notifier) = guard.as_ref() {
-                            if let Err(e) = notifier.send(&n).await {
-                                warn!(error = %e, "desktop notification failed");
+                            match notifier.send(&n).await {
+                                Ok(id) => desktop_id = Some(id),
+                                Err(e) => warn!(error = %e, "desktop notification failed"),
+                            }
+                        }
+                    }
+                    Response::Notified { desktop_id }
+                }
+
+                Request::CloseDesktopNotification { desktop_id } => {
+                    if let Some(guard) = self.ensure_notifier().await {
+                        if let Some(notifier) = guard.as_ref() {
+                            if let Err(e) = notifier.close(desktop_id).await {
+                                // Closing an unknown id is not an error
+                                // worth surfacing — the FDO daemon may
+                                // already have aged the entry out.
+                                warn!(error = %e, desktop_id, "close notification failed");
                             }
                         }
                     }

@@ -405,10 +405,13 @@ impl Handler for GuiHandler {
                         Some(p) => self.inner.store().workspace_for_pane(p).await,
                         None => None,
                     };
-                    // Ask the GTK side to record the entry. It returns
-                    // `false` when the source pane+surface is already
-                    // focused — in that case we also skip the desktop
-                    // toast so flowmux stays out of the way.
+                    // Ask the GTK side to record the entry. The ack
+                    // returns `None` when the source pane+surface is
+                    // already focused — in that case we also skip the
+                    // desktop toast so flowmux stays out of the way.
+                    // `Some(entry_id)` is the in-process popover id we
+                    // need so we can later attach the FDO desktop id
+                    // returned by the daemon.
                     let (tx, rx) = oneshot::channel();
                     let _ = self
                         .bridge
@@ -423,9 +426,10 @@ impl Handler for GuiHandler {
                             ack: tx,
                         })
                         .await;
-                    let should_toast = rx.await.unwrap_or(true);
-                    if should_toast {
-                        self.inner
+                    let entry_id = rx.await.unwrap_or(None);
+                    if let Some(entry_id) = entry_id {
+                        let resp = self
+                            .inner
                             .handle(Request::Notify {
                                 pane,
                                 surface,
@@ -433,7 +437,31 @@ impl Handler for GuiHandler {
                                 body: body.clone(),
                                 level,
                             })
-                            .await
+                            .await;
+                        // Forward the desktop id (when present) to the
+                        // GUI store so the bell popover's "mark all
+                        // read" sweep can later ask the FDO daemon to
+                        // close the toast and shrink the dock badge.
+                        if let Response::Notified {
+                            desktop_id: Some(desktop_id),
+                        } = resp
+                        {
+                            let _ = self
+                                .bridge
+                                .tx
+                                .send(GtkCommand::SetNotificationDesktopId {
+                                    id: entry_id,
+                                    desktop_id,
+                                })
+                                .await;
+                        }
+                        // Hooks and other CLI callers expect a benign
+                        // success — collapse Notified into Ok so the
+                        // wire shape stays stable for them.
+                        match resp {
+                            Response::Notified { .. } => Response::Ok,
+                            other => other,
+                        }
                     } else {
                         Response::Ok
                     }

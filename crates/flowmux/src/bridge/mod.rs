@@ -247,9 +247,12 @@ pub enum GtkCommand {
     /// row to bring to the foreground without a second store lookup.
     /// `surface` is the specific tab inside `pane` so suppression can
     /// compare and the click router can switch tabs.
-    /// `ack` reports back whether the IPC handler should also fire the
-    /// desktop toast: `false` means we suppressed because the source
-    /// pane+surface is already focused.
+    /// `ack` reports back the [`NotificationId`] of the freshly-pushed
+    /// entry, so the IPC handler can later attach the FDO desktop
+    /// notification id via [`Self::SetNotificationDesktopId`]. Returns
+    /// `None` when the GUI suppressed the notification (source pane +
+    /// surface already focused) — the IPC handler interprets this as
+    /// "do not fire the desktop toast either".
     AddNotification {
         pane: Option<PaneId>,
         surface: Option<SurfaceId>,
@@ -257,7 +260,26 @@ pub enum GtkCommand {
         title: String,
         body: String,
         level: NotificationLevel,
-        ack: oneshot::Sender<bool>,
+        ack: oneshot::Sender<Option<NotificationId>>,
+    },
+    /// Tell the GUI store which FDO desktop notification id was
+    /// assigned to a previously-added entry. Used by the bell popover
+    /// to ask the daemon to drop the toast (and the dock badge) once
+    /// the user reads it inside flowmux.
+    SetNotificationDesktopId {
+        id: NotificationId,
+        desktop_id: u32,
+    },
+    /// Ask the FDO notification daemon to close the supplied
+    /// `desktop_id`s. Fired when the user opens the bell popover (so
+    /// the entries become "read" inside flowmux) — closing the
+    /// matching toasts on the OS side is what actually shrinks the
+    /// dock / launcher badge in GNOME / KDE. flowmux sends
+    /// `AttentionNeeded` toasts with `expire_timeout = 0`, so without
+    /// an explicit close they linger in the notification center
+    /// forever.
+    CloseDesktopNotifications {
+        desktop_ids: Vec<u32>,
     },
     /// User clicked a row in the bell popover. Mark the entry read,
     /// activate its workspace (if known), and grab focus on the source
