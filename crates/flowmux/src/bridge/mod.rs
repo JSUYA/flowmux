@@ -294,6 +294,11 @@ pub enum GtkCommand {
     /// activate its workspace (if known), and grab focus on the source
     /// pane (if known). Mirrors cmux's `openNotification → focusTab`.
     OpenNotification { id: NotificationId },
+    /// User clicked the trash button on a bell-popover row. Drop the
+    /// entry from the in-process transcript, withdraw its FDO toast
+    /// (when one exists) and re-publish the dock badge unread count.
+    /// Refreshes the popover so the row vanishes immediately.
+    DeleteNotification { id: NotificationId },
     /// Cycle to the previous / next workspace in sidebar order.
     FocusWorkspaceDir { dir: WsNav },
     /// Jump straight to the N-th workspace (1-indexed; clamped to

@@ -7,7 +7,7 @@ use crate::bridge::{
     Bridge, BrowserActionResult, BrowserOp, BrowserOpenOutcome, FocusDir, GtkCommand, WsNav,
 };
 use crate::keybindings::FocusedPane;
-use crate::notifications::{NotificationStore, SetDesktopIdResult};
+use crate::notifications::{NotificationStore, RemoveOutcome, SetDesktopIdResult};
 use crate::theme::ResolvedTheme;
 use crate::ui::sidebar::Sidebar;
 use crate::ui::terminal_pane::PaneCallbacks;
@@ -1569,6 +1569,30 @@ impl WindowController {
                 // a desktop toast / popover row brings flowmux up even
                 // if it was minimized or behind another window.
                 self.window.present();
+            }
+            GtkCommand::DeleteNotification { id } => {
+                // Trash button on the bell-popover row. Drop the entry,
+                // close any live FDO toast (so the system notification
+                // center shrinks in lockstep), re-publish the dock
+                // badge if the unread count changed, and re-render the
+                // popover so the deleted row vanishes immediately.
+                match self.notifications.remove(id) {
+                    RemoveOutcome::Unknown => {
+                        tracing::debug!(%id, "delete notification: id not found");
+                    }
+                    RemoveOutcome::RemovedRead => {
+                        // Read-only delete: unread count unchanged, no
+                        // FDO toast was outstanding for this entry.
+                        self.sidebar.refresh_notification_popover();
+                    }
+                    RemoveOutcome::RemovedUnread { desktop_id } => {
+                        if let Some(did) = desktop_id {
+                            self.close_desktop_notifications(vec![did]);
+                        }
+                        self.refresh_launcher_badge();
+                        self.sidebar.refresh_notification_popover();
+                    }
+                }
             }
             GtkCommand::FocusWorkspaceAt { idx } => {
                 let snap = self.store.snapshot().await;
@@ -5235,6 +5259,176 @@ mod tests {
                 .pane_frame(pane_c)
                 .is_none(),
             "closed pane C should be forgotten by the registry"
+        );
+    }
+
+    /// Build a controller wired to a fresh workspace with one pane,
+    /// returning the ids needed to push notifications. Inline so the
+    /// trash-button tests below do not depend on helpers that may be
+    /// absent from any given branch.
+    async fn build_notif_test_controller(
+        app_id: &str,
+    ) -> (WindowController, WorkspaceId, PaneId) {
+        adw::init().expect("libadwaita should initialize in GTK test");
+        let root = std::env::temp_dir().join(format!("flowmux-notif-trash-{app_id}"));
+        std::fs::create_dir_all(&root).unwrap();
+        let store = StateStore::new_lazy(State::default());
+        let ws_id = store.create_workspace(Some("ws".into()), root).await;
+        let ws = store.get_workspace(ws_id).await.unwrap();
+        let pane = ws.surfaces[0].root_pane.first_leaf_id().unwrap();
+        let (bridge, _rx) = Bridge::new();
+        let app = adw::Application::builder()
+            .application_id(app_id)
+            .build();
+        app.register(None::<&gtk::gio::Cancellable>).unwrap();
+        let controller = WindowController::new(
+            &app,
+            store.clone(),
+            Arc::new(ResolvedTheme::load()),
+            bridge,
+            gtk::CssProvider::new(),
+        );
+        controller.render_workspace(&ws);
+        store.set_active_workspace(Some(ws_id)).await;
+        (controller, ws_id, pane)
+    }
+
+    /// Push a notification through the dispatcher (same path the IPC
+    /// handler takes). Returns the entry id; suppressed pushes (when
+    /// the source pane is already focused) panic so tests catch the
+    /// unexpected suppression rather than hide it as a None.
+    async fn push_notif(
+        controller: &WindowController,
+        pane: PaneId,
+        workspace: WorkspaceId,
+        title: &str,
+    ) -> flowmux_core::NotificationId {
+        let (ack_tx, ack_rx) = oneshot::channel();
+        controller
+            .dispatch(GtkCommand::AddNotification {
+                pane: Some(pane),
+                surface: None,
+                workspace: Some(workspace),
+                title: title.into(),
+                body: String::new(),
+                level: flowmux_core::NotificationLevel::AttentionNeeded,
+                ack: ack_tx,
+            })
+            .await;
+        ack_rx
+            .await
+            .unwrap()
+            .expect("push must record an entry — window is inactive in tests so suppression should not trigger")
+    }
+
+    /// Trash button on a bell-popover row dispatches
+    /// `GtkCommand::DeleteNotification`. After dispatch the entry must
+    /// be gone from the in-process transcript, the unread count must
+    /// drop by exactly one for an unread entry, and unrelated entries
+    /// must be untouched. Pins the user-visible feature: clicking the
+    /// trash icon next to a notification removes that notification
+    /// from the popover list while leaving every other entry alone.
+    #[gtk::test]
+    async fn delete_notification_dispatch_removes_only_targeted_unread_entry() {
+        let (controller, ws_id, pane) =
+            build_notif_test_controller("com.flowmux.App.UiTest.NotifTrashRemovesUnread").await;
+        let id_a = push_notif(&controller, pane, ws_id, "a").await;
+        let id_b = push_notif(&controller, pane, ws_id, "b").await;
+        let id_c = push_notif(&controller, pane, ws_id, "c").await;
+        assert_eq!(controller.notifications.unread_count(), 3);
+
+        // Trash on the middle entry — same dispatch the bell-popover
+        // row's trash button issues.
+        controller
+            .dispatch(GtkCommand::DeleteNotification { id: id_b })
+            .await;
+
+        assert!(
+            controller.notifications.find(id_b).is_none(),
+            "deleted entry must be gone from the in-memory store"
+        );
+        assert!(
+            controller.notifications.find(id_a).is_some(),
+            "deleting one entry must not touch unrelated entries"
+        );
+        assert!(
+            controller.notifications.find(id_c).is_some(),
+            "deleting a middle entry must leave later entries alone"
+        );
+        assert_eq!(
+            controller.notifications.unread_count(),
+            2,
+            "deleting one unread entry must drop unread_count by exactly one — this is the value the dock badge republishes"
+        );
+        // Surviving entries must keep insertion order so the rendered
+        // popover still shows newest-at-top correctly.
+        let surviving: Vec<_> = controller
+            .notifications
+            .entries()
+            .iter()
+            .map(|e| e.id)
+            .collect();
+        assert_eq!(surviving, vec![id_a, id_c]);
+    }
+
+    /// Trash button on an entry the user already opened (read=true)
+    /// must still drop the entry from the transcript without changing
+    /// the unread count. Without this branch the dispatcher would
+    /// republish the badge unnecessarily on every read-row delete,
+    /// or — worse — skip the popover refresh and leave a ghost row.
+    #[gtk::test]
+    async fn delete_notification_dispatch_on_read_entry_keeps_unread_count() {
+        let (controller, ws_id, pane) =
+            build_notif_test_controller("com.flowmux.App.UiTest.NotifTrashRemovesRead").await;
+        let id = push_notif(&controller, pane, ws_id, "old").await;
+        // Mark it read directly so we can isolate the read-branch
+        // delete from the workspace-sweep path.
+        controller.notifications.mark_read(id);
+        assert_eq!(controller.notifications.unread_count(), 0);
+
+        controller
+            .dispatch(GtkCommand::DeleteNotification { id })
+            .await;
+
+        assert!(
+            controller.notifications.find(id).is_none(),
+            "deleting a read entry must still remove it from the transcript"
+        );
+        assert_eq!(
+            controller.notifications.unread_count(),
+            0,
+            "deleting an already-read entry must not move the unread count"
+        );
+    }
+
+    /// Trash button on an id the store no longer knows about (e.g. the
+    /// entry already aged out under MAX_RETAINED, or two trash clicks
+    /// raced) must be a safe no-op — no panic, no badge change, no
+    /// FDO close roundtrip. This pins the dispatcher's `Unknown` arm
+    /// so a future refactor that removes it surfaces here.
+    #[gtk::test]
+    async fn delete_notification_dispatch_on_unknown_id_is_safe_noop() {
+        let (controller, ws_id, pane) =
+            build_notif_test_controller("com.flowmux.App.UiTest.NotifTrashUnknownIsNoop").await;
+        push_notif(&controller, pane, ws_id, "kept").await;
+        let unread_before = controller.notifications.unread_count();
+        let count_before = controller.notifications.entries().len();
+
+        controller
+            .dispatch(GtkCommand::DeleteNotification {
+                id: flowmux_core::NotificationId::new(),
+            })
+            .await;
+
+        assert_eq!(
+            controller.notifications.entries().len(),
+            count_before,
+            "Unknown id must not delete an unrelated entry"
+        );
+        assert_eq!(
+            controller.notifications.unread_count(),
+            unread_before,
+            "Unknown id must not change unread_count"
         );
     }
 }

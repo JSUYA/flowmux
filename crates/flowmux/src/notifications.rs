@@ -190,6 +190,31 @@ impl NotificationStore {
         self.inner.borrow().iter().find(|e| e.id == id).cloned()
     }
 
+    /// Drop the entry with `id` from the in-memory transcript. Used by
+    /// the per-row trash button in the bell popover so the user can
+    /// clear individual entries without acknowledging the rest. Returns
+    /// [`RemoveOutcome`] so the caller can decide whether to also close
+    /// the matching FDO toast and refresh the dock badge: only entries
+    /// that were unread (and carried a `desktop_id`) need a follow-up
+    /// `CloseDesktopNotifications`, and the badge only needs a
+    /// re-publish when the unread count actually moved.
+    pub fn remove(&self, id: NotificationId) -> RemoveOutcome {
+        let mut entries = self.inner.borrow_mut();
+        let Some(idx) = entries.iter().position(|e| e.id == id) else {
+            return RemoveOutcome::Unknown;
+        };
+        let entry = entries.remove(idx).expect("position just confirmed it exists");
+        if entry.read {
+            // Read entries don't move the unread count and never had a
+            // pending FDO toast — pure transcript-only delete.
+            RemoveOutcome::RemovedRead
+        } else {
+            RemoveOutcome::RemovedUnread {
+                desktop_id: entry.desktop_id,
+            }
+        }
+    }
+
     /// Return a fresh `Vec` snapshot in insertion order. The caller owns
     /// the list and may render newest-first.
     pub fn entries(&self) -> Vec<NotificationEntry> {
@@ -205,6 +230,27 @@ impl NotificationStore {
     pub fn unread_count(&self) -> usize {
         self.inner.borrow().iter().filter(|e| !e.read).count()
     }
+}
+
+/// Outcome of [`NotificationStore::remove`]. Tells the dispatcher
+/// whether the deleted entry was unread (so the dock badge dropped by
+/// one) and whether it had a live FDO toast that still needs to be
+/// withdrawn from the desktop notification center.
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoveOutcome {
+    /// Entry was found, was already read, and was dropped. No
+    /// `unread_count()` change, no FDO toast to close.
+    RemovedRead,
+    /// Entry was found, was unread, and was dropped. `unread_count()`
+    /// went down by one — caller should re-publish the dock badge.
+    /// `desktop_id` is `Some` when the FDO daemon had returned a toast
+    /// id; caller should close it so the system notification center
+    /// drops the row in lockstep with the bell popover.
+    RemovedUnread { desktop_id: Option<u32> },
+    /// No entry with that id exists (already deleted, never existed,
+    /// or aged out under the cap). Safe to ignore.
+    Unknown,
 }
 
 /// Outcome of [`NotificationStore::set_desktop_id`]. Lets the IPC
@@ -567,6 +613,151 @@ mod tests {
         assert_eq!(s.set_desktop_id(id, 99), SetDesktopIdResult::Stored);
         assert_eq!(s.mark_all_unread_read(), vec![99]);
         assert!(s.mark_all_unread_read().is_empty());
+    }
+
+    #[test]
+    fn remove_unread_entry_drops_it_and_reports_desktop_id_for_toast_close() {
+        let s = store();
+        let a = s.push(
+            "a".into(),
+            "".into(),
+            NotificationLevel::AttentionNeeded,
+            None,
+            None,
+            None,
+        );
+        let b = s.push(
+            "b".into(),
+            "".into(),
+            NotificationLevel::AttentionNeeded,
+            None,
+            None,
+            None,
+        );
+        let _ = s.set_desktop_id(b, 77);
+
+        // Trash button on `b` (unread, has desktop_id) — must report
+        // the id so the dispatcher can call CloseDesktopNotifications.
+        assert_eq!(
+            s.remove(b),
+            RemoveOutcome::RemovedUnread {
+                desktop_id: Some(77)
+            },
+            "deleting an unread entry must surface its desktop_id so the FDO toast is withdrawn"
+        );
+        assert!(
+            s.find(b).is_none(),
+            "removed entry must no longer be findable"
+        );
+        assert_eq!(
+            s.unread_count(),
+            1,
+            "unread_count must drop by exactly one after removing an unread entry"
+        );
+
+        // Trash button on `a` (unread, no desktop_id captured) — still
+        // unread/dropped, but desktop_id is None so caller skips the
+        // FDO close roundtrip.
+        assert_eq!(
+            s.remove(a),
+            RemoveOutcome::RemovedUnread { desktop_id: None },
+            "unread entry without a desktop_id still reports RemovedUnread but skips toast close"
+        );
+        assert_eq!(s.unread_count(), 0);
+        assert_eq!(s.entries().len(), 0);
+    }
+
+    #[test]
+    fn remove_read_entry_drops_it_without_touching_unread_count() {
+        let s = store();
+        let a = s.push(
+            "a".into(),
+            "".into(),
+            NotificationLevel::Info,
+            None,
+            None,
+            None,
+        );
+        let b = s.push(
+            "b".into(),
+            "".into(),
+            NotificationLevel::Info,
+            None,
+            None,
+            None,
+        );
+        s.mark_read(a);
+        let unread_before = s.unread_count();
+
+        assert_eq!(
+            s.remove(a),
+            RemoveOutcome::RemovedRead,
+            "deleting an already-read entry must report RemovedRead so the dispatcher skips the badge republish"
+        );
+        assert!(s.find(a).is_none());
+        assert_eq!(
+            s.unread_count(),
+            unread_before,
+            "removing a read entry must not change unread_count"
+        );
+        assert_eq!(s.entries().len(), 1);
+        assert_eq!(s.entries()[0].id, b, "remaining order must be preserved");
+    }
+
+    #[test]
+    fn remove_unknown_id_is_safe_noop() {
+        let s = store();
+        let id = s.push(
+            "x".into(),
+            "".into(),
+            NotificationLevel::Info,
+            None,
+            None,
+            None,
+        );
+        // Already-deleted / never-existed id must round-trip Unknown
+        // so the dispatcher skips refresh work and FDO close calls.
+        assert_eq!(s.remove(NotificationId::new()), RemoveOutcome::Unknown);
+        assert_eq!(s.entries().len(), 1);
+        // First delete succeeds, second on the same id is Unknown.
+        assert!(matches!(s.remove(id), RemoveOutcome::RemovedUnread { .. }));
+        assert_eq!(s.remove(id), RemoveOutcome::Unknown);
+    }
+
+    #[test]
+    fn remove_preserves_insertion_order_of_surrounding_entries() {
+        let s = store();
+        let a = s.push(
+            "a".into(),
+            "".into(),
+            NotificationLevel::Info,
+            None,
+            None,
+            None,
+        );
+        let b = s.push(
+            "b".into(),
+            "".into(),
+            NotificationLevel::Info,
+            None,
+            None,
+            None,
+        );
+        let c = s.push(
+            "c".into(),
+            "".into(),
+            NotificationLevel::Info,
+            None,
+            None,
+            None,
+        );
+        let _ = s.remove(b);
+        let ids: Vec<_> = s.entries().iter().map(|e| e.id).collect();
+        assert_eq!(
+            ids,
+            vec![a, c],
+            "removing a middle entry must collapse the gap without reordering survivors"
+        );
     }
 
     #[test]
