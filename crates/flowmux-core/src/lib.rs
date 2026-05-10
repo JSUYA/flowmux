@@ -325,50 +325,12 @@ impl Pane {
         ratio: f32,
         new_content: PaneContent,
     ) -> Option<PaneId> {
-        match self {
-            Pane::Leaf { id, .. } if *id == target => {
-                let original = std::mem::replace(
-                    self,
-                    Pane::Split {
-                        id: PaneId::new(),
-                        direction,
-                        ratio,
-                        first: Box::new(Pane::Leaf {
-                            id: target,
-                            content: PaneContent::tabbed_terminal("Terminal", None),
-                        }),
-                        second: Box::new(Pane::Leaf {
-                            id: PaneId::new(),
-                            content: new_content.clone(),
-                        }),
-                    },
-                );
-                if let (
-                    Pane::Split { first, second, .. },
-                    Pane::Leaf {
-                        content: orig_content,
-                        ..
-                    },
-                ) = (self, &original)
-                {
-                    *first = Box::new(Pane::Leaf {
-                        id: target,
-                        content: orig_content.clone(),
-                    });
-                    let new_id = if let Pane::Leaf { id, .. } = &**second {
-                        *id
-                    } else {
-                        unreachable!()
-                    };
-                    return Some(new_id);
-                }
-                None
-            }
-            Pane::Leaf { .. } => None,
-            Pane::Split { first, second, .. } => first
-                .split_leaf(target, direction, ratio, new_content.clone())
-                .or_else(|| second.split_leaf(target, direction, ratio, new_content)),
-        }
+        // Pass new_content by reference until we reach the matching leaf,
+        // then take ownership for the single placement. Saves a chain of
+        // PaneContent::clone calls (each carrying owned tab Vec<PaneSurface>)
+        // on the way down.
+        let mut new_content = Some(new_content);
+        split_leaf_descend(self, target, direction, ratio, &mut new_content)
     }
 
     /// Walk every leaf id in DFS order.
@@ -401,24 +363,11 @@ impl Pane {
         target: PaneId,
         surface: PaneSurface,
     ) -> Option<SurfaceId> {
-        match self {
-            Pane::Leaf { id, content } if *id == target => {
-                content.normalize_to_tabs(None);
-                match content {
-                    PaneContent::Tabs { active, surfaces } => {
-                        let id = surface.id;
-                        *active = id;
-                        surfaces.push(surface);
-                        Some(id)
-                    }
-                    PaneContent::Terminal { .. } | PaneContent::Browser { .. } => None,
-                }
-            }
-            Pane::Leaf { .. } => None,
-            Pane::Split { first, second, .. } => first
-                .add_surface_to_leaf(target, surface.clone())
-                .or_else(|| second.add_surface_to_leaf(target, surface)),
-        }
+        // PaneSurface contains owned strings (title, kind data); cloning
+        // it on every Split node along the path is the expensive part —
+        // moving once via Option::take avoids that.
+        let mut surface = Some(surface);
+        add_surface_to_leaf_descend(self, target, &mut surface)
     }
 
     pub fn set_active_surface(&mut self, target: PaneId, surface_id: SurfaceId) -> bool {
@@ -476,27 +425,12 @@ impl Pane {
     }
 
     pub fn rename_surface(&mut self, target: PaneId, surface_id: SurfaceId, title: String) -> bool {
-        match self {
-            Pane::Leaf { id, content } if *id == target => match content {
-                PaneContent::Tabs { surfaces, .. } => {
-                    if let Some(surface) =
-                        surfaces.iter_mut().find(|surface| surface.id == surface_id)
-                    {
-                        surface.title = title;
-                        surface.title_locked = true;
-                        true
-                    } else {
-                        false
-                    }
-                }
-                PaneContent::Terminal { .. } | PaneContent::Browser { .. } => false,
-            },
-            Pane::Leaf { .. } => false,
-            Pane::Split { first, second, .. } => {
-                first.rename_surface(target, surface_id, title.clone())
-                    || second.rename_surface(target, surface_id, title)
-            }
-        }
+        // Carry the title as Option<String> through the descent so it is
+        // moved into the matching leaf rather than cloned at every Split.
+        // For deep pane trees this turns an O(depth) chain of String clones
+        // into a single move.
+        let mut title = Some(title);
+        rename_surface_descend(self, target, surface_id, &mut title)
     }
 
     /// Update a browser surface's stored URL. Called on webview navigation so
@@ -509,30 +443,8 @@ impl Pane {
         surface_id: SurfaceId,
         new_url: String,
     ) -> bool {
-        match self {
-            Pane::Leaf { id, content } if *id == target => match content {
-                PaneContent::Tabs { surfaces, .. } => {
-                    if let Some(surface) =
-                        surfaces.iter_mut().find(|surface| surface.id == surface_id)
-                    {
-                        if let SurfaceKind::Browser { initial_url } = &mut surface.kind {
-                            if initial_url.as_deref() == Some(new_url.as_str()) {
-                                return false;
-                            }
-                            *initial_url = Some(new_url);
-                            return true;
-                        }
-                    }
-                    false
-                }
-                PaneContent::Terminal { .. } | PaneContent::Browser { .. } => false,
-            },
-            Pane::Leaf { .. } => false,
-            Pane::Split { first, second, .. } => {
-                first.set_surface_browser_url(target, surface_id, new_url.clone())
-                    || second.set_surface_browser_url(target, surface_id, new_url)
-            }
-        }
+        let mut new_url = Some(new_url);
+        set_surface_browser_url_descend(self, target, surface_id, &mut new_url)
     }
 
     /// Auto-rename a surface from an external signal (browser page title,
@@ -547,42 +459,11 @@ impl Pane {
         if new_title.trim().is_empty() {
             return false;
         }
-        match self {
-            Pane::Leaf { id, content } if *id == target => match content {
-                PaneContent::Tabs { surfaces, .. } => {
-                    if let Some(surface) =
-                        surfaces.iter_mut().find(|surface| surface.id == surface_id)
-                    {
-                        if surface.title_locked || surface.title == new_title {
-                            return false;
-                        }
-                        // Drop OSC 0/2 when it is really a shell PS1 cwd echo.
-                        // Otherwise every prompt's `user@host: /path` would
-                        // overwrite folder labels and freeze tab/window titles
-                        // in PS1 form. flowmux separately applies cwd folder
-                        // names through terminal_tab_title_for_cwd via
-                        // set_surface_cwd, while external program titles such
-                        // as vi/codex/claude/tmux do not match the PS1 pattern
-                        // and pass through.
-                        if let SurfaceKind::Terminal { cwd: Some(cwd), .. } = &surface.kind {
-                            let home = std::env::var_os("HOME").map(PathBuf::from);
-                            if title_is_shell_cwd_echo(&new_title, cwd, home.as_deref()) {
-                                return false;
-                            }
-                        }
-                        surface.title = new_title;
-                        return true;
-                    }
-                    false
-                }
-                PaneContent::Terminal { .. } | PaneContent::Browser { .. } => false,
-            },
-            Pane::Leaf { .. } => false,
-            Pane::Split { first, second, .. } => {
-                first.set_surface_title_auto(target, surface_id, new_title.clone())
-                    || second.set_surface_title_auto(target, surface_id, new_title)
-            }
-        }
+        // Reading $HOME once per call avoids the per-recursion env hit when
+        // we descend through deep pane trees.
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let mut new_title = Some(new_title);
+        set_surface_title_auto_descend(self, target, surface_id, &mut new_title, home.as_deref())
     }
 
     pub fn set_surface_cwd(
@@ -591,41 +472,8 @@ impl Pane {
         surface_id: SurfaceId,
         new_cwd: PathBuf,
     ) -> bool {
-        match self {
-            Pane::Leaf { id, content } if *id == target => match content {
-                PaneContent::Tabs { surfaces, .. } => {
-                    if let Some(surface) =
-                        surfaces.iter_mut().find(|surface| surface.id == surface_id)
-                    {
-                        if let SurfaceKind::Terminal { cwd, .. } = &mut surface.kind {
-                            // Update folder-based labels only when cwd actually
-                            // changes. If cwd is the same, do not let polling
-                            // overwrite external program titles from OSC 0/2 on
-                            // each tick.
-                            if cwd.as_ref() == Some(&new_cwd) {
-                                return false;
-                            }
-                            *cwd = Some(new_cwd);
-                            if !surface.title_locked {
-                                let next_title =
-                                    terminal_tab_title_for_cwd(cwd.as_deref());
-                                if surface.title != next_title {
-                                    surface.title = next_title;
-                                }
-                            }
-                            return true;
-                        }
-                    }
-                    false
-                }
-                PaneContent::Terminal { .. } | PaneContent::Browser { .. } => false,
-            },
-            Pane::Leaf { .. } => false,
-            Pane::Split { first, second, .. } => {
-                first.set_surface_cwd(target, surface_id, new_cwd.clone())
-                    || second.set_surface_cwd(target, surface_id, new_cwd)
-            }
-        }
+        let mut new_cwd = Some(new_cwd);
+        set_surface_cwd_descend(self, target, surface_id, &mut new_cwd)
     }
 
     /// Move the terminal or browser tab identified by `surface_id` within the
@@ -872,8 +720,7 @@ impl Pane {
             Pane::Leaf { id, content } if *id == target => content_has_browser(content),
             Pane::Leaf { .. } => false,
             Pane::Split { first, second, .. } => {
-                first.pane_has_browser_surface(target)
-                    || second.pane_has_browser_surface(target)
+                first.pane_has_browser_surface(target) || second.pane_has_browser_surface(target)
             }
         }
     }
@@ -895,6 +742,236 @@ impl Pane {
         match find_right_sibling_browser_leaf_inner(self, from) {
             RightSiblingSearch::Match(p) => Some(p),
             _ => None,
+        }
+    }
+}
+
+/// Helpers used by `Pane::set_surface_*`-family methods. They take the
+/// owned payload as `&mut Option<T>` so the value moves into the matching
+/// leaf via `Option::take` instead of being cloned at every Split node
+/// during the descent. The public methods are thin wrappers that wrap
+/// the owned value into `Some` and call here.
+fn rename_surface_descend(
+    node: &mut Pane,
+    target: PaneId,
+    surface_id: SurfaceId,
+    title: &mut Option<String>,
+) -> bool {
+    match node {
+        Pane::Leaf { id, content } if *id == target => match content {
+            PaneContent::Tabs { surfaces, .. } => {
+                let Some(surface) = surfaces.iter_mut().find(|surface| surface.id == surface_id)
+                else {
+                    return false;
+                };
+                surface.title = title
+                    .take()
+                    .expect("title is Some until consumed at the matching leaf");
+                surface.title_locked = true;
+                true
+            }
+            PaneContent::Terminal { .. } | PaneContent::Browser { .. } => false,
+        },
+        Pane::Leaf { .. } => false,
+        Pane::Split { first, second, .. } => {
+            rename_surface_descend(first, target, surface_id, title)
+                || rename_surface_descend(second, target, surface_id, title)
+        }
+    }
+}
+
+fn set_surface_browser_url_descend(
+    node: &mut Pane,
+    target: PaneId,
+    surface_id: SurfaceId,
+    new_url: &mut Option<String>,
+) -> bool {
+    match node {
+        Pane::Leaf { id, content } if *id == target => match content {
+            PaneContent::Tabs { surfaces, .. } => {
+                let Some(surface) = surfaces.iter_mut().find(|surface| surface.id == surface_id)
+                else {
+                    return false;
+                };
+                let SurfaceKind::Browser { initial_url } = &mut surface.kind else {
+                    return false;
+                };
+                let candidate = new_url
+                    .as_ref()
+                    .expect("new_url is Some until taken at match");
+                if initial_url.as_deref() == Some(candidate.as_str()) {
+                    return false;
+                }
+                *initial_url = Some(new_url.take().unwrap());
+                true
+            }
+            PaneContent::Terminal { .. } | PaneContent::Browser { .. } => false,
+        },
+        Pane::Leaf { .. } => false,
+        Pane::Split { first, second, .. } => {
+            set_surface_browser_url_descend(first, target, surface_id, new_url)
+                || set_surface_browser_url_descend(second, target, surface_id, new_url)
+        }
+    }
+}
+
+fn set_surface_title_auto_descend(
+    node: &mut Pane,
+    target: PaneId,
+    surface_id: SurfaceId,
+    new_title: &mut Option<String>,
+    home: Option<&Path>,
+) -> bool {
+    match node {
+        Pane::Leaf { id, content } if *id == target => match content {
+            PaneContent::Tabs { surfaces, .. } => {
+                let Some(surface) = surfaces.iter_mut().find(|surface| surface.id == surface_id)
+                else {
+                    return false;
+                };
+                let candidate = new_title
+                    .as_ref()
+                    .expect("new_title is Some until taken at match");
+                if surface.title_locked || surface.title == *candidate {
+                    return false;
+                }
+                if let SurfaceKind::Terminal { cwd: Some(cwd), .. } = &surface.kind {
+                    if title_is_shell_cwd_echo(candidate, cwd, home) {
+                        return false;
+                    }
+                }
+                surface.title = new_title.take().unwrap();
+                true
+            }
+            PaneContent::Terminal { .. } | PaneContent::Browser { .. } => false,
+        },
+        Pane::Leaf { .. } => false,
+        Pane::Split { first, second, .. } => {
+            set_surface_title_auto_descend(first, target, surface_id, new_title, home)
+                || set_surface_title_auto_descend(second, target, surface_id, new_title, home)
+        }
+    }
+}
+
+fn set_surface_cwd_descend(
+    node: &mut Pane,
+    target: PaneId,
+    surface_id: SurfaceId,
+    new_cwd: &mut Option<PathBuf>,
+) -> bool {
+    match node {
+        Pane::Leaf { id, content } if *id == target => match content {
+            PaneContent::Tabs { surfaces, .. } => {
+                let Some(surface) = surfaces.iter_mut().find(|surface| surface.id == surface_id)
+                else {
+                    return false;
+                };
+                let SurfaceKind::Terminal { cwd, .. } = &mut surface.kind else {
+                    return false;
+                };
+                let candidate = new_cwd
+                    .as_ref()
+                    .expect("new_cwd is Some until taken at match");
+                if cwd.as_ref() == Some(candidate) {
+                    return false;
+                }
+                *cwd = Some(new_cwd.take().unwrap());
+                if !surface.title_locked {
+                    let next_title = terminal_tab_title_for_cwd(cwd.as_deref());
+                    if surface.title != next_title {
+                        surface.title = next_title;
+                    }
+                }
+                true
+            }
+            PaneContent::Terminal { .. } | PaneContent::Browser { .. } => false,
+        },
+        Pane::Leaf { .. } => false,
+        Pane::Split { first, second, .. } => {
+            set_surface_cwd_descend(first, target, surface_id, new_cwd)
+                || set_surface_cwd_descend(second, target, surface_id, new_cwd)
+        }
+    }
+}
+
+fn add_surface_to_leaf_descend(
+    node: &mut Pane,
+    target: PaneId,
+    surface: &mut Option<PaneSurface>,
+) -> Option<SurfaceId> {
+    match node {
+        Pane::Leaf { id, content } if *id == target => {
+            content.normalize_to_tabs(None);
+            match content {
+                PaneContent::Tabs { active, surfaces } => {
+                    let s = surface
+                        .take()
+                        .expect("surface is Some until taken at match");
+                    let id = s.id;
+                    *active = id;
+                    surfaces.push(s);
+                    Some(id)
+                }
+                PaneContent::Terminal { .. } | PaneContent::Browser { .. } => None,
+            }
+        }
+        Pane::Leaf { .. } => None,
+        Pane::Split { first, second, .. } => add_surface_to_leaf_descend(first, target, surface)
+            .or_else(|| add_surface_to_leaf_descend(second, target, surface)),
+    }
+}
+
+fn split_leaf_descend(
+    node: &mut Pane,
+    target: PaneId,
+    direction: SplitDirection,
+    ratio: f32,
+    new_content: &mut Option<PaneContent>,
+) -> Option<PaneId> {
+    match node {
+        Pane::Leaf { id, .. } if *id == target => {
+            let original = std::mem::replace(
+                node,
+                Pane::Split {
+                    id: PaneId::new(),
+                    direction,
+                    ratio,
+                    first: Box::new(Pane::Leaf {
+                        id: target,
+                        content: PaneContent::tabbed_terminal("Terminal", None),
+                    }),
+                    second: Box::new(Pane::Leaf {
+                        id: PaneId::new(),
+                        content: new_content
+                            .take()
+                            .expect("new_content is Some until taken at match"),
+                    }),
+                },
+            );
+            if let (
+                Pane::Split { first, second, .. },
+                Pane::Leaf {
+                    content: orig_content,
+                    ..
+                },
+            ) = (node, original)
+            {
+                *first = Box::new(Pane::Leaf {
+                    id: target,
+                    content: orig_content,
+                });
+                let new_id = match &**second {
+                    Pane::Leaf { id, .. } => *id,
+                    Pane::Split { .. } => unreachable!(),
+                };
+                return Some(new_id);
+            }
+            None
+        }
+        Pane::Leaf { .. } => None,
+        Pane::Split { first, second, .. } => {
+            split_leaf_descend(first, target, direction, ratio, new_content)
+                .or_else(|| split_leaf_descend(second, target, direction, ratio, new_content))
         }
     }
 }
@@ -1448,11 +1525,7 @@ mod tests {
         let surface_id = pane.active_surface_id(pane_id).unwrap();
 
         // Enter an external program: set_surface_title_auto applies "Claude Code".
-        assert!(pane.set_surface_title_auto(
-            pane_id,
-            surface_id,
-            "Claude Code".into(),
-        ));
+        assert!(pane.set_surface_title_auto(pane_id, surface_id, "Claude Code".into(),));
         assert_eq!(pane.surface_title(pane_id, surface_id), Some("Claude Code"));
 
         // Polling sees the same cwd again; it should be a no-op and keep the
@@ -1580,11 +1653,7 @@ mod tests {
         ));
         // Without home information, tilde matching is unavailable but absolute
         // path matching still works.
-        assert!(!title_is_shell_cwd_echo(
-            "junsu@host: ~/dev/os",
-            cwd,
-            None,
-        ));
+        assert!(!title_is_shell_cwd_echo("junsu@host: ~/dev/os", cwd, None,));
     }
 
     #[test]
@@ -1592,21 +1661,9 @@ mod tests {
         let cwd = Path::new("/tmp/flowmux-shell-echo-test");
         // Titles from external programs such as vi/codex/claude/tmux do not
         // match the PS1 pattern (`prefix:[ ]<cwd>`).
-        assert!(!title_is_shell_cwd_echo(
-            "vim src/main.rs",
-            cwd,
-            None,
-        ));
-        assert!(!title_is_shell_cwd_echo(
-            "tmux: 0:bash*",
-            cwd,
-            None,
-        ));
-        assert!(!title_is_shell_cwd_echo(
-            "claude — Anthropic",
-            cwd,
-            None,
-        ));
+        assert!(!title_is_shell_cwd_echo("vim src/main.rs", cwd, None,));
+        assert!(!title_is_shell_cwd_echo("tmux: 0:bash*", cwd, None,));
+        assert!(!title_is_shell_cwd_echo("claude — Anthropic", cwd, None,));
         // vim opening a file inside cwd should also pass through because its
         // prefix does not end with `:`.
         assert!(!title_is_shell_cwd_echo(
@@ -1651,11 +1708,7 @@ mod tests {
         );
 
         // External program titles, such as vi, still apply normally.
-        assert!(pane.set_surface_title_auto(
-            pane_id,
-            surface_id,
-            "vim src/main.rs".into(),
-        ));
+        assert!(pane.set_surface_title_auto(pane_id, surface_id, "vim src/main.rs".into(),));
         assert_eq!(
             pane.surface_title(pane_id, surface_id),
             Some("vim src/main.rs")
@@ -1933,8 +1986,14 @@ mod tests {
         // Target content remains original; new_pane has fresh content.
         let target_content = tree.find_leaf_content(target).unwrap();
         let new_content = tree.find_leaf_content(new_pane).unwrap();
-        let (PaneContent::Tabs { surfaces: t_surfs, .. }, PaneContent::Tabs { surfaces: n_surfs, .. }) =
-            (&target_content, &new_content)
+        let (
+            PaneContent::Tabs {
+                surfaces: t_surfs, ..
+            },
+            PaneContent::Tabs {
+                surfaces: n_surfs, ..
+            },
+        ) = (&target_content, &new_content)
         else {
             panic!("expected tabbed content for both")
         };
@@ -2469,10 +2528,7 @@ mod tests {
             vsplit(term_leaf(term_id), browser_leaf(near_id)),
             browser_leaf(far_id),
         );
-        assert_eq!(
-            pane.find_right_sibling_browser_leaf(term_id),
-            Some(near_id)
-        );
+        assert_eq!(pane.find_right_sibling_browser_leaf(term_id), Some(near_id));
     }
 
     #[test]
@@ -2494,10 +2550,7 @@ mod tests {
             vsplit(term_leaf(term_id), term_leaf(neighbor_id)),
             browser_leaf(far_id),
         );
-        assert_eq!(
-            pane.find_right_sibling_browser_leaf(term_id),
-            Some(far_id)
-        );
+        assert_eq!(pane.find_right_sibling_browser_leaf(term_id), Some(far_id));
     }
 
     #[test]
@@ -2541,7 +2594,10 @@ mod tests {
 
         let ws = WorkspaceId::new();
         let s = ws.to_string();
-        assert_eq!(WorkspaceId::from_str(&format!("workspace:{s}")).unwrap(), ws);
+        assert_eq!(
+            WorkspaceId::from_str(&format!("workspace:{s}")).unwrap(),
+            ws
+        );
     }
 
     #[test]
