@@ -152,6 +152,20 @@ Notes for the Flatpak build:
 - After upgrading the repo, re-run step 3 to rebuild against the new
   source. The `--force-clean` flag wipes the previous build tree.
 
+If browser tabs open but render as a blank page (WebKit's web process
+aborts with `Could not create default EGL display: EGL_BAD_PARAMETER`),
+the host's GL stack is too old for the newer Mesa inside the Flatpak
+sandbox. Disable WebKit's GPU path with the `FLOWMUX_WEBKIT_HW_ACCEL`
+environment variable — set it once and it sticks across launches:
+
+```bash
+flatpak override --user --env=FLOWMUX_WEBKIT_HW_ACCEL=never com.flowmux.App
+flatpak run com.flowmux.App
+```
+
+Pages then render via CPU rasterisation. Hardware video decoding is
+lost, but the browser pane works.
+
 ### Recommended (optional) — full media playback in tab browser
 
 WebKitGTK delegates media decoding to GStreamer. Without these

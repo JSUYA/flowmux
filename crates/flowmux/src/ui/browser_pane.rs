@@ -132,7 +132,27 @@ impl BrowserPane {
             // blocked in main.rs by disabling the DMA-BUF renderer. webkit6
             // 0.4 exposes only Always / Never, not ON_DEMAND, and Never would
             // also lose video acceleration.
-            settings.set_hardware_acceleration_policy(webkit6::HardwareAccelerationPolicy::Always);
+            //
+            // Escape hatch: on hosts where WebKit's web process aborts with
+            // `Could not create default EGL display: EGL_BAD_PARAMETER`
+            // (e.g. Ubuntu 22.04 + flatpak: host Mesa is too old for the
+            // newer Mesa shipped in org.freedesktop.Platform.GL//24.08),
+            // setting FLOWMUX_WEBKIT_HW_ACCEL=never makes WebKit skip the
+            // EGL setup entirely and CPU-rasterise. Pages render; video
+            // accel is lost.
+            let hw_accel_policy = match std::env::var("FLOWMUX_WEBKIT_HW_ACCEL")
+                .as_deref()
+                .map(str::trim)
+            {
+                Ok("never") | Ok("Never") | Ok("NEVER") => {
+                    tracing::info!(
+                        "FLOWMUX_WEBKIT_HW_ACCEL=never set; disabling WebKit GPU acceleration"
+                    );
+                    webkit6::HardwareAccelerationPolicy::Never
+                }
+                _ => webkit6::HardwareAccelerationPolicy::Always,
+            };
+            settings.set_hardware_acceleration_policy(hw_accel_policy);
         } else {
             tracing::warn!("WebView::settings() returned None — media options skipped");
         }
