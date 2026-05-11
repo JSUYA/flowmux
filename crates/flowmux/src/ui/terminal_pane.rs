@@ -501,27 +501,29 @@ fn is_enter_key(keyval: gtk::gdk::Key) -> bool {
 ///   .bashrc / .zshrc so the user's PS1 + helpers are defined before
 ///   the first prompt.
 ///
-/// * **Inside Flatpak** — three layers, all required:
+/// * **Inside Flatpak** — run `flatpak-spawn --host --watch-bus -- bash
+///   -l`. The wrapper escapes the sandbox so the shell sees the host's
+///   `~/.bashrc`, host `PATH`, and host-installed tools (`git`, `tig`,
+///   `xset`, …). `--watch-bus` ties the host-side process lifetime to
+///   ours so closing the pane reaps the shell.
 ///
-///     1. `flatpak-spawn --host --watch-bus` — escape the sandbox so
-///        the shell sees the host's `~/.bashrc`, the host's `PATH`,
-///        and host-installed tools (`git`, `tig`, …). `--watch-bus`
-///        ties the host-side process lifetime to ours so closing the
-///        pane reaps the shell. Requires
-///        `--talk-name=org.freedesktop.Flatpak` in the manifest.
-///     2. `script -q -c '…' /dev/null` — `flatpak-spawn` forwards
-///        stdin/stdout/stderr FDs but does NOT set up a controlling
-///        terminal on the host process, so dash refuses with
-///        `can't access tty; job control turned off` and bash
-///        silently disables job control. `script` allocates a fresh
-///        PTY on the host and assigns it as the ctty before exec'ing
-///        the inner command, restoring full job control + readline.
-///     3. `bash -l` (not `$SHELL -l`) — the sandbox's `$SHELL` is
-///        unreliable; on the GNOME Platform runtime it often resolves
-///        to `/bin/sh` (= dash on the host), which is what triggered
-///        the dash prompt the first time this was attempted. Force
-///        bash explicitly; zsh / fish users would need a follow-up to
-///        plumb the user's actual host shell via `getent passwd`.
+///   We force `bash` rather than passing `$SHELL` through: the sandbox's
+///   `$SHELL` on the GNOME Platform runtime frequently arrives as
+///   `/bin/sh`, which on the Debian/Ubuntu host is dash — dash without
+///   a controlling terminal emits `can't access tty; job control
+///   turned off` and has no readline, breaking the pane. bash is more
+///   forgiving: it silently disables job control when the inherited
+///   stdin tty is not its ctty, but readline, prompt expansion, and
+///   normal command execution all keep working. A previous attempt
+///   wrapped the inner shell in `script(1)` to allocate a fresh ctty,
+///   but that combination produced a runaway prompt-redraw loop
+///   through `flatpak-spawn`'s FD forwarding; the simpler unwrapped
+///   form is what works in practice. zsh / fish users in Flatpak get
+///   bash for now; lifting that requires resolving the user's actual
+///   host shell via `getent passwd` and is left as a follow-up.
+///
+///   Requires `--talk-name=org.freedesktop.Flatpak` in the Flatpak
+///   manifest's finish-args.
 fn default_shell_argv() -> Vec<String> {
     if is_flatpak_sandbox() {
         vec![
@@ -529,11 +531,8 @@ fn default_shell_argv() -> Vec<String> {
             "--host".into(),
             "--watch-bus".into(),
             "--".into(),
-            "script".into(),
-            "-q".into(),
-            "-c".into(),
-            "exec bash -l".into(),
-            "/dev/null".into(),
+            "bash".into(),
+            "-l".into(),
         ]
     } else {
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
