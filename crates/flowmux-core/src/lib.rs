@@ -407,15 +407,19 @@ impl Pane {
         }
     }
 
+    /// Pick a cwd to seed a newly spawned terminal next to `target`.
+    ///
+    /// Used by split and add-tab so the new terminal opens where the user is
+    /// looking. Resolution:
+    ///   1. If the active surface is a terminal with a tracked cwd, use it.
+    ///   2. If the active surface is a browser, walk earlier tabs in this
+    ///      pane and use the most recent terminal's cwd. Browsers do not
+    ///      have a cwd of their own, so this preserves the user's prior
+    ///      location instead of dropping to the workspace root.
     pub fn terminal_surface_cwd(&self, target: PaneId) -> Option<PathBuf> {
         match self {
             Pane::Leaf { id, content } if *id == target => {
-                content
-                    .active_surface()
-                    .and_then(|surface| match &surface.kind {
-                        SurfaceKind::Terminal { cwd, .. } => cwd.clone(),
-                        SurfaceKind::Browser { .. } => None,
-                    })
+                content.cwd_for_new_terminal()
             }
             Pane::Leaf { .. } => None,
             Pane::Split { first, second, .. } => first
@@ -1137,6 +1141,35 @@ impl PaneContent {
         }
     }
 
+    /// cwd to seed a new terminal spawned inside this pane. Active terminal's
+    /// cwd wins. If the active surface is a browser, walks earlier tabs and
+    /// returns the most recent terminal's cwd so the new terminal opens in
+    /// the user's last directory rather than the workspace root.
+    pub fn cwd_for_new_terminal(&self) -> Option<PathBuf> {
+        let PaneContent::Tabs { active, surfaces } = self else {
+            return None;
+        };
+        let active_idx = surfaces
+            .iter()
+            .position(|surface| surface.id == *active)
+            .unwrap_or(0);
+        let active_surface = surfaces.get(active_idx)?;
+        match &active_surface.kind {
+            SurfaceKind::Terminal { cwd, .. } => cwd.clone(),
+            SurfaceKind::Browser { .. } => {
+                surfaces[..active_idx]
+                    .iter()
+                    .rev()
+                    .find_map(|surface| match &surface.kind {
+                        SurfaceKind::Terminal {
+                            cwd: Some(cwd), ..
+                        } => Some(cwd.clone()),
+                        _ => None,
+                    })
+            }
+        }
+    }
+
     pub fn active_surface_mut(&mut self) -> Option<&mut PaneSurface> {
         match self {
             PaneContent::Tabs { active, surfaces } => {
@@ -1497,6 +1530,105 @@ mod tests {
             panic!("expected tabbed leaf")
         };
         assert!(surfaces[0].title_locked);
+    }
+
+    #[test]
+    fn terminal_surface_cwd_uses_active_tab_cwd() {
+        // A pane with three terminal tabs at /tmp, /home, /bin. While viewing
+        // /home, splitting should seed the new terminal at /home.
+        let pane_id = PaneId::new();
+        let mut pane = Pane::Leaf {
+            id: pane_id,
+            content: PaneContent::tabbed_terminal("tmp", Some("/tmp".into())),
+        };
+        let home = PaneSurface::terminal("home", Some("/home".into()));
+        let home_id = home.id;
+        let bin = PaneSurface::terminal("bin", Some("/bin".into()));
+        pane.add_surface_to_leaf(pane_id, home).unwrap();
+        pane.add_surface_to_leaf(pane_id, bin).unwrap();
+        assert!(pane.set_active_surface(pane_id, home_id));
+
+        assert_eq!(
+            pane.terminal_surface_cwd(pane_id),
+            Some(std::path::PathBuf::from("/home"))
+        );
+    }
+
+    #[test]
+    fn terminal_surface_cwd_falls_back_to_prior_terminal_when_browser_active() {
+        // Tabs in order: terminal(/tmp), browser, terminal(/home). With the
+        // browser active, the new terminal should inherit /tmp - the most
+        // recent terminal that comes *before* the browser in tab order.
+        let pane_id = PaneId::new();
+        let mut pane = Pane::Leaf {
+            id: pane_id,
+            content: PaneContent::tabbed_terminal("tmp", Some("/tmp".into())),
+        };
+        let browser = PaneSurface::browser("docs", "https://docs.test".into());
+        let browser_id = browser.id;
+        let home = PaneSurface::terminal("home", Some("/home".into()));
+        pane.add_surface_to_leaf(pane_id, browser).unwrap();
+        pane.add_surface_to_leaf(pane_id, home).unwrap();
+        assert!(pane.set_active_surface(pane_id, browser_id));
+
+        assert_eq!(
+            pane.terminal_surface_cwd(pane_id),
+            Some(std::path::PathBuf::from("/tmp"))
+        );
+    }
+
+    #[test]
+    fn terminal_surface_cwd_picks_most_recent_terminal_before_browser() {
+        // Tabs in order: terminal(/a), terminal(/b), browser. With the browser
+        // active, the closest terminal before it (/b) wins.
+        let pane_id = PaneId::new();
+        let mut pane = Pane::Leaf {
+            id: pane_id,
+            content: PaneContent::tabbed_terminal("a", Some("/a".into())),
+        };
+        let b = PaneSurface::terminal("b", Some("/b".into()));
+        pane.add_surface_to_leaf(pane_id, b).unwrap();
+        let browser = PaneSurface::browser("docs", "https://docs.test".into());
+        let browser_id = browser.id;
+        pane.add_surface_to_leaf(pane_id, browser).unwrap();
+        assert!(pane.set_active_surface(pane_id, browser_id));
+
+        assert_eq!(
+            pane.terminal_surface_cwd(pane_id),
+            Some(std::path::PathBuf::from("/b"))
+        );
+    }
+
+    #[test]
+    fn terminal_surface_cwd_returns_none_when_browser_has_no_prior_terminal() {
+        // Tabs in order: browser, terminal(/home). With the browser active,
+        // there is no terminal *before* it - resolution returns None so the
+        // caller falls back to the workspace root.
+        let pane_id = PaneId::new();
+        let pane_id_inner = pane_id;
+        let mut pane = Pane::Leaf {
+            id: pane_id_inner,
+            content: PaneContent::Tabs {
+                active: SurfaceId::new(),
+                surfaces: vec![],
+            },
+        };
+        let browser = PaneSurface::browser("docs", "https://docs.test".into());
+        let browser_id = browser.id;
+        let term = PaneSurface::terminal("home", Some("/home".into()));
+        // Manually set the surfaces vec because tabbed_terminal would create
+        // a terminal first.
+        if let Pane::Leaf {
+            content: PaneContent::Tabs { active, surfaces },
+            ..
+        } = &mut pane
+        {
+            surfaces.push(browser);
+            surfaces.push(term);
+            *active = browser_id;
+        }
+
+        assert_eq!(pane.terminal_surface_cwd(pane_id), None);
     }
 
     #[test]
