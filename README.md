@@ -112,6 +112,17 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
 ### Ubuntu 22.04 (jammy) — install via Flatpak
 
+> **Heads-up:** Ubuntu < 24.04 is **not recommended**. The Flatpak
+> path below works as a fallback, but because the terminal pane runs
+> the sandbox's own shell, host-installed tools (`git`, `tig`, `vim`,
+> `htop`, …) are **not visible** from inside the pane — only what
+> ships in the GNOME Platform runtime is reachable. Attempts to
+> escape the sandbox via `flatpak-spawn --host` fail to inherit a
+> controlling terminal cleanly (kernel rejects `TIOCSCTTY` on the
+> forwarded PTY), so this is a fundamental Flatpak limitation rather
+> than a configuration issue. If you need full host-tool access,
+> upgrade to Ubuntu 24.04+ and use the native apt build above.
+
 The native apt build above needs GTK 4.12+ and `libwebkitgtk-6.0`,
 neither of which is in the 22.04 archive. On 22.04 the supported path
 is Flatpak: the GNOME 48 runtime brings GTK 4.18, libadwaita 1.8,
