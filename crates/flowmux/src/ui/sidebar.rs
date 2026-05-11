@@ -13,7 +13,7 @@
 //! +----------------+
 //! ```
 //!
-//! The toolbar's `+` adds a workspace (Ctrl+Shift+N equivalent) and
+//! The toolbar's `+` adds a workspace (Ctrl+N equivalent) and
 //! the bell shows an in-process notification transcript. The list
 //! rows expose hover-X close, color bar, right-click menu (rename /
 //! recolor / close).
@@ -104,7 +104,7 @@ impl Sidebar {
 
         let new_btn = gtk::Button::from_icon_name("list-add-symbolic");
         new_btn.add_css_class("flat");
-        new_btn.set_tooltip_text(Some("New workspace (Ctrl+Shift+N)"));
+        new_btn.set_tooltip_text(Some("New workspace (Ctrl+N)"));
         let bridge_for_new = bridge.clone();
         new_btn.connect_clicked(move |_| {
             let bridge = bridge_for_new.clone();

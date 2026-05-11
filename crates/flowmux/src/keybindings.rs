@@ -77,7 +77,12 @@ pub const BINDINGS: &[(&str, &[&str])] = &[
     // browser-tab add button on the right side of the tab bar and pairs with
     // Ctrl+Shift+T for terminal tabs.
     ("win.new-browser-surface", &["<Ctrl><Shift>b"]),
-    ("win.new-workspace", &["<Ctrl><Shift>n"]),
+    // Ctrl+N opens a new workspace inside this window; Ctrl+Shift+N launches
+    // a brand-new flowmux window (a separate OS process under NON_UNIQUE).
+    // The two are deliberately split so the unshifted form stays cheap and
+    // local while the shifted form is the heavier "open another app window".
+    ("win.new-workspace", &["<Ctrl>n"]),
+    ("win.new-window", &["<Ctrl><Shift>n"]),
 ];
 
 /// Install accelerators on the application.
@@ -151,6 +156,7 @@ pub fn install_actions(
             })
             .build()
     };
+    let new_window = make_new_window_action();
     let new_surface = make_pane_action(
         "new-surface",
         focused.clone(),
@@ -242,6 +248,7 @@ pub fn install_actions(
         next_surface,
         prev_surface,
         new_workspace,
+        new_window,
         next_workspace,
         prev_workspace,
         w1,
@@ -422,6 +429,37 @@ fn make_close_surface_action(
         .build()
 }
 
+/// Action for `win.new-window` (Ctrl+Shift+N). Spawns a fresh `flowmux`
+/// process so the user gets a second top-level window. `NON_UNIQUE` on the
+/// GApplication is what makes this give a real window rather than an
+/// activation hand-off; see `build_application` in `main.rs` for the why.
+///
+/// We re-exec `current_exe()` (not just `"flowmux"`) so a build run out of
+/// `target/release/` opens another copy of the same binary rather than
+/// whatever happens to be on `PATH`.
+fn make_new_window_action() -> gtk::gio::ActionEntry<adw::ApplicationWindow> {
+    gtk::gio::ActionEntry::builder("new-window")
+        .activate(move |_, _, _| {
+            tracing::debug!(action = "new-window", "key action fired");
+            let exe = match std::env::current_exe() {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!(error = %e, "new-window: could not resolve current_exe()");
+                    return;
+                }
+            };
+            match std::process::Command::new(&exe).spawn() {
+                Ok(child) => {
+                    tracing::info!(pid = child.id(), exe = %exe.display(), "spawned new flowmux window");
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, exe = %exe.display(), "new-window: failed to spawn");
+                }
+            }
+        })
+        .build()
+}
+
 /// Action for `win.quit-app` (Ctrl+Shift+W). Asks the user to confirm
 /// before tearing the entire flowmux window down. We close the window
 /// rather than calling `application.quit()` so the existing
@@ -555,6 +593,56 @@ mod tests {
     fn ctrl_shift_b_opens_new_browser_surface_distinct_from_terminal_tab() {
         assert_eq!(accels("win.new-surface"), &["<Ctrl><Shift>t"]);
         assert_eq!(accels("win.new-browser-surface"), &["<Ctrl><Shift>b"]);
+    }
+
+    /// Ctrl+N must create a workspace inside the current window and
+    /// Ctrl+Shift+N must launch a brand-new flowmux window. These were
+    /// swapped intentionally — the unshifted form is the cheap/local
+    /// action, the shifted form is the heavier "open another app window"
+    /// action. Pinning both so a future shortcut shuffle doesn't quietly
+    /// flip them back.
+    #[test]
+    fn ctrl_n_opens_new_workspace_and_ctrl_shift_n_opens_new_window() {
+        assert_eq!(accels("win.new-workspace"), &["<Ctrl>n"]);
+        assert_eq!(accels("win.new-window"), &["<Ctrl><Shift>n"]);
+        // The two actions must not share an accelerator — sharing would
+        // collapse "new workspace in this window" and "new window" onto
+        // the same key.
+        let ws: std::collections::HashSet<_> =
+            accels("win.new-workspace").iter().copied().collect();
+        for accel in accels("win.new-window") {
+            assert!(
+                !ws.contains(accel),
+                "win.new-window must not share an accelerator with win.new-workspace"
+            );
+        }
+    }
+
+    /// The new-window action must be registered on the ApplicationWindow
+    /// under the `win` action group so the Ctrl+Shift+N accelerator
+    /// actually routes somewhere. Catches a regression where the entry
+    /// is built but never reaches `add_action_entries`.
+    #[gtk::test]
+    async fn new_window_action_is_registered_on_application_window_under_win_namespace() {
+        use gtk::gio::prelude::ActionGroupExt;
+
+        adw::init().expect("libadwaita should initialize in GTK test");
+        let app = adw::Application::builder()
+            .application_id("com.flowmux.App.UiTest.NewWindowActionRegistered")
+            .flags(gtk::gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(None::<&gtk::gio::Cancellable>).unwrap();
+        let window = adw::ApplicationWindow::builder()
+            .application(&app)
+            .default_width(320)
+            .default_height(240)
+            .build();
+        window.add_action_entries([make_new_window_action()]);
+
+        assert!(
+            window.has_action("new-window"),
+            "new-window action must be registered on the window so Ctrl+Shift+N routes to it"
+        );
     }
 
     /// Ctrl+Shift+W must trigger the whole-window quit confirmation,
