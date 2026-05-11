@@ -501,26 +501,42 @@ fn is_enter_key(keyval: gtk::gdk::Key) -> bool {
 ///   .bashrc / .zshrc so the user's PS1 + helpers are defined before
 ///   the first prompt.
 ///
-/// * **Inside Flatpak** — wrap with `flatpak-spawn --host --watch-bus`
-///   so the shell actually runs on the host, not inside the sandbox.
-///   Without this the sandbox's shell can't see the host's `~/.bashrc`
-///   nor any host-installed tools (`git`, `tig`, `xset`, …), producing
-///   `sh: git: command not found` for every command. `--watch-bus`
-///   ties the host-side process lifetime to ours so closing the pane
-///   actually reaps the shell. Requires
-///   `--talk-name=org.freedesktop.Flatpak` in the Flatpak manifest's
-///   finish-args.
+/// * **Inside Flatpak** — three layers, all required:
+///
+///     1. `flatpak-spawn --host --watch-bus` — escape the sandbox so
+///        the shell sees the host's `~/.bashrc`, the host's `PATH`,
+///        and host-installed tools (`git`, `tig`, …). `--watch-bus`
+///        ties the host-side process lifetime to ours so closing the
+///        pane reaps the shell. Requires
+///        `--talk-name=org.freedesktop.Flatpak` in the manifest.
+///     2. `script -q -c '…' /dev/null` — `flatpak-spawn` forwards
+///        stdin/stdout/stderr FDs but does NOT set up a controlling
+///        terminal on the host process, so dash refuses with
+///        `can't access tty; job control turned off` and bash
+///        silently disables job control. `script` allocates a fresh
+///        PTY on the host and assigns it as the ctty before exec'ing
+///        the inner command, restoring full job control + readline.
+///     3. `bash -l` (not `$SHELL -l`) — the sandbox's `$SHELL` is
+///        unreliable; on the GNOME Platform runtime it often resolves
+///        to `/bin/sh` (= dash on the host), which is what triggered
+///        the dash prompt the first time this was attempted. Force
+///        bash explicitly; zsh / fish users would need a follow-up to
+///        plumb the user's actual host shell via `getent passwd`.
 fn default_shell_argv() -> Vec<String> {
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
     if is_flatpak_sandbox() {
         vec![
             "flatpak-spawn".into(),
             "--host".into(),
             "--watch-bus".into(),
-            shell,
-            "-l".into(),
+            "--".into(),
+            "script".into(),
+            "-q".into(),
+            "-c".into(),
+            "exec bash -l".into(),
+            "/dev/null".into(),
         ]
     } else {
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
         vec![shell, "-l".into()]
     }
 }
