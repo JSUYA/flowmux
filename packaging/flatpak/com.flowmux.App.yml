@@ -30,6 +30,11 @@ modules:
       build-args:
         - --share=network
     config-opts:
+      # Force libdir=lib (meson defaults to lib64 on x86_64) so the
+      # generated vte-2.91-gtk4.pc lands in /app/lib/pkgconfig, which is
+      # what flatpak adds to PKG_CONFIG_PATH and where the runtime linker
+      # looks for /app libraries.
+      - -Dlibdir=lib
       - -Dgtk3=false
       - -Dgtk4=true
       - -Dvapi=false
