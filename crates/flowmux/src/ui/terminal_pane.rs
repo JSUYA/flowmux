@@ -501,29 +501,35 @@ fn is_enter_key(keyval: gtk::gdk::Key) -> bool {
 ///   .bashrc / .zshrc so the user's PS1 + helpers are defined before
 ///   the first prompt.
 ///
-/// * **Inside Flatpak** — run `flatpak-spawn --host --watch-bus -- bash
-///   -l`. The wrapper escapes the sandbox so the shell sees the host's
-///   `~/.bashrc`, host `PATH`, and host-installed tools (`git`, `tig`,
-///   `xset`, …). `--watch-bus` ties the host-side process lifetime to
-///   ours so closing the pane reaps the shell.
+/// * **Inside Flatpak** — run `flatpak-spawn --host --watch-bus --
+///   setsid --ctty bash -l`. The wrapper layers are:
 ///
-///   We force `bash` rather than passing `$SHELL` through: the sandbox's
-///   `$SHELL` on the GNOME Platform runtime frequently arrives as
-///   `/bin/sh`, which on the Debian/Ubuntu host is dash — dash without
-///   a controlling terminal emits `can't access tty; job control
-///   turned off` and has no readline, breaking the pane. bash is more
-///   forgiving: it silently disables job control when the inherited
-///   stdin tty is not its ctty, but readline, prompt expansion, and
-///   normal command execution all keep working. A previous attempt
-///   wrapped the inner shell in `script(1)` to allocate a fresh ctty,
-///   but that combination produced a runaway prompt-redraw loop
-///   through `flatpak-spawn`'s FD forwarding; the simpler unwrapped
-///   form is what works in practice. zsh / fish users in Flatpak get
-///   bash for now; lifting that requires resolving the user's actual
-///   host shell via `getent passwd` and is left as a follow-up.
+///   * `flatpak-spawn --host --watch-bus` — escape the sandbox so the
+///     shell sees the host's `~/.bashrc`, host `PATH`, and
+///     host-installed tools (`git`, `tig`, `xset`, …). `--watch-bus`
+///     ties the host-side process to our lifetime. Requires
+///     `--talk-name=org.freedesktop.Flatpak` in the manifest.
 ///
-///   Requires `--talk-name=org.freedesktop.Flatpak` in the Flatpak
-///   manifest's finish-args.
+///   * `setsid --ctty` — start a new session on the host and assign
+///     the forwarded PTY FD as the new session's controlling terminal
+///     via `TIOCSCTTY`. Without this step, programs that open
+///     `/dev/tty` directly (tig, less, vim, htop, …) fail with
+///     "Failed to open tty for input" and bash prints "cannot set
+///     terminal process group … no job control in this shell". With
+///     it, the host shell gets full job-control and `/dev/tty` works.
+///     The kernel rejects this if the PTY is already claimed by
+///     another session (the sandbox's `flatpak-spawn` process); when
+///     that happens setsid exits with an error and the pane shows it
+///     instead of running a broken shell. A previous attempt wrapped
+///     the shell in `script(1)` to allocate a fresh host-side PTY,
+///     but that combination produced a runaway prompt-redraw loop
+///     through `flatpak-spawn`'s FD forwarding.
+///
+///   * `bash -l` (not `$SHELL -l`) — the sandbox's `$SHELL` on the
+///     GNOME Platform runtime often arrives as `/bin/sh`, which on
+///     Debian/Ubuntu hosts is dash, and dash without ctty refuses to
+///     start. Force bash; zsh / fish users get bash for now, lifting
+///     that needs `getent passwd` plumbing as a follow-up.
 fn default_shell_argv() -> Vec<String> {
     if is_flatpak_sandbox() {
         vec![
@@ -531,6 +537,8 @@ fn default_shell_argv() -> Vec<String> {
             "--host".into(),
             "--watch-bus".into(),
             "--".into(),
+            "setsid".into(),
+            "--ctty".into(),
             "bash".into(),
             "-l".into(),
         ]
