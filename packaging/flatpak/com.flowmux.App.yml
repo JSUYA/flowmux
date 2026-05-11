@@ -19,6 +19,27 @@ finish-args:
   # by default so the in-sandbox `flowmux` CLI uses the same path.
 
 modules:
+  # libvte is not bundled in org.gnome.Platform (terminal lib, not generic
+  # GNOME). Build it from upstream so the vte4-sys crate's pkg-config probe
+  # finds `vte-2.91-gtk4 >= 0.76` inside the sandbox.
+  - name: vte
+    buildsystem: meson
+    config-opts:
+      - -Dgtk3=false
+      - -Dgtk4=true
+      - -Dvapi=false
+      - -Dgir=false
+      - -Ddocs=false
+      - -D_systemd=false
+    cleanup:
+      - /bin
+      - /libexec
+      - /share/vala
+    sources:
+      - type: git
+        url: https://gitlab.gnome.org/GNOME/vte.git
+        tag: '0.80.0'
+
   - name: flowmux
     buildsystem: simple
     build-options:
