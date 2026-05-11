@@ -493,29 +493,164 @@ fn is_enter_key(keyval: gtk::gdk::Key) -> bool {
 /// argv used when the caller asks for the default shell (no explicit
 /// command).
 ///
-/// Runs `$SHELL -l` (login shell). The `-l` flag makes any POSIX-ish
-/// shell source the per-shell profile (.bash_profile / .profile /
-/// .zprofile / fish login conf), which in turn pulls .bashrc / .zshrc
-/// so the user's PS1 + helpers are defined before the first prompt.
-/// Same convention xterm / alacritty / kitty use.
+/// **Outside a sandbox** — run `$SHELL -l`. The `-l` flag makes any
+/// POSIX-ish shell source the per-shell profile (.bash_profile /
+/// .profile / .zprofile / fish login conf), which in turn pulls
+/// .bashrc / .zshrc so the user's PS1 + helpers are defined before
+/// the first prompt. Same convention xterm / alacritty / kitty use.
 ///
-/// Note on Flatpak: inside a Flatpak sandbox this runs the sandbox's
-/// own shell, so it cannot see host-installed tools (`git`, `tig`,
-/// `xset`, …) — only what's packaged in the GNOME Platform runtime.
-/// Several attempts at escaping the sandbox via `flatpak-spawn --host`
-/// (with `script(1)` and `setsid --ctty` wrappers) were tried and
-/// each produced a worse failure mode: `setsid` is denied
-/// `TIOCSCTTY` because the kernel keeps the PTY's session leader as
-/// the in-sandbox `flatpak-spawn` process, and the `script` wrapper
-/// caused a runaway prompt-redraw loop through `flatpak-spawn`'s
-/// FD-forwarding pipe. A controlling-terminal-aware host bridge
-/// remains a future option, but the only currently working baseline
-/// is the in-sandbox shell. Users who need host tools should install
-/// flowmux natively rather than via Flatpak.
+/// **Inside Flatpak** — wrap the host shell in an inline Python
+/// bridge. `flatpak-spawn --host` forwards stdin/stdout FDs to a host
+/// process but cannot grant `TIOCSCTTY` on the sandbox PTY (kernel
+/// keeps the in-sandbox `flatpak-spawn` as the session leader), so a
+/// bare host shell starts with no controlling terminal: `tig` /
+/// `vim` / `less` / `htop` and similar tools that open `/dev/tty`
+/// outright fail. We worked around this several ways before, all of
+/// which produced worse symptoms: `script -c …` caused a runaway
+/// prompt-redraw loop through `flatpak-spawn`'s FD-forwarding pipe;
+/// `setsid --ctty` got `EPERM` because the original PTY belongs to
+/// another session.
+///
+/// The Python bridge does the job by hand and cleanly:
+///
+///   1. `pty.fork()` (= libc `forkpty(3)`) allocates a *fresh* PTY
+///      pair on the host. `TIOCSCTTY` on a newly-created PTY always
+///      succeeds, so the child shell gets full ctty + job control +
+///      `/dev/tty`.
+///   2. The user's actual host shell is resolved via
+///      `pwd.getpwuid(os.getuid()).pw_shell`, i.e. from the host's
+///      `/etc/passwd` rather than the sandbox's potentially mangled
+///      `$SHELL` (which on the GNOME Platform runtime tends to
+///      arrive as `/bin/sh`, putting bash into POSIX mode and
+///      breaking `.bashrc`'s `export var-with-dash=…` lines).
+///   3. The parent process is a tiny select loop that pumps bytes
+///      between the forwarded sandbox PTY (FD 0 / FD 1) and the new
+///      host PTY's master FD, plus polls `TIOCGWINSZ` to forward
+///      window-resize updates. Hand-written so we don't trip the
+///      same FD-forwarding edge case that broke `script(1)`.
+///   4. On exit it `SIGHUP`s the shell's process group so the host
+///      side is reaped when flowmux's pane goes away.
+///
+/// Python 3 ships with every mainstream Linux desktop and `pty` is
+/// in the stdlib, so this needs no additional packages on the host.
+/// Requires `--talk-name=org.freedesktop.Flatpak` in the Flatpak
+/// manifest's finish-args so `flatpak-spawn` can reach the session
+/// helper.
 fn default_shell_argv() -> Vec<String> {
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
-    vec![shell, "-l".into()]
+    if is_flatpak_sandbox() {
+        vec![
+            "flatpak-spawn".into(),
+            "--host".into(),
+            "--watch-bus".into(),
+            "--".into(),
+            "python3".into(),
+            "-u".into(),
+            "-c".into(),
+            FLATPAK_HOST_SHELL_BRIDGE.into(),
+        ]
+    } else {
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
+        vec![shell, "-l".into()]
+    }
 }
+
+/// Detect whether the current process is running inside a Flatpak
+/// sandbox. Flatpak sets `FLATPAK_ID` for sandboxed apps and writes a
+/// `/.flatpak-info` file at the sandbox root; either is sufficient
+/// proof.
+fn is_flatpak_sandbox() -> bool {
+    std::env::var_os("FLATPAK_ID").is_some() || std::path::Path::new("/.flatpak-info").exists()
+}
+
+/// Inline Python program that runs on the *host* via `flatpak-spawn
+/// --host`. See `default_shell_argv` for the why; the script itself
+/// is intentionally small and self-contained because it's passed as
+/// `python3 -c <source>` argv. Edits here change the behavior of the
+/// shell that flowmux's terminal pane exposes when running inside a
+/// Flatpak sandbox.
+const FLATPAK_HOST_SHELL_BRIDGE: &str = r#"
+import pty, os, sys, fcntl, termios, struct, select, signal, pwd
+
+shell = pwd.getpwuid(os.getuid()).pw_shell or '/bin/bash'
+
+def winsize():
+    try:
+        return struct.unpack('HHHH', fcntl.ioctl(0, termios.TIOCGWINSZ, b'\x00' * 8))
+    except OSError:
+        return (24, 80, 0, 0)
+
+pid, fd = pty.fork()
+if pid == 0:
+    # Child: pty.fork() has already made us the session leader of a
+    # fresh PTY and wired its slave to stdin/stdout/stderr. exec the
+    # user's login shell.
+    os.execvp(shell, [shell, '-l'])
+
+last_ws = None
+def sync_winsize():
+    global last_ws
+    cur = winsize()
+    if cur != last_ws:
+        last_ws = cur
+        try:
+            fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack('HHHH', *cur))
+        except OSError:
+            pass
+
+sync_winsize()
+
+def on_term(*_):
+    try:
+        os.killpg(os.getpgid(pid), signal.SIGHUP)
+    except OSError:
+        pass
+    sys.exit(0)
+
+signal.signal(signal.SIGTERM, on_term)
+signal.signal(signal.SIGHUP, on_term)
+
+try:
+    while True:
+        # 0.5s tick doubles as a winsize poll: flatpak-spawn doesn't
+        # forward SIGWINCH reliably so we re-read TIOCGWINSZ on every
+        # idle wake-up and push it through to the host PTY.
+        rfds, _, _ = select.select([0, fd], [], [], 0.5)
+        sync_winsize()
+        if 0 in rfds:
+            try:
+                data = os.read(0, 4096)
+            except OSError:
+                data = b''
+            if not data:
+                break
+            try:
+                os.write(fd, data)
+            except OSError:
+                break
+        if fd in rfds:
+            try:
+                data = os.read(fd, 4096)
+            except OSError:
+                data = b''
+            if not data:
+                break
+            try:
+                os.write(1, data)
+            except OSError:
+                break
+except KeyboardInterrupt:
+    pass
+
+try:
+    os.killpg(os.getpgid(pid), signal.SIGHUP)
+except OSError:
+    pass
+try:
+    _, status = os.waitpid(pid, 0)
+    sys.exit(os.waitstatus_to_exitcode(status))
+except (ChildProcessError, ValueError):
+    sys.exit(0)
+"#;
 
 #[cfg(test)]
 mod tests {
