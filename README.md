@@ -134,7 +134,7 @@ will be degraded unless gst-plugins-bad is installed.`
 
 ```bash
 # release build of the GUI app and the CLI helper
-cargo build --release -p flowmux -p flowmux-cli
+cargo build --release -p flowmux -p flowmux-cli -p flowmux-core -p flowmux-daemon
 ```
 
 The release profile produces two binaries under `target/release/`:
