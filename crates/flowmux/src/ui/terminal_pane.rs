@@ -214,6 +214,7 @@ impl TerminalPane {
         // same pane. Plain clicks continue into VTE text selection.
         install_url_link_handling(&term, id, callbacks.on_open_url.clone());
         install_shift_enter_newline_handling(&term);
+        install_flatpak_ibus_nav_workaround(&term);
 
         // Process exit.
         {
@@ -569,6 +570,114 @@ fn install_shift_enter_newline_handling(term: &vte::Terminal) {
         let shortcut = gtk::Shortcut::new(Some(trigger), Some(action.clone()));
         controller.add_shortcut(shortcut);
     }
+
+    term.add_controller(controller);
+}
+
+/// Workaround for the Ubuntu 22.04 host + GNOME 48 Flatpak runtime
+/// IBus regression where plain navigation / editing keys during
+/// Hangul preedit are silently dropped. The deciding reproducer was
+/// that the same keys with `Ctrl` held down worked fine on the same
+/// setup — Ctrl takes the event past GTK's IM filter without
+/// involving IBus at all. That places the bug in the IBus daemon-
+/// path the runtime's GTK4 immodule uses for plain non-character
+/// keys, somewhere between the in-sandbox client and the host's
+/// IBus 1.5.26 daemon. Neither half is under flowmux's control, so
+/// the only available fix is to bypass that path from the
+/// application side.
+///
+/// Approach: install a capture-phase `ShortcutController` on the
+/// VTE widget for the affected plain keys. When one matches we
+/// feed the equivalent terminal byte sequence straight to the PTY
+/// and consume the event so VTE's own IM-aware handler never sees
+/// it — exactly the path a plain key takes on a working host
+/// (IBus says "not for me", GTK passes the event through, VTE
+/// feeds the PTY). Letter / number / punctuation keys are not
+/// intercepted, so Korean composition itself still goes through
+/// IBus and preedit keeps working for character input.
+///
+/// What is intentionally **not** intercepted:
+///   * Space. Its natural role inside IBus is "commit the current
+///     preedit + insert space", and bypassing it would feed bare
+///     0x20 to the PTY without committing the Korean syllable,
+///     dropping the user's text on the floor. Commit with
+///     `Ctrl+Space` (which works on this setup precisely because
+///     the Ctrl modifier bypasses IBus) before pressing Space.
+///   * Letter / number / punctuation keys. IBus needs to see them.
+///   * Function keys F1..F12. Encoding varies enough across
+///     terminfo profiles that getting it wrong is worse than
+///     leaving them on the broken-but-rarely-used IBus path.
+///
+/// **Enter is bypassed by user request, with the same caveat as
+/// Space would carry.** Pressing plain Enter while preedit is on
+/// screen sends only `\r` to the PTY; the in-progress Korean
+/// syllable is NOT committed first and is lost. Users who need to
+/// keep that syllable should commit it with `Ctrl+Enter` before
+/// hitting Enter, or fall back to typing the syllable + Space (no
+/// bypass) + Enter (bypass). The trade-off is deliberate: a
+/// working plain Enter is more useful than a no-op one.
+///
+/// Active only inside a Flatpak sandbox (`/.flatpak-info` exists).
+/// Native builds talk to a matching-version IBus daemon and do
+/// not exhibit the drop, so they keep the regular path with no
+/// behavioural change. `FLOWMUX_NO_IBUS_NAV_WORKAROUND=1`
+/// disables the bypass for bisection.
+fn install_flatpak_ibus_nav_workaround(term: &vte::Terminal) {
+    if std::env::var_os("FLOWMUX_NO_IBUS_NAV_WORKAROUND").is_some() {
+        return;
+    }
+    if !std::path::Path::new("/.flatpak-info").exists() {
+        return;
+    }
+
+    let controller = gtk::ShortcutController::new();
+    controller.set_propagation_phase(gtk::PropagationPhase::Capture);
+    controller.set_scope(gtk::ShortcutScope::Local);
+
+    let bind = |keyval: gtk::gdk::Key, bytes: &'static [u8]| {
+        let term_widget = term.clone();
+        let action = gtk::CallbackAction::new(move |_, _| {
+            term_widget.feed_child(bytes);
+            glib::Propagation::Stop
+        });
+        let trigger = gtk::KeyvalTrigger::new(keyval, gtk::gdk::ModifierType::empty());
+        controller.add_shortcut(gtk::Shortcut::new(Some(trigger), Some(action)));
+    };
+
+    // Standard xterm encodings — same bytes VTE itself would write
+    // to the PTY when its key handler reached the forward-to-PTY
+    // branch on a working IM path. We are not changing semantics,
+    // only skipping the broken IBus round trip.
+    bind(gtk::gdk::Key::BackSpace, b"\x7f");
+    bind(gtk::gdk::Key::Delete, b"\x1b[3~");
+    bind(gtk::gdk::Key::Tab, b"\t");
+    bind(gtk::gdk::Key::Escape, b"\x1b");
+    // Enter: plain CR. Cost — any pending Hangul preedit is silently
+    // dropped (the GTK4 immodule does not expose an external commit
+    // hook). Documented in the function header above.
+    bind(gtk::gdk::Key::Return, b"\r");
+    bind(gtk::gdk::Key::ISO_Enter, b"\r");
+    bind(gtk::gdk::Key::Left, b"\x1b[D");
+    bind(gtk::gdk::Key::Right, b"\x1b[C");
+    bind(gtk::gdk::Key::Up, b"\x1b[A");
+    bind(gtk::gdk::Key::Down, b"\x1b[B");
+    bind(gtk::gdk::Key::Home, b"\x1b[H");
+    bind(gtk::gdk::Key::End, b"\x1b[F");
+    bind(gtk::gdk::Key::Page_Up, b"\x1b[5~");
+    bind(gtk::gdk::Key::Page_Down, b"\x1b[6~");
+    // Keypad variants of the same keys — some layouts (notebook + Fn,
+    // X11 with NumLock off, …) report them as the KP_* keysyms even
+    // when the user hits the equivalent unshifted key.
+    bind(gtk::gdk::Key::KP_Delete, b"\x1b[3~");
+    bind(gtk::gdk::Key::KP_Enter, b"\r");
+    bind(gtk::gdk::Key::KP_Left, b"\x1b[D");
+    bind(gtk::gdk::Key::KP_Right, b"\x1b[C");
+    bind(gtk::gdk::Key::KP_Up, b"\x1b[A");
+    bind(gtk::gdk::Key::KP_Down, b"\x1b[B");
+    bind(gtk::gdk::Key::KP_Home, b"\x1b[H");
+    bind(gtk::gdk::Key::KP_End, b"\x1b[F");
+    bind(gtk::gdk::Key::KP_Page_Up, b"\x1b[5~");
+    bind(gtk::gdk::Key::KP_Page_Down, b"\x1b[6~");
 
     term.add_controller(controller);
 }
