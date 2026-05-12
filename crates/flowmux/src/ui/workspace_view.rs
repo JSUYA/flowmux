@@ -1133,7 +1133,11 @@ fn build_panel(
             });
             pane.widget.add_controller(focus);
 
-            let widget = pane.root.clone();
+            // The bare VTE widget is the pane's root — never wrap it in
+            // a one-child layout container before inserting it into the
+            // surface stack. See the doc comment on TerminalPane.widget
+            // for why (Paned split sizing regression).
+            let widget = pane.widget.clone().upcast::<gtk::Widget>();
             let mut r = registry.borrow_mut();
             r.terminals.insert(surface.id, pane);
             r.surface_workspace.insert(surface.id, workspace);

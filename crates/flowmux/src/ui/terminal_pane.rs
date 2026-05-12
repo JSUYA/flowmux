@@ -24,10 +24,23 @@ use vte::prelude::*;
 #[derive(Clone)]
 pub struct TerminalPane {
     pub id: PaneId,
-    /// The VTE widget itself — apply_to_vte / feed call into this.
+    /// The VTE widget itself. Doubles as the pane's *root* widget — the
+    /// thing that gets inserted into the workspace's pane stack. Callers
+    /// pass `pane.widget.clone().upcast::<gtk::Widget>()` whenever they
+    /// need a generic widget handle.
+    ///
+    /// **Do not wrap this in another widget when inserting it into the
+    /// pane tree.** A previous attempt (commit eb2d176, reverted) hosted
+    /// a Shift+Enter `ShortcutController` on a one-child `gtk::Box`
+    /// wrapper around the VTE; the wrapper's measure() did not propagate
+    /// VTE's natural character-cell minimum the way a direct child does,
+    /// so once two `gtk::Paned` splits were nested, tig / vim / htop
+    /// rendered with the left/right/top/bottom edges clipped. The bare
+    /// `vte::Terminal` must remain the immediate child of whatever
+    /// container holds it for the existing `set_shrink_*_child(false)`
+    /// fix (commit b507b7a) on each `gtk::Paned` to keep producing
+    /// correct sizes.
     pub widget: vte::Terminal,
-    /// Widget that goes into a pane-local surface stack.
-    pub root: gtk::Widget,
     /// PID of the spawned shell.
     pub pid: Rc<Cell<Option<i32>>>,
 }
@@ -343,7 +356,6 @@ impl TerminalPane {
 
         Self {
             id,
-            root: term.clone().upcast(),
             widget: term,
             pid,
         }
