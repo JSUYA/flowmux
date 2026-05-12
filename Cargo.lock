@@ -1011,6 +1011,8 @@ dependencies = [
  "flowmux-core",
  "flowmux-ipc",
  "flowmux-notify",
+ "libc",
+ "nix",
  "serde",
  "serde_json",
  "tempfile",

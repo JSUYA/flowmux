@@ -159,6 +159,7 @@ impl TerminalPane {
     /// explicit flags. Build the vector with `flowmux_terminal::agent_pty_env`.
     pub fn spawn(
         id: PaneId,
+        surface: SurfaceId,
         argv: Vec<String>,
         cwd: Option<std::path::PathBuf>,
         extra_env: Vec<(String, String)>,
@@ -171,11 +172,18 @@ impl TerminalPane {
         term.set_audible_bell(false);
 
         // OSC 99 (Konsole-format) is not exposed as a signal on Ubuntu's
-        // VTE 0.76 build — the `notification-received` signal is a
-        // Konsole extension compiled out in upstream VTE. We capture
-        // OSC notifications via the `flowmux notify-stream` CLI today,
-        // and a PTY-tee path is planned in flowmux-terminal so the GUI
-        // can subscribe directly without wrapping every command.
+        // VTE 0.68 / 0.76 builds — the `notification-received` signal is
+        // a Konsole extension compiled out in upstream VTE. We capture
+        // OSC 9 / 99 / 777 by wrapping the shell argv with
+        // `flowmuxctl pty-tee` (see `wrap_argv_with_pty_tee` below):
+        // the helper forks the shell on an inner PTY, snoops every
+        // inner→outer byte through `flowmux_notify::OscExtractor`, and
+        // forwards parsed notifications to the daemon via
+        // `Request::Notify`. The GUI's `on_notification` callback is
+        // therefore not the path that fires for real OSCs; the daemon
+        // dispatches them directly, identical to a `flowmux notify`
+        // CLI call. The callback remains in `PaneCallbacks` for the
+        // hypothetical day VTE upstream reinstates the signal.
         let _unused_notification_cb = &callbacks.on_notification;
 
         // BEL — generic attention.
@@ -292,6 +300,14 @@ impl TerminalPane {
         } else {
             argv
         };
+        // Wrap the shell argv with `flowmuxctl pty-tee` so OSC 9/99/777
+        // emitted by terminal-side agents (Claude Code, Codex, …)
+        // reach the desktop notification subsystem even on VTE
+        // versions (0.68 on Ubuntu 22.04, 0.76 on Ubuntu 24.04) that
+        // silently drop those escapes. If the helper is missing we
+        // fall back to a direct shell spawn so the terminal still
+        // works — only the OSC sniffer is lost.
+        let argv = wrap_argv_with_pty_tee(argv, id, surface);
         let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
         let cwd_str = cwd.as_ref().and_then(|p| p.to_str());
 
@@ -336,6 +352,43 @@ impl TerminalPane {
     pub fn feed(&self, bytes: &[u8]) {
         self.widget.feed_child(bytes);
     }
+}
+
+/// Prepend `flowmuxctl pty-tee --pane <id> --surface <id> --` in front
+/// of the user's shell argv so OSC 9 / 99 / 777 escapes emitted by
+/// terminal-side agents (Claude Code, Codex, OpenCode, …) reach the
+/// daemon's `Request::Notify` path. VTE 0.68 (Ubuntu 22.04) and 0.76
+/// (Ubuntu 24.04) both silently swallow those OSCs because they were
+/// only ever wired into the Konsole-private `notification-received`
+/// signal that upstream VTE compiles out — the tee is the only
+/// distribution-agnostic interception point.
+///
+/// Falls back to the original argv when `flowmuxctl` cannot be
+/// located. The terminal then works exactly as before, just without
+/// OSC-driven alarms — strictly a graceful degradation.
+fn wrap_argv_with_pty_tee(
+    argv: Vec<String>,
+    pane: PaneId,
+    surface: SurfaceId,
+) -> Vec<String> {
+    let Some(ctl) = flowmux_terminal::find_flowmuxctl() else {
+        tracing::warn!(
+            "flowmuxctl not found next to the GUI binary; OSC 9/99/777 alarms \
+             from terminal-side agents will be silently dropped until it is \
+             installed. Falling back to a direct shell spawn."
+        );
+        return argv;
+    };
+    let mut wrapped = Vec::with_capacity(argv.len() + 6);
+    wrapped.push(ctl.display().to_string());
+    wrapped.push("pty-tee".to_string());
+    wrapped.push("--pane".to_string());
+    wrapped.push(pane.to_string());
+    wrapped.push("--surface".to_string());
+    wrapped.push(surface.to_string());
+    wrapped.push("--".to_string());
+    wrapped.extend(argv);
+    wrapped
 }
 
 // ---- URL link handling --------------------------------------------------
@@ -451,43 +504,61 @@ fn install_url_link_handling(
 
 const ALT_ENTER_BYTES: &[u8] = b"\x1b\r";
 
+/// Intercept Shift+Enter on the VTE widget and translate it to ESC+CR — the
+/// byte sequence agent TUIs (Claude, Codex, OpenCode) already treat as
+/// "insert newline" — before VTE's own Enter handler sees the event.
+///
+/// ### Why a `ShortcutController` and not an `EventControllerKey`
+///
+/// An earlier version of this hook used `gtk::EventControllerKey` in
+/// `PropagationPhase::Capture`. That sits in front of VTE's internal IM
+/// filter on every keystroke, and on Ubuntu 22.04's GTK 4.6 + VTE 0.68
+/// combination the IBus Hangul preedit handler ends up desynchronized when
+/// any capture-phase key controller is attached to the VTE widget. The
+/// reported symptom is that Backspace and the arrow keys stop reacting
+/// while a Korean syllable is being composed — IBus Hangul never receives
+/// them, so the preedit cannot be edited or committed. Plain ASCII typing,
+/// composition itself, and any key event outside of preedit are unaffected,
+/// which is why the regression slipped through.
+///
+/// `gtk::ShortcutController` only ever fires when an incoming event matches
+/// one of its `KeyvalTrigger`s. Every other keystroke — including the keys
+/// IBus Hangul cares about during preedit — propagates untouched to VTE's
+/// native IM path, so the GTK4 + IBus pipeline behaves exactly as it would
+/// on a vanilla `vte::Terminal` with no controller attached.
 fn install_shift_enter_newline_handling(term: &vte::Terminal) {
-    // A traditional PTY does not carry a distinct Shift+Enter event.
-    // Agent TUIs already treat Alt+Enter as "insert newline", so synthesize
-    // that byte sequence for Shift+Enter before VTE sees a plain Enter.
-    let key = gtk::EventControllerKey::new();
-    key.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let controller = gtk::ShortcutController::new();
+    // Capture phase: VTE's own Shift+Enter handling sends \r to the PTY at
+    // the target phase, which would defeat the translation. Capture beats
+    // it; matching events are consumed before VTE sees them, non-matching
+    // events propagate normally.
+    controller.set_propagation_phase(gtk::PropagationPhase::Capture);
+    controller.set_scope(gtk::ShortcutScope::Local);
 
     let term_widget = term.clone();
-    key.connect_key_pressed(move |_, keyval, _keycode, state| {
-        if should_translate_shift_enter(keyval, state) {
-            term_widget.feed_child(ALT_ENTER_BYTES);
-            glib::Propagation::Stop
-        } else {
-            glib::Propagation::Proceed
-        }
+    let action = gtk::CallbackAction::new(move |_, _| {
+        term_widget.feed_child(ALT_ENTER_BYTES);
+        glib::Propagation::Stop
     });
 
-    term.add_controller(key);
-}
-
-fn should_translate_shift_enter(keyval: gtk::gdk::Key, state: gtk::gdk::ModifierType) -> bool {
-    if !is_enter_key(keyval) || !state.contains(gtk::gdk::ModifierType::SHIFT_MASK) {
-        return false;
+    // Cover the three keysyms a layout can produce for Enter:
+    //   - Return: the main keyboard's Enter key
+    //   - KP_Enter: numpad Enter
+    //   - ISO_Enter: keyboards that route through an ISO layout group
+    // `KeyvalTrigger` matches only when the requested modifiers are exactly
+    // present (CapsLock / NumLock latches are ignored), so Ctrl+Shift+Enter
+    // and Alt+Shift+Enter stay on VTE's native path.
+    for keyval in [
+        gtk::gdk::Key::Return,
+        gtk::gdk::Key::KP_Enter,
+        gtk::gdk::Key::ISO_Enter,
+    ] {
+        let trigger = gtk::KeyvalTrigger::new(keyval, gtk::gdk::ModifierType::SHIFT_MASK);
+        let shortcut = gtk::Shortcut::new(Some(trigger), Some(action.clone()));
+        controller.add_shortcut(shortcut);
     }
 
-    let native_modifiers = gtk::gdk::ModifierType::CONTROL_MASK
-        | gtk::gdk::ModifierType::ALT_MASK
-        | gtk::gdk::ModifierType::SUPER_MASK
-        | gtk::gdk::ModifierType::HYPER_MASK
-        | gtk::gdk::ModifierType::META_MASK;
-    !state.intersects(native_modifiers)
-}
-
-fn is_enter_key(keyval: gtk::gdk::Key) -> bool {
-    keyval == gtk::gdk::Key::Return
-        || keyval == gtk::gdk::Key::KP_Enter
-        || keyval == gtk::gdk::Key::ISO_Enter
+    term.add_controller(controller);
 }
 
 /// argv used when the caller asks for the default shell (no explicit
@@ -766,31 +837,10 @@ mod tests {
     }
 
     #[test]
-    fn shift_enter_is_translated_for_prompt_newlines() {
-        assert!(should_translate_shift_enter(
-            gtk::gdk::Key::Return,
-            gtk::gdk::ModifierType::SHIFT_MASK
-        ));
-        assert!(should_translate_shift_enter(
-            gtk::gdk::Key::KP_Enter,
-            gtk::gdk::ModifierType::SHIFT_MASK | gtk::gdk::ModifierType::LOCK_MASK
-        ));
+    fn shift_enter_byte_sequence_is_esc_cr() {
+        // Agent TUIs (Claude, Codex, OpenCode) all treat ESC+CR as "insert
+        // newline". Lock the wire format so a future refactor does not turn
+        // Shift+Enter into a literal newline submission again.
         assert_eq!(ALT_ENTER_BYTES, b"\x1b\r");
-    }
-
-    #[test]
-    fn plain_or_modified_enter_keeps_native_terminal_handling() {
-        assert!(!should_translate_shift_enter(
-            gtk::gdk::Key::Return,
-            gtk::gdk::ModifierType::empty()
-        ));
-        assert!(!should_translate_shift_enter(
-            gtk::gdk::Key::Return,
-            gtk::gdk::ModifierType::SHIFT_MASK | gtk::gdk::ModifierType::CONTROL_MASK
-        ));
-        assert!(!should_translate_shift_enter(
-            gtk::gdk::Key::Return,
-            gtk::gdk::ModifierType::SHIFT_MASK | gtk::gdk::ModifierType::ALT_MASK
-        ));
     }
 }

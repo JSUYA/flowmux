@@ -7,8 +7,9 @@
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use flowmux_config::paths;
-use flowmux_core::{NotificationLevel, PaneId, SplitDirection};
+use flowmux_core::{NotificationLevel, PaneId, SplitDirection, SurfaceId};
 use flowmux_ipc::{client::Client, protocol::Request, protocol::Response};
+use std::ffi::OsString;
 use std::io::Read;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -17,6 +18,7 @@ mod agent;
 mod doctor;
 mod hook_install;
 mod hooks;
+mod pty_tee;
 
 /// Read `FLOWMUX_PANE_ID` (set by `flowmux` at PTY spawn time) and parse
 /// it as a `PaneId`. Returns `None` if the env var is missing or invalid.
@@ -132,6 +134,34 @@ enum Cmd {
         /// Optional pane id to attribute notifications to.
         #[arg(long)]
         pane: Option<PaneId>,
+    },
+
+    /// Internal: PTY-tee proxy used by the GUI as a transparent
+    /// wrapper around the user's shell.
+    ///
+    /// Forks the child argv on an inner PTY, pumps bytes between the
+    /// outer terminal (VTE) and the inner shell, and snoops every
+    /// inner→outer byte through the OSC parser so OSC 9 / 99 / 777
+    /// notifications emitted by agents like Claude Code or Codex
+    /// reach the daemon's `Request::Notify` path even though VTE
+    /// 0.68/0.76 silently drop those escapes.
+    ///
+    /// Hidden because end users should never invoke it directly —
+    /// `terminal_pane::spawn` wraps the shell with it automatically.
+    #[command(name = "pty-tee", hide = true)]
+    PtyTee {
+        /// Pane id this terminal belongs to. Forwarded as the
+        /// notification's `pane` so the bell-popover click router can
+        /// focus the right pane.
+        #[arg(long)]
+        pane: Option<PaneId>,
+        /// Surface (tab) id inside `pane`. Lets the router switch
+        /// tabs when the user is currently looking at a sibling.
+        #[arg(long)]
+        surface: Option<SurfaceId>,
+        /// Argv of the user's shell (everything after `--`).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 1..)]
+        argv: Vec<OsString>,
     },
 
     /// Open a workspace with N panes, each running `claude`.
@@ -438,7 +468,36 @@ async fn main() -> anyhow::Result<()> {
         // ping the daemon; `Fix` never does.
         Cmd::Doctor => return run_doctor(cli.socket.clone(), cli.json).await,
         Cmd::Fix => return run_fix(cli.json),
+        Cmd::PtyTee { .. } => {} // handled below, after the connect block
         _ => {}
+    }
+
+    // pty-tee owns its own (synchronous) PTY pump and a worker thread
+    // for IPC; running it under the outer tokio runtime would prevent
+    // the blocking poll() loop from ever yielding. Dispatch it here,
+    // outside the daemon-connect path, so `Cmd::PtyTee` works even if
+    // the daemon hasn't come up yet — the worker reconnects on its
+    // own with backoff. The `matches!` gate is two lines so we can
+    // destructure-by-value below without borrowing-then-moving `cmd`.
+    if matches!(cmd, Cmd::PtyTee { .. }) {
+        let Cmd::PtyTee {
+            pane,
+            surface,
+            argv,
+        } = cmd
+        else {
+            unreachable!("matches! just confirmed the variant")
+        };
+        // Escape the outer tokio runtime into a fresh OS thread so the
+        // blocking poll() inside pty_tee::run does not starve runtime
+        // workers; the IPC half lives on its own current-thread tokio
+        // runtime spawned inside pty_tee::ipc_worker.
+        let socket = cli.socket.clone();
+        let handle = std::thread::spawn(move || pty_tee::run(pane, surface, socket, argv));
+        let exit_code = handle
+            .join()
+            .map_err(|_| anyhow::anyhow!("pty-tee thread panicked"))??;
+        std::process::exit(exit_code);
     }
 
     let socket = cli
@@ -618,6 +677,7 @@ fn build_request(cmd: Cmd) -> anyhow::Result<Request> {
         Cmd::Hooks { .. } => unreachable!("handled before request build"),
         Cmd::Doctor => unreachable!("handled before request build"),
         Cmd::Fix => unreachable!("handled before request build"),
+        Cmd::PtyTee { .. } => unreachable!("handled before request build"),
     })
 }
 

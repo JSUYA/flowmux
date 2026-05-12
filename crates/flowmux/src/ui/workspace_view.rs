@@ -1069,8 +1069,14 @@ fn build_panel(
                 &socket,
                 bundled_cli.as_deref(),
             );
-            let pane =
-                TerminalPane::spawn(pane_id, argv, cwd.clone(), extra_env, callbacks.clone());
+            let pane = TerminalPane::spawn(
+                pane_id,
+                surface.id,
+                argv,
+                cwd.clone(),
+                extra_env,
+                callbacks.clone(),
+            );
             theme.apply_to_vte(&pane.widget);
             // Start the new terminal widget with the current zoom option.
             pane.widget

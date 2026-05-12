@@ -12,7 +12,7 @@
 //! See `docs/upstream-mapping/terminal.md` for the parity matrix.
 
 use flowmux_core::{PaneId, SurfaceId, WorkspaceId};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, thiserror::Error)]
 pub enum TerminalError {
@@ -81,6 +81,50 @@ pub fn agent_pty_env(
 /// strings expected by GLib / VTE `spawn_async` envv arrays.
 pub fn env_to_kv_strings(env: &[(String, String)]) -> Vec<String> {
     env.iter().map(|(k, v)| format!("{k}={v}")).collect()
+}
+
+/// Locate the `flowmuxctl` helper binary so the GUI can wrap a shell
+/// spawn with `flowmuxctl pty-tee -- <argv>` (the OSC-notification
+/// snooper). The lookup mirrors the priority in
+/// `flowmux::delegate_to_cli_if_needed` so a packaged install (debian
+/// /usr/bin/flowmux + /usr/lib/flowmux/flowmuxctl, or flatpak) and a
+/// dev-tree `cargo run` install both Just Work:
+///
+/// 1. Sibling of `current_exe()` (e.g. `~/.local/bin/flowmux` next to
+///    `~/.local/bin/flowmuxctl`, or a Cargo `target/debug/` build).
+/// 2. `<prefix>/lib/flowmux/flowmuxctl` derived two levels above
+///    `current_exe()` (debian / flatpak layout where only `flowmux` is
+///    on `PATH`).
+/// 3. `flowmuxctl` on `PATH` as a last resort.
+///
+/// Returns `None` only when none of the above resolve — callers (the
+/// terminal pane in particular) should fall back to spawning the
+/// shell directly so the absence of OSC alarms degrades gracefully
+/// instead of breaking the terminal entirely.
+pub fn find_flowmuxctl() -> Option<PathBuf> {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let cand = dir.join("flowmuxctl");
+            if cand.is_file() {
+                return Some(cand);
+            }
+        }
+        if let Some(prefix) = exe.parent().and_then(|p| p.parent()) {
+            let cand = prefix.join("lib").join("flowmux").join("flowmuxctl");
+            if cand.is_file() {
+                return Some(cand);
+            }
+        }
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            let cand = dir.join("flowmuxctl");
+            if cand.is_file() {
+                return Some(cand);
+            }
+        }
+    }
+    None
 }
 
 pub trait TerminalBackend {
