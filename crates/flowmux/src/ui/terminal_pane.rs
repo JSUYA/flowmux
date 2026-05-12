@@ -171,6 +171,22 @@ impl TerminalPane {
         term.set_scrollback_lines(10_000);
         term.set_audible_bell(false);
 
+        // Wrap the VTE in a passthrough `gtk::Box`. Capture-phase event
+        // controllers attached to the wrapper still fire before VTE (capture
+        // walks down the widget tree from the root toward the focused child),
+        // but the VTE widget itself owns no `ShortcutController` /
+        // `EventControllerKey`. On Ubuntu 22.04's GTK 4.6 + VTE 0.68 + IBus
+        // Hangul combo, *any* key-side controller on the VTE widget — even a
+        // `ShortcutController` that only matches Shift+Enter — desynchronizes
+        // the IM preedit pipeline, and Backspace + arrow keys stop reaching
+        // IBus while a Korean syllable is being composed. Hosting the
+        // controller on a parent leaves VTE's IM path untouched. See
+        // `install_shift_enter_newline_handling` for the long version.
+        let term_root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        term_root.set_hexpand(true);
+        term_root.set_vexpand(true);
+        term_root.append(&term);
+
         // OSC 99 (Konsole-format) is not exposed as a signal on Ubuntu's
         // VTE 0.68 / 0.76 builds — the `notification-received` signal is
         // a Konsole extension compiled out in upstream VTE. We capture
@@ -200,7 +216,7 @@ impl TerminalPane {
         // cursor; Ctrl+left-click opens the URL in a new browser tab in the
         // same pane. Plain clicks continue into VTE text selection.
         install_url_link_handling(&term, id, callbacks.on_open_url.clone());
-        install_shift_enter_newline_handling(&term);
+        install_shift_enter_newline_handling(term_root.upcast_ref::<gtk::Widget>(), &term);
 
         // Process exit.
         {
@@ -343,7 +359,7 @@ impl TerminalPane {
 
         Self {
             id,
-            root: term.clone().upcast(),
+            root: term_root.upcast(),
             widget: term,
             pid,
         }
@@ -504,29 +520,31 @@ fn install_url_link_handling(
 
 const ALT_ENTER_BYTES: &[u8] = b"\x1b\r";
 
-/// Intercept Shift+Enter on the VTE widget and translate it to ESC+CR — the
-/// byte sequence agent TUIs (Claude, Codex, OpenCode) already treat as
-/// "insert newline" — before VTE's own Enter handler sees the event.
+/// Intercept Shift+Enter and translate it to ESC+CR — the byte sequence
+/// agent TUIs (Claude, Codex, OpenCode) already treat as "insert newline" —
+/// before VTE's own Enter handler sees the event.
 ///
-/// ### Why a `ShortcutController` and not an `EventControllerKey`
+/// ### Where the controller is attached, and why not on the VTE widget
 ///
-/// An earlier version of this hook used `gtk::EventControllerKey` in
-/// `PropagationPhase::Capture`. That sits in front of VTE's internal IM
-/// filter on every keystroke, and on Ubuntu 22.04's GTK 4.6 + VTE 0.68
-/// combination the IBus Hangul preedit handler ends up desynchronized when
-/// any capture-phase key controller is attached to the VTE widget. The
-/// reported symptom is that Backspace and the arrow keys stop reacting
-/// while a Korean syllable is being composed — IBus Hangul never receives
-/// them, so the preedit cannot be edited or committed. Plain ASCII typing,
-/// composition itself, and any key event outside of preedit are unaffected,
-/// which is why the regression slipped through.
+/// The controller is intentionally attached to `host`, a parent widget
+/// wrapping the VTE, and never to the `vte::Terminal` itself. The capture
+/// phase still beats VTE's native Shift+Enter handling because capture
+/// walks down the widget tree from root → focused child, so a parent's
+/// capture-phase controller runs before the focused VTE widget's own
+/// handlers either way.
 ///
-/// `gtk::ShortcutController` only ever fires when an incoming event matches
-/// one of its `KeyvalTrigger`s. Every other keystroke — including the keys
-/// IBus Hangul cares about during preedit — propagates untouched to VTE's
-/// native IM path, so the GTK4 + IBus pipeline behaves exactly as it would
-/// on a vanilla `vte::Terminal` with no controller attached.
-fn install_shift_enter_newline_handling(term: &vte::Terminal) {
+/// On Ubuntu 22.04's GTK 4.6 + VTE 0.68 + IBus Hangul combo, *any*
+/// key-side event controller attached to the VTE widget — including a
+/// `ShortcutController` that only matches Shift+Enter — desynchronizes the
+/// IM preedit pipeline. The reported symptom is that Backspace and arrow
+/// keys stop reaching IBus while a Korean syllable is being composed, so
+/// the preedit cannot be edited or committed. Plain ASCII typing,
+/// composition itself, and any key event outside of preedit are
+/// unaffected, which is why the regression survived an initial
+/// `EventControllerKey → ShortcutController` swap. Hosting the controller
+/// one level above leaves the VTE widget controller-free on the key side
+/// while keeping the Shift+Enter translation intact.
+fn install_shift_enter_newline_handling(host: &gtk::Widget, term: &vte::Terminal) {
     let controller = gtk::ShortcutController::new();
     // Capture phase: VTE's own Shift+Enter handling sends \r to the PTY at
     // the target phase, which would defeat the translation. Capture beats
@@ -558,7 +576,7 @@ fn install_shift_enter_newline_handling(term: &vte::Terminal) {
         controller.add_shortcut(shortcut);
     }
 
-    term.add_controller(controller);
+    host.add_controller(controller);
 }
 
 /// argv used when the caller asks for the default shell (no explicit
