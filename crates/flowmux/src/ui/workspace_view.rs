@@ -822,6 +822,7 @@ fn attach_tab_dnd_handlers(
     callbacks: &PaneCallbacks,
 ) {
     let saw_tab_drop_target = callbacks.tab_drag_drop_seen.clone();
+    let opened_new_window = Rc::new(Cell::new(false));
 
     let drag_source = gtk::DragSource::new();
     drag_source.set_actions(gtk::gdk::DragAction::MOVE);
@@ -833,14 +834,35 @@ fn attach_tab_dnd_handlers(
     });
     let tab_for_begin = tab.clone();
     let saw_target_for_begin = saw_tab_drop_target.clone();
+    let opened_for_begin = opened_new_window.clone();
     drag_source.connect_drag_begin(move |_, _| {
         saw_target_for_begin.set(false);
+        opened_for_begin.set(false);
         tab_for_begin.set_opacity(0.4);
         tab_for_begin.add_css_class("flowmux-pane-tab-dragging");
     });
     let tab_for_end = tab.clone();
     let saw_target_for_end = saw_tab_drop_target.clone();
-    drag_source.connect_drag_end(move |_, _, _| {
+    let opened_for_end = opened_new_window.clone();
+    let new_window_cb_for_end = callbacks.on_tab_drag_to_new_window.clone();
+    drag_source.connect_drag_end(move |_, drag, delete_data| {
+        tracing::debug!(
+            %pane_id,
+            %surface_id,
+            delete_data,
+            selected_action = ?drag.selected_action(),
+            saw_tab_drop_target = saw_target_for_end.get(),
+            "tab drag end"
+        );
+        if !saw_target_for_end.get() && !opened_for_end.get() {
+            opened_for_end.set(true);
+            tracing::info!(
+                %pane_id,
+                %surface_id,
+                "tab drag ended outside tab targets; opening new window"
+            );
+            (new_window_cb_for_end.borrow_mut())(pane_id, surface_id);
+        }
         saw_target_for_end.set(false);
         tab_for_end.set_opacity(1.0);
         tab_for_end.remove_css_class("flowmux-pane-tab-dragging");
@@ -848,14 +870,25 @@ fn attach_tab_dnd_handlers(
     let tab_for_cancel = tab.clone();
     let saw_target_for_cancel = saw_tab_drop_target.clone();
     let new_window_cb = callbacks.on_tab_drag_to_new_window.clone();
-    drag_source.connect_drag_cancel(move |_, _, reason| {
+    let opened_for_cancel = opened_new_window.clone();
+    drag_source.connect_drag_cancel(move |_, drag, reason| {
         tab_for_cancel.set_opacity(1.0);
         tab_for_cancel.remove_css_class("flowmux-pane-tab-dragging");
+        tracing::debug!(
+            %pane_id,
+            %surface_id,
+            ?reason,
+            selected_action = ?drag.selected_action(),
+            saw_tab_drop_target = saw_target_for_cancel.get(),
+            "tab drag cancel"
+        );
         if matches!(
             reason,
             gtk::gdk::DragCancelReason::NoTarget | gtk::gdk::DragCancelReason::Error
         ) && !saw_target_for_cancel.get()
+            && !opened_for_cancel.get()
         {
+            opened_for_cancel.set(true);
             tracing::info!(
                 %pane_id,
                 %surface_id,
