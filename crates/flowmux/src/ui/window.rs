@@ -16,7 +16,10 @@ use crate::ui::workspace_view::{
     PaneRegistry, TornOffSurface,
 };
 use adw::prelude::*;
-use flowmux_core::{PaneId, PlacementStrategy, SplitDirection, SurfaceId, Workspace, WorkspaceId};
+use flowmux_core::{
+    Pane, PaneContent, PaneId, PaneSurface, PlacementStrategy, SplitDirection, Surface, SurfaceId,
+    SurfaceKind, Workspace, WorkspaceId,
+};
 use flowmux_daemon::StateStore;
 use gtk::glib;
 use std::cell::{Cell, RefCell};
@@ -616,35 +619,221 @@ impl WindowController {
         self.refresh_window_title().await;
     }
 
+    fn build_torn_off_pane(
+        torn: TornOffSurface,
+        title: &str,
+        window_ref: Rc<RefCell<Option<glib::WeakRef<adw::ApplicationWindow>>>>,
+    ) -> gtk::Widget {
+        let frame = gtk::Frame::new(None);
+        frame.add_css_class("flowmux-pane");
+        frame.set_hexpand(true);
+        frame.set_vexpand(true);
+
+        let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        root.set_hexpand(true);
+        root.set_vexpand(true);
+
+        let tabbar = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        tabbar.add_css_class("flowmux-pane-tabbar");
+
+        let tabs = gtk::Box::new(gtk::Orientation::Horizontal, 2);
+        tabs.add_css_class("flowmux-pane-tabs");
+        tabs.set_hexpand(false);
+
+        let tab = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        tab.add_css_class("flowmux-pane-tab");
+        tab.add_css_class("active");
+
+        let button = gtk::Button::new();
+        button.add_css_class("flat");
+        button.add_css_class("flowmux-pane-tab-main");
+        button.set_tooltip_text(Some(title));
+        button.set_focus_on_click(false);
+
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        let icon_name = match torn.kind {
+            SurfaceKind::Terminal { .. } => "utilities-terminal-symbolic",
+            SurfaceKind::Browser { .. } => "web-browser-symbolic",
+        };
+        row.append(&gtk::Image::from_icon_name(icon_name));
+        let label = gtk::Label::new(Some(title));
+        label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        label.set_max_width_chars(18);
+        label.set_tooltip_text(Some(title));
+        row.append(&label);
+        button.set_child(Some(&row));
+
+        let focus_for_tab = torn.focus.clone();
+        button.connect_clicked(move |_| {
+            focus_for_tab.grab_focus();
+        });
+        tab.append(&button);
+
+        let close = gtk::Button::from_icon_name("window-close-symbolic");
+        close.add_css_class("flat");
+        close.add_css_class("flowmux-pane-tab-close");
+        close.set_tooltip_text(Some("Close tab"));
+        close.set_focus_on_click(false);
+        let window_ref_for_close = window_ref.clone();
+        close.connect_clicked(move |_| {
+            if let Some(window) = window_ref_for_close
+                .borrow()
+                .as_ref()
+                .and_then(|window| window.upgrade())
+            {
+                window.close();
+            }
+        });
+        tab.append(&close);
+        tabs.append(&tab);
+
+        let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        spacer.set_hexpand(true);
+
+        let tools = gtk::Box::new(gtk::Orientation::Horizontal, 1);
+        tools.add_css_class("flowmux-pane-tools");
+        for (icon, tooltip) in [
+            ("go-next-symbolic", "Split right"),
+            ("go-down-symbolic", "Split down"),
+            ("tab-new-symbolic", "Add tab"),
+            ("web-browser-symbolic", "Add browser tab"),
+        ] {
+            let button = gtk::Button::from_icon_name(icon);
+            button.add_css_class("flat");
+            button.add_css_class("flowmux-pane-tool");
+            button.set_tooltip_text(Some(tooltip));
+            button.set_focus_on_click(false);
+            button.set_sensitive(false);
+            tools.append(&button);
+        }
+
+        let stack = gtk::Stack::new();
+        stack.set_hexpand(true);
+        stack.set_vexpand(true);
+        stack.set_transition_type(gtk::StackTransitionType::Crossfade);
+        stack.add_named(&torn.content, Some(&torn.surface.to_string()));
+        stack.set_visible_child_name(&torn.surface.to_string());
+
+        tabbar.append(&tabs);
+        tabbar.append(&spacer);
+        tabbar.append(&tools);
+        root.append(&tabbar);
+        root.append(&stack);
+        frame.set_child(Some(&root));
+        frame.upcast()
+    }
+
     fn present_torn_off_surface(&self, app: &gtk::Application, torn: TornOffSurface) {
         let title = match torn.title.trim() {
             "" => "flowmux".to_string(),
             title => title.to_string(),
         };
         let window_title = format!("flowmux - {title}");
+
+        let workspace_id = WorkspaceId::new();
+        let pane_surface = PaneSurface {
+            id: torn.surface,
+            title: title.clone(),
+            title_locked: false,
+            kind: torn.kind.clone(),
+        };
+        let workspace = Workspace {
+            id: workspace_id,
+            name: title.clone(),
+            custom_title: None,
+            root_dir: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/")),
+            git: None,
+            listening_ports: Vec::new(),
+            surfaces: vec![Surface {
+                id: torn.surface,
+                kind: torn.kind.clone(),
+                title: title.clone(),
+                root_pane: Pane::Leaf {
+                    id: torn.pane,
+                    content: PaneContent::Tabs {
+                        active: torn.surface,
+                        surfaces: vec![pane_surface],
+                    },
+                },
+            }],
+            color: None,
+        };
+
+        let (sidebar_bridge, _sidebar_rx) = Bridge::new();
+        let window_ref: Rc<RefCell<Option<glib::WeakRef<adw::ApplicationWindow>>>> =
+            Rc::new(RefCell::new(None));
+        let window_ref_for_sidebar = window_ref.clone();
+        let sidebar = Sidebar::new(
+            |_| {},
+            move |_| {
+                if let Some(window) = window_ref_for_sidebar
+                    .borrow()
+                    .as_ref()
+                    .and_then(|window| window.upgrade())
+                {
+                    window.close();
+                }
+            },
+            sidebar_bridge,
+            NotificationStore::new(),
+        );
+        sidebar.root.set_size_request(160, -1);
+        sidebar.upsert(&workspace);
+        sidebar.select_workspace(workspace_id);
+
+        let stack = gtk::Stack::new();
+        stack.set_transition_type(gtk::StackTransitionType::Crossfade);
+        stack.set_hexpand(true);
+        stack.set_vexpand(true);
+
+        let focus = torn.focus.clone();
+        let pane_id = torn.pane;
+        let surface_id = torn.surface;
+        let pane = Self::build_torn_off_pane(torn, &title, window_ref.clone());
+        stack.add_named(&pane, Some(&workspace_id.to_string()));
+        stack.set_visible_child_name(&workspace_id.to_string());
+
+        let sidebar_pos = match self.sidebar_split.position() {
+            pos if pos > 0 => pos,
+            _ => 260,
+        };
+        let split = gtk::Paned::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .start_child(&sidebar.root)
+            .end_child(&stack)
+            .resize_start_child(false)
+            .resize_end_child(true)
+            .shrink_start_child(false)
+            .shrink_end_child(false)
+            .position(sidebar_pos)
+            .build();
+
+        let content_overlay = gtk::Overlay::new();
+        content_overlay.set_child(Some(&split));
+
         let toolbar = adw::ToolbarView::new();
         toolbar.add_top_bar(&adw::HeaderBar::new());
-        toolbar.set_content(Some(&torn.content));
+        toolbar.set_content(Some(&content_overlay));
 
         let window = adw::ApplicationWindow::builder()
             .application(app)
-            .default_width(1000)
-            .default_height(700)
+            .default_width(1280)
+            .default_height(800)
             .icon_name(crate::APP_ID)
             .title(&window_title)
             .build();
         window.set_content(Some(&toolbar));
+        *window_ref.borrow_mut() = Some(window.downgrade());
         window.present();
 
-        let focus = torn.focus.clone();
         glib::idle_add_local_once(move || {
             focus.grab_focus();
         });
         tracing::info!(
-            pane = %torn.pane,
-            surface = %torn.surface,
+            pane = %pane_id,
+            surface = %surface_id,
             title = %title,
-            "tore tab off into standalone window"
+            "tore tab off into flowmux window"
         );
     }
 

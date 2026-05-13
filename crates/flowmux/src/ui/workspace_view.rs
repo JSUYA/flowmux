@@ -49,6 +49,7 @@ pub struct TornOffSurface {
     pub pane: PaneId,
     pub surface: SurfaceId,
     pub title: String,
+    pub kind: SurfaceKind,
     pub content: gtk::Widget,
     pub focus: gtk::Widget,
 }
@@ -372,12 +373,27 @@ impl PaneRegistry {
         }
         stack.remove(&content);
 
-        let focus = if let Some(terminal) = self.terminals.remove(&surface) {
-            terminal.root_widget()
+        let (focus, kind) = if let Some(terminal) = self.terminals.remove(&surface) {
+            (
+                terminal.root_widget(),
+                SurfaceKind::Terminal {
+                    shell: None,
+                    cwd: terminal.current_dir(),
+                },
+            )
         } else if let Some(browser) = self.browsers.remove(&surface) {
-            browser.web_view.clone().upcast::<gtk::Widget>()
+            (
+                browser.web_view.clone().upcast::<gtk::Widget>(),
+                SurfaceKind::Browser { initial_url: None },
+            )
         } else {
-            content.clone()
+            (
+                content.clone(),
+                SurfaceKind::Terminal {
+                    shell: None,
+                    cwd: None,
+                },
+            )
         };
         self.surface_tab_labels.remove(&surface);
         self.surface_workspace.remove(&surface);
@@ -392,6 +408,7 @@ impl PaneRegistry {
             pane,
             surface,
             title,
+            kind,
             content,
             focus,
         })

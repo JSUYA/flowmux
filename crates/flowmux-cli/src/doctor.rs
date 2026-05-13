@@ -729,7 +729,9 @@ mod tests {
     /// the user simply hasn't installed the agents yet.
     #[test]
     fn doctor_on_empty_home_reports_warn_not_needsfix() {
+        let _lock = home_env_lock();
         let home = fake_home();
+        let _h = HomeOverride::set(home.path());
         let report = collect_offline(home.path(), None);
         let agents = report
             .sections
