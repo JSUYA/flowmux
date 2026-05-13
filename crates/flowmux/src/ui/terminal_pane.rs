@@ -159,6 +159,13 @@ pub struct PaneCallbacks {
     /// Reorder a tab within the same pane by drag and drop. The third argument
     /// is the final 0-based index after the move, clamped if it exceeds length.
     pub on_reorder_surface: Rc<RefCell<dyn FnMut(PaneId, SurfaceId, usize)>>,
+    /// A tab drag ended without landing on another tab drop target. The caller
+    /// opens a new top-level flowmux window, matching the Ctrl+Shift+N path.
+    pub on_tab_drag_to_new_window: Rc<RefCell<dyn FnMut(PaneId, SurfaceId)>>,
+    /// Shared across all surface tabs in one window for the duration of a drag.
+    /// The source tab uses this to distinguish a true no-target drag from a
+    /// rejected drop on a known tab (self/cross-pane/invalid payload).
+    pub tab_drag_drop_seen: Rc<Cell<bool>>,
     /// VTE reported that a terminal surface changed its cwd.
     pub on_terminal_cwd_changed: Rc<RefCell<dyn FnMut(PaneId, SurfaceId, PathBuf)>>,
     /// WebKit reported that a browser pane navigated to a new URL.

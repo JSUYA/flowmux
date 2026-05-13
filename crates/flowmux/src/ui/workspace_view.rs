@@ -773,7 +773,8 @@ fn build_surface_tab_widget(
 }
 
 /// Attach controllers that reorder terminal or browser tabs left/right within
-/// the same pane by drag and drop.
+/// the same pane by drag and drop, and open a new window when a tab drag ends
+/// without landing on another tab.
 ///
 /// - `DragSource`: serializes the (PaneId, SurfaceId) pair as UTF-8 in the
 ///   ContentProvider. PaneId is included so DropTarget can reject cross-pane moves.
@@ -785,6 +786,8 @@ fn attach_tab_dnd_handlers(
     surface_id: SurfaceId,
     callbacks: &PaneCallbacks,
 ) {
+    let saw_tab_drop_target = callbacks.tab_drag_drop_seen.clone();
+
     let drag_source = gtk::DragSource::new();
     drag_source.set_actions(gtk::gdk::DragAction::MOVE);
     drag_source.connect_prepare(move |_, _, _| {
@@ -797,19 +800,36 @@ fn attach_tab_dnd_handlers(
         Some(gtk::gdk::ContentProvider::for_value(&payload.to_value()))
     });
     let tab_for_begin = tab.clone();
+    let saw_target_for_begin = saw_tab_drop_target.clone();
     drag_source.connect_drag_begin(move |_, _| {
+        saw_target_for_begin.set(false);
         tab_for_begin.set_opacity(0.4);
         tab_for_begin.add_css_class("flowmux-pane-tab-dragging");
     });
     let tab_for_end = tab.clone();
+    let saw_target_for_end = saw_tab_drop_target.clone();
     drag_source.connect_drag_end(move |_, _, _| {
+        saw_target_for_end.set(false);
         tab_for_end.set_opacity(1.0);
         tab_for_end.remove_css_class("flowmux-pane-tab-dragging");
     });
     let tab_for_cancel = tab.clone();
-    drag_source.connect_drag_cancel(move |_, _, _| {
+    let saw_target_for_cancel = saw_tab_drop_target.clone();
+    let new_window_cb = callbacks.on_tab_drag_to_new_window.clone();
+    drag_source.connect_drag_cancel(move |_, _, reason| {
         tab_for_cancel.set_opacity(1.0);
         tab_for_cancel.remove_css_class("flowmux-pane-tab-dragging");
+        if matches!(reason, gtk::gdk::DragCancelReason::NoTarget)
+            && !saw_target_for_cancel.get()
+        {
+            tracing::info!(
+                %pane_id,
+                %surface_id,
+                "tab drag ended without a drop target; opening new window"
+            );
+            (new_window_cb.borrow_mut())(pane_id, surface_id);
+        }
+        saw_target_for_cancel.set(false);
         false
     });
     tab.add_controller(drag_source);
@@ -847,7 +867,9 @@ fn attach_tab_dnd_handlers(
     let tab_for_drop = tab.clone();
     let reorder_cb = callbacks.on_reorder_surface.clone();
     let position_of_surface_cb = callbacks.position_of_surface_in_pane.clone();
+    let saw_target_for_drop = saw_tab_drop_target.clone();
     drop_target.connect_drop(move |_, value, x, _y| {
+        saw_target_for_drop.set(true);
         tracing::debug!(%target_pane, %target_surface, "tab drop fired");
         tab_for_drop.remove_css_class("flowmux-pane-tab-drop-before");
         tab_for_drop.remove_css_class("flowmux-pane-tab-drop-after");

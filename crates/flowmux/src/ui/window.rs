@@ -2550,6 +2550,38 @@ fn make_callbacks(
                 });
             }))
         },
+        on_tab_drag_to_new_window: Rc::new(RefCell::new(move |pane, surface| {
+            tracing::debug!(%pane, %surface, "tab drag requested new window");
+            let exe = match std::env::current_exe() {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "tab drag new-window: could not resolve current_exe()"
+                    );
+                    return;
+                }
+            };
+            match std::process::Command::new(&exe).spawn() {
+                Ok(child) => {
+                    tracing::info!(
+                        pid = child.id(),
+                        exe = %exe.display(),
+                        %pane,
+                        %surface,
+                        "tab drag spawned new flowmux window"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        exe = %exe.display(),
+                        "tab drag new-window: failed to spawn"
+                    );
+                }
+            }
+        })),
+        tab_drag_drop_seen: Rc::new(Cell::new(false)),
         on_terminal_cwd_changed: {
             let bridge = bridge.clone();
             Rc::new(RefCell::new(move |pane, surface, cwd| {
