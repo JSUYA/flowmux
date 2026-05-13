@@ -50,6 +50,7 @@ pub struct TerminalPane {
 struct TerminalRuntime {
     id: PaneId,
     widget: gtk::DrawingArea,
+    im_context: gtk::IMMulticontext,
     master: OwnedFd,
     pid: Rc<Cell<Option<i32>>>,
     state: RefCell<TerminalState>,
@@ -274,9 +275,13 @@ impl TerminalPane {
             selection: None,
         };
 
+        let im_context = gtk::IMMulticontext::new();
+        im_context.set_use_preedit(true);
+
         let runtime = Rc::new(TerminalRuntime {
             id,
             widget: widget.clone(),
+            im_context: im_context.clone(),
             master,
             pid: pid.clone(),
             state: RefCell::new(state),
@@ -285,6 +290,16 @@ impl TerminalPane {
             title_handlers: RefCell::new(Vec::new()),
             cwd_handlers: RefCell::new(Vec::new()),
         });
+
+        {
+            let weak = Rc::downgrade(&runtime);
+            im_context.connect_commit(move |_, text| {
+                let Some(rt) = weak.upgrade() else {
+                    return;
+                };
+                rt.write_child(text.as_bytes());
+            });
+        }
 
         let pane = Self {
             id,
@@ -637,7 +652,15 @@ fn resize_state_to_pixels(
 fn install_focus_handler(pane: &TerminalPane, on_focus: Rc<RefCell<dyn FnMut(PaneId)>>) {
     let id = pane.id;
     let focus_ctrl = gtk::EventControllerFocus::new();
-    focus_ctrl.connect_enter(move |_| (on_focus.borrow_mut())(id));
+    let im_in = pane.runtime.im_context.clone();
+    focus_ctrl.connect_enter(move |_| {
+        im_in.focus_in();
+        (on_focus.borrow_mut())(id);
+    });
+    let im_out = pane.runtime.im_context.clone();
+    focus_ctrl.connect_leave(move |_| {
+        im_out.focus_out();
+    });
     pane.widget.add_controller(focus_ctrl);
 }
 
@@ -709,8 +732,13 @@ fn install_context_menu(
 }
 
 fn install_key_input(pane: &TerminalPane) {
+    if ibus_nav_workaround_enabled() {
+        install_ibus_nav_bypass(pane);
+    }
+
     let weak = Rc::downgrade(&pane.runtime);
     let controller = gtk::EventControllerKey::new();
+    controller.set_im_context(Some(&pane.runtime.im_context));
     controller.connect_key_pressed(move |_controller, key, _keycode, state| {
         let Some(runtime) = weak.upgrade() else {
             return glib::Propagation::Proceed;
@@ -725,6 +753,87 @@ fn install_key_input(pane: &TerminalPane) {
         glib::Propagation::Stop
     });
     pane.widget.add_controller(controller);
+}
+
+/// Whether the Flatpak/IBus 22.04 navigation-key drop bypass should run.
+///
+/// On Ubuntu 22.04 hosts the GTK4 ibus immodule (compiled against IBus
+/// >= 1.5.30 expectations) and the system IBus 1.5.26 daemon disagree on
+/// the `PostProcessKeyEvent` DBus property, which causes plain
+/// Backspace/Delete/Tab/Esc/Return/arrows/Home/End/PageUp/PageDown to
+/// be silently dropped while a Hangul preedit is on screen. We can't
+/// detect the host daemon version from inside the Flatpak sandbox, so
+/// we gate on the sandbox flag and let users opt out with
+/// `FLOWMUX_NO_IBUS_NAV_WORKAROUND=1`.
+fn ibus_nav_workaround_enabled() -> bool {
+    if std::env::var_os("FLOWMUX_NO_IBUS_NAV_WORKAROUND").is_some() {
+        return false;
+    }
+    is_flatpak_sandbox()
+}
+
+fn install_ibus_nav_bypass(pane: &TerminalPane) {
+    let weak = Rc::downgrade(&pane.runtime);
+    let controller = gtk::EventControllerKey::new();
+    controller.set_propagation_phase(gtk::PropagationPhase::Capture);
+    controller.connect_key_pressed(move |_controller, key, _keycode, state| {
+        if !is_plain_nav_key(key, state) {
+            return glib::Propagation::Proceed;
+        }
+        let Some(runtime) = weak.upgrade() else {
+            return glib::Propagation::Proceed;
+        };
+        if app_accel_should_win(key, state) {
+            return glib::Propagation::Proceed;
+        }
+        let Some(bytes) = encode_key_legacy(&runtime, key, state) else {
+            return glib::Propagation::Proceed;
+        };
+        runtime.write_child(&bytes);
+        glib::Propagation::Stop
+    });
+    pane.widget.add_controller(controller);
+}
+
+/// Plain (no Ctrl/Alt/Super/Meta) navigation and edit keys affected by
+/// the 22.04 IBus immodule drop. Space is intentionally excluded so the
+/// in-flight Hangul syllable can still commit through the IM context.
+fn is_plain_nav_key(key: gtk::gdk::Key, mods: gtk::gdk::ModifierType) -> bool {
+    let blocking = gtk::gdk::ModifierType::CONTROL_MASK
+        | gtk::gdk::ModifierType::ALT_MASK
+        | gtk::gdk::ModifierType::META_MASK
+        | gtk::gdk::ModifierType::SUPER_MASK;
+    if mods.intersects(blocking) {
+        return false;
+    }
+    matches!(
+        key,
+        gtk::gdk::Key::BackSpace
+            | gtk::gdk::Key::Delete
+            | gtk::gdk::Key::KP_Delete
+            | gtk::gdk::Key::Tab
+            | gtk::gdk::Key::ISO_Left_Tab
+            | gtk::gdk::Key::Escape
+            | gtk::gdk::Key::Return
+            | gtk::gdk::Key::KP_Enter
+            | gtk::gdk::Key::ISO_Enter
+            | gtk::gdk::Key::Up
+            | gtk::gdk::Key::Down
+            | gtk::gdk::Key::Left
+            | gtk::gdk::Key::Right
+            | gtk::gdk::Key::KP_Up
+            | gtk::gdk::Key::KP_Down
+            | gtk::gdk::Key::KP_Left
+            | gtk::gdk::Key::KP_Right
+            | gtk::gdk::Key::Home
+            | gtk::gdk::Key::End
+            | gtk::gdk::Key::KP_Home
+            | gtk::gdk::Key::KP_End
+            | gtk::gdk::Key::Page_Up
+            | gtk::gdk::Key::Page_Down
+            | gtk::gdk::Key::KP_Page_Up
+            | gtk::gdk::Key::KP_Page_Down
+    )
 }
 
 fn install_scroll_input(pane: &TerminalPane) {
