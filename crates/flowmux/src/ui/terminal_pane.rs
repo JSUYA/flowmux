@@ -1967,6 +1967,57 @@ mod tests {
     }
 
     #[test]
+    fn mapped_ghostty_keys_encode_without_crashing() {
+        let terminal = Terminal::new(TerminalOptions {
+            cols: DEFAULT_COLS,
+            rows: DEFAULT_ROWS,
+            max_scrollback: MAX_SCROLLBACK,
+        })
+        .unwrap();
+        use gtk::glib::translate::FromGlib;
+
+        let keys = (0..=u16::MAX as u32)
+            .map(|raw| unsafe { gtk::gdk::Key::from_glib(raw) })
+            .filter(|key| gdk_key_to_ghostty_key(*key).is_some())
+            .collect::<Vec<_>>();
+        assert!(!keys.is_empty());
+        let modifier_sets = [
+            gtk::gdk::ModifierType::empty(),
+            gtk::gdk::ModifierType::SHIFT_MASK,
+            gtk::gdk::ModifierType::CONTROL_MASK,
+            gtk::gdk::ModifierType::ALT_MASK,
+            gtk::gdk::ModifierType::SHIFT_MASK | gtk::gdk::ModifierType::ALT_MASK,
+        ];
+
+        for key in keys {
+            assert_ne!(key, gtk::gdk::Key::BackSpace);
+            for mods in modifier_sets {
+                let ghostty_key = gdk_key_to_ghostty_key(key).unwrap();
+                let mut event = KeyEvent::new().unwrap();
+                event
+                    .set_action(KeyAction::Press)
+                    .set_key(ghostty_key)
+                    .set_mods(ghostty_mods_from_gdk(mods))
+                    .set_consumed_mods(consumed_mods_for_key(key, mods));
+                if let Some(ch) = key.to_unicode().filter(|ch| !ch.is_control()) {
+                    event
+                        .set_utf8(Some(ch.to_string()))
+                        .set_unshifted_codepoint(unshifted_codepoint_for_key(key, ch));
+                }
+
+                let mut encoder = KeyEncoder::new().unwrap();
+                encoder
+                    .set_options_from_terminal(&terminal)
+                    .set_alt_esc_prefix(true);
+                let mut out = Vec::new();
+                encoder
+                    .encode_to_vec(&event, &mut out)
+                    .unwrap_or_else(|e| panic!("failed to encode {key:?} with {mods:?}: {e:?}"));
+            }
+        }
+    }
+
+    #[test]
     fn ghostty_key_encoder_uses_decckm_for_application_arrows() {
         let mut terminal = Terminal::new(TerminalOptions {
             cols: DEFAULT_COLS,
