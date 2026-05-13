@@ -266,33 +266,30 @@ pub enum GtkCommand {
         level: NotificationLevel,
         ack: oneshot::Sender<Option<NotificationId>>,
     },
-    /// Tell the GUI store which FDO desktop notification id was
+    /// Tell the GUI store which `org.gtk.Notifications` id was
     /// assigned to a previously-added entry. Used by the bell popover
-    /// to ask the daemon to drop the toast (and the dock badge) once
-    /// the user reads it inside flowmux.
+    /// to ask the daemon to withdraw the toast (and shrink the dock
+    /// badge) once the user reads it inside flowmux.
     SetNotificationDesktopId {
         id: NotificationId,
-        desktop_id: u32,
+        desktop_id: String,
     },
-    /// Ask the FDO notification daemon to close the supplied
-    /// `desktop_id`s. Fired when the user opens the bell popover (so
-    /// the entries become "read" inside flowmux) — closing the
-    /// matching toasts on the OS side is what actually shrinks the
-    /// dock / launcher badge in GNOME / KDE. flowmux sends
-    /// `AttentionNeeded` toasts with `expire_timeout = 0`, so without
-    /// an explicit close they linger in the notification center
-    /// forever.
+    /// Ask the daemon to withdraw the supplied `desktop_id`s through
+    /// `org.gtk.Notifications.RemoveNotification`. On GNOME this drops
+    /// the entry from the message tray (Super+V) **and** decrements
+    /// Ubuntu Dock's per-app notification counter, so the dock badge
+    /// shrinks in lockstep. The dispatcher coalesces this with the
+    /// store-level `mark_*_read` sweep that produced the ids.
     CloseDesktopNotifications {
-        desktop_ids: Vec<u32>,
+        desktop_ids: Vec<String>,
     },
-    /// Re-publish the current `unread_count()` to the dock via the
-    /// `com.canonical.Unity.LauncherEntry::Update` D-Bus signal so
-    /// the dock badge stays in lockstep with notifications the user
-    /// has actually acknowledged. Sent after every notification state
-    /// change (push, mark read, sweep, workspace activation) because
-    /// closing FDO toasts alone is not always enough — Ubuntu Dock /
-    /// Dash-to-Dock track the count via this Unity signal, not the
-    /// FDO message tray.
+    /// Historic no-op. Earlier flowmux drove the dock badge directly
+    /// via `com.canonical.Unity.LauncherEntry::Update`; the badge
+    /// counter is now derived by the dock from
+    /// `org.gtk.Notifications` per-app entries, so we don't have to
+    /// publish anything for it to converge. The variant is kept so
+    /// existing dispatch sites compile while the rewrite settles —
+    /// remove together with its handler in a follow-up.
     RefreshLauncherBadge,
     /// User clicked a row in the bell popover. Mark the entry read,
     /// activate its workspace (if known), and grab focus on the source

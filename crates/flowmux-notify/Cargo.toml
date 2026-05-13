@@ -16,3 +16,4 @@ tracing = { workspace = true }
 zbus = { workspace = true }
 serde = { workspace = true }
 chrono = { workspace = true }
+uuid = { workspace = true }

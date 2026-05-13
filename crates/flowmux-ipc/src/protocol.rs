@@ -246,15 +246,14 @@ pub enum Request {
     },
 
     /// Close (withdraw) a desktop notification previously emitted by
-    /// flowmux. The `desktop_id` is the value the FDO notification
-    /// daemon returned from `Notify` — flowmux echoes it back via
-    /// `Response::Notified` so the GUI can later ask the daemon to
-    /// dismiss the entry once the user reads it through the in-app
-    /// bell popover. Without this, `AttentionNeeded` toasts (sent with
-    /// `expire_timeout = 0`) accumulate in the OS notification center
-    /// and inflate the dock badge counter.
+    /// flowmux. The `desktop_id` is the string id we passed to
+    /// `org.gtk.Notifications.AddNotification` — flowmux echoes it back
+    /// via `Response::Notified` so the GUI can later ask the daemon to
+    /// withdraw the entry once the user reads it through the in-app
+    /// bell popover. Without this, `AttentionNeeded` toasts accumulate
+    /// in the GNOME message tray and the dock badge stays pinned.
     CloseDesktopNotification {
-        desktop_id: u32,
+        desktop_id: String,
     },
 }
 
@@ -298,14 +297,14 @@ pub enum Response {
     AgentSession {
         session_id: Option<String>,
     },
-    /// Reply to `Request::Notify`. Carries the FDO desktop notification
+    /// Reply to `Request::Notify`. Carries the `org.gtk.Notifications`
     /// id the daemon assigned, so the GUI can later issue
     /// `Request::CloseDesktopNotification` to drop the badge once the
     /// user reads it inside flowmux. `None` means no desktop toast was
-    /// actually sent (the FDO daemon was unreachable, or the toast was
-    /// suppressed).
+    /// actually sent (the notifications daemon was unreachable, or the
+    /// toast was suppressed).
     Notified {
-        desktop_id: Option<u32>,
+        desktop_id: Option<String>,
     },
     Error(RpcError),
 }

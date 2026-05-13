@@ -58,11 +58,17 @@ pub struct WindowController {
     /// the head through third panes, shortened to the last 3 folders with a
     /// "..." prefix. Updated on focus moves within a workspace.
     focus_mru: Rc<RefCell<HashMap<WorkspaceId, std::collections::VecDeque<PaneId>>>>,
-    /// FDO notification client used to close (withdraw) toasts when the
-    /// user opens the bell popover. Connected lazily on first close and
-    /// reused thereafter. Lives on the GTK main thread (the GUI is
-    /// single-threaded) so a `Rc<RefCell<…>>` is enough.
-    notifier: Rc<RefCell<Option<flowmux_notify::DesktopNotifier>>>,
+    /// `org.gtk.Notifications` client used to withdraw toasts when the
+    /// user acknowledges them in flowmux. Defaults to a fresh empty
+    /// cell; `main.rs` swaps in the same cell `DaemonHandler` uses to
+    /// send `AddNotification` (via [`Self::use_shared_notifier`]) so
+    /// both sides run through the same `Connection::session()`.
+    /// gnome-shell keys entries by `(sender bus name, app_id)`, so a
+    /// withdraw from a second connection silently fails to match — the
+    /// dock badge and message-tray entry stay until the user clears
+    /// them by hand. Uses a `tokio::sync::Mutex` so the same handle
+    /// can be shared with the tokio-side daemon handler.
+    notifier: Arc<tokio::sync::Mutex<Option<flowmux_notify::DesktopNotifier>>>,
     /// Set while a launcher-badge publish task is in flight on the main
     /// context. Combined with `badge_dirty` it serializes overlapping
     /// `refresh_launcher_badge` calls so the *last* state of
@@ -217,7 +223,7 @@ impl WindowController {
             css_provider,
             clipboard_toast,
             focus_mru: Rc::new(RefCell::new(HashMap::new())),
-            notifier: Rc::new(RefCell::new(None)),
+            notifier: Arc::new(tokio::sync::Mutex::new(None)),
             badge_publisher_busy: Rc::new(Cell::new(false)),
             badge_dirty: Rc::new(Cell::new(false)),
             tokio_handle,
@@ -225,6 +231,20 @@ impl WindowController {
         controller.install_state_flush_on_close();
         controller.install_cwd_polling_fallback();
         controller
+    }
+
+    /// Replace the lazily-initialized notifier cell with one shared
+    /// with `DaemonHandler`. Must be called before the controller is
+    /// cloned (clones capture the current `Arc`), otherwise the GUI
+    /// keeps issuing `RemoveNotification` on a different
+    /// `Connection::session()` than the `AddNotification` came from
+    /// and gnome-shell — which keys by `(sender, app_id)` — never
+    /// drops the matching entry.
+    pub fn use_shared_notifier(
+        &mut self,
+        handle: Arc<tokio::sync::Mutex<Option<flowmux_notify::DesktopNotifier>>>,
+    ) {
+        self.notifier = handle;
     }
 
     pub fn show_status_when_empty(&self) {
@@ -1804,9 +1824,24 @@ impl WindowController {
                     let _ = ack.send(None);
                     return;
                 }
-                let entry_id = self
-                    .notifications
-                    .push(title, body, level, pane, surface, workspace);
+                let Some(entry_id) =
+                    self.notifications
+                        .push(title, body, level, pane, surface, workspace)
+                else {
+                    // Near-duplicate of an entry pushed within
+                    // `DUP_WINDOW`: the OSC path and the lifecycle
+                    // hook both fired for the same Stop event. Ack
+                    // with None so the IPC handler also skips the
+                    // desktop toast — one row, one toast per event.
+                    tracing::debug!(
+                        ?pane,
+                        ?surface,
+                        ?level,
+                        "notification deduplicated against recent entry"
+                    );
+                    let _ = ack.send(None);
+                    return;
+                };
                 self.sidebar.bump_notification_badge();
                 if matches!(level, flowmux_core::NotificationLevel::AttentionNeeded) {
                     if let Some(ws_id) = workspace {
@@ -1824,7 +1859,7 @@ impl WindowController {
                 // sweep had nothing to close. Detect that here and fire
                 // a one-off close so the FDO toast does not linger and
                 // the dock badge stays in sync.
-                match self.notifications.set_desktop_id(id, desktop_id) {
+                match self.notifications.set_desktop_id(id, desktop_id.clone()) {
                     SetDesktopIdResult::Stale => {
                         self.close_desktop_notifications(vec![desktop_id]);
                         self.refresh_launcher_badge();
@@ -2402,11 +2437,15 @@ impl WindowController {
         }
     }
 
-    /// Connect (lazily) to the FDO notifications service and ask it to
-    /// close the given `desktop_id`s. Used by the bell popover sweep,
-    /// the workspace-activation sweep, the OpenNotification click, and
-    /// the late-arriving SetNotificationDesktopId race fix.
-    fn close_desktop_notifications(&self, desktop_ids: Vec<u32>) {
+    /// Connect (lazily) to the `org.gtk.Notifications` service and ask
+    /// it to withdraw the given `desktop_id`s. Used by the bell popover
+    /// sweep, the workspace-activation sweep, the OpenNotification
+    /// click, and the late-arriving SetNotificationDesktopId race fix.
+    /// On GNOME this destroys the `MessageTray.Source` entry, which is
+    /// what actually shrinks Ubuntu Dock's per-app notification count —
+    /// the legacy FDO `CloseNotification` path used to leave both the
+    /// message-tray entry and the badge stuck.
+    fn close_desktop_notifications(&self, desktop_ids: Vec<String>) {
         if desktop_ids.is_empty() {
             return;
         }
@@ -2417,39 +2456,32 @@ impl WindowController {
             // context for every `await`. The GTK main thread is not a
             // Tokio worker, so without this guard the first `.await`
             // panics with "no reactor running"; the panic is swallowed
-            // by GLib's task wrapper and the FDO toast never closes,
-            // leaving the OS notification center inflated and the dock
-            // badge stuck. The guard lives for the entire async block,
+            // by GLib's task wrapper and the toast never closes,
+            // leaving the message tray inflated and the dock badge
+            // stuck. The guard lives for the entire async block,
             // covering connect + every `close().await`.
             let _enter = handle.as_ref().map(|h| h.enter());
             let Some(notifier) = ensure_desktop_notifier(&notifier_cell).await else {
                 return;
             };
             for did in desktop_ids {
-                if let Err(e) = notifier.close(did).await {
-                    tracing::debug!(error = %e, did, "close notification failed");
+                if let Err(e) = notifier.close(&did).await {
+                    tracing::debug!(error = %e, %did, "close notification failed");
                 }
             }
         });
     }
 
-    /// Publish the current unread-notification count to the dock via
-    /// `com.canonical.Unity.LauncherEntry::Update`. Closing FDO toasts
-    /// alone is not always enough — Ubuntu Dock / Dash-to-Dock derive
-    /// the badge from this Unity signal, so we have to drive it
-    /// explicitly whenever `NotificationStore` state changes.
-    ///
-    /// Two refresh calls are coalesced and serialized: an in-flight
-    /// publish task races with later state changes (a fresh
-    /// `AddNotification` that grew `unread_count()`, or a
-    /// `mark_workspace_read` sweep that shrank it), and `spawn_local`
-    /// gives no FIFO guarantee across awaits. Without coalescing the
-    /// older count could land *after* the newer one and leave the dock
-    /// badge stuck — exactly the "badge stays on 2 even after I clicked
-    /// the workspace" symptom this guards against. The single in-flight
-    /// task republishes until `badge_dirty` stays false, so the dock
-    /// converges to the freshest `unread_count()` regardless of how
-    /// many overlapping callers fired the refresh.
+    /// Republish the unread-notification count to the dock via the
+    /// Unity LauncherEntry signal. `org.gtk.Notifications.RemoveNotification`
+    /// clears the GNOME message-tray dot, but Ubuntu Dock's *number
+    /// circle* on the launcher icon is driven exclusively by this
+    /// Unity-vintage signal — without re-emitting after each
+    /// mark-read sweep, the circle stays pinned at the last published
+    /// value. An in-flight publish task acts as the single publisher;
+    /// further refreshes set `badge_dirty`, and the task re-reads
+    /// `unread_count()` after each `await` so bursty pushes/sweeps
+    /// always converge to the freshest value.
     fn refresh_launcher_badge(&self) {
         if self.badge_publisher_busy.get() {
             // Another spawn_local is already publishing. Just signal it
@@ -2467,35 +2499,21 @@ impl WindowController {
         let dirty = self.badge_dirty.clone();
         let handle = self.tokio_handle.clone();
         glib::MainContext::default().spawn_local(async move {
-            // See `close_desktop_notifications`: zbus's tokio executor
-            // needs an active runtime context across every `await`.
-            // Without it, `update_launcher_count` panics inside
-            // `spawn_local` and the dock badge never updates. Holding
-            // the enter guard for the whole async block (including the
-            // republish loop) keeps the runtime in scope.
+            // zbus's tokio executor needs an active runtime context
+            // across every `await`. Without it, `update_launcher_count`
+            // panics inside `spawn_local`, GLib swallows the panic, and
+            // the dock badge never updates.
             let _enter = handle.as_ref().map(|h| h.enter());
-            // Drive the dock association through the same constant the
-            // FDO `desktop-entry` hint uses; if the two ever drift the
-            // launcher badge and the message-tray dot land on different
-            // app icons and the user sees a stuck badge after ack.
             let app_uri = format!(
                 "application://{}.desktop",
                 flowmux_notify::DESKTOP_FILE_BASENAME
             );
             loop {
                 let Some(notifier) = ensure_desktop_notifier(&notifier_cell).await else {
-                    // No notifier available (no D-Bus, headless test).
-                    // Drop the dirty flag too so the next refresh starts
-                    // a fresh task instead of inheriting our stale
-                    // pending-bit, which would otherwise spin forever
-                    // on a republish loop that never connects.
                     dirty.set(false);
                     busy.set(false);
                     return;
                 };
-                // Re-read *after* the connect await: any sweep that
-                // landed while we were suspended is reflected here, and
-                // the publish below will carry the freshest value.
                 let count = store.unread_count() as i64;
                 if let Err(e) = notifier.update_launcher_count(&app_uri, count).await {
                     tracing::debug!(error = %e, count, "launcher entry update failed");
@@ -2504,8 +2522,6 @@ impl WindowController {
                     busy.set(false);
                     return;
                 }
-                // A refresh request arrived during publish — loop and
-                // republish with the now-current unread_count.
                 dirty.set(false);
             }
         });
@@ -2534,30 +2550,30 @@ impl WindowController {
     }
 }
 
-/// Lazily connect to the FDO notifications service and return a clone
-/// of the cached [`flowmux_notify::DesktopNotifier`].
+/// Lazily connect to `org.gtk.Notifications` and return a clone of
+/// the cached [`flowmux_notify::DesktopNotifier`].
 ///
-/// The cell is `Rc<RefCell<Option<…>>>`, but every consumer issues
-/// `await`-ing D-Bus calls. Holding `borrow_mut()` across the await
-/// would let two `spawn_local` tasks (e.g. the close-and-refresh pair
-/// fired when the bell popover is opened) collide — the second one
-/// panics on `RefCell` re-borrow, the panic gets swallowed by glib's
-/// task wrapper, and the launcher badge never updates. So we briefly
-/// touch the cell to read or to install a freshly connected notifier,
-/// drop the borrow, and only then await on a cloned handle.
+/// The cell is an `Arc<tokio::sync::Mutex<…>>` shared with the
+/// daemon-side handler so that the first connection wins the lazy
+/// init race and both the `AddNotification` (tokio side) and
+/// `RemoveNotification` (GTK side) paths reuse the same unique bus
+/// name. gnome-shell keys entries by `(sender, app_id)`, so swapping
+/// connections mid-flight is exactly what leaves the dock badge
+/// pinned after the user acks.
 async fn ensure_desktop_notifier(
-    cell: &Rc<RefCell<Option<flowmux_notify::DesktopNotifier>>>,
+    cell: &Arc<tokio::sync::Mutex<Option<flowmux_notify::DesktopNotifier>>>,
 ) -> Option<flowmux_notify::DesktopNotifier> {
-    if let Some(n) = cell.borrow().as_ref().cloned() {
-        return Some(n);
+    let mut guard = cell.lock().await;
+    if let Some(n) = guard.as_ref() {
+        return Some(n.clone());
     }
     match flowmux_notify::DesktopNotifier::connect().await {
         Ok(n) => {
-            *cell.borrow_mut() = Some(n.clone());
+            *guard = Some(n.clone());
             Some(n)
         }
         Err(e) => {
-            tracing::debug!(error = %e, "could not connect to FDO notifications");
+            tracing::debug!(error = %e, "could not connect to org.gtk.Notifications");
             None
         }
     }
@@ -5917,7 +5933,7 @@ mod tests {
         controller
             .dispatch(GtkCommand::SetNotificationDesktopId {
                 id,
-                desktop_id: 4242,
+                desktop_id: "did-4242".into(),
             })
             .await;
 
@@ -5927,8 +5943,8 @@ mod tests {
             "late desktop_id arriving after a sweep must not re-inflate the badge",
         );
         assert_eq!(
-            controller.notifications.find(id).unwrap().desktop_id,
-            Some(4242),
+            controller.notifications.find(id).unwrap().desktop_id.as_deref(),
+            Some("did-4242"),
             "even though the entry is already read, the late desktop_id should still be recorded so any subsequent close path has it",
         );
     }
@@ -6172,7 +6188,7 @@ mod tests {
         controller
             .dispatch(GtkCommand::SetNotificationDesktopId {
                 id,
-                desktop_id: 9001,
+                desktop_id: "did-9001".into(),
             })
             .await;
         assert_eq!(controller.notifications.unread_count(), 1);
@@ -6183,9 +6199,9 @@ mod tests {
         let to_close = controller.notifications.mark_all_unread_read();
         assert_eq!(
             to_close,
-            vec![9001],
+            vec!["did-9001".to_string()],
             "the popover sweep must surface the desktop_id so the dispatcher \
-             can close the FDO toast in lockstep with marking the entry read",
+             can withdraw the desktop toast in lockstep with marking the entry read",
         );
         // Step (2): the dispatcher closes the toast on the FDO daemon.
         controller
@@ -6250,7 +6266,7 @@ mod tests {
         controller
             .dispatch(GtkCommand::SetNotificationDesktopId {
                 id,
-                desktop_id: 4242,
+                desktop_id: "did-4242".into(),
             })
             .await;
         assert_eq!(
@@ -6260,8 +6276,8 @@ mod tests {
              the entry was already read by the popover sweep",
         );
         assert_eq!(
-            controller.notifications.find(id).unwrap().desktop_id,
-            Some(4242),
+            controller.notifications.find(id).unwrap().desktop_id.as_deref(),
+            Some("did-4242"),
             "the late desktop_id must still be recorded so any subsequent close \
              path (e.g. an explicit DeleteNotification) has it",
         );
@@ -6292,13 +6308,13 @@ mod tests {
         controller
             .dispatch(GtkCommand::SetNotificationDesktopId {
                 id: a,
-                desktop_id: 11,
+                desktop_id: "did-11".into(),
             })
             .await;
         controller
             .dispatch(GtkCommand::SetNotificationDesktopId {
                 id: b,
-                desktop_id: 22,
+                desktop_id: "did-22".into(),
             })
             .await;
 
@@ -6307,7 +6323,7 @@ mod tests {
         // implementation later reorders so this test still pins the
         // contents rather than the ordering.
         to_close.sort();
-        assert_eq!(to_close, vec![11, 22]);
+        assert_eq!(to_close, vec!["did-11".to_string(), "did-22".to_string()]);
         controller
             .dispatch(GtkCommand::CloseDesktopNotifications {
                 desktop_ids: to_close,
@@ -6318,11 +6334,11 @@ mod tests {
             .await;
         assert_eq!(controller.notifications.unread_count(), 0);
 
-        // Late reply for c → Stale → dispatcher closes 33 and refreshes.
+        // Late reply for c → Stale → dispatcher closes did-33 and refreshes.
         controller
             .dispatch(GtkCommand::SetNotificationDesktopId {
                 id: c,
-                desktop_id: 33,
+                desktop_id: "did-33".into(),
             })
             .await;
         assert_eq!(controller.notifications.unread_count(), 0);
@@ -6374,7 +6390,7 @@ mod tests {
                 controller
                     .dispatch(GtkCommand::SetNotificationDesktopId {
                         id,
-                        desktop_id: (i as u32) + 1,
+                        desktop_id: format!("did-{}", i + 1),
                     })
                     .await;
             }
@@ -6453,7 +6469,7 @@ mod tests {
                     controller
                         .dispatch(GtkCommand::SetNotificationDesktopId {
                             id,
-                            desktop_id: (batch * PER_BATCH + i) as u32 + 1,
+                            desktop_id: format!("did-{}", batch * PER_BATCH + i + 1),
                         })
                         .await;
                 }
@@ -6537,7 +6553,7 @@ mod tests {
                         controller
                             .dispatch(GtkCommand::SetNotificationDesktopId {
                                 id: old,
-                                desktop_id: i as u32 * 100,
+                                desktop_id: format!("did-{}", i * 100),
                             })
                             .await;
                         assert_invariant(&format!("after set_desktop_id at i={i}"));

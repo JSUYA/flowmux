@@ -1,64 +1,73 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Send desktop notifications via `org.freedesktop.Notifications`.
+//! Send desktop notifications via `org.gtk.Notifications`.
 //!
-//! On Linux this is the standard FDO spec implemented by GNOME Shell,
-//! KDE plasma, dunst, mako, etc. — the equivalent of macOS
-//! UserNotifications used by cmux.
+//! On Linux this is the modern, GNOME-backed path. Compared to the
+//! legacy `org.freedesktop.Notifications` interface:
+//!
+//! * GNOME Shell binds every entry to the calling `app_id` (matched
+//!   against the installed `.desktop` basename), so the dock badge
+//!   counter — which Ubuntu Dock derives from the per-app entries in
+//!   `Main.messageTray` — increments / decrements in lockstep with our
+//!   `AddNotification` / `RemoveNotification` calls.
+//! * `RemoveNotification` actually destroys the `MessageTray.Source`
+//!   notification on GNOME 46, so both the entry in the message tray
+//!   (Super+V) **and** the dock badge drop the moment we acknowledge.
+//!   The legacy FDO `CloseNotification` only dismissed the live toast
+//!   on this stack — the history entry persisted and the dock badge
+//!   stayed pinned, which is the exact regression that motivated the
+//!   switch.
+//!
+//! The id type is a client-chosen `String`, not the `u32` the FDO
+//! daemon used to return. We generate a UUID per notification so a
+//! later `close(&id)` round-trip is unambiguous even when several
+//! notifications fly in parallel.
 
 use flowmux_core::{Notification, NotificationLevel};
 use std::collections::HashMap;
 use zbus::{proxy, zvariant::Value, Connection};
 
-/// Object path the Unity LauncherEntry signal is broadcast on. Dock
-/// implementations (Ubuntu Dock, Dash-to-Dock, KDE Plasma, plank) match
-/// on the interface name + `com.canonical.Unity.LauncherEntry::Update`
-/// member, so the path itself just needs to be unique-ish and stable
-/// across emissions for the same app.
+/// Object path the Unity LauncherEntry signal is broadcast on. Ubuntu
+/// Dock, Dash-to-Dock, KDE Plasma and plank all match on the interface
+/// name + `com.canonical.Unity.LauncherEntry::Update` member. GNOME's
+/// `org.gtk.Notifications.RemoveNotification` clears the message-tray
+/// dot, but Ubuntu Dock's per-app *number circle* is still driven by
+/// this Unity-vintage signal — without it the launcher count stays
+/// pinned at the last published value after the user acknowledges.
 const LAUNCHER_ENTRY_PATH: &str = "/com/canonical/unity/launcherentry/flowmux";
 const LAUNCHER_ENTRY_INTERFACE: &str = "com.canonical.Unity.LauncherEntry";
 const LAUNCHER_ENTRY_MEMBER: &str = "Update";
 
 /// Basename of the installed desktop file (`com.flowmux.App.desktop`)
-/// without the `.desktop` extension. Used as:
-///
-/// 1. The `desktop-entry` hint on every FDO `Notify` call so GNOME
-///    Shell, KDE Plasma and `notification-daemon` can group flowmux
-///    toasts under the same launcher icon and — crucially — clear
-///    the dock indicator the moment we issue `CloseNotification`.
-///    Mismatching this string against the real desktop file name
-///    makes GNOME Shell associate the toast with a non-existent app
-///    id, and the message-tray dot then survives even after every
-///    pending toast has been withdrawn (the exact "badge stays after
-///    ack" symptom this constant guards against).
-/// 2. The icon name (FDO `app_icon` argument) so the toast image
-///    matches the dock icon. Falls back to the system theme when the
-///    flowmux icon is not installed.
+/// without the `.desktop` extension. Used as the `app_id` argument on
+/// every `AddNotification` / `RemoveNotification` call so GNOME Shell
+/// binds the notification to flowmux's launcher icon. A drift between
+/// this string and the real desktop file name lands the dock badge on
+/// a non-existent app id and the user is left with a stuck counter.
 ///
 /// Keep this in lockstep with `crates/flowmux/src/main.rs::APP_ID`
 /// and `resources/desktop/com.flowmux.App.desktop`.
 pub const DESKTOP_FILE_BASENAME: &str = "com.flowmux.App";
 
-/// FDO Notifications proxy. Spec: <https://specifications.freedesktop.org/notification-spec/>.
+/// `org.gtk.Notifications` proxy. Implemented by gnome-shell on GNOME
+/// and by the GApplication backend elsewhere. The interface is the
+/// in-process wire `g_application_send_notification` /
+/// `g_application_withdraw_notification` use, so calling it directly
+/// from zbus has the same observable behaviour as routing through a
+/// `Gio.Application`.
 #[proxy(
-    interface = "org.freedesktop.Notifications",
-    default_service = "org.freedesktop.Notifications",
-    default_path = "/org/freedesktop/Notifications"
+    interface = "org.gtk.Notifications",
+    default_service = "org.gtk.Notifications",
+    default_path = "/org/gtk/Notifications"
 )]
-trait FdoNotifications {
-    #[allow(clippy::too_many_arguments)]
-    fn notify(
+trait GtkNotifications {
+    fn add_notification(
         &self,
-        app_name: &str,
-        replaces_id: u32,
-        app_icon: &str,
-        summary: &str,
-        body: &str,
-        actions: Vec<&str>,
-        hints: std::collections::HashMap<&str, Value<'_>>,
-        expire_timeout: i32,
-    ) -> zbus::Result<u32>;
+        app_id: &str,
+        id: &str,
+        notification: HashMap<&str, Value<'_>>,
+    ) -> zbus::Result<()>;
 
-    fn close_notification(&self, id: u32) -> zbus::Result<()>;
+    fn remove_notification(&self, app_id: &str, id: &str) -> zbus::Result<()>;
 }
 
 #[derive(Clone)]
@@ -73,45 +82,51 @@ impl DesktopNotifier {
         })
     }
 
-    pub async fn send(&self, n: &Notification) -> zbus::Result<u32> {
-        let proxy = FdoNotificationsProxy::new(&self.conn).await?;
-        let mut hints = std::collections::HashMap::new();
-        hints.insert("urgency", Value::U8(urgency_for(n.level)));
-        // MUST match the installed `.desktop` basename so GNOME Shell /
-        // KDE Plasma group the toast under flowmux's launcher icon —
-        // otherwise the dock dot survives `CloseNotification` and the
-        // user is left with a stuck badge after acknowledging.
-        hints.insert("desktop-entry", Value::Str(DESKTOP_FILE_BASENAME.into()));
+    /// Send a notification. Returns the client-chosen id that future
+    /// `close` calls must use; on GNOME this is the same id the
+    /// `MessageTray.Source` records, so a later `RemoveNotification`
+    /// drops both the tray entry and the dock badge in lockstep.
+    pub async fn send(&self, n: &Notification) -> zbus::Result<String> {
+        let proxy = GtkNotificationsProxy::new(&self.conn).await?;
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut notif: HashMap<&str, Value<'_>> = HashMap::new();
+        notif.insert("title", Value::Str(n.title.as_str().into()));
+        notif.insert("body", Value::Str(n.body.as_str().into()));
+        // GApplication notification priority maps cleanly to our levels:
+        //   * Info            → "normal"
+        //   * AttentionNeeded → "high"   (lifts the banner above the rest)
+        //   * Error           → "urgent" (sticky on GNOME — keeps the toast
+        //                       visible until the user clicks).
+        notif.insert("priority", Value::Str(priority_for(n.level).into()));
+        // The "icon" hint takes a serialized GIcon. We omit it: GNOME
+        // falls back to the launcher icon (resolved via app_id) which
+        // is exactly the visual association we want, and serializing a
+        // GIcon by hand is more failure surface than this is worth.
         proxy
-            .notify(
-                "flowmux",
-                0,
-                DESKTOP_FILE_BASENAME,
-                &n.title,
-                &n.body,
-                vec![],
-                hints,
-                expire_for(n.level),
-            )
-            .await
+            .add_notification(DESKTOP_FILE_BASENAME, &id, notif)
+            .await?;
+        Ok(id)
     }
 
-    /// Tell the FDO notification daemon to close (and silently
-    /// withdraw) the notification with `desktop_id`. We use this to
-    /// drop dock/launcher counters once the user has acknowledged the
-    /// alert in flowmux's own bell popover — without it, AttentionNeeded
-    /// toasts (which we send with `expire_timeout = 0`) would otherwise
-    /// linger forever in the GNOME / KDE notification center.
-    pub async fn close(&self, desktop_id: u32) -> zbus::Result<()> {
-        let proxy = FdoNotificationsProxy::new(&self.conn).await?;
-        proxy.close_notification(desktop_id).await
+    /// Withdraw a previously sent notification. On GNOME this destroys
+    /// the `MessageTray.Source` entry and removes the message-tray dot
+    /// next to the launcher icon. The *number circle* on Ubuntu Dock is
+    /// driven by [`Self::update_launcher_count`] instead — call both
+    /// when you want the entire dock indicator to converge with the
+    /// in-app unread count. Idempotent: an unknown id is a benign
+    /// no-op on the server side.
+    pub async fn close(&self, desktop_id: &str) -> zbus::Result<()> {
+        let proxy = GtkNotificationsProxy::new(&self.conn).await?;
+        proxy
+            .remove_notification(DESKTOP_FILE_BASENAME, desktop_id)
+            .await
     }
 
     /// Publish the unread-notification count to the dock badge via the
     /// `com.canonical.Unity.LauncherEntry::Update` D-Bus signal. Ubuntu
     /// Dock, Dash-to-Dock, KDE Plasma and plank all listen for this
-    /// signal. `count <= 0` hides the badge by sending
-    /// `count-visible = false`.
+    /// signal to drive their per-app number circle. `count <= 0` hides
+    /// the badge by sending `count-visible = false`.
     ///
     /// `app_uri` should be `application://<desktop-file-name>.desktop`
     /// (e.g. `application://com.flowmux.App.desktop`) so the dock can
@@ -137,20 +152,11 @@ impl DesktopNotifier {
     }
 }
 
-fn urgency_for(level: NotificationLevel) -> u8 {
-    // FDO urgency levels: 0 = low, 1 = normal, 2 = critical.
+fn priority_for(level: NotificationLevel) -> &'static str {
     match level {
-        NotificationLevel::Info => 0,
-        NotificationLevel::AttentionNeeded => 1,
-        NotificationLevel::Error => 2,
-    }
-}
-
-fn expire_for(level: NotificationLevel) -> i32 {
-    // -1 lets the desktop apply its default; critical sticks until dismissed.
-    match level {
-        NotificationLevel::Error | NotificationLevel::AttentionNeeded => 0,
-        NotificationLevel::Info => -1,
+        NotificationLevel::Info => "normal",
+        NotificationLevel::AttentionNeeded => "high",
+        NotificationLevel::Error => "urgent",
     }
 }
 
@@ -158,14 +164,10 @@ fn expire_for(level: NotificationLevel) -> i32 {
 mod tests {
     use super::*;
 
-    /// The `desktop-entry` hint, the FDO `app_icon` argument, and the
-    /// LauncherEntry `app_uri` all need to key off the same `.desktop`
-    /// basename so GNOME Shell / KDE Plasma / Ubuntu Dock / Dash-to-Dock
-    /// route the notification, the icon, and the badge to the same app.
-    /// A drift between any of these is exactly the "badge stays after
-    /// the user acknowledges" symptom that recurred three times before
-    /// — pin the literal here so a future rename surfaces in CI before
-    /// it ships.
+    /// The app_id we pass to `AddNotification` must match the installed
+    /// `.desktop` basename; otherwise GNOME Shell binds the notification
+    /// to a non-existent launcher and Ubuntu Dock's per-app counter
+    /// never finds it, leaving the badge stuck after we ack.
     #[test]
     fn desktop_file_basename_matches_installed_desktop_file() {
         assert_eq!(
@@ -175,27 +177,13 @@ mod tests {
         );
     }
 
+    /// Pin the level→priority mapping so a future refactor that flips
+    /// Info ↔ AttentionNeeded does not silently downgrade agent toasts
+    /// to "normal" and lose the elevated banner placement on GNOME.
     #[test]
-    fn urgency_for_levels_maps_to_fdo_codes() {
-        // FDO spec: 0=low, 1=normal, 2=critical. Pin the mapping so a
-        // future refactor that flips Info ↔ AttentionNeeded does not
-        // silently downgrade agent toasts.
-        assert_eq!(urgency_for(NotificationLevel::Info), 0);
-        assert_eq!(urgency_for(NotificationLevel::AttentionNeeded), 1);
-        assert_eq!(urgency_for(NotificationLevel::Error), 2);
-    }
-
-    /// AttentionNeeded and Error both intentionally pick `expire_timeout =
-    /// 0` so the toast lingers in the message tray until flowmux itself
-    /// withdraws it via `CloseNotification`. If a refactor changed this
-    /// to a positive timeout, GNOME would auto-expire the toast after a
-    /// few seconds and the dock badge would *also* clear on its own —
-    /// which sounds nice but masks the bell-popover sweep / workspace
-    /// activation sweep, hiding real regressions.
-    #[test]
-    fn expire_for_attention_and_error_returns_zero_so_caller_must_close_explicitly() {
-        assert_eq!(expire_for(NotificationLevel::AttentionNeeded), 0);
-        assert_eq!(expire_for(NotificationLevel::Error), 0);
-        assert_eq!(expire_for(NotificationLevel::Info), -1);
+    fn priority_for_levels_maps_to_gtk_notifications_strings() {
+        assert_eq!(priority_for(NotificationLevel::Info), "normal");
+        assert_eq!(priority_for(NotificationLevel::AttentionNeeded), "high");
+        assert_eq!(priority_for(NotificationLevel::Error), "urgent");
     }
 }

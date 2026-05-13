@@ -115,8 +115,23 @@ impl<F: FnMut(&str)> OscExtractor<F> {
                     // ST terminator (ESC \\)
                     self.emit();
                     self.state = State::Ground;
+                } else if b == b']' {
+                    // `ESC ]` inside an open OSC starts a *new* OSC.
+                    // VTE handles this by aborting the previous,
+                    // unterminated sequence; we mirror that so a
+                    // misbehaving stream like
+                    //   ESC ] 9 ; ESC ] 4 ; 0 ; rgb BEL
+                    // does NOT splice the OSC 4 color-set body into
+                    // the OSC 9 buffer and ship a bogus
+                    // `Terminal / 4;0;rgb...` entry to the bell
+                    // popover. Drop the partial buffer, stay in Osc
+                    // so the fresh payload accumulates cleanly.
+                    self.buf.clear();
+                    self.state = State::Osc;
                 } else {
-                    // Spurious ESC inside payload; treat as data.
+                    // Spurious ESC followed by an unrelated byte —
+                    // treat both as payload data (some agents log
+                    // literal ESC X mid-body).
                     self.push_or_overflow(0x1B);
                     self.push_or_overflow(b);
                     if self.state != State::OscOverflow {
@@ -286,5 +301,26 @@ mod tests {
         // proper OSC still parses.
         let s = b"\x1b[2J\x1b]9;ok\x07";
         assert_eq!(collect(s), vec!["9;ok"]);
+    }
+
+    /// Regression: an agent left an OSC open and another OSC started
+    /// before BEL/ST. The earlier implementation pushed the inner
+    /// `ESC ]` back into the buffer as data, so the second OSC's
+    /// payload was spliced onto the first one's prefix and the parser
+    /// dropped a malformed `Terminal / 4;0;rgb…` entry into the bell
+    /// popover. We now treat `ESC ]` mid-OSC as a restart, mirroring
+    /// VTE's behaviour: only the second payload survives.
+    #[test]
+    fn nested_open_bracket_aborts_previous_payload_and_starts_new() {
+        let s = b"\x1b]9;\x1b]4;0;rgb:11/22/33\x07";
+        assert_eq!(collect(s), vec!["4;0;rgb:11/22/33"]);
+    }
+
+    /// Same idea but the abandoning sequence carried partial body
+    /// bytes before the restart — those must also be discarded.
+    #[test]
+    fn nested_open_bracket_discards_partial_body_of_previous_osc() {
+        let s = b"\x1b]9;leftover-bytes\x1b]9;clean\x07";
+        assert_eq!(collect(s), vec!["9;clean"]);
     }
 }

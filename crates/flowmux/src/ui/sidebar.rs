@@ -132,19 +132,25 @@ impl Sidebar {
         let popover_for_show = bell_popover.clone();
         let bell_for_show = bell_button.clone();
         bell_popover.connect_show(move |_| {
-            // Opening the bell popover is the user's "I read these"
-            // gesture: flip every unread entry to read so the rows
-            // render dimmed, and forward the FDO desktop ids of the
-            // toasts that were actually delivered to the OS so the
-            // window dispatcher can close them. Without that close,
-            // GNOME / KDE keep the entries in the notification center
-            // and the dock badge counter never decreases.
-            //
-            // Always send a follow-up RefreshLauncherBadge even when
-            // `desktop_ids` is empty: an entry whose desktop_id has
-            // not yet arrived from the daemon (IPC race) still flipped
-            // to read here, so the unread count we publish to the
-            // Unity LauncherEntry signal must shrink regardless.
+            // Render BEFORE the ack sweep so unread entries still look
+            // unread (full opacity, accent on AttentionNeeded titles)
+            // the moment the popover appears. The previous order
+            // marked everything read first, so the user saw every row
+            // dimmed even on first open — the exact symptom this
+            // guards against. On the *next* open, those entries are
+            // legitimately read and dim correctly.
+            popover_for_show.set_child(Some(&render_notification_list(
+                &store_for_show,
+                bridge_for_rows.clone(),
+                popover_for_show.clone(),
+            )));
+            bell_for_show.remove_css_class("accent");
+
+            // Now ack: flip the store, withdraw the matching desktop
+            // toasts so the system tray / dock badge converge.
+            // `desktop_ids` may be empty when no toast had a desktop
+            // id yet (IPC race) — we still dispatch the refresh so
+            // any pending badge state catches up.
             let desktop_ids = store_for_show.mark_all_unread_read();
             let bridge = bridge_for_close.clone();
             gtk::glib::MainContext::default().spawn_local(async move {
@@ -156,12 +162,6 @@ impl Sidebar {
                 }
                 let _ = bridge.tx.send(GtkCommand::RefreshLauncherBadge).await;
             });
-            popover_for_show.set_child(Some(&render_notification_list(
-                &store_for_show,
-                bridge_for_rows.clone(),
-                popover_for_show.clone(),
-            )));
-            bell_for_show.remove_css_class("accent");
         });
         toolbar.append(&bell_button);
 

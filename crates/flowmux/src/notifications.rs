@@ -2,7 +2,7 @@
 //! In-process notification log shown in the sidebar's bell popover.
 //!
 //! flowmux already forwards every `Request::Notify` to the desktop via
-//! `org.freedesktop.Notifications` (flowmux-notify). The GUI also keeps
+//! `org.gtk.Notifications` (flowmux-notify). The GUI also keeps
 //! a small in-memory transcript so the user can scroll past
 //! notifications even after the OS toast fades — pressing the bell
 //! button at the top of the sidebar opens a popover listing them.
@@ -21,6 +21,20 @@ use std::rc::Rc;
 /// 9 stream) can otherwise grow this unbounded over a long session.
 /// 200 matches cmux's `TerminalNotificationStore` policy.
 const MAX_RETAINED: usize = 200;
+
+/// Suppress a fresh entry when an entry with the same `(pane, surface,
+/// level)` arrived within this window. Codex / Claude Code emit Stop
+/// twice per agent turn from our perspective — once as OSC 9/99 (snooped
+/// by `flowmuxctl pty-tee`) and once as the lifecycle hook spawn
+/// (`flowmuxctl hooks <agent> stop`). Both legitimately fire the
+/// daemon's `Request::Notify`, so the bell popover would otherwise show
+/// two rows per completion. Eight seconds covers the worst observed
+/// skew between the in-band OSC and the hook process spawn (cold-start
+/// node / python interpreter on the first call of a session). Genuine
+/// back-to-back completions on the same tab are rare on that scale, so
+/// the wider window is the cheaper trade-off than the user-visible
+/// double toast.
+const DUP_WINDOW: chrono::Duration = chrono::Duration::milliseconds(8000);
 
 #[derive(Debug, Clone)]
 pub struct NotificationEntry {
@@ -44,14 +58,14 @@ pub struct NotificationEntry {
     /// reached the GUI thread. Without it we cannot route clicks back to
     /// the right side-panel row.
     pub workspace: Option<WorkspaceId>,
-    /// FDO `org.freedesktop.Notifications.Notify` id returned by the
-    /// notification daemon when the desktop toast was sent. Stored so
-    /// that — once the user reads this entry inside the bell popover —
-    /// flowmux can issue `CloseNotification(desktop_id)` to the FDO
-    /// daemon and shrink the GNOME / KDE dock badge accordingly.
+    /// `org.gtk.Notifications` id we passed to `AddNotification` for
+    /// the desktop toast. Stored so that — once the user reads this
+    /// entry inside the bell popover — flowmux can issue
+    /// `RemoveNotification(desktop_id)` so the GNOME message-tray
+    /// entry vanishes and the dock badge shrinks in lockstep.
     /// `None` when the toast was suppressed (e.g. source pane already
-    /// focused) or when the FDO daemon was unreachable.
-    pub desktop_id: Option<u32>,
+    /// focused) or when the notifications daemon was unreachable.
+    pub desktop_id: Option<String>,
 }
 
 /// Thread-local notification store backing the sidebar bell popover and
@@ -73,7 +87,11 @@ impl NotificationStore {
 
     /// Append a fresh entry. When the buffer is full the oldest entry
     /// is dropped to keep memory bounded under chatty agent streams.
-    /// Returns the assigned id so the caller can later reference it.
+    /// Returns the assigned id so the caller can later reference it,
+    /// or `None` when the entry was suppressed as a near-duplicate of
+    /// an entry pushed inside [`DUP_WINDOW`] (see the constant for
+    /// why both the OSC sniffer and the lifecycle hook fire on the
+    /// same Stop event).
     pub fn push(
         &self,
         title: String,
@@ -82,9 +100,36 @@ impl NotificationStore {
         pane: Option<PaneId>,
         surface: Option<SurfaceId>,
         workspace: Option<WorkspaceId>,
-    ) -> NotificationId {
-        let id = NotificationId::new();
+    ) -> Option<NotificationId> {
+        let now = chrono::Utc::now();
         let mut entries = self.inner.borrow_mut();
+        // Same (pane, surface) inside DUP_WINDOW → drop. Body and
+        // level are intentionally NOT part of the key: the OSC path
+        // carries the raw agent message ("Codex finished — review
+        // the diff") at the heuristic-inferred level (Info when the
+        // text lacks "waiting"/"approval"/…), while the lifecycle
+        // hook path carries our formatted summary ("Codex ready /
+        // task complete") at hard-coded AttentionNeeded. Both fire
+        // for the same Stop event, so matching on pane+surface is
+        // the only key that catches the duplicate; including level
+        // re-introduced the 2× toast we are trying to suppress.
+        //
+        // Pane-less notifications (`flowmuxctl notify` with no --pane,
+        // global toasts) skip the dedupe — they can legitimately fire
+        // back-to-back from unrelated callers, and we have no other
+        // signal to tell them apart.
+        if pane.is_some() && surface.is_some() {
+            if let Some(last) = entries
+                .iter()
+                .rev()
+                .find(|e| e.pane == pane && e.surface == surface)
+            {
+                if now.signed_duration_since(last.created_at) < DUP_WINDOW {
+                    return None;
+                }
+            }
+        }
+        let id = NotificationId::new();
         if entries.len() >= MAX_RETAINED {
             entries.pop_front();
         }
@@ -93,14 +138,14 @@ impl NotificationStore {
             title,
             body,
             level,
-            created_at: chrono::Utc::now(),
+            created_at: now,
             read: false,
             pane,
             surface,
             workspace,
             desktop_id: None,
         });
-        id
+        Some(id)
     }
 
     /// Flip `read = true` for `id`. Returns `true` when the entry was
@@ -116,10 +161,10 @@ impl NotificationStore {
         false
     }
 
-    /// Record the FDO desktop notification id assigned to `id`. The
-    /// IPC handler calls this after the daemon returns
-    /// `Response::Notified` so the popover can later ask the daemon to
-    /// dismiss the toast when the user reads it inside flowmux.
+    /// Record the desktop notification id assigned to `id`. The IPC
+    /// handler calls this after the daemon returns `Response::Notified`
+    /// so the popover can later ask the daemon to withdraw the toast
+    /// when the user reads it inside flowmux.
     ///
     /// Returns [`SetDesktopIdResult`] so the caller can detect the IPC
     /// race where the user already swept the entry to read (by opening
@@ -127,8 +172,8 @@ impl NotificationStore {
     /// daemon's `Notify` reply arrived. In that case
     /// `mark_all_unread_read` / `mark_workspace_read` had no
     /// `desktop_id` to return, so the toast would otherwise stay alive
-    /// in the notification center and the dock badge would not shrink.
-    pub fn set_desktop_id(&self, id: NotificationId, desktop_id: u32) -> SetDesktopIdResult {
+    /// in the message tray and the dock badge would not shrink.
+    pub fn set_desktop_id(&self, id: NotificationId, desktop_id: String) -> SetDesktopIdResult {
         let mut entries = self.inner.borrow_mut();
         match entries.iter_mut().find(|e| e.id == id) {
             Some(e) => {
@@ -145,17 +190,19 @@ impl NotificationStore {
 
     /// Flip every unread entry to `read = true` and return the
     /// `desktop_id` of each one that previously carried a desktop
-    /// notification. The caller is expected to forward those ids to
-    /// `Request::CloseDesktopNotification` so the FDO notification
-    /// center clears them out. Returns an empty vec when nothing
-    /// changed — handy for skipping a no-op IPC roundtrip.
-    pub fn mark_all_unread_read(&self) -> Vec<u32> {
+    /// notification. The caller forwards those ids to
+    /// `Request::CloseDesktopNotification` so
+    /// `org.gtk.Notifications.RemoveNotification` drops the matching
+    /// message-tray entries and the dock badge converges. Returns an
+    /// empty vec when nothing changed — handy for skipping a no-op IPC
+    /// roundtrip.
+    pub fn mark_all_unread_read(&self) -> Vec<String> {
         let mut entries = self.inner.borrow_mut();
         let mut closed = Vec::new();
         for e in entries.iter_mut() {
             if !e.read {
                 e.read = true;
-                if let Some(did) = e.desktop_id {
+                if let Some(did) = e.desktop_id.take() {
                     closed.push(did);
                 }
             }
@@ -172,13 +219,13 @@ impl NotificationStore {
     ///
     /// Entries with `workspace = None` (global notifications) are
     /// untouched; only the bell popover sweep clears those.
-    pub fn mark_workspace_read(&self, ws: WorkspaceId) -> Vec<u32> {
+    pub fn mark_workspace_read(&self, ws: WorkspaceId) -> Vec<String> {
         let mut entries = self.inner.borrow_mut();
         let mut closed = Vec::new();
         for e in entries.iter_mut() {
             if !e.read && e.workspace == Some(ws) {
                 e.read = true;
-                if let Some(did) = e.desktop_id {
+                if let Some(did) = e.desktop_id.take() {
                     closed.push(did);
                 }
             }
@@ -193,11 +240,10 @@ impl NotificationStore {
     /// Drop the entry with `id` from the in-memory transcript. Used by
     /// the per-row trash button in the bell popover so the user can
     /// clear individual entries without acknowledging the rest. Returns
-    /// [`RemoveOutcome`] so the caller can decide whether to also close
-    /// the matching FDO toast and refresh the dock badge: only entries
-    /// that were unread (and carried a `desktop_id`) need a follow-up
-    /// `CloseDesktopNotifications`, and the badge only needs a
-    /// re-publish when the unread count actually moved.
+    /// [`RemoveOutcome`] so the caller can decide whether to also
+    /// withdraw the matching desktop toast: only entries that were
+    /// unread (and carried a `desktop_id`) need a follow-up
+    /// `CloseDesktopNotifications`.
     pub fn remove(&self, id: NotificationId) -> RemoveOutcome {
         let mut entries = self.inner.borrow_mut();
         let Some(idx) = entries.iter().position(|e| e.id == id) else {
@@ -206,7 +252,7 @@ impl NotificationStore {
         let entry = entries.remove(idx).expect("position just confirmed it exists");
         if entry.read {
             // Read entries don't move the unread count and never had a
-            // pending FDO toast — pure transcript-only delete.
+            // pending desktop toast — pure transcript-only delete.
             RemoveOutcome::RemovedRead
         } else {
             RemoveOutcome::RemovedUnread {
@@ -221,33 +267,30 @@ impl NotificationStore {
         self.inner.borrow().iter().cloned().collect()
     }
 
-    /// Number of unread entries. Drives the OS dock-badge count via
-    /// `DesktopNotifier::update_launcher_count` — every state change
-    /// (`push`, `mark_read`, `mark_workspace_read`,
-    /// `mark_all_unread_read`) should be followed by re-emitting this
-    /// number so the dock reflects only notifications the user has
-    /// not yet acknowledged.
+    /// Number of unread entries. Surfaced to tests and the UI for
+    /// invariants ("after I acked, this is 0"). The dock badge is now
+    /// derived by the desktop from `org.gtk.Notifications` per-app
+    /// state, so this value does not need to be re-published anywhere.
     pub fn unread_count(&self) -> usize {
         self.inner.borrow().iter().filter(|e| !e.read).count()
     }
 }
 
 /// Outcome of [`NotificationStore::remove`]. Tells the dispatcher
-/// whether the deleted entry was unread (so the dock badge dropped by
-/// one) and whether it had a live FDO toast that still needs to be
-/// withdrawn from the desktop notification center.
+/// whether the deleted entry was unread and whether it had a live
+/// desktop toast that still needs to be withdrawn from the message
+/// tray.
 #[must_use]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RemoveOutcome {
     /// Entry was found, was already read, and was dropped. No
-    /// `unread_count()` change, no FDO toast to close.
+    /// `unread_count()` change, no desktop toast to close.
     RemovedRead,
-    /// Entry was found, was unread, and was dropped. `unread_count()`
-    /// went down by one — caller should re-publish the dock badge.
-    /// `desktop_id` is `Some` when the FDO daemon had returned a toast
-    /// id; caller should close it so the system notification center
+    /// Entry was found, was unread, and was dropped. `desktop_id` is
+    /// `Some` when the notifications daemon had handed us a toast id;
+    /// caller should withdraw it so the message tray (and dock badge)
     /// drops the row in lockstep with the bell popover.
-    RemovedUnread { desktop_id: Option<u32> },
+    RemovedUnread { desktop_id: Option<String> },
     /// No entry with that id exists (already deleted, never existed,
     /// or aged out under the cap). Safe to ignore.
     Unknown,
@@ -289,7 +332,7 @@ mod tests {
             None,
             None,
             None,
-        );
+        ).expect("push must record an entry");
         let found = s.find(id).expect("entry should be findable by id");
         assert_eq!(found.title, "Claude");
         assert_eq!(found.body, "done");
@@ -306,7 +349,7 @@ mod tests {
             None,
             None,
             None,
-        );
+        ).expect("push must record an entry");
         assert!(s.mark_read(id), "first mark_read should report a change");
         assert!(!s.mark_read(id), "second mark_read on same id is a no-op");
         assert!(s.find(id).unwrap().read);
@@ -329,7 +372,7 @@ mod tests {
             None,
             None,
             None,
-        );
+        ).expect("push must record an entry");
         let b = s.push(
             "b".into(),
             "".into(),
@@ -337,7 +380,7 @@ mod tests {
             None,
             None,
             None,
-        );
+        ).expect("push must record an entry");
         let c = s.push(
             "c".into(),
             "".into(),
@@ -345,7 +388,7 @@ mod tests {
             None,
             None,
             None,
-        );
+        ).expect("push must record an entry");
         let entries = s.entries();
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[0].id, a);
@@ -372,7 +415,7 @@ mod tests {
             Some(pane),
             Some(surface),
             Some(ws),
-        );
+        ).expect("push must record an entry");
         let e = s.find(id).unwrap();
         assert_eq!(e.pane, Some(pane));
         assert_eq!(e.surface, Some(surface));
@@ -400,10 +443,13 @@ mod tests {
         assert_eq!(entries.len(), MAX_RETAINED);
         // The first 5 ids should no longer be findable.
         for stale in &ids[..5] {
-            assert!(s.find(*stale).is_none());
+            assert!(s.find(stale.expect("test push must succeed")).is_none());
         }
         // The newest id should still be at the tail.
-        assert_eq!(entries.last().unwrap().id, *ids.last().unwrap());
+        assert_eq!(
+            entries.last().unwrap().id,
+            ids.last().unwrap().expect("test push must succeed")
+        );
     }
 
     #[test]
@@ -418,7 +464,7 @@ mod tests {
             Some(pane),
             None,
             Some(ws),
-        );
+        ).expect("push must record an entry");
         let b = s.push(
             "claude".into(),
             "step 2".into(),
@@ -426,13 +472,13 @@ mod tests {
             Some(pane),
             None,
             Some(ws),
-        );
+        ).expect("push must record an entry");
         assert_ne!(a, b);
         assert_eq!(s.entries().len(), 2);
     }
 
     #[test]
-    fn set_desktop_id_attaches_fdo_id_to_existing_entry() {
+    fn set_desktop_id_attaches_id_to_existing_entry() {
         let s = store();
         let id = s.push(
             "Claude".into(),
@@ -441,9 +487,12 @@ mod tests {
             None,
             None,
             None,
+        ).expect("push must record an entry");
+        assert_eq!(
+            s.set_desktop_id(id, "did-42".into()),
+            SetDesktopIdResult::Stored
         );
-        assert_eq!(s.set_desktop_id(id, 42), SetDesktopIdResult::Stored);
-        assert_eq!(s.find(id).unwrap().desktop_id, Some(42));
+        assert_eq!(s.find(id).unwrap().desktop_id.as_deref(), Some("did-42"));
     }
 
     #[test]
@@ -452,7 +501,7 @@ mod tests {
         // No panic, no insert — just silently ignored. Mirrors the
         // mark_read contract for entries that aged out under the cap.
         assert_eq!(
-            s.set_desktop_id(NotificationId::new(), 7),
+            s.set_desktop_id(NotificationId::new(), "did-7".into()),
             SetDesktopIdResult::Unknown
         );
         assert_eq!(s.entries().len(), 0);
@@ -463,8 +512,8 @@ mod tests {
         // Simulates the IPC race: the user opened the popover and
         // mark_all_unread_read flipped the entry to read before the
         // daemon's `Notify` reply (which carries the desktop_id) made
-        // it back to the GUI. Without Stale, the FDO toast would never
-        // be closed and the dock badge would stay inflated.
+        // it back to the GUI. Without Stale, the desktop toast would
+        // never be withdrawn and the dock badge would stay inflated.
         let s = store();
         let id = s.push(
             "Claude".into(),
@@ -473,12 +522,15 @@ mod tests {
             None,
             None,
             None,
-        );
+        ).expect("push must record an entry");
         // Sweep first (no desktop_id yet → empty vec).
         assert!(s.mark_all_unread_read().is_empty());
         // Late-arriving desktop id should report Stale.
-        assert_eq!(s.set_desktop_id(id, 99), SetDesktopIdResult::Stale);
-        assert_eq!(s.find(id).unwrap().desktop_id, Some(99));
+        assert_eq!(
+            s.set_desktop_id(id, "did-99".into()),
+            SetDesktopIdResult::Stale
+        );
+        assert_eq!(s.find(id).unwrap().desktop_id.as_deref(), Some("did-99"));
     }
 
     #[test]
@@ -491,7 +543,7 @@ mod tests {
             None,
             None,
             None,
-        );
+        ).expect("push must record an entry");
         let b = s.push(
             "b".into(),
             "".into(),
@@ -499,7 +551,7 @@ mod tests {
             None,
             None,
             None,
-        );
+        ).expect("push must record an entry");
         let c = s.push(
             "c".into(),
             "".into(),
@@ -507,12 +559,12 @@ mod tests {
             None,
             None,
             None,
-        );
+        ).expect("push must record an entry");
         // Entry `a` carries no desktop_id (e.g. toast was suppressed),
         // so it should be marked read but NOT show up in the close
         // list. `b` and `c` should both round-trip their ids.
-        let _ = s.set_desktop_id(b, 11);
-        let _ = s.set_desktop_id(c, 22);
+        let _ = s.set_desktop_id(b, "did-11".into());
+        let _ = s.set_desktop_id(c, "did-22".into());
         // Pre-mark `b` as already read so the loop must skip it and
         // not double-emit its desktop_id.
         s.mark_read(b);
@@ -520,7 +572,7 @@ mod tests {
         assert_eq!(s.unread_count(), 0);
         // Order follows insertion order; only the previously-unread
         // ones with a desktop_id should appear.
-        assert_eq!(to_close, vec![22]);
+        assert_eq!(to_close, vec!["did-22".to_string()]);
         // `a` still has no desktop_id but is now read.
         assert!(s.find(a).unwrap().read);
         assert!(s.find(c).unwrap().read);
@@ -538,7 +590,7 @@ mod tests {
             None,
             None,
             Some(ws_a),
-        );
+        ).expect("push must record an entry");
         let a2 = s.push(
             "claude".into(),
             "step 2".into(),
@@ -546,7 +598,7 @@ mod tests {
             None,
             None,
             Some(ws_a),
-        );
+        ).expect("push must record an entry");
         let b1 = s.push(
             "codex".into(),
             "step 1".into(),
@@ -554,7 +606,7 @@ mod tests {
             None,
             None,
             Some(ws_b),
-        );
+        ).expect("push must record an entry");
         let global = s.push(
             "ready".into(),
             "global".into(),
@@ -562,13 +614,13 @@ mod tests {
             None,
             None,
             None,
-        );
-        let _ = s.set_desktop_id(a1, 11);
-        let _ = s.set_desktop_id(a2, 12);
-        let _ = s.set_desktop_id(b1, 21);
+        ).expect("push must record an entry");
+        let _ = s.set_desktop_id(a1, "did-11".into());
+        let _ = s.set_desktop_id(a2, "did-12".into());
+        let _ = s.set_desktop_id(b1, "did-21".into());
         // ws_a sweep: only a1 / a2 close, b1 + global stay unread.
         let closed = s.mark_workspace_read(ws_a);
-        assert_eq!(closed, vec![11, 12]);
+        assert_eq!(closed, vec!["did-11".to_string(), "did-12".to_string()]);
         assert!(s.find(a1).unwrap().read);
         assert!(s.find(a2).unwrap().read);
         assert!(!s.find(b1).unwrap().read);
@@ -589,7 +641,7 @@ mod tests {
             None,
             None,
             None,
-        );
+        ).expect("push must record an entry");
         // Activating a workspace must never collaterally clear global
         // notifications — only the bell popover sweep does that.
         assert!(s.mark_workspace_read(ws).is_empty());
@@ -609,9 +661,12 @@ mod tests {
             None,
             None,
             None,
+        ).expect("push must record an entry");
+        assert_eq!(
+            s.set_desktop_id(id, "did-99".into()),
+            SetDesktopIdResult::Stored
         );
-        assert_eq!(s.set_desktop_id(id, 99), SetDesktopIdResult::Stored);
-        assert_eq!(s.mark_all_unread_read(), vec![99]);
+        assert_eq!(s.mark_all_unread_read(), vec!["did-99".to_string()]);
         assert!(s.mark_all_unread_read().is_empty());
     }
 
@@ -625,7 +680,7 @@ mod tests {
             None,
             None,
             None,
-        );
+        ).expect("push must record an entry");
         let b = s.push(
             "b".into(),
             "".into(),
@@ -633,17 +688,17 @@ mod tests {
             None,
             None,
             None,
-        );
-        let _ = s.set_desktop_id(b, 77);
+        ).expect("push must record an entry");
+        let _ = s.set_desktop_id(b, "did-77".into());
 
         // Trash button on `b` (unread, has desktop_id) — must report
         // the id so the dispatcher can call CloseDesktopNotifications.
         assert_eq!(
             s.remove(b),
             RemoveOutcome::RemovedUnread {
-                desktop_id: Some(77)
+                desktop_id: Some("did-77".into())
             },
-            "deleting an unread entry must surface its desktop_id so the FDO toast is withdrawn"
+            "deleting an unread entry must surface its desktop_id so the desktop toast is withdrawn"
         );
         assert!(
             s.find(b).is_none(),
@@ -677,7 +732,7 @@ mod tests {
             None,
             None,
             None,
-        );
+        ).expect("push must record an entry");
         let b = s.push(
             "b".into(),
             "".into(),
@@ -685,7 +740,7 @@ mod tests {
             None,
             None,
             None,
-        );
+        ).expect("push must record an entry");
         s.mark_read(a);
         let unread_before = s.unread_count();
 
@@ -714,7 +769,7 @@ mod tests {
             None,
             None,
             None,
-        );
+        ).expect("push must record an entry");
         // Already-deleted / never-existed id must round-trip Unknown
         // so the dispatcher skips refresh work and FDO close calls.
         assert_eq!(s.remove(NotificationId::new()), RemoveOutcome::Unknown);
@@ -734,7 +789,7 @@ mod tests {
             None,
             None,
             None,
-        );
+        ).expect("push must record an entry");
         let b = s.push(
             "b".into(),
             "".into(),
@@ -742,7 +797,7 @@ mod tests {
             None,
             None,
             None,
-        );
+        ).expect("push must record an entry");
         let c = s.push(
             "c".into(),
             "".into(),
@@ -750,7 +805,7 @@ mod tests {
             None,
             None,
             None,
-        );
+        ).expect("push must record an entry");
         let _ = s.remove(b);
         let ids: Vec<_> = s.entries().iter().map(|e| e.id).collect();
         assert_eq!(
@@ -773,7 +828,7 @@ mod tests {
             Some(pane),
             Some(tab_a),
             None,
-        );
+        ).expect("push must record an entry");
         let id_b = s.push(
             "Codex".into(),
             "tab B done".into(),
@@ -781,7 +836,7 @@ mod tests {
             Some(pane),
             Some(tab_b),
             None,
-        );
+        ).expect("push must record an entry");
         assert_eq!(s.find(id_a).unwrap().surface, Some(tab_a));
         assert_eq!(s.find(id_b).unwrap().surface, Some(tab_b));
     }

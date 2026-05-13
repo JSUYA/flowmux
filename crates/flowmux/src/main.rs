@@ -136,10 +136,14 @@ fn main() -> anyhow::Result<()> {
     store.spawn_persist(rt.handle());
 
     let (bridge, rx) = Bridge::new();
-    let handler = Arc::new(GuiHandler::new(
-        DaemonHandler::new(store.clone()),
-        bridge.clone(),
-    ));
+    let daemon_handler = DaemonHandler::new(store.clone());
+    // Hand the GTK controller the same notifier cell the daemon
+    // handler uses to send `AddNotification`. gnome-shell's
+    // `org.gtk.Notifications` keys entries by `(sender, app_id)`, so a
+    // withdraw issued through a second `Connection::session()` never
+    // matches and the dock badge stays pinned after the user acks.
+    let shared_notifier = daemon_handler.notifier_handle();
+    let handler = Arc::new(GuiHandler::new(daemon_handler, bridge.clone()));
 
     let socket_clone = socket.clone();
     rt.spawn(async move {
@@ -164,6 +168,7 @@ fn main() -> anyhow::Result<()> {
     // by GLib's task wrapper, and the dock badge / notification close
     // path silently never runs.
     let tokio_handle_for_activate = rt.handle().clone();
+    let shared_notifier_for_activate = shared_notifier;
     app.connect_activate(move |app| {
         gtk::Window::set_default_icon_name(APP_ID);
 
@@ -196,7 +201,7 @@ fn main() -> anyhow::Result<()> {
             );
         }
 
-        let controller = WindowController::new(
+        let mut controller = WindowController::new(
             app,
             store_for_activate.clone(),
             theme,
@@ -204,6 +209,7 @@ fn main() -> anyhow::Result<()> {
             provider,
             Some(tokio_handle_for_activate.clone()),
         );
+        controller.use_shared_notifier(shared_notifier_for_activate.clone());
         keybindings::install_actions(
             &controller.window,
             bridge_for_activate.clone(),

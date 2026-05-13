@@ -34,6 +34,18 @@ impl DaemonHandler {
         &self.store
     }
 
+    /// Hand out a clone of the lazily-instantiated notifier cell so the
+    /// GUI side can issue `RemoveNotification` through the **same**
+    /// `Connection::session()` that this handler used to send the
+    /// `AddNotification`. gnome-shell's `org.gtk.Notifications` keys
+    /// each entry by `(sender bus name, app_id)`, so a withdraw from a
+    /// second connection silently fails to match and the dock badge /
+    /// message-tray entry stays pinned. Sharing the cell makes both
+    /// sides reuse the first connection that wins the lazy init race.
+    pub fn notifier_handle(&self) -> Arc<tokio::sync::Mutex<Option<flowmux_notify::DesktopNotifier>>> {
+        self.notifier.clone()
+    }
+
     async fn ensure_notifier(
         &self,
     ) -> Option<tokio::sync::MutexGuard<'_, Option<flowmux_notify::DesktopNotifier>>> {
@@ -42,7 +54,7 @@ impl DaemonHandler {
             match flowmux_notify::DesktopNotifier::connect().await {
                 Ok(n) => *guard = Some(n),
                 Err(e) => {
-                    warn!(error = %e, "could not connect to org.freedesktop.Notifications");
+                    warn!(error = %e, "could not connect to org.gtk.Notifications");
                     return None;
                 }
             }
@@ -91,7 +103,7 @@ impl Handler for DaemonHandler {
                         created_at: chrono::Utc::now(),
                         read: false,
                     };
-                    let mut desktop_id: Option<u32> = None;
+                    let mut desktop_id: Option<String> = None;
                     if let Some(guard) = self.ensure_notifier().await {
                         if let Some(notifier) = guard.as_ref() {
                             match notifier.send(&n).await {
@@ -106,11 +118,12 @@ impl Handler for DaemonHandler {
                 Request::CloseDesktopNotification { desktop_id } => {
                     if let Some(guard) = self.ensure_notifier().await {
                         if let Some(notifier) = guard.as_ref() {
-                            if let Err(e) = notifier.close(desktop_id).await {
-                                // Closing an unknown id is not an error
-                                // worth surfacing — the FDO daemon may
-                                // already have aged the entry out.
-                                warn!(error = %e, desktop_id, "close notification failed");
+                            if let Err(e) = notifier.close(&desktop_id).await {
+                                // Closing an unknown id is benign — the
+                                // notifications daemon may already have
+                                // dropped the entry, e.g. because the
+                                // user cleared the message tray by hand.
+                                warn!(error = %e, %desktop_id, "close notification failed");
                             }
                         }
                     }

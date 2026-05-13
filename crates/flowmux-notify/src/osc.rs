@@ -30,11 +30,12 @@ pub fn parse_osc(payload: &str) -> Option<OscNotification> {
 }
 
 fn parse_osc_9(body: &str) -> OscNotification {
-    let body = body.trim();
+    let body = sanitize(body);
+    let level = infer_level(&body);
     OscNotification {
         title: "Terminal".into(),
-        body: body.to_string(),
-        level: infer_level(body),
+        body,
+        level,
     }
 }
 
@@ -44,10 +45,12 @@ fn parse_osc_99(rest: &str) -> OscNotification {
         Some((opts, body)) => (opts, body),
         None => ("", rest),
     };
+    let body = sanitize(body);
+    let level = infer_level(&body);
     OscNotification {
         title: "Terminal".into(),
-        body: body.trim().to_string(),
-        level: infer_level(body),
+        body,
+        level,
     }
 }
 
@@ -58,14 +61,28 @@ fn parse_osc_777(rest: &str) -> Option<OscNotification> {
     if kind != "notify" {
         return None;
     }
-    let summary = parts.next()?.trim().to_string();
-    let body = parts.next().unwrap_or("").trim().to_string();
+    let summary = sanitize(parts.next()?);
+    let body = sanitize(parts.next().unwrap_or(""));
     let level = infer_level(if body.is_empty() { &summary } else { &body });
     Some(OscNotification {
         title: summary,
         body,
         level,
     })
+}
+
+/// Strip control characters from an OSC field before it reaches the
+/// user-visible bell popover. Real notification bodies are plain text;
+/// anything else (ESC, BEL, OSC remnants from a misbehaving emitter)
+/// would render as garbled boxes in the GTK label and tripled as the
+/// "Terminal / 4;0;rgb…" entries the user reported. Tab + newline are
+/// kept so multi-line messages survive verbatim.
+fn sanitize(s: &str) -> String {
+    s.chars()
+        .filter(|&c| c == '\n' || c == '\t' || !c.is_control())
+        .collect::<String>()
+        .trim()
+        .to_string()
 }
 
 /// Heuristic level inference. cmux's documented behavior is that any

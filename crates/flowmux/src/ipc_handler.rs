@@ -410,8 +410,8 @@ impl Handler for GuiHandler {
                     // already focused — in that case we also skip the
                     // desktop toast so flowmux stays out of the way.
                     // `Some(entry_id)` is the in-process popover id we
-                    // need so we can later attach the FDO desktop id
-                    // returned by the daemon.
+                    // need so we can later attach the gtk notifications
+                    // id returned by the daemon.
                     let (tx, rx) = oneshot::channel();
                     let _ = self
                         .bridge
@@ -443,7 +443,7 @@ impl Handler for GuiHandler {
                         // read" sweep can later ask the FDO daemon to
                         // close the toast and shrink the dock badge.
                         if let Response::Notified {
-                            desktop_id: Some(desktop_id),
+                            desktop_id: Some(ref desktop_id),
                         } = resp
                         {
                             let _ = self
@@ -451,7 +451,7 @@ impl Handler for GuiHandler {
                                 .tx
                                 .send(GtkCommand::SetNotificationDesktopId {
                                     id: entry_id,
-                                    desktop_id,
+                                    desktop_id: desktop_id.clone(),
                                 })
                                 .await;
                         }
