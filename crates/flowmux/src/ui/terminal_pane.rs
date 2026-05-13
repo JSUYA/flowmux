@@ -1170,7 +1170,6 @@ fn gdk_key_to_ghostty_key(key: gtk::gdk::Key) -> Option<GhosttyKey> {
         gtk::gdk::Key::semicolon | gtk::gdk::Key::colon => GhosttyKey::Semicolon,
         gtk::gdk::Key::slash | gtk::gdk::Key::question => GhosttyKey::Slash,
         gtk::gdk::Key::space => GhosttyKey::Space,
-        gtk::gdk::Key::BackSpace => GhosttyKey::Backspace,
         gtk::gdk::Key::Delete => GhosttyKey::Delete,
         gtk::gdk::Key::Return | gtk::gdk::Key::ISO_Enter => GhosttyKey::Enter,
         gtk::gdk::Key::Escape => GhosttyKey::Escape,
@@ -1960,6 +1959,11 @@ mod tests {
             gdk_key_to_ghostty_key(gtk::gdk::Key::Page_Down),
             Some(GhosttyKey::PageDown)
         );
+    }
+
+    #[test]
+    fn backspace_uses_legacy_encoding_path() {
+        assert_eq!(gdk_key_to_ghostty_key(gtk::gdk::Key::BackSpace), None);
     }
 
     #[test]
