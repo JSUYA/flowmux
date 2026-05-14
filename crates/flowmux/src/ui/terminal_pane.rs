@@ -510,19 +510,26 @@ impl TerminalRuntime {
     fn process_output(self: &Rc<Self>, bytes: &[u8]) {
         let mut state = self.state.borrow_mut();
         state.terminal.vt_write(bytes);
-        let title = state.terminal.title().unwrap_or_default().to_string();
-        let pwd = state.terminal.pwd().unwrap_or_default().to_string();
-        let title_changed = title != state.last_title;
-        let pwd_changed = pwd != state.last_pwd;
-        if title_changed {
-            state.last_title = title.clone();
-        }
+        // Compare title/pwd as &str first so heavy TUIs that never
+        // touch the window title (the common case for opencode, vim,
+        // less, …) avoid two String allocations per 8 KiB chunk.
+        let title_str = state.terminal.title().unwrap_or_default();
+        let title_changed = title_str != state.last_title;
+        let new_title: Option<String> = if title_changed {
+            let owned = title_str.to_string();
+            state.last_title = owned.clone();
+            Some(owned)
+        } else {
+            None
+        };
+        let pwd_str = state.terminal.pwd().unwrap_or_default();
+        let pwd_changed = pwd_str != state.last_pwd;
         if pwd_changed {
-            state.last_pwd = pwd;
+            state.last_pwd = pwd_str.to_string();
         }
         drop(state);
 
-        if title_changed {
+        if let Some(title) = new_title {
             let pane = self.pane_for_callbacks();
             for handler in self.title_handlers.borrow().iter() {
                 handler(&pane, title.clone());
@@ -535,7 +542,6 @@ impl TerminalRuntime {
             }
         }
         self.widget.queue_draw();
-        self.refresh_scrollbar();
     }
 
     fn pane_for_callbacks(self: &Rc<Self>) -> TerminalPane {
@@ -674,6 +680,14 @@ fn draw_terminal(
             Ok(cells) => cells,
             Err(_) => break,
         };
+        // Contiguous non-default-bg cells in this row are merged into a
+        // single Cairo rectangle so a styled line like
+        // `\x1b[44m……some 80 cells……\x1b[0m` becomes one fill plus a
+        // few `set_source_rgba` calls instead of 80 of each. The run
+        // tracks (start_col, end_col_exclusive, color); default-bg
+        // cells flush and skip any new fill because the row was
+        // already wiped to the terminal bg at the top of draw_terminal.
+        let mut bg_run: Option<(u16, u16, gtk::gdk::RGBA)> = None;
         let mut x = 0u16;
         while let Some(cell) = cells.next() {
             let raw = cell.raw_cell().ok();
@@ -700,20 +714,32 @@ fn draw_terminal(
             // over the right half of the head's glyph.
             let wide = raw.map(|c| c.wide().ok()).flatten();
             let is_spacer_tail = matches!(wide, Some(CellWide::SpacerTail));
-            let cell_span = if matches!(wide, Some(CellWide::Wide)) {
-                2.0
+            let cell_span: u16 = if matches!(wide, Some(CellWide::Wide)) {
+                2
             } else {
-                1.0
+                1
             };
-            if !is_spacer_tail && bg != visuals.bg {
-                set_source_rgba(cr, &bg);
-                cr.rectangle(
-                    px,
-                    py,
-                    (metrics.width * cell_span).ceil(),
-                    metrics.height.ceil(),
-                );
-                let _ = cr.fill();
+
+            if is_spacer_tail {
+                // Spacer tail: do not break the open run (the wide head
+                // before us already extended the run by two columns) and
+                // do not render any glyph of our own.
+            } else if bg == visuals.bg {
+                if let Some((start, end, color)) = bg_run.take() {
+                    paint_bg_run(cr, &metrics, start, end, y, &color);
+                }
+            } else {
+                match bg_run {
+                    Some(ref mut run) if run.1 == x && run.2 == bg => {
+                        run.1 = x.saturating_add(cell_span);
+                    }
+                    _ => {
+                        if let Some((start, end, color)) = bg_run.take() {
+                            paint_bg_run(cr, &metrics, start, end, y, &color);
+                        }
+                        bg_run = Some((x, x.saturating_add(cell_span), bg));
+                    }
+                }
             }
 
             let graphemes = cell.graphemes().unwrap_or_default();
@@ -732,6 +758,9 @@ fn draw_terminal(
                 pangocairo::functions::show_layout(cr, &layout);
             }
             x = x.saturating_add(1);
+        }
+        if let Some((start, end, color)) = bg_run.take() {
+            paint_bg_run(cr, &metrics, start, end, y, &color);
         }
         y = y.saturating_add(1);
     }
@@ -1254,12 +1283,32 @@ fn install_io_watch(pane: &TerminalPane, on_child_exited: Rc<RefCell<dyn FnMut(P
             let Some(runtime) = weak.upgrade() else {
                 return glib::ControlFlow::Break;
             };
+            // Pump every available chunk before yielding. Refresh the
+            // scrollbar exactly once per batch instead of after every
+            // 8 KiB read — TUIs like opencode flood the PTY with many
+            // short chunks per frame, and `terminal.scrollbar()` plus
+            // `gtk::Adjustment::configure` per chunk was the dominant
+            // cost of the io watch on that workload.
             let mut buf = [0u8; 8192];
+            let mut received_any = false;
             loop {
                 match read_fd(fd, &mut buf) {
-                    ReadResult::Data(n) => runtime.process_output(&buf[..n]),
-                    ReadResult::WouldBlock => return glib::ControlFlow::Continue,
-                    ReadResult::Eof | ReadResult::Error => return glib::ControlFlow::Break,
+                    ReadResult::Data(n) => {
+                        runtime.process_output(&buf[..n]);
+                        received_any = true;
+                    }
+                    ReadResult::WouldBlock => {
+                        if received_any {
+                            runtime.refresh_scrollbar();
+                        }
+                        return glib::ControlFlow::Continue;
+                    }
+                    ReadResult::Eof | ReadResult::Error => {
+                        if received_any {
+                            runtime.refresh_scrollbar();
+                        }
+                        return glib::ControlFlow::Break;
+                    }
                 }
             }
         },
@@ -2050,6 +2099,30 @@ fn scaled_font(font: &gtk::pango::FontDescription, scale: f64) -> gtk::pango::Fo
     let scaled = (size * scale).max(1.0);
     out.set_size((scaled * gtk::pango::SCALE as f64).round() as i32);
     out
+}
+
+/// Fill the rectangle spanning columns `start..end` on row `y` with
+/// `color`. Centralized helper for the batched background pass in
+/// `draw_terminal` so the run-flush sites stay short and identical.
+fn paint_bg_run(
+    cr: &gtk::cairo::Context,
+    metrics: &CellMetrics,
+    start: u16,
+    end: u16,
+    y: u16,
+    color: &gtk::gdk::RGBA,
+) {
+    if end <= start {
+        return;
+    }
+    set_source_rgba(cr, color);
+    cr.rectangle(
+        start as f64 * metrics.width,
+        y as f64 * metrics.height,
+        (end - start) as f64 * metrics.width,
+        metrics.height.ceil(),
+    );
+    let _ = cr.fill();
 }
 
 fn set_source_rgba(cr: &gtk::cairo::Context, rgba: &gtk::gdk::RGBA) {
