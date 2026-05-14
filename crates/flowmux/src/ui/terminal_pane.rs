@@ -6,8 +6,10 @@
 //! the former external terminal widget dependency while keeping the public `TerminalPane`
 //! surface used by the rest of flowmux.
 
+use crate::ui::terminal_surface::TerminalSurface;
 use flowmux_core::{PaneId, SurfaceId};
 use gtk::glib;
+use gtk::graphene;
 use gtk::prelude::*;
 use libghostty_vt::key::{
     Action as KeyAction, Encoder as KeyEncoder, Event as KeyEvent, Key as GhosttyKey,
@@ -41,7 +43,7 @@ pub struct TerminalPane {
     /// Root GTK widget for this terminal surface. The object identity is
     /// stable across split tree changes so the live PTY child survives pane
     /// reparenting.
-    pub widget: gtk::DrawingArea,
+    pub widget: TerminalSurface,
     /// PID of the spawned shell or pty-tee wrapper.
     pub pid: Rc<Cell<Option<i32>>>,
     runtime: Rc<TerminalRuntime>,
@@ -49,13 +51,13 @@ pub struct TerminalPane {
 
 struct TerminalRuntime {
     id: PaneId,
-    widget: gtk::DrawingArea,
-    /// `gtk::Overlay` whose child is the DrawingArea and whose overlay
-    /// is the vertical scrollback scrollbar pinned to the right edge.
-    /// Using an Overlay keeps the DrawingArea's allocation identical
+    widget: TerminalSurface,
+    /// `gtk::Overlay` whose child is the `TerminalSurface` and whose
+    /// overlay is the vertical scrollback scrollbar pinned to the right
+    /// edge. Using an Overlay keeps the surface's allocation identical
     /// to what it was before the scrollbar existed, which matters
     /// because some GTK/compositor combinations on the desktop render
-    /// the DrawingArea as fully transparent when it is wrapped in a
+    /// the inner widget as fully transparent when it is wrapped in a
     /// horizontal `gtk::Box` instead.
     container: gtk::Overlay,
     /// Drives the scrollback scrollbar. Mirrors libghostty's viewport
@@ -222,13 +224,15 @@ impl TerminalPane {
         callbacks: PaneCallbacks,
     ) -> Self {
         let _unused_notification_cb = &callbacks.on_notification;
-        let widget = gtk::DrawingArea::new();
+        let widget = TerminalSurface::new();
         widget.set_hexpand(true);
         widget.set_vexpand(true);
         widget.set_focusable(true);
         widget.add_css_class("flowmux-terminal");
-        widget.set_content_width((DEFAULT_COLS as f64 * DEFAULT_CELL_WIDTH).ceil() as i32);
-        widget.set_content_height((DEFAULT_ROWS as f64 * DEFAULT_CELL_HEIGHT).ceil() as i32);
+        widget.set_size_request(
+            (DEFAULT_COLS as f64 * DEFAULT_CELL_WIDTH).ceil() as i32,
+            (DEFAULT_ROWS as f64 * DEFAULT_CELL_HEIGHT).ceil() as i32,
+        );
 
         let argv = if argv.is_empty() {
             default_shell_argv()
@@ -275,13 +279,13 @@ impl TerminalPane {
         let im_context = gtk::IMMulticontext::new();
         im_context.set_use_preedit(true);
 
-        // Wrap the DrawingArea in a `gtk::Overlay` so we can pin a
-        // vertical scrollback scrollbar to the right edge without
-        // changing the DrawingArea's allocation. The Overlay becomes
-        // the pane's root widget while the DrawingArea continues to own
-        // every controller (keyboard, focus, draw, selection, …). An
+        // Wrap the terminal surface in a `gtk::Overlay` so we can pin
+        // a vertical scrollback scrollbar to the right edge without
+        // changing the surface's allocation. The Overlay becomes the
+        // pane's root widget while the surface continues to own every
+        // controller (keyboard, focus, snapshot, selection, …). An
         // earlier attempt that used a horizontal `gtk::Box` rendered
-        // the DrawingArea fully transparent on some desktop GTK builds,
+        // the surface fully transparent on some desktop GTK builds,
         // so the Overlay layout is now the only path.
         let container = gtk::Overlay::new();
         container.set_hexpand(true);
@@ -623,33 +627,39 @@ impl Default for TerminalVisuals {
 
 fn install_draw_func(pane: &TerminalPane) {
     let weak = Rc::downgrade(&pane.runtime);
-    pane.widget.set_draw_func(move |widget, cr, _w, _h| {
+    pane.widget.set_snapshot_fn(move |snapshot, widget| {
         let Some(runtime) = weak.upgrade() else {
             return;
         };
-        draw_terminal(&runtime, widget, cr);
+        snapshot_terminal(&runtime, widget, snapshot);
     });
 }
 
-fn draw_terminal(
+fn snapshot_terminal(
     runtime: &Rc<TerminalRuntime>,
-    widget: &gtk::DrawingArea,
-    cr: &gtk::cairo::Context,
+    widget: &gtk::Widget,
+    snapshot: &gtk::Snapshot,
 ) {
     let mut state = runtime.state.borrow_mut();
     let visuals = state.visuals.clone();
     let metrics = state.metrics.clone();
     let selection = state.selection;
 
-    set_source_rgba(cr, &visuals.bg);
-    let alloc = widget.allocation();
-    cr.rectangle(0.0, 0.0, alloc.width() as f64, alloc.height() as f64);
-    let _ = cr.fill();
+    // Whole-widget background. The Snapshot pipeline does not auto-
+    // clear because each frame is composited against the parent's
+    // node tree, so we still emit a single ColorNode covering the
+    // allocation before any per-cell fill is appended on top.
+    let alloc_w = widget.width() as f32;
+    let alloc_h = widget.height() as f32;
+    snapshot.append_color(
+        &visuals.bg,
+        &graphene::Rect::new(0.0, 0.0, alloc_w, alloc_h),
+    );
 
     let TerminalState {
         terminal, render, ..
     } = &mut *state;
-    let Ok(snapshot) = render.update(terminal) else {
+    let Ok(render_snapshot) = render.update(terminal) else {
         return;
     };
     let layout = widget.create_pango_layout(None::<&str>);
@@ -662,7 +672,7 @@ fn draw_terminal(
             return;
         }
     };
-    let mut rows = match row_iter.update(&snapshot) {
+    let mut rows = match row_iter.update(&render_snapshot) {
         Ok(rows) => rows,
         Err(e) => {
             tracing::warn!(error = ?e, "failed to read ghostty rows");
@@ -670,6 +680,12 @@ fn draw_terminal(
         }
     };
 
+    // Reused across rows so the per-draw allocation cost is one Vec
+    // rather than one per row. Each entry caches the painted cell's
+    // computed colors and grapheme cluster so the row can be drawn in
+    // two passes (background fills first, glyphs second) without
+    // re-iterating libghostty's cell stream.
+    let mut row_buf: Vec<RowCell> = Vec::with_capacity(metrics.cols as usize);
     let mut y = 0u16;
     while let Some(row) = rows.next() {
         let mut cell_iter = match CellIterator::new() {
@@ -680,14 +696,7 @@ fn draw_terminal(
             Ok(cells) => cells,
             Err(_) => break,
         };
-        // Contiguous non-default-bg cells in this row are merged into a
-        // single Cairo rectangle so a styled line like
-        // `\x1b[44m……some 80 cells……\x1b[0m` becomes one fill plus a
-        // few `set_source_rgba` calls instead of 80 of each. The run
-        // tracks (start_col, end_col_exclusive, color); default-bg
-        // cells flush and skip any new fill because the row was
-        // already wiped to the terminal bg at the top of draw_terminal.
-        let mut bg_run: Option<(u16, u16, gtk::gdk::RGBA)> = None;
+        row_buf.clear();
         let mut x = 0u16;
         while let Some(cell) = cells.next() {
             let raw = cell.raw_cell().ok();
@@ -705,13 +714,11 @@ fn draw_terminal(
                 fg = visuals.selection_fg.unwrap_or(visuals.fg);
             }
 
-            let px = x as f64 * metrics.width;
-            let py = y as f64 * metrics.height;
-            // Wide cells (e.g. Hangul) span two columns: the head holds the
-            // grapheme and renders its glyph across both, the tail acts as
-            // a placeholder. Stretch the head's background fill across both
-            // columns and skip the tail's fill so the tail does not paint
-            // over the right half of the head's glyph.
+            // Wide cells (e.g. Hangul) span two columns: the head holds
+            // the grapheme and renders its glyph across both, the tail
+            // acts as a placeholder. The bg run extends two columns at
+            // the head, and the spacer tail is skipped so it does not
+            // paint over the right half of the head's glyph.
             let wide = raw.map(|c| c.wide().ok()).flatten();
             let is_spacer_tail = matches!(wide, Some(CellWide::SpacerTail));
             let cell_span: u16 = if matches!(wide, Some(CellWide::Wide)) {
@@ -720,89 +727,110 @@ fn draw_terminal(
                 1
             };
 
-            if is_spacer_tail {
-                // Spacer tail: do not break the open run (the wide head
-                // before us already extended the run by two columns) and
-                // do not render any glyph of our own.
-            } else if bg == visuals.bg {
-                if let Some((start, end, color)) = bg_run.take() {
-                    paint_bg_run(cr, &metrics, start, end, y, &color);
-                }
-            } else {
-                match bg_run {
-                    Some(ref mut run) if run.1 == x && run.2 == bg => {
-                        run.1 = x.saturating_add(cell_span);
-                    }
-                    _ => {
-                        if let Some((start, end, color)) = bg_run.take() {
-                            paint_bg_run(cr, &metrics, start, end, y, &color);
-                        }
-                        bg_run = Some((x, x.saturating_add(cell_span), bg));
-                    }
-                }
-            }
-
             let graphemes = cell.graphemes().unwrap_or_default();
-            if !graphemes.is_empty() && !is_spacer_tail {
-                let text: String = graphemes.into_iter().collect();
-                layout.set_text(&text);
-                set_source_rgba(cr, &fg);
-                // Align this layout's own baseline to the row baseline.
-                // Drawing every glyph from the layout's top-left makes
-                // fallback-font scripts like Hangul render with a
-                // visibly different baseline from monospace Latin
-                // because each font reports its own ascent.
-                let layout_baseline =
-                    layout.baseline() as f64 / gtk::pango::SCALE as f64;
-                cr.move_to(px, py + metrics.baseline - layout_baseline);
-                pangocairo::functions::show_layout(cr, &layout);
-            }
+            let text: Option<String> = if is_spacer_tail || graphemes.is_empty() {
+                None
+            } else {
+                Some(graphemes.into_iter().collect())
+            };
+
+            row_buf.push(RowCell {
+                x,
+                span: cell_span,
+                fg,
+                bg,
+                text,
+                is_spacer_tail,
+            });
             x = x.saturating_add(1);
         }
-        if let Some((start, end, color)) = bg_run.take() {
-            paint_bg_run(cr, &metrics, start, end, y, &color);
+
+        // Pass 1: background fills. Contiguous non-default-bg cells are
+        // merged into a single ColorNode so a styled line that used to
+        // be one fill per cell becomes one node per color change.
+        // Spacer tails are skipped — the preceding wide head already
+        // extended the run two columns to cover them.
+        let mut bg_run: Option<(u16, u16, gtk::gdk::RGBA)> = None;
+        for info in &row_buf {
+            if info.is_spacer_tail {
+                continue;
+            }
+            if info.bg == visuals.bg {
+                if let Some((start, end, color)) = bg_run.take() {
+                    append_bg_run(snapshot, &metrics, start, end, y, &color);
+                }
+                continue;
+            }
+            match bg_run {
+                Some(ref mut run) if run.1 == info.x && run.2 == info.bg => {
+                    run.1 = info.x.saturating_add(info.span);
+                }
+                _ => {
+                    if let Some((start, end, color)) = bg_run.take() {
+                        append_bg_run(snapshot, &metrics, start, end, y, &color);
+                    }
+                    bg_run = Some((info.x, info.x.saturating_add(info.span), info.bg));
+                }
+            }
         }
+        if let Some((start, end, color)) = bg_run.take() {
+            append_bg_run(snapshot, &metrics, start, end, y, &color);
+        }
+
+        // Pass 2: glyphs. Appending text after every background node
+        // for the row guarantees no later flush paints on top of an
+        // already-rendered grapheme — the structural reason we now
+        // use Snapshot rather than cairo's z-ordered command stream.
+        for info in &row_buf {
+            let Some(text) = info.text.as_ref() else {
+                continue;
+            };
+            layout.set_text(text);
+            // Align this layout's own baseline to the row baseline.
+            // Appending every layout from its own top-left would make
+            // fallback-font scripts like Hangul render with a visibly
+            // different baseline from monospace Latin because each
+            // font reports its own ascent.
+            let layout_baseline = layout.baseline() as f64 / gtk::pango::SCALE as f64;
+            let px = info.x as f64 * metrics.width;
+            let py = y as f64 * metrics.height + metrics.baseline - layout_baseline;
+            snapshot.save();
+            snapshot.translate(&graphene::Point::new(px as f32, py as f32));
+            snapshot.append_layout(&layout, &info.fg);
+            snapshot.restore();
+        }
+
         y = y.saturating_add(1);
     }
 
-    if snapshot.cursor_visible().unwrap_or(false) {
-        if let Ok(Some(cursor)) = snapshot.cursor_viewport() {
-            let x = cursor.x as f64 * metrics.width;
-            let y = cursor.y as f64 * metrics.height;
-            set_source_rgba(
-                cr,
-                &snapshot
-                    .cursor_color()
-                    .ok()
-                    .flatten()
-                    .map(TerminalVisuals::rgba_from_rgb)
-                    .unwrap_or(visuals.cursor),
-            );
-            match snapshot
+    if render_snapshot.cursor_visible().unwrap_or(false) {
+        if let Ok(Some(cursor)) = render_snapshot.cursor_viewport() {
+            let cx = cursor.x as f64 * metrics.width;
+            let cy = cursor.y as f64 * metrics.height;
+            let cursor_color = render_snapshot
+                .cursor_color()
+                .ok()
+                .flatten()
+                .map(TerminalVisuals::rgba_from_rgb)
+                .unwrap_or(visuals.cursor);
+            let style = render_snapshot
                 .cursor_visual_style()
-                .unwrap_or(CursorVisualStyle::Block)
-            {
-                CursorVisualStyle::Bar => {
-                    cr.rectangle(x, y, 2.0, metrics.height);
-                }
-                CursorVisualStyle::Underline => {
-                    cr.rectangle(x, y + metrics.height - 2.0, metrics.width, 2.0);
-                }
-                CursorVisualStyle::Block | CursorVisualStyle::BlockHollow => {
-                    cr.rectangle(x, y, metrics.width, metrics.height);
-                }
-                _ => {
-                    cr.rectangle(x, y, metrics.width, metrics.height);
-                }
-            }
-            let _ = cr.stroke();
+                .unwrap_or(CursorVisualStyle::Block);
+            append_cursor(
+                snapshot,
+                &metrics,
+                cx as f32,
+                cy as f32,
+                style,
+                &cursor_color,
+            );
         }
     }
 }
 
 fn install_resize_handler(pane: &TerminalPane) {
     let weak = Rc::downgrade(&pane.runtime);
-    pane.widget.connect_resize(move |_widget, width, height| {
+    pane.widget.connect_resize(move |width, height| {
         let Some(runtime) = weak.upgrade() else {
             return;
         };
@@ -932,28 +960,46 @@ fn install_key_input(pane: &TerminalPane) {
     let controller = gtk::EventControllerKey::new();
     controller.set_im_context(Some(&pane.runtime.im_context));
     controller.connect_key_pressed(move |_controller, key, _keycode, state| {
-        let Some(runtime) = weak.upgrade() else {
-            return glib::Propagation::Proceed;
-        };
-        if app_accel_should_win(key, state) {
-            return glib::Propagation::Proceed;
+        match weak.upgrade() {
+            Some(runtime) => handle_key(&runtime, key, state),
+            None => glib::Propagation::Proceed,
         }
-        // Keep PgUp/Dn parity with the IBus bypass on hosts that do not
-        // install it (FLOWMUX_NO_IBUS_NAV_WORKAROUND=1 or non-sandbox
-        // runs). Plain PgUp/Dn scrolls the viewport on the primary
-        // screen and falls through to the app on alt-screen TUIs;
-        // Shift+PgUp/Dn always scrolls.
-        if let Some(action) = page_action_for_key(key, state) {
-            handle_page_key(&runtime, action);
-            return glib::Propagation::Stop;
-        }
-        let Some(bytes) = encode_key(&runtime, key, state) else {
-            return glib::Propagation::Proceed;
-        };
-        runtime.write_child(&bytes);
-        glib::Propagation::Stop
     });
     pane.widget.add_controller(controller);
+}
+
+/// Single keyboard dispatch entry. Called from both the regular
+/// `gtk::EventControllerKey` path and the capture-phase
+/// `gtk::ShortcutController` IBus 22.04 bypass so the two paths can
+/// never disagree about how a given key resolves. Order matters:
+///
+///   1. Application accelerator (`app_accel_should_win`) — pass through
+///      so `Ctrl+T` and friends reach the application chrome.
+///   2. PgUp/PgDn smart paging — viewport scroll on the primary screen,
+///      escape forwarding on the alt screen, Shift always scrolls.
+///   3. libghostty key encoder (DECCKM/kitty/keyboard-protocol aware)
+///      with a static fallback for keys ghostty doesn't model.
+///
+/// Returning `Stop` consumes the event; `Proceed` lets it continue down
+/// the controller stack (and, in capture phase, lets the bubble-phase
+/// `EventControllerKey` see it).
+fn handle_key(
+    runtime: &Rc<TerminalRuntime>,
+    key: gtk::gdk::Key,
+    mods: gtk::gdk::ModifierType,
+) -> glib::Propagation {
+    if app_accel_should_win(key, mods) {
+        return glib::Propagation::Proceed;
+    }
+    if let Some(action) = page_action_for_key(key, mods) {
+        handle_page_key(runtime, action);
+        return glib::Propagation::Stop;
+    }
+    let Some(bytes) = encode_key(runtime, key, mods) else {
+        return glib::Propagation::Proceed;
+    };
+    runtime.write_child(&bytes);
+    glib::Propagation::Stop
 }
 
 /// Whether the Flatpak/IBus 22.04 navigation-key drop bypass should run.
@@ -988,103 +1034,65 @@ fn install_ibus_nav_bypass(pane: &TerminalPane) {
     controller.set_propagation_phase(gtk::PropagationPhase::Capture);
     controller.set_scope(gtk::ShortcutScope::Local);
 
-    // Plain navigation/edit keys: write a fixed byte sequence to the PTY.
-    // PgUp/Dn are handled below because their semantics depend on which
-    // screen the terminal is in (alt screen → send escape, primary →
-    // scroll viewport).
-    let byte_bindings: &[(gtk::gdk::Key, &'static [u8])] = &[
-        (gtk::gdk::Key::BackSpace, b"\x7f"),
-        (gtk::gdk::Key::Delete, b"\x1b[3~"),
-        (gtk::gdk::Key::Tab, b"\t"),
-        (gtk::gdk::Key::Escape, b"\x1b"),
-        (gtk::gdk::Key::Return, b"\r"),
-        (gtk::gdk::Key::ISO_Enter, b"\r"),
-        (gtk::gdk::Key::Left, b"\x1b[D"),
-        (gtk::gdk::Key::Right, b"\x1b[C"),
-        (gtk::gdk::Key::Up, b"\x1b[A"),
-        (gtk::gdk::Key::Down, b"\x1b[B"),
-        (gtk::gdk::Key::Home, b"\x1b[H"),
-        (gtk::gdk::Key::End, b"\x1b[F"),
-        (gtk::gdk::Key::KP_Delete, b"\x1b[3~"),
-        (gtk::gdk::Key::KP_Enter, b"\r"),
-        (gtk::gdk::Key::KP_Left, b"\x1b[D"),
-        (gtk::gdk::Key::KP_Right, b"\x1b[C"),
-        (gtk::gdk::Key::KP_Up, b"\x1b[A"),
-        (gtk::gdk::Key::KP_Down, b"\x1b[B"),
-        (gtk::gdk::Key::KP_Home, b"\x1b[H"),
-        (gtk::gdk::Key::KP_End, b"\x1b[F"),
+    // The capture-phase shortcuts now share the regular `handle_key`
+    // dispatcher with the bubble-phase EventControllerKey. Two wins
+    // over the previous hard-coded byte tables:
+    //
+    //   * Arrow keys correctly track the terminal's DECCKM mode (i.e.
+    //     `vim`/`less` arrow-key bindings respond as the app expects)
+    //     because the same `encode_key` path runs.
+    //   * Adding a new key only requires touching the table below
+    //     plus the encoder, not two parallel lookup tables.
+    //
+    // The list mirrors the IBus 1.5.26 set of plain navigation/edit
+    // keys that the 22.04 ibus-gtk4 immodule silently drops during a
+    // Hangul preedit, plus the Shift variants of Page_Up/Down so
+    // forced viewport scroll keeps working from inside alt-screen
+    // TUIs even on hosts that need this bypass.
+    const EMPTY: gtk::gdk::ModifierType = gtk::gdk::ModifierType::empty();
+    const SHIFT: gtk::gdk::ModifierType = gtk::gdk::ModifierType::SHIFT_MASK;
+    let bypass_keys: &[(gtk::gdk::Key, gtk::gdk::ModifierType)] = &[
+        (gtk::gdk::Key::BackSpace, EMPTY),
+        (gtk::gdk::Key::Delete, EMPTY),
+        (gtk::gdk::Key::Tab, EMPTY),
+        (gtk::gdk::Key::Escape, EMPTY),
+        (gtk::gdk::Key::Return, EMPTY),
+        (gtk::gdk::Key::ISO_Enter, EMPTY),
+        (gtk::gdk::Key::Left, EMPTY),
+        (gtk::gdk::Key::Right, EMPTY),
+        (gtk::gdk::Key::Up, EMPTY),
+        (gtk::gdk::Key::Down, EMPTY),
+        (gtk::gdk::Key::Home, EMPTY),
+        (gtk::gdk::Key::End, EMPTY),
+        (gtk::gdk::Key::Page_Up, EMPTY),
+        (gtk::gdk::Key::Page_Down, EMPTY),
+        (gtk::gdk::Key::KP_Delete, EMPTY),
+        (gtk::gdk::Key::KP_Enter, EMPTY),
+        (gtk::gdk::Key::KP_Left, EMPTY),
+        (gtk::gdk::Key::KP_Right, EMPTY),
+        (gtk::gdk::Key::KP_Up, EMPTY),
+        (gtk::gdk::Key::KP_Down, EMPTY),
+        (gtk::gdk::Key::KP_Home, EMPTY),
+        (gtk::gdk::Key::KP_End, EMPTY),
+        (gtk::gdk::Key::KP_Page_Up, EMPTY),
+        (gtk::gdk::Key::KP_Page_Down, EMPTY),
+        (gtk::gdk::Key::Page_Up, SHIFT),
+        (gtk::gdk::Key::Page_Down, SHIFT),
+        (gtk::gdk::Key::KP_Page_Up, SHIFT),
+        (gtk::gdk::Key::KP_Page_Down, SHIFT),
     ];
 
-    for (key, bytes) in byte_bindings {
+    for (key, mods) in bypass_keys {
         let weak = Rc::downgrade(&pane.runtime);
-        let bytes = *bytes;
+        let key = *key;
+        let mods = *mods;
         let action = gtk::CallbackAction::new(move |_, _| {
             if let Some(runtime) = weak.upgrade() {
-                runtime.write_child(bytes);
+                return handle_key(&runtime, key, mods);
             }
             glib::Propagation::Stop
         });
-        let trigger = gtk::KeyvalTrigger::new(*key, gtk::gdk::ModifierType::empty());
-        controller.add_shortcut(gtk::Shortcut::new(Some(trigger), Some(action)));
-    }
-
-    // PgUp/Dn — smart paging plus an unconditional Shift+PgUp/Dn scroll
-    // so users can reach the scrollback even from inside an alt-screen
-    // TUI. `KeyvalTrigger` only matches exact modifier combinations, so
-    // each variant gets its own shortcut and an explicit `PageAction`.
-    let page_bindings: &[(gtk::gdk::Key, gtk::gdk::ModifierType, PageAction)] = &[
-        (
-            gtk::gdk::Key::Page_Up,
-            gtk::gdk::ModifierType::empty(),
-            PageAction::SmartUp,
-        ),
-        (
-            gtk::gdk::Key::Page_Down,
-            gtk::gdk::ModifierType::empty(),
-            PageAction::SmartDown,
-        ),
-        (
-            gtk::gdk::Key::KP_Page_Up,
-            gtk::gdk::ModifierType::empty(),
-            PageAction::SmartUp,
-        ),
-        (
-            gtk::gdk::Key::KP_Page_Down,
-            gtk::gdk::ModifierType::empty(),
-            PageAction::SmartDown,
-        ),
-        (
-            gtk::gdk::Key::Page_Up,
-            gtk::gdk::ModifierType::SHIFT_MASK,
-            PageAction::ScrollUp,
-        ),
-        (
-            gtk::gdk::Key::Page_Down,
-            gtk::gdk::ModifierType::SHIFT_MASK,
-            PageAction::ScrollDown,
-        ),
-        (
-            gtk::gdk::Key::KP_Page_Up,
-            gtk::gdk::ModifierType::SHIFT_MASK,
-            PageAction::ScrollUp,
-        ),
-        (
-            gtk::gdk::Key::KP_Page_Down,
-            gtk::gdk::ModifierType::SHIFT_MASK,
-            PageAction::ScrollDown,
-        ),
-    ];
-
-    for (key, mods, action_kind) in page_bindings {
-        let weak = Rc::downgrade(&pane.runtime);
-        let kind = *action_kind;
-        let action = gtk::CallbackAction::new(move |_, _| {
-            if let Some(runtime) = weak.upgrade() {
-                handle_page_key(&runtime, kind);
-            }
-            glib::Propagation::Stop
-        });
-        let trigger = gtk::KeyvalTrigger::new(*key, *mods);
+        let trigger = gtk::KeyvalTrigger::new(key, mods);
         controller.add_shortcut(gtk::Shortcut::new(Some(trigger), Some(action)));
     }
 
@@ -2101,11 +2109,23 @@ fn scaled_font(font: &gtk::pango::FontDescription, scale: f64) -> gtk::pango::Fo
     out
 }
 
-/// Fill the rectangle spanning columns `start..end` on row `y` with
+/// Cached paint data for one cell, collected during the row-iteration
+/// pass in `snapshot_terminal` so the row can then be rendered in two
+/// independent passes (backgrounds, then glyphs).
+struct RowCell {
+    x: u16,
+    span: u16,
+    fg: gtk::gdk::RGBA,
+    bg: gtk::gdk::RGBA,
+    text: Option<String>,
+    is_spacer_tail: bool,
+}
+
+/// Append a ColorNode covering columns `start..end` on row `y` with
 /// `color`. Centralized helper for the batched background pass in
-/// `draw_terminal` so the run-flush sites stay short and identical.
-fn paint_bg_run(
-    cr: &gtk::cairo::Context,
+/// `snapshot_terminal` so the run-flush sites stay short and identical.
+fn append_bg_run(
+    snapshot: &gtk::Snapshot,
     metrics: &CellMetrics,
     start: u16,
     end: u16,
@@ -2115,23 +2135,54 @@ fn paint_bg_run(
     if end <= start {
         return;
     }
-    set_source_rgba(cr, color);
-    cr.rectangle(
-        start as f64 * metrics.width,
-        y as f64 * metrics.height,
-        (end - start) as f64 * metrics.width,
-        metrics.height.ceil(),
-    );
-    let _ = cr.fill();
+    let x_px = start as f32 * metrics.width as f32;
+    let y_px = y as f32 * metrics.height as f32;
+    let w_px = (end - start) as f32 * metrics.width as f32;
+    let h_px = metrics.height.ceil() as f32;
+    snapshot.append_color(color, &graphene::Rect::new(x_px, y_px, w_px, h_px));
 }
 
-fn set_source_rgba(cr: &gtk::cairo::Context, rgba: &gtk::gdk::RGBA) {
-    cr.set_source_rgba(
-        rgba.red() as f64,
-        rgba.green() as f64,
-        rgba.blue() as f64,
-        rgba.alpha() as f64,
-    );
+/// Append the cursor shape at the cell position `(cx, cy)` using the
+/// given `style` and `color`. `BlockHollow` is rendered as a 1px outline
+/// made of four thin ColorNodes; every other variant is a single fill.
+fn append_cursor(
+    snapshot: &gtk::Snapshot,
+    metrics: &CellMetrics,
+    cx: f32,
+    cy: f32,
+    style: CursorVisualStyle,
+    color: &gtk::gdk::RGBA,
+) {
+    let cell_w = metrics.width as f32;
+    let cell_h = metrics.height as f32;
+    match style {
+        CursorVisualStyle::Bar => {
+            snapshot.append_color(color, &graphene::Rect::new(cx, cy, 2.0, cell_h));
+        }
+        CursorVisualStyle::Underline => {
+            snapshot.append_color(
+                color,
+                &graphene::Rect::new(cx, cy + cell_h - 2.0, cell_w, 2.0),
+            );
+        }
+        CursorVisualStyle::BlockHollow => {
+            // 1px outline mimics the cairo `stroke` path the previous
+            // implementation used for the unfocused-pane cursor look.
+            snapshot.append_color(color, &graphene::Rect::new(cx, cy, cell_w, 1.0));
+            snapshot.append_color(
+                color,
+                &graphene::Rect::new(cx, cy + cell_h - 1.0, cell_w, 1.0),
+            );
+            snapshot.append_color(color, &graphene::Rect::new(cx, cy, 1.0, cell_h));
+            snapshot.append_color(
+                color,
+                &graphene::Rect::new(cx + cell_w - 1.0, cy, 1.0, cell_h),
+            );
+        }
+        _ => {
+            snapshot.append_color(color, &graphene::Rect::new(cx, cy, cell_w, cell_h));
+        }
+    }
 }
 
 fn rgba(s: &str) -> gtk::gdk::RGBA {
@@ -2587,5 +2638,29 @@ mod tests {
         assert!(
             page_action_for_key(gtk::gdk::Key::Home, gtk::gdk::ModifierType::empty()).is_none()
         );
+    }
+
+    /// Construction smoke test for the Snapshot-based widget. Confirms
+    /// the `gobject_subclass` registration succeeds, that the widget
+    /// behaves as a `gtk::Widget` for layout properties, and that
+    /// installing a snapshot/resize closure does not panic. Skips when
+    /// GTK cannot initialize (headless CI without a display).
+    #[gtk::test]
+    fn terminal_surface_constructs_and_accepts_closures() {
+        use crate::ui::terminal_surface::TerminalSurface;
+        if gtk::init().is_err() {
+            return;
+        }
+        let surface = TerminalSurface::new();
+        surface.set_focusable(true);
+        surface.set_hexpand(true);
+        surface.set_vexpand(true);
+        surface.set_size_request(640, 408);
+        // Set both closures and make sure subsequent state queries do
+        // not trip a panic in the imp::TerminalSurface accessors.
+        surface.set_snapshot_fn(|_snapshot, _widget| {});
+        surface.connect_resize(|_w, _h| {});
+        assert!(surface.is_focusable());
+        let _: gtk::Widget = surface.upcast();
     }
 }
