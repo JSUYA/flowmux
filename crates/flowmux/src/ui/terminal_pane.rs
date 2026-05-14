@@ -50,6 +50,14 @@ pub struct TerminalPane {
 struct TerminalRuntime {
     id: PaneId,
     widget: gtk::DrawingArea,
+    /// Horizontal `gtk::Box` housing the DrawingArea on the left and the
+    /// vertical scrollback scrollbar on the right. Pane reparenting and
+    /// CSS focus styling target this widget; the DrawingArea continues
+    /// to own every controller (key, focus, draw, selection, …).
+    container: gtk::Box,
+    /// Drives the scrollback scrollbar. Mirrors libghostty's viewport
+    /// state — see [`TerminalRuntime::refresh_scrollbar`].
+    scroll_adjustment: gtk::Adjustment,
     im_context: gtk::IMMulticontext,
     master: OwnedFd,
     pid: Rc<Cell<Option<i32>>>,
@@ -130,7 +138,7 @@ impl TerminalPane {
     }
 
     pub fn root_widget(&self) -> gtk::Widget {
-        self.widget.clone().upcast::<gtk::Widget>()
+        self.runtime.container.clone().upcast::<gtk::Widget>()
     }
 
     pub fn grab_focus(&self) {
@@ -264,9 +272,32 @@ impl TerminalPane {
         let im_context = gtk::IMMulticontext::new();
         im_context.set_use_preedit(true);
 
+        // Wrap the DrawingArea in a horizontal Box so we can put a
+        // vertical scrollback scrollbar to its right. The Box becomes
+        // the pane's root widget while the DrawingArea continues to own
+        // every controller (keyboard, focus, draw, selection, …).
+        let container = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        container.set_hexpand(true);
+        container.set_vexpand(true);
+        container.append(&widget);
+
+        let scroll_adjustment = gtk::Adjustment::new(
+            0.0,
+            0.0,
+            DEFAULT_ROWS as f64,
+            1.0,
+            DEFAULT_ROWS as f64,
+            DEFAULT_ROWS as f64,
+        );
+        let scrollbar = gtk::Scrollbar::new(gtk::Orientation::Vertical, Some(&scroll_adjustment));
+        scrollbar.set_vexpand(true);
+        container.append(&scrollbar);
+
         let runtime = Rc::new(TerminalRuntime {
             id,
             widget: widget.clone(),
+            container: container.clone(),
+            scroll_adjustment: scroll_adjustment.clone(),
             im_context: im_context.clone(),
             master,
             pid: pid.clone(),
@@ -308,6 +339,45 @@ impl TerminalPane {
                     return;
                 };
                 rt.write_child(text.as_bytes());
+            });
+        }
+
+        // Connect the scrollbar adjustment to libghostty's viewport.
+        // Skip the call when `target == current` so the `configure`
+        // calls in `refresh_scrollbar` cannot re-enter and re-scroll.
+        {
+            let weak = Rc::downgrade(&runtime);
+            scroll_adjustment.connect_value_changed(move |adj| {
+                let Some(runtime) = weak.upgrade() else {
+                    return;
+                };
+                let current_offset = {
+                    let state = runtime.state.borrow();
+                    match state.terminal.scrollbar() {
+                        Ok(sb) => sb.offset,
+                        Err(_) => return,
+                    }
+                };
+                let target = adj.value().round() as i64;
+                let delta = target - current_offset as i64;
+                if delta == 0 {
+                    return;
+                }
+                let clamped = delta.clamp(isize::MIN as i64, isize::MAX as i64) as isize;
+                {
+                    let mut state = runtime.state.borrow_mut();
+                    state
+                        .terminal
+                        .scroll_viewport(ScrollViewport::Delta(clamped));
+                }
+                runtime.widget.queue_draw();
+                // Snap the adjustment back to libghostty's actual offset
+                // in case the delta was clamped (e.g. dragging past the
+                // scrollback top or bottom). The handler's identity
+                // guard (`delta == 0`) prevents the configure call from
+                // re-entering — the second pass reads the new offset
+                // and sees it equal to `target`.
+                runtime.refresh_scrollbar();
             });
         }
 
@@ -380,6 +450,29 @@ impl TerminalRuntime {
         write_fd(self.master.as_raw_fd(), bytes);
     }
 
+    /// Resync the scrollbar adjustment from libghostty's current viewport.
+    ///
+    /// `terminal.scrollbar()` reports `{total, offset, len}` in rows: the
+    /// total scrollable area, the current top-of-viewport row, and the
+    /// visible window. Map those to the GTK adjustment so the scrollbar
+    /// thumb position matches the rendered viewport. Borrow the state
+    /// read-only inside a tight scope so the `configure` call below
+    /// happens with no borrow held — its `value-changed` handler needs
+    /// a mutable borrow of `state` to scroll.
+    fn refresh_scrollbar(&self) {
+        let (offset, total, len) = {
+            let state = self.state.borrow();
+            match state.terminal.scrollbar() {
+                Ok(sb) => (sb.offset as f64, sb.total as f64, sb.len as f64),
+                Err(_) => return,
+            }
+        };
+        let page = len.max(1.0);
+        let upper = total.max(page);
+        self.scroll_adjustment
+            .configure(offset, 0.0, upper, 1.0, page, page);
+    }
+
     fn process_output(self: &Rc<Self>, bytes: &[u8]) {
         let mut state = self.state.borrow_mut();
         state.terminal.vt_write(bytes);
@@ -408,6 +501,7 @@ impl TerminalRuntime {
             }
         }
         self.widget.queue_draw();
+        self.refresh_scrollbar();
     }
 
     fn pane_for_callbacks(self: &Rc<Self>) -> TerminalPane {
@@ -649,8 +743,11 @@ fn install_resize_handler(pane: &TerminalPane) {
         let Some(runtime) = weak.upgrade() else {
             return;
         };
-        let mut state = runtime.state.borrow_mut();
-        resize_state_to_pixels(&runtime, &mut state, width, height);
+        {
+            let mut state = runtime.state.borrow_mut();
+            resize_state_to_pixels(&runtime, &mut state, width, height);
+        }
+        runtime.refresh_scrollbar();
     });
 }
 
@@ -778,6 +875,15 @@ fn install_key_input(pane: &TerminalPane) {
         if app_accel_should_win(key, state) {
             return glib::Propagation::Proceed;
         }
+        // Keep PgUp/Dn parity with the IBus bypass on hosts that do not
+        // install it (FLOWMUX_NO_IBUS_NAV_WORKAROUND=1 or non-sandbox
+        // runs). Plain PgUp/Dn scrolls the viewport on the primary
+        // screen and falls through to the app on alt-screen TUIs;
+        // Shift+PgUp/Dn always scrolls.
+        if let Some(action) = page_action_for_key(key, state) {
+            handle_page_key(&runtime, action);
+            return glib::Propagation::Stop;
+        }
         let Some(bytes) = encode_key(&runtime, key, state) else {
             return glib::Propagation::Proceed;
         };
@@ -819,7 +925,11 @@ fn install_ibus_nav_bypass(pane: &TerminalPane) {
     controller.set_propagation_phase(gtk::PropagationPhase::Capture);
     controller.set_scope(gtk::ShortcutScope::Local);
 
-    let bindings: &[(gtk::gdk::Key, &'static [u8])] = &[
+    // Plain navigation/edit keys: write a fixed byte sequence to the PTY.
+    // PgUp/Dn are handled below because their semantics depend on which
+    // screen the terminal is in (alt screen → send escape, primary →
+    // scroll viewport).
+    let byte_bindings: &[(gtk::gdk::Key, &'static [u8])] = &[
         (gtk::gdk::Key::BackSpace, b"\x7f"),
         (gtk::gdk::Key::Delete, b"\x1b[3~"),
         (gtk::gdk::Key::Tab, b"\t"),
@@ -832,8 +942,6 @@ fn install_ibus_nav_bypass(pane: &TerminalPane) {
         (gtk::gdk::Key::Down, b"\x1b[B"),
         (gtk::gdk::Key::Home, b"\x1b[H"),
         (gtk::gdk::Key::End, b"\x1b[F"),
-        (gtk::gdk::Key::Page_Up, b"\x1b[5~"),
-        (gtk::gdk::Key::Page_Down, b"\x1b[6~"),
         (gtk::gdk::Key::KP_Delete, b"\x1b[3~"),
         (gtk::gdk::Key::KP_Enter, b"\r"),
         (gtk::gdk::Key::KP_Left, b"\x1b[D"),
@@ -842,11 +950,9 @@ fn install_ibus_nav_bypass(pane: &TerminalPane) {
         (gtk::gdk::Key::KP_Down, b"\x1b[B"),
         (gtk::gdk::Key::KP_Home, b"\x1b[H"),
         (gtk::gdk::Key::KP_End, b"\x1b[F"),
-        (gtk::gdk::Key::KP_Page_Up, b"\x1b[5~"),
-        (gtk::gdk::Key::KP_Page_Down, b"\x1b[6~"),
     ];
 
-    for (key, bytes) in bindings {
+    for (key, bytes) in byte_bindings {
         let weak = Rc::downgrade(&pane.runtime);
         let bytes = *bytes;
         let action = gtk::CallbackAction::new(move |_, _| {
@@ -859,7 +965,136 @@ fn install_ibus_nav_bypass(pane: &TerminalPane) {
         controller.add_shortcut(gtk::Shortcut::new(Some(trigger), Some(action)));
     }
 
+    // PgUp/Dn — smart paging plus an unconditional Shift+PgUp/Dn scroll
+    // so users can reach the scrollback even from inside an alt-screen
+    // TUI. `KeyvalTrigger` only matches exact modifier combinations, so
+    // each variant gets its own shortcut and an explicit `PageAction`.
+    let page_bindings: &[(gtk::gdk::Key, gtk::gdk::ModifierType, PageAction)] = &[
+        (
+            gtk::gdk::Key::Page_Up,
+            gtk::gdk::ModifierType::empty(),
+            PageAction::SmartUp,
+        ),
+        (
+            gtk::gdk::Key::Page_Down,
+            gtk::gdk::ModifierType::empty(),
+            PageAction::SmartDown,
+        ),
+        (
+            gtk::gdk::Key::KP_Page_Up,
+            gtk::gdk::ModifierType::empty(),
+            PageAction::SmartUp,
+        ),
+        (
+            gtk::gdk::Key::KP_Page_Down,
+            gtk::gdk::ModifierType::empty(),
+            PageAction::SmartDown,
+        ),
+        (
+            gtk::gdk::Key::Page_Up,
+            gtk::gdk::ModifierType::SHIFT_MASK,
+            PageAction::ScrollUp,
+        ),
+        (
+            gtk::gdk::Key::Page_Down,
+            gtk::gdk::ModifierType::SHIFT_MASK,
+            PageAction::ScrollDown,
+        ),
+        (
+            gtk::gdk::Key::KP_Page_Up,
+            gtk::gdk::ModifierType::SHIFT_MASK,
+            PageAction::ScrollUp,
+        ),
+        (
+            gtk::gdk::Key::KP_Page_Down,
+            gtk::gdk::ModifierType::SHIFT_MASK,
+            PageAction::ScrollDown,
+        ),
+    ];
+
+    for (key, mods, action_kind) in page_bindings {
+        let weak = Rc::downgrade(&pane.runtime);
+        let kind = *action_kind;
+        let action = gtk::CallbackAction::new(move |_, _| {
+            if let Some(runtime) = weak.upgrade() {
+                handle_page_key(&runtime, kind);
+            }
+            glib::Propagation::Stop
+        });
+        let trigger = gtk::KeyvalTrigger::new(*key, *mods);
+        controller.add_shortcut(gtk::Shortcut::new(Some(trigger), Some(action)));
+    }
+
     pane.widget.add_controller(controller);
+}
+
+/// Behaviour applied when PgUp/Dn fires. `Smart*` is the default — scroll
+/// the viewport on the primary screen and forward the legacy CSI escape
+/// (`\x1b[5~` / `\x1b[6~`) on the alt screen so vim/less/man can still
+/// page their own buffers. `Scroll*` is the unconditional viewport-only
+/// path used by Shift+PgUp/Dn and reachable from any screen.
+#[derive(Clone, Copy)]
+enum PageAction {
+    SmartUp,
+    SmartDown,
+    ScrollUp,
+    ScrollDown,
+}
+
+const SCREEN_ALTERNATE: u32 = 1;
+
+fn is_alternate_screen(runtime: &TerminalRuntime) -> bool {
+    let state = runtime.state.borrow();
+    matches!(state.terminal.active_screen(), Ok(s) if s == SCREEN_ALTERNATE)
+}
+
+fn handle_page_key(runtime: &Rc<TerminalRuntime>, action: PageAction) {
+    let up = matches!(action, PageAction::SmartUp | PageAction::ScrollUp);
+    let should_scroll = match action {
+        PageAction::ScrollUp | PageAction::ScrollDown => true,
+        PageAction::SmartUp | PageAction::SmartDown => !is_alternate_screen(runtime),
+    };
+    if should_scroll {
+        scroll_viewport_by_page(runtime, up);
+    } else {
+        runtime.write_child(if up { b"\x1b[5~" } else { b"\x1b[6~" });
+    }
+}
+
+fn scroll_viewport_by_page(runtime: &Rc<TerminalRuntime>, up: bool) {
+    let rows = runtime.state.borrow().metrics.rows as isize;
+    let step = (rows.max(2) - 1).max(1);
+    let delta = if up { -step } else { step };
+    {
+        let mut state = runtime.state.borrow_mut();
+        state.terminal.scroll_viewport(ScrollViewport::Delta(delta));
+    }
+    runtime.widget.queue_draw();
+    runtime.refresh_scrollbar();
+}
+
+fn page_action_for_key(key: gtk::gdk::Key, mods: gtk::gdk::ModifierType) -> Option<PageAction> {
+    // Pass anything with Ctrl/Alt/Super through to `encode_key` so app
+    // shortcuts that involve PgUp/Dn (e.g. tab navigation in shells)
+    // keep their original meaning.
+    let other = mods - gtk::gdk::ModifierType::SHIFT_MASK;
+    if !other.is_empty() {
+        return None;
+    }
+    let shift = mods.contains(gtk::gdk::ModifierType::SHIFT_MASK);
+    match key {
+        gtk::gdk::Key::Page_Up | gtk::gdk::Key::KP_Page_Up => Some(if shift {
+            PageAction::ScrollUp
+        } else {
+            PageAction::SmartUp
+        }),
+        gtk::gdk::Key::Page_Down | gtk::gdk::Key::KP_Page_Down => Some(if shift {
+            PageAction::ScrollDown
+        } else {
+            PageAction::SmartDown
+        }),
+        _ => None,
+    }
 }
 
 fn install_scroll_input(pane: &TerminalPane) {
@@ -869,11 +1104,13 @@ fn install_scroll_input(pane: &TerminalPane) {
         let Some(runtime) = weak.upgrade() else {
             return glib::Propagation::Proceed;
         };
-        let mut state = runtime.state.borrow_mut();
-        let delta = if dy > 0.0 { 3 } else { -3 };
-        state.terminal.scroll_viewport(ScrollViewport::Delta(delta));
-        drop(state);
+        {
+            let mut state = runtime.state.borrow_mut();
+            let delta = if dy > 0.0 { 3 } else { -3 };
+            state.terminal.scroll_viewport(ScrollViewport::Delta(delta));
+        }
         runtime.widget.queue_draw();
+        runtime.refresh_scrollbar();
         glib::Propagation::Stop
     });
     pane.widget.add_controller(scroll);
@@ -2183,5 +2420,65 @@ mod tests {
         let mut out = Vec::new();
         encoder.encode_to_vec(&event, &mut out).unwrap();
         assert_eq!(out, b"\x1bOA");
+    }
+
+    #[test]
+    fn plain_page_keys_route_through_smart_page_action() {
+        assert!(matches!(
+            page_action_for_key(gtk::gdk::Key::Page_Up, gtk::gdk::ModifierType::empty()),
+            Some(PageAction::SmartUp)
+        ));
+        assert!(matches!(
+            page_action_for_key(gtk::gdk::Key::Page_Down, gtk::gdk::ModifierType::empty()),
+            Some(PageAction::SmartDown)
+        ));
+        assert!(matches!(
+            page_action_for_key(gtk::gdk::Key::KP_Page_Up, gtk::gdk::ModifierType::empty()),
+            Some(PageAction::SmartUp)
+        ));
+    }
+
+    #[test]
+    fn shift_page_keys_always_scroll_the_viewport() {
+        assert!(matches!(
+            page_action_for_key(gtk::gdk::Key::Page_Up, gtk::gdk::ModifierType::SHIFT_MASK),
+            Some(PageAction::ScrollUp)
+        ));
+        assert!(matches!(
+            page_action_for_key(gtk::gdk::Key::Page_Down, gtk::gdk::ModifierType::SHIFT_MASK),
+            Some(PageAction::ScrollDown)
+        ));
+    }
+
+    /// Ctrl/Alt-combined PgUp/Dn must fall through to `encode_key` so
+    /// app-level shortcuts (shell tab-cycling, IDE keybinds inside a
+    /// nested terminal, etc.) keep their original meaning.
+    #[test]
+    fn ctrl_or_alt_modifiers_skip_the_page_action_path() {
+        assert!(
+            page_action_for_key(gtk::gdk::Key::Page_Up, gtk::gdk::ModifierType::CONTROL_MASK)
+                .is_none()
+        );
+        assert!(
+            page_action_for_key(gtk::gdk::Key::Page_Down, gtk::gdk::ModifierType::ALT_MASK)
+                .is_none()
+        );
+        assert!(page_action_for_key(
+            gtk::gdk::Key::Page_Up,
+            gtk::gdk::ModifierType::CONTROL_MASK | gtk::gdk::ModifierType::SHIFT_MASK,
+        )
+        .is_none());
+    }
+
+    /// Non-page keys must not match the page-action gate. This catches a
+    /// regression where the dispatcher accidentally swallows arrow keys.
+    #[test]
+    fn non_page_keys_do_not_match_page_action() {
+        assert!(
+            page_action_for_key(gtk::gdk::Key::Up, gtk::gdk::ModifierType::empty()).is_none()
+        );
+        assert!(
+            page_action_for_key(gtk::gdk::Key::Home, gtk::gdk::ModifierType::empty()).is_none()
+        );
     }
 }
