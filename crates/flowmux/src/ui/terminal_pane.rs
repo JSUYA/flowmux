@@ -1875,10 +1875,17 @@ const ALT_ENTER_BYTES: &[u8] = b"\x1b\r";
 
 fn default_shell_argv() -> Vec<String> {
     if is_flatpak_sandbox() {
+        // flatpak-spawn --host does not inherit the sandbox's
+        // environment. Forward TERM/COLORTERM explicitly so the host
+        // shell (and any ncurses-based program it launches such as
+        // opencode, vim, less) sees the same terminal capability hints
+        // the sandbox-side PTY child receives from terminal_child_env.
         vec![
             "flatpak-spawn".into(),
             "--host".into(),
             "--watch-bus".into(),
+            "--env=TERM=xterm-256color".into(),
+            "--env=COLORTERM=truecolor".into(),
             "--".into(),
             "python3".into(),
             "-u".into(),
