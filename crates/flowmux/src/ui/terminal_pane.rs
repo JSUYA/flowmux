@@ -50,11 +50,14 @@ pub struct TerminalPane {
 struct TerminalRuntime {
     id: PaneId,
     widget: gtk::DrawingArea,
-    /// Horizontal `gtk::Box` housing the DrawingArea on the left and the
-    /// vertical scrollback scrollbar on the right. Pane reparenting and
-    /// CSS focus styling target this widget; the DrawingArea continues
-    /// to own every controller (key, focus, draw, selection, …).
-    container: gtk::Box,
+    /// `gtk::Overlay` whose child is the DrawingArea and whose overlay
+    /// is the vertical scrollback scrollbar pinned to the right edge.
+    /// Using an Overlay keeps the DrawingArea's allocation identical
+    /// to what it was before the scrollbar existed, which matters
+    /// because some GTK/compositor combinations on the desktop render
+    /// the DrawingArea as fully transparent when it is wrapped in a
+    /// horizontal `gtk::Box` instead.
+    container: gtk::Overlay,
     /// Drives the scrollback scrollbar. Mirrors libghostty's viewport
     /// state — see [`TerminalRuntime::refresh_scrollbar`].
     scroll_adjustment: gtk::Adjustment,
@@ -272,14 +275,18 @@ impl TerminalPane {
         let im_context = gtk::IMMulticontext::new();
         im_context.set_use_preedit(true);
 
-        // Wrap the DrawingArea in a horizontal Box so we can put a
-        // vertical scrollback scrollbar to its right. The Box becomes
+        // Wrap the DrawingArea in a `gtk::Overlay` so we can pin a
+        // vertical scrollback scrollbar to the right edge without
+        // changing the DrawingArea's allocation. The Overlay becomes
         // the pane's root widget while the DrawingArea continues to own
-        // every controller (keyboard, focus, draw, selection, …).
-        let container = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        // every controller (keyboard, focus, draw, selection, …). An
+        // earlier attempt that used a horizontal `gtk::Box` rendered
+        // the DrawingArea fully transparent on some desktop GTK builds,
+        // so the Overlay layout is now the only path.
+        let container = gtk::Overlay::new();
         container.set_hexpand(true);
         container.set_vexpand(true);
-        container.append(&widget);
+        container.set_child(Some(&widget));
 
         let scroll_adjustment = gtk::Adjustment::new(
             0.0,
@@ -291,7 +298,9 @@ impl TerminalPane {
         );
         let scrollbar = gtk::Scrollbar::new(gtk::Orientation::Vertical, Some(&scroll_adjustment));
         scrollbar.set_vexpand(true);
-        container.append(&scrollbar);
+        scrollbar.set_halign(gtk::Align::End);
+        scrollbar.set_valign(gtk::Align::Fill);
+        container.add_overlay(&scrollbar);
 
         let runtime = Rc::new(TerminalRuntime {
             id,
