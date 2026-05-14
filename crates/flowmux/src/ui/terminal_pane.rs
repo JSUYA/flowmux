@@ -782,68 +782,62 @@ fn ibus_nav_workaround_enabled() -> bool {
     is_flatpak_sandbox()
 }
 
+/// Install a capture-phase `gtk::ShortcutController` that intercepts
+/// the plain navigation/edit keys IBus 1.5.26 drops on the 22.04 host
+/// Flatpak path. ShortcutController is the same mechanism the old
+/// VTE-era fix (`eb9059f`) used: it fires before any
+/// `EventControllerKey` on the widget — including the IM-attached one
+/// installed by `install_key_input` — so the broken ibus-gtk4 round
+/// trip never sees these keys. Using a second `EventControllerKey`
+/// here triggered an empty-terminal Backspace crash on Flatpak 22.04,
+/// presumably because the immodule cannot tolerate two key controllers
+/// sharing one widget when only one has an IM context bound.
 fn install_ibus_nav_bypass(pane: &TerminalPane) {
-    let weak = Rc::downgrade(&pane.runtime);
-    let controller = gtk::EventControllerKey::new();
+    let controller = gtk::ShortcutController::new();
     controller.set_propagation_phase(gtk::PropagationPhase::Capture);
-    controller.connect_key_pressed(move |_controller, key, _keycode, state| {
-        if !is_plain_nav_key(key, state) {
-            return glib::Propagation::Proceed;
-        }
-        let Some(runtime) = weak.upgrade() else {
-            return glib::Propagation::Proceed;
-        };
-        if app_accel_should_win(key, state) {
-            return glib::Propagation::Proceed;
-        }
-        let Some(bytes) = encode_key_legacy(&runtime, key, state) else {
-            return glib::Propagation::Proceed;
-        };
-        runtime.write_child(&bytes);
-        glib::Propagation::Stop
-    });
-    pane.widget.add_controller(controller);
-}
+    controller.set_scope(gtk::ShortcutScope::Local);
 
-/// Plain (no Ctrl/Alt/Super/Meta) navigation and edit keys affected by
-/// the 22.04 IBus immodule drop. Space is intentionally excluded so the
-/// in-flight Hangul syllable can still commit through the IM context.
-fn is_plain_nav_key(key: gtk::gdk::Key, mods: gtk::gdk::ModifierType) -> bool {
-    let blocking = gtk::gdk::ModifierType::CONTROL_MASK
-        | gtk::gdk::ModifierType::ALT_MASK
-        | gtk::gdk::ModifierType::META_MASK
-        | gtk::gdk::ModifierType::SUPER_MASK;
-    if mods.intersects(blocking) {
-        return false;
+    let bindings: &[(gtk::gdk::Key, &'static [u8])] = &[
+        (gtk::gdk::Key::BackSpace, b"\x7f"),
+        (gtk::gdk::Key::Delete, b"\x1b[3~"),
+        (gtk::gdk::Key::Tab, b"\t"),
+        (gtk::gdk::Key::Escape, b"\x1b"),
+        (gtk::gdk::Key::Return, b"\r"),
+        (gtk::gdk::Key::ISO_Enter, b"\r"),
+        (gtk::gdk::Key::Left, b"\x1b[D"),
+        (gtk::gdk::Key::Right, b"\x1b[C"),
+        (gtk::gdk::Key::Up, b"\x1b[A"),
+        (gtk::gdk::Key::Down, b"\x1b[B"),
+        (gtk::gdk::Key::Home, b"\x1b[H"),
+        (gtk::gdk::Key::End, b"\x1b[F"),
+        (gtk::gdk::Key::Page_Up, b"\x1b[5~"),
+        (gtk::gdk::Key::Page_Down, b"\x1b[6~"),
+        (gtk::gdk::Key::KP_Delete, b"\x1b[3~"),
+        (gtk::gdk::Key::KP_Enter, b"\r"),
+        (gtk::gdk::Key::KP_Left, b"\x1b[D"),
+        (gtk::gdk::Key::KP_Right, b"\x1b[C"),
+        (gtk::gdk::Key::KP_Up, b"\x1b[A"),
+        (gtk::gdk::Key::KP_Down, b"\x1b[B"),
+        (gtk::gdk::Key::KP_Home, b"\x1b[H"),
+        (gtk::gdk::Key::KP_End, b"\x1b[F"),
+        (gtk::gdk::Key::KP_Page_Up, b"\x1b[5~"),
+        (gtk::gdk::Key::KP_Page_Down, b"\x1b[6~"),
+    ];
+
+    for (key, bytes) in bindings {
+        let weak = Rc::downgrade(&pane.runtime);
+        let bytes = *bytes;
+        let action = gtk::CallbackAction::new(move |_, _| {
+            if let Some(runtime) = weak.upgrade() {
+                runtime.write_child(bytes);
+            }
+            glib::Propagation::Stop
+        });
+        let trigger = gtk::KeyvalTrigger::new(*key, gtk::gdk::ModifierType::empty());
+        controller.add_shortcut(gtk::Shortcut::new(Some(trigger), Some(action)));
     }
-    matches!(
-        key,
-        gtk::gdk::Key::BackSpace
-            | gtk::gdk::Key::Delete
-            | gtk::gdk::Key::KP_Delete
-            | gtk::gdk::Key::Tab
-            | gtk::gdk::Key::ISO_Left_Tab
-            | gtk::gdk::Key::Escape
-            | gtk::gdk::Key::Return
-            | gtk::gdk::Key::KP_Enter
-            | gtk::gdk::Key::ISO_Enter
-            | gtk::gdk::Key::Up
-            | gtk::gdk::Key::Down
-            | gtk::gdk::Key::Left
-            | gtk::gdk::Key::Right
-            | gtk::gdk::Key::KP_Up
-            | gtk::gdk::Key::KP_Down
-            | gtk::gdk::Key::KP_Left
-            | gtk::gdk::Key::KP_Right
-            | gtk::gdk::Key::Home
-            | gtk::gdk::Key::End
-            | gtk::gdk::Key::KP_Home
-            | gtk::gdk::Key::KP_End
-            | gtk::gdk::Key::Page_Up
-            | gtk::gdk::Key::Page_Down
-            | gtk::gdk::Key::KP_Page_Up
-            | gtk::gdk::Key::KP_Page_Down
-    )
+
+    pane.widget.add_controller(controller);
 }
 
 fn install_scroll_input(pane: &TerminalPane) {
