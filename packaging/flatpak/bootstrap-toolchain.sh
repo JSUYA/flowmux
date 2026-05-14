@@ -60,6 +60,29 @@ export PATH="$CARGO_HOME/bin:$zig_dir:$PATH"
 rustc --version
 zig version
 
+# Zig package cache. libghostty-vt-sys builds ghostty with `zig build`,
+# which pulls nested git dependencies (vaxis, uucode, …) through the
+# Zig package manager. The flatpak-builder sandbox has --share=network
+# but DNS to github.com is unreliable from 22.04 hosts and the build
+# fails the first time it hits a transient SERVFAIL. Pre-populate the
+# cache here with retries so the actual cargo build runs offline.
+export ZIG_GLOBAL_CACHE_DIR="${ZIG_GLOBAL_CACHE_DIR:-$toolchain_dir/zig-cache}"
+mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
+
+if [ -n "${GHOSTTY_SOURCE_DIR:-}" ] && [ -f "$GHOSTTY_SOURCE_DIR/build.zig" ]; then
+    attempt=0
+    until (cd "$GHOSTTY_SOURCE_DIR" && zig build --fetch); do
+        attempt=$((attempt + 1))
+        if [ "$attempt" -ge 5 ]; then
+            echo "zig fetch failed after $attempt attempts" >&2
+            exit 1
+        fi
+        sleep_for=$((attempt * 2))
+        echo "zig fetch attempt $attempt failed, retrying in ${sleep_for}s..." >&2
+        sleep "$sleep_for"
+    done
+fi
+
 if [ "$#" -eq 0 ]; then
     exit 0
 fi
