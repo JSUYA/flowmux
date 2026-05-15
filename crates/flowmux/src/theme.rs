@@ -23,6 +23,7 @@
 
 use gtk::gdk;
 use gtk::pango;
+use vte::prelude::*;
 
 pub struct ResolvedTheme {
     pub font: pango::FontDescription,
@@ -112,7 +113,29 @@ impl ResolvedTheme {
     }
 
     pub fn apply_to_terminal(&self, term: &crate::ui::terminal_pane::TerminalPane) {
-        term.apply_theme(self);
+        let vte: &vte::Terminal = &term.widget;
+        vte.set_font(Some(&self.font));
+        let refs: Vec<&gdk::RGBA> = self.palette.iter().collect();
+        vte.set_colors(Some(&self.fg), Some(&self.bg), &refs);
+        vte.set_color_cursor(Some(&self.cursor));
+        if let Some(sbg) = &self.selection_bg {
+            vte.set_color_highlight(Some(sbg));
+        }
+        if let Some(sfg) = &self.selection_fg {
+            vte.set_color_highlight_foreground(Some(sfg));
+        }
+        // Block-blink cursor, no audible bell, generous scrollback —
+        // matches the look the pre-libghostty build shipped with.
+        vte.set_cursor_blink_mode(vte::CursorBlinkMode::On);
+        vte.set_cursor_shape(vte::CursorShape::Block);
+        vte.set_audible_bell(false);
+        vte.set_scrollback_lines(20_000);
+        // Snap the viewport back to the cursor when the user presses
+        // any key, so a scrolled-up history view doesn't silently swallow
+        // input. Output does NOT snap, so a live `tig` / `vim` redraw
+        // can paint without yanking a user-scrolled view.
+        vte.set_scroll_on_keystroke(true);
+        vte.set_scroll_on_output(false);
     }
 
     pub fn is_dark(&self) -> bool {

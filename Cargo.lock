@@ -961,7 +961,7 @@ dependencies = [
 
 [[package]]
 name = "flowmux"
-version = "0.2.8"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -979,20 +979,18 @@ dependencies = [
  "gtk4",
  "libadwaita",
  "libc",
- "libghostty-vt",
- "libghostty-vt-sys",
  "nix",
- "pangocairo",
  "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "vte4",
  "webkit6",
 ]
 
 [[package]]
 name = "flowmux-browser"
-version = "0.2.8"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "dirs",
@@ -1005,7 +1003,7 @@ dependencies = [
 
 [[package]]
 name = "flowmux-cli"
-version = "0.2.8"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1029,7 +1027,7 @@ dependencies = [
 
 [[package]]
 name = "flowmux-config"
-version = "0.2.8"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "dirs",
@@ -1041,7 +1039,7 @@ dependencies = [
 
 [[package]]
 name = "flowmux-cookies"
-version = "0.2.8"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1055,7 +1053,7 @@ dependencies = [
 
 [[package]]
 name = "flowmux-core"
-version = "0.2.8"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "serde",
@@ -1066,7 +1064,7 @@ dependencies = [
 
 [[package]]
 name = "flowmux-daemon"
-version = "0.2.8"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1086,7 +1084,7 @@ dependencies = [
 
 [[package]]
 name = "flowmux-ipc"
-version = "0.2.8"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "flowmux-config",
@@ -1101,7 +1099,7 @@ dependencies = [
 
 [[package]]
 name = "flowmux-notify"
-version = "0.2.8"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1116,7 +1114,7 @@ dependencies = [
 
 [[package]]
 name = "flowmux-procmon"
-version = "0.2.8"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "thiserror 1.0.69",
@@ -1125,7 +1123,7 @@ dependencies = [
 
 [[package]]
 name = "flowmux-ssh"
-version = "0.2.8"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1139,7 +1137,7 @@ dependencies = [
 
 [[package]]
 name = "flowmux-state"
-version = "0.2.8"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1155,7 +1153,7 @@ dependencies = [
 
 [[package]]
 name = "flowmux-terminal"
-version = "0.2.8"
+version = "0.3.0"
 dependencies = [
  "flowmux-core",
  "thiserror 1.0.69",
@@ -1163,7 +1161,7 @@ dependencies = [
 
 [[package]]
 name = "flowmux-vcs"
-version = "0.2.8"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "flowmux-core",
@@ -2601,16 +2599,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "int-enum"
-version = "1.2.0"
+name = "io-lifetimes"
+version = "2.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e366a1634cccc76b4cfd3e7580de9b605e4d93f1edac48d786c1f867c0def495"
-dependencies = [
- "proc-macro2",
- "proc-macro2-diagnostics",
- "quote",
- "syn",
-]
+checksum = "06432fb54d3be7964ecd3649233cddf80db2832f47fec34c01f65b3d9d774983"
 
 [[package]]
 name = "is_terminal_polyfill"
@@ -2760,23 +2752,6 @@ name = "libc"
 version = "0.2.186"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
-
-[[package]]
-name = "libghostty-vt"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d8afe5cc9ae303133220e530b28b7addbbf591160bb1564b88f7ee61387fee74"
-dependencies = [
- "bitflags",
- "int-enum",
- "libghostty-vt-sys",
-]
-
-[[package]]
-name = "libghostty-vt-sys"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aee97068da1692162c4523d54843bdcb43fecf086a9ee412a3375817e433faca"
 
 [[package]]
 name = "libm"
@@ -3102,32 +3077,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pangocairo"
-version = "0.20.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "58890dc451db9964ac2d8874f903a4370a4b3932aa5281ff0c8d9810937ad84f"
-dependencies = [
- "cairo-rs",
- "glib",
- "libc",
- "pango",
- "pangocairo-sys",
-]
-
-[[package]]
-name = "pangocairo-sys"
-version = "0.20.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b9952903f88aa93e2927e7bca2d1ebae64fc26545a9280b4ce6bddeda26b5c42"
-dependencies = [
- "cairo-sys-rs",
- "glib-sys",
- "libc",
- "pango-sys",
- "system-deps",
-]
-
-[[package]]
 name = "parking"
 version = "2.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3353,18 +3302,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8fd00f0bb2e90d81d1044c2b32617f68fcb9fa3bb7640c23e9c748e53fb30934"
 dependencies = [
  "unicode-ident",
-]
-
-[[package]]
-name = "proc-macro2-diagnostics"
-version = "0.10.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "af066a9c399a26e020ada66a034357a868728e72cd426f3adcd35f80d88d88c8"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
- "version_check",
 ]
 
 [[package]]
@@ -4470,6 +4407,39 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "vte4"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7759016227e58e3239b8dca9c4a70086345844872b1f27cba0dba990fef5cb44"
+dependencies = [
+ "cairo-rs",
+ "gdk4",
+ "gio",
+ "glib",
+ "gtk4",
+ "io-lifetimes",
+ "libc",
+ "pango",
+ "vte4-sys",
+]
+
+[[package]]
+name = "vte4-sys"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2c1aa57d29283c6eeac2e34c16791436275d254ac02b8590b02698feef197234"
+dependencies = [
+ "cairo-sys-rs",
+ "gdk4-sys",
+ "gio-sys",
+ "glib-sys",
+ "gtk4-sys",
+ "libc",
+ "pango-sys",
+ "system-deps",
+]
 
 [[package]]
 name = "walkdir"

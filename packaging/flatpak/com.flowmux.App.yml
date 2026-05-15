@@ -21,31 +21,43 @@ finish-args:
   - --talk-name=org.freedesktop.Flatpak
 
 modules:
+  # Build VTE 0.80 from source. The GNOME 48 runtime ships a newer VTE,
+  # but pinning a known release keeps the GTK4 binding's `v0_70` feature
+  # set well within the runtime's available symbols even when the
+  # upstream runtime is bumped between flowmux releases.
+  - name: vte
+    buildsystem: meson
+    config-opts:
+      # Force libdir=lib (meson defaults to lib64 on x86_64) so the
+      # generated vte-2.91-gtk4.pc lands in /app/lib/pkgconfig, which is
+      # what flatpak adds to PKG_CONFIG_PATH and where the runtime
+      # linker looks for /app libraries.
+      - -Dlibdir=lib
+      - -Dgtk3=false
+      - -Dgtk4=true
+      - -Dvapi=false
+      - -Dgir=false
+      - -Ddocs=false
+      - -D_systemd=false
+    cleanup:
+      - /bin
+      - /libexec
+      - /share/vala
+    sources:
+      - type: git
+        url: https://gitlab.gnome.org/GNOME/vte.git
+        tag: '0.80.0'
+
   - name: flowmux
     buildsystem: simple
     build-options:
+      append-path: /usr/lib/sdk/rust-stable/bin
       build-args:
         - --share=network
-      env:
-        # Use the pre-fetched ghostty checkout instead of cloning from
-        # github.com during the build (the build sandbox can't always
-        # reach github.com, and even when it can the clone is fragile).
-        # The commit must match GHOSTTY_COMMIT in libghostty-vt-sys's
-        # build.rs.
-        GHOSTTY_SOURCE_DIR: /run/build/flowmux/ghostty-src
     build-commands:
-      - bash packaging/flatpak/bootstrap-toolchain.sh cargo build --release --manifest-path Cargo.toml -p flowmux -p flowmux-cli
+      - cargo build --release --manifest-path Cargo.toml -p flowmux -p flowmux-cli
       - install -Dm755 target/release/flowmux    /app/bin/flowmux
       - install -Dm755 target/release/flowmuxctl /app/lib/flowmux/flowmuxctl
-      - |
-        set -eu
-        ghostty_lib_dir="$(find target/release/build -path '*/ghostty-install/lib' -type d -print -quit)"
-        if [ -z "$ghostty_lib_dir" ]; then
-            echo "libghostty-vt build output was not found" >&2
-            exit 1
-        fi
-        install -d /app/lib
-        cp -P "$ghostty_lib_dir"/libghostty-vt.so* /app/lib/
       - install -Dm644 resources/desktop/com.flowmux.App.desktop /app/share/applications/com.flowmux.App.desktop
       - install -Dm644 resources/icons/flowmux.svg /app/share/icons/hicolor/scalable/apps/com.flowmux.App.svg
       - for size in 16 24 32 48 64 96 128 256 512; do install -Dm644 "resources/icons/flowmux-${size}.png" "/app/share/icons/hicolor/${size}x${size}/apps/com.flowmux.App.png"; done
@@ -55,12 +67,3 @@ modules:
     sources:
       - type: dir
         path: ../..
-      # Pre-fetched ghostty source. Must match the GHOSTTY_COMMIT pin in
-      # libghostty-vt-sys 0.1.1's build.rs so cargo's checked-in
-      # bindings line up with the C ABI. flatpak-builder downloads
-      # this during its prepare phase (host network) so the in-sandbox
-      # build never needs github.com.
-      - type: git
-        url: https://github.com/ghostty-org/ghostty.git
-        commit: bebca84668947bfc92b9a30ed58712e1c34eee1d
-        dest: ghostty-src
