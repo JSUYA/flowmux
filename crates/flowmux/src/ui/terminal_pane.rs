@@ -903,6 +903,75 @@ fn install_flatpak_ibus_nav_workaround(term: &vte::Terminal) {
     bind_byte(gtk::gdk::Key::greater, shift, b'>');
     bind_byte(gtk::gdk::Key::question, shift, b'?');
 
+    // Digit row. IBus drops these too during Hangul preedit on
+    // 22.04 (digits do not map to Hangul jamo). Without this, typing
+    // a number into opencode / vim / less while the IME is the
+    // active one silently fails until the user switches input
+    // method off.
+    bind_byte(gtk::gdk::Key::_0, empty, b'0');
+    bind_byte(gtk::gdk::Key::_1, empty, b'1');
+    bind_byte(gtk::gdk::Key::_2, empty, b'2');
+    bind_byte(gtk::gdk::Key::_3, empty, b'3');
+    bind_byte(gtk::gdk::Key::_4, empty, b'4');
+    bind_byte(gtk::gdk::Key::_5, empty, b'5');
+    bind_byte(gtk::gdk::Key::_6, empty, b'6');
+    bind_byte(gtk::gdk::Key::_7, empty, b'7');
+    bind_byte(gtk::gdk::Key::_8, empty, b'8');
+    bind_byte(gtk::gdk::Key::_9, empty, b'9');
+
+    // Numeric keypad digit row. Some layouts report numpad digits
+    // as `KP_0..KP_9` rather than the main-row keysyms, and IBus's
+    // drop applies equally there.
+    let kp_digits = [
+        gtk::gdk::Key::KP_0,
+        gtk::gdk::Key::KP_1,
+        gtk::gdk::Key::KP_2,
+        gtk::gdk::Key::KP_3,
+        gtk::gdk::Key::KP_4,
+        gtk::gdk::Key::KP_5,
+        gtk::gdk::Key::KP_6,
+        gtk::gdk::Key::KP_7,
+        gtk::gdk::Key::KP_8,
+        gtk::gdk::Key::KP_9,
+    ];
+    for (i, key) in kp_digits.iter().enumerate() {
+        bind_byte(*key, empty, b'0' + i as u8);
+    }
+    bind_byte(gtk::gdk::Key::KP_Multiply, empty, b'*');
+    bind_byte(gtk::gdk::Key::KP_Add, empty, b'+');
+    bind_byte(gtk::gdk::Key::KP_Subtract, empty, b'-');
+    bind_byte(gtk::gdk::Key::KP_Divide, empty, b'/');
+    bind_byte(gtk::gdk::Key::KP_Decimal, empty, b'.');
+
+    // Function keys F1 .. F12 using the xterm normal-mode encoding
+    // that bash / vim / less / tig / opencode all expect. F1-F4 are
+    // the SS3 family (`ESC O <letter>`); F5+ are the CSI tilde
+    // family (`ESC [ <digits> ~`). flowmuxctl pty-tee does not
+    // rewrite these, so forwarding the literal bytes here is
+    // sufficient.
+    let bind_bytes = |keyval: gtk::gdk::Key, mods: gtk::gdk::ModifierType, bytes: &'static [u8]| {
+        let term_widget = term.clone();
+        let action = gtk::CallbackAction::new(move |_, _| {
+            term_widget.feed_child(bytes);
+            glib::Propagation::Stop
+        });
+        let trigger = gtk::KeyvalTrigger::new(keyval, mods);
+        controller.add_shortcut(gtk::Shortcut::new(Some(trigger), Some(action)));
+    };
+    bind_bytes(gtk::gdk::Key::F1, empty, b"\x1bOP");
+    bind_bytes(gtk::gdk::Key::F2, empty, b"\x1bOQ");
+    bind_bytes(gtk::gdk::Key::F3, empty, b"\x1bOR");
+    bind_bytes(gtk::gdk::Key::F4, empty, b"\x1bOS");
+    bind_bytes(gtk::gdk::Key::F5, empty, b"\x1b[15~");
+    bind_bytes(gtk::gdk::Key::F6, empty, b"\x1b[17~");
+    bind_bytes(gtk::gdk::Key::F7, empty, b"\x1b[18~");
+    bind_bytes(gtk::gdk::Key::F8, empty, b"\x1b[19~");
+    bind_bytes(gtk::gdk::Key::F9, empty, b"\x1b[20~");
+    bind_bytes(gtk::gdk::Key::F10, empty, b"\x1b[21~");
+    bind_bytes(gtk::gdk::Key::F11, empty, b"\x1b[23~");
+    bind_bytes(gtk::gdk::Key::F12, empty, b"\x1b[24~");
+    bind_bytes(gtk::gdk::Key::Insert, empty, b"\x1b[2~");
+
     term.add_controller(controller);
 }
 
