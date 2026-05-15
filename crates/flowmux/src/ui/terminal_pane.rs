@@ -24,23 +24,18 @@ use vte::prelude::*;
 #[derive(Clone)]
 pub struct TerminalPane {
     pub id: PaneId,
-    /// The VTE widget itself. Doubles as the pane's *root* widget — the
-    /// thing that gets inserted into the workspace's pane stack. Callers
-    /// pass `pane.widget.clone().upcast::<gtk::Widget>()` whenever they
-    /// need a generic widget handle.
-    ///
-    /// **Do not wrap this in another widget when inserting it into the
-    /// pane tree.** A previous attempt (commit eb2d176, reverted) hosted
-    /// a Shift+Enter `ShortcutController` on a one-child `gtk::Box`
-    /// wrapper around the VTE; the wrapper's measure() did not propagate
-    /// VTE's natural character-cell minimum the way a direct child does,
-    /// so once two `gtk::Paned` splits were nested, tig / vim / htop
-    /// rendered with the left/right/top/bottom edges clipped. The bare
-    /// `vte::Terminal` must remain the immediate child of whatever
-    /// container holds it for the existing `set_shrink_*_child(false)`
-    /// fix (commit b507b7a) on each `gtk::Paned` to keep producing
-    /// correct sizes.
+    /// The VTE widget itself. Sits inside `container` and owns every
+    /// event controller, IM context, focus, and PTY child. Theme and
+    /// font calls target this widget directly.
     pub widget: vte::Terminal,
+    /// Root container exposed to the pane tree. A `gtk::Overlay` whose
+    /// main child is `widget` (so the VTE keeps its natural-size
+    /// propagation) plus an overlaid `gtk::Scrollbar` on the right edge
+    /// bound to the VTE's vadjustment. The Overlay deliberately does
+    /// **not** wrap the VTE in a `gtk::Box` — the latter approach
+    /// (commit eb2d176, reverted) broke `gtk::Paned` minimum-size
+    /// propagation and clipped tig / vim / htop in nested splits.
+    pub container: gtk::Overlay,
     /// PID of the spawned shell.
     pub pid: Rc<Cell<Option<i32>>>,
 }
@@ -72,7 +67,7 @@ impl TerminalPane {
     }
 
     pub fn root_widget(&self) -> gtk::Widget {
-        self.widget.clone().upcast::<gtk::Widget>()
+        self.container.clone().upcast::<gtk::Widget>()
     }
 
     pub fn grab_focus(&self) {
@@ -215,6 +210,27 @@ impl TerminalPane {
         term.set_vexpand(true);
         term.set_scrollback_lines(10_000);
         term.set_audible_bell(false);
+
+        // Wrap the VTE in a `gtk::Overlay` so we can pin a vertical
+        // `gtk::Scrollbar` to its right edge without going through a
+        // `gtk::Box` (which broke `gtk::Paned` minimum-size propagation
+        // in commit eb2d176, since reverted). The scrollbar is bound
+        // to the VTE's own vadjustment so the thumb mirrors the
+        // scrollback state without a separate adjustment to keep in
+        // sync.
+        let container = gtk::Overlay::new();
+        container.set_hexpand(true);
+        container.set_vexpand(true);
+        container.set_child(Some(&term));
+        let scrollbar = gtk::Scrollbar::new(
+            gtk::Orientation::Vertical,
+            term.vadjustment().as_ref(),
+        );
+        scrollbar.set_halign(gtk::Align::End);
+        scrollbar.set_valign(gtk::Align::Fill);
+        container.add_overlay(&scrollbar);
+
+        install_smart_page_keys(&term);
 
         // OSC 99 (Konsole-format) is not exposed as a signal on Ubuntu's
         // VTE 0.68 / 0.76 builds — the `notification-received` signal is
@@ -390,6 +406,7 @@ impl TerminalPane {
         Self {
             id,
             widget: term,
+            container,
             pid,
         }
     }
@@ -633,6 +650,84 @@ fn install_shift_enter_newline_handling(term: &vte::Terminal) {
     term.add_controller(controller);
 }
 
+/// Smart paging for PgUp / PgDn / Shift+PgUp / Shift+PgDn.
+///
+/// VTE's default binding for plain PgUp/Dn is to send the cursor-key
+/// escape `\x1b[5~` / `\x1b[6~` to the PTY. In a regular shell prompt
+/// bash's readline binds those to `history-search-backward` /
+/// `history-search-forward` — visually the same as Up/Down arrow,
+/// which is not what users expect from PgUp/Dn in a multiplexed
+/// terminal. Apps that opt into mouse / alt-screen modes (tig, vim,
+/// less, htop, opencode) do want the raw escape though.
+///
+/// Heuristic: if the VTE has scrollable history (vadjustment range
+/// extends past the visible page), scroll the viewport by one page;
+/// otherwise let the keystroke fall through to VTE so the foreground
+/// app receives the escape. Shift+PgUp/Dn always scrolls — the user
+/// has signaled "scroll" by holding Shift.
+fn install_smart_page_keys(term: &vte::Terminal) {
+    let controller = gtk::ShortcutController::new();
+    controller.set_propagation_phase(gtk::PropagationPhase::Capture);
+    controller.set_scope(gtk::ShortcutScope::Local);
+
+    const EMPTY: gtk::gdk::ModifierType = gtk::gdk::ModifierType::empty();
+    const SHIFT: gtk::gdk::ModifierType = gtk::gdk::ModifierType::SHIFT_MASK;
+    let bindings: &[(gtk::gdk::Key, gtk::gdk::ModifierType, i32, bool)] = &[
+        (gtk::gdk::Key::Page_Up, EMPTY, -1, false),
+        (gtk::gdk::Key::Page_Down, EMPTY, 1, false),
+        (gtk::gdk::Key::KP_Page_Up, EMPTY, -1, false),
+        (gtk::gdk::Key::KP_Page_Down, EMPTY, 1, false),
+        (gtk::gdk::Key::Page_Up, SHIFT, -1, true),
+        (gtk::gdk::Key::Page_Down, SHIFT, 1, true),
+        (gtk::gdk::Key::KP_Page_Up, SHIFT, -1, true),
+        (gtk::gdk::Key::KP_Page_Down, SHIFT, 1, true),
+    ];
+
+    for (key, mods, direction, always_scroll) in bindings {
+        let term_widget = term.clone();
+        let direction = *direction;
+        let always_scroll = *always_scroll;
+        let action = gtk::CallbackAction::new(move |_, _| {
+            let Some(adj) = term_widget.vadjustment() else {
+                return glib::Propagation::Proceed;
+            };
+            let upper = adj.upper();
+            let page = adj.page_size().max(1.0);
+            let has_scrollback = upper > page;
+            if !always_scroll && !has_scrollback {
+                // Alt-screen / empty scrollback: forward the legacy
+                // PgUp/Dn escape so foreground apps (tig, vim, less,
+                // htop) can page their own buffer. We feed it
+                // directly rather than letting VTE handle the key
+                // because the capture-phase IBus bypass below would
+                // intercept the keystroke on the Flatpak 22.04 path
+                // and route it through its own table.
+                let bytes: &[u8] = if direction < 0 {
+                    b"\x1b[5~"
+                } else {
+                    b"\x1b[6~"
+                };
+                term_widget.feed_child(bytes);
+                return glib::Propagation::Stop;
+            }
+            let mut target = adj.value() + (direction as f64) * page;
+            if target < adj.lower() {
+                target = adj.lower();
+            }
+            let max = (upper - page).max(adj.lower());
+            if target > max {
+                target = max;
+            }
+            adj.set_value(target);
+            glib::Propagation::Stop
+        });
+        let trigger = gtk::KeyvalTrigger::new(*key, *mods);
+        controller.add_shortcut(gtk::Shortcut::new(Some(trigger), Some(action)));
+    }
+
+    term.add_controller(controller);
+}
+
 /// Workaround for the Ubuntu 22.04 host + GNOME 48 Flatpak runtime
 /// IBus regression where plain navigation / editing keys during
 /// Hangul preedit are silently dropped. The deciding reproducer was
@@ -720,8 +815,11 @@ fn install_flatpak_ibus_nav_workaround(term: &vte::Terminal) {
     bind(gtk::gdk::Key::Down, b"\x1b[B");
     bind(gtk::gdk::Key::Home, b"\x1b[H");
     bind(gtk::gdk::Key::End, b"\x1b[F");
-    bind(gtk::gdk::Key::Page_Up, b"\x1b[5~");
-    bind(gtk::gdk::Key::Page_Down, b"\x1b[6~");
+    // Page_Up / Page_Down are handled in `install_smart_page_keys`,
+    // which decides between scrolling the viewport (primary screen
+    // with scrollback) and forwarding the escape (alt screen / empty
+    // scrollback). Including them here would double-handle the key
+    // and defeat the scroll path.
     // Keypad variants of the same keys — some layouts (notebook + Fn,
     // X11 with NumLock off, …) report them as the KP_* keysyms even
     // when the user hits the equivalent unshifted key.
@@ -733,8 +831,6 @@ fn install_flatpak_ibus_nav_workaround(term: &vte::Terminal) {
     bind(gtk::gdk::Key::KP_Down, b"\x1b[B");
     bind(gtk::gdk::Key::KP_Home, b"\x1b[H");
     bind(gtk::gdk::Key::KP_End, b"\x1b[F");
-    bind(gtk::gdk::Key::KP_Page_Up, b"\x1b[5~");
-    bind(gtk::gdk::Key::KP_Page_Down, b"\x1b[6~");
 
     term.add_controller(controller);
 }
