@@ -214,23 +214,41 @@ impl TerminalPane {
         // Wrap the VTE in a `gtk::Overlay` so we can pin a vertical
         // `gtk::Scrollbar` to its right edge without going through a
         // `gtk::Box` (which broke `gtk::Paned` minimum-size propagation
-        // in commit eb2d176, since reverted). The scrollbar is bound
-        // to the VTE's own vadjustment so the thumb mirrors the
-        // scrollback state without a separate adjustment to keep in
-        // sync.
+        // in commit eb2d176, since reverted).
+        //
+        // Some VTE builds (notably the 0.78 source build we use in the
+        // 22.04 Flatpak path) hand back a fresh `gtk::Adjustment` from
+        // the `vadjustment` property right after construction, before
+        // the widget is realized. Binding the scrollbar to that
+        // transient adjustment leaves the bar empty / invisible.
+        // Instead, create our own `gtk::Adjustment`, push it into the
+        // VTE via the `vadjustment` property, and hand the same
+        // instance to the `gtk::Scrollbar`. The Adjustment outlives
+        // both widgets and stays stable across realization, which is
+        // what GTK 4.16+'s scrollbar drawing path needs to keep the
+        // thumb visible.
+        let scroll_adjustment = gtk::Adjustment::new(0.0, 0.0, 1.0, 1.0, 1.0, 1.0);
+        term.set_property("vadjustment", &scroll_adjustment);
         let container = gtk::Overlay::new();
         container.set_hexpand(true);
         container.set_vexpand(true);
         container.set_child(Some(&term));
         let scrollbar = gtk::Scrollbar::new(
             gtk::Orientation::Vertical,
-            term.vadjustment().as_ref(),
+            Some(&scroll_adjustment),
         );
         scrollbar.set_halign(gtk::Align::End);
         scrollbar.set_valign(gtk::Align::Fill);
+        // Force the scrollbar to render unconditionally so the 22.04
+        // Flatpak path does not auto-hide it. A standalone bar with
+        // explicit width survives the GTK 4.16+ overlay-scrolling
+        // heuristics that the runtime applies by default.
+        scrollbar.set_visible(true);
+        scrollbar.set_can_focus(false);
+        scrollbar.set_width_request(12);
         container.add_overlay(&scrollbar);
 
-        install_smart_page_keys(&term);
+        install_smart_page_keys(&term, &scroll_adjustment);
 
         // OSC 99 (Konsole-format) is not exposed as a signal on Ubuntu's
         // VTE 0.68 / 0.76 builds — the `notification-received` signal is
@@ -665,7 +683,7 @@ fn install_shift_enter_newline_handling(term: &vte::Terminal) {
 /// otherwise let the keystroke fall through to VTE so the foreground
 /// app receives the escape. Shift+PgUp/Dn always scrolls — the user
 /// has signaled "scroll" by holding Shift.
-fn install_smart_page_keys(term: &vte::Terminal) {
+fn install_smart_page_keys(term: &vte::Terminal, scroll_adjustment: &gtk::Adjustment) {
     let controller = gtk::ShortcutController::new();
     controller.set_propagation_phase(gtk::PropagationPhase::Capture);
     controller.set_scope(gtk::ShortcutScope::Local);
@@ -685,12 +703,10 @@ fn install_smart_page_keys(term: &vte::Terminal) {
 
     for (key, mods, direction, always_scroll) in bindings {
         let term_widget = term.clone();
+        let adj = scroll_adjustment.clone();
         let direction = *direction;
         let always_scroll = *always_scroll;
         let action = gtk::CallbackAction::new(move |_, _| {
-            let Some(adj) = term_widget.vadjustment() else {
-                return glib::Propagation::Proceed;
-            };
             let upper = adj.upper();
             let page = adj.page_size().max(1.0);
             let has_scrollback = upper > page;
