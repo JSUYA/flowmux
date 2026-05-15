@@ -166,7 +166,7 @@ fn main() -> anyhow::Result<()> {
 
     // GTK runs on the main thread.
     let app = build_application();
-    keybindings::install_accels(&app);
+    keybindings::install_accels(&app, &flowmux_config::options::load());
     let store_for_activate = store.clone();
     let rx_for_activate = rx.clone();
     let bridge_for_activate = bridge.clone();

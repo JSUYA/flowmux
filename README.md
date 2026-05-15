@@ -73,6 +73,37 @@ window so multiple sessions don't bleed into each other.
   installing an agent that wasn't on the host when flowmux was first
   set up.
 
+### Customizable keybindings
+- Open the options dialog and switch to the **Keybindings** tab to
+  rebind any pane / workspace / tab / clipboard / window shortcut.
+  Changes take effect after the next restart.
+- The same edits land in `$XDG_CONFIG_HOME/flowmux/options.json`
+  under a `keybindings` field. Only the actions you change need to
+  appear — anything missing keeps its default, and an empty array
+  marks an action as explicitly unbound:
+
+  ```json
+  {
+    "keybindings": {
+      "copy":  ["<Ctrl>c"],
+      "paste": ["<Ctrl>v"],
+      "next-workspace": []
+    }
+  }
+  ```
+
+  Accelerator strings follow GTK's
+  [`gtk_accelerator_parse`](https://docs.gtk.org/gtk4/func.accelerator_parse.html)
+  syntax (`<Ctrl>`, `<Shift>`, `<Alt>`, …). Invalid entries are logged
+  and skipped at startup; the rest of an action's accelerators still
+  install.
+- A small set of terminal-side shortcuts handle IME / scroll quirks
+  on Ubuntu 22.04 + Hangul preedit and are intentionally **not**
+  user-editable: Shift+Enter (Hangul preedit flush) and the smart
+  PgUp/PgDn paging on the terminal scrollback. These live one layer
+  below the GTK action map and rebinding them would re-introduce the
+  input-method bugs they fix.
+
 
 ## Layout
 

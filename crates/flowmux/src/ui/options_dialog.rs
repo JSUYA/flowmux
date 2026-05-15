@@ -18,6 +18,7 @@
 //! dialog returns the user's intended [`Options`] through the callback.
 
 use adw::prelude::*;
+use flowmux_config::keybindings::KeybindingOverrides;
 use flowmux_config::options::{
     BrowserEngine, Options, FOCUS_BORDER_OPACITY_MAX, FOCUS_BORDER_OPACITY_MIN, ZOOM_MAX, ZOOM_MIN,
 };
@@ -43,8 +44,8 @@ fn build_dialog(
     let dialog = adw::Window::builder()
         .transient_for(parent)
         .modal(true)
-        .default_width(440)
-        .default_height(220)
+        .default_width(560)
+        .default_height(540)
         .title("Options")
         .build();
 
@@ -64,16 +65,17 @@ fn build_dialog(
     let opacity_widgets = build_focus_opacity_row(current.focus_border_opacity);
     let persist_check = build_persist_check(current.persist_browser_session);
 
-    let body = gtk::Box::new(gtk::Orientation::Vertical, 12);
-    body.set_margin_top(16);
-    body.set_margin_bottom(16);
-    body.set_margin_start(20);
-    body.set_margin_end(20);
-    body.append(&row("Global zoom (%)", &zoom_spin));
-    body.append(&row("Browser web view", &engine_drop));
-    body.append(&row("Focus border color", &focus_color_btn));
-    body.append(&row("Focus border opacity (%)", &opacity_widgets.row));
-    body.append(&row("Keep browser session data", &persist_check));
+    // General tab body — the original options dialog contents.
+    let general = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    general.set_margin_top(16);
+    general.set_margin_bottom(16);
+    general.set_margin_start(20);
+    general.set_margin_end(20);
+    general.append(&row("Global zoom (%)", &zoom_spin));
+    general.append(&row("Browser web view", &engine_drop));
+    general.append(&row("Focus border color", &focus_color_btn));
+    general.append(&row("Focus border opacity (%)", &opacity_widgets.row));
+    general.append(&row("Keep browser session data", &persist_check));
 
     let hint = gtk::Label::new(Some(
         "The selected label isolates the cookie/session directory for new \
@@ -84,11 +86,30 @@ fn build_dialog(
     hint.set_max_width_chars(46);
     hint.add_css_class("dim-label");
     hint.set_xalign(0.0);
-    body.append(&hint);
+    general.append(&hint);
+
+    // Keybindings tab — edits write into kb_state below, picked up by
+    // collect_options when the user clicks OK.
+    let kb_state = std::rc::Rc::new(std::cell::RefCell::new(current.keybindings.clone()));
+    let keybindings_tab = crate::ui::keybindings_panel::build(kb_state.clone());
+
+    let stack = adw::ViewStack::new();
+    stack.add_titled(&general, Some("general"), "General");
+    stack.add_titled(&keybindings_tab, Some("keybindings"), "Keybindings");
+    let switcher = adw::ViewSwitcher::new();
+    switcher.set_stack(Some(&stack));
+    switcher.set_policy(adw::ViewSwitcherPolicy::Wide);
+    header.set_title_widget(Some(&switcher));
+
+    let body = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    body.append(&stack);
 
     // Bottom actions. Reset applies Options::default() through the same
     // on_apply path the OK button uses, so the caller handles persistence
-    // and live CSS reloads while the dialog only closes itself.
+    // and live CSS reloads while the dialog only closes itself. The
+    // global Reset only wipes General-tab options — Keybindings has its
+    // own Reset-all button on its own tab so a misclick here does not
+    // also blow away every shortcut the user customised.
     let reset_btn = gtk::Button::with_label("Reset to defaults");
     reset_btn.add_css_class("destructive-action");
     let about_btn = gtk::Button::with_label("About");
@@ -96,6 +117,9 @@ fn build_dialog(
     footer_spacer.set_hexpand(true);
     let footer_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     footer_row.set_margin_top(4);
+    footer_row.set_margin_start(20);
+    footer_row.set_margin_end(20);
+    footer_row.set_margin_bottom(12);
     footer_row.append(&reset_btn);
     footer_row.append(&footer_spacer);
     footer_row.append(&about_btn);
@@ -119,13 +143,23 @@ fn build_dialog(
         let opacity_spin = opacity_widgets.spin.clone();
         let persist_check = persist_check.clone();
         let on_apply = on_apply.clone();
+        let kb_state = kb_state.clone();
         ok_btn.connect_clicked(move |_| {
+            let kb = kb_state.borrow().clone();
+            let conflicts = crate::ui::keybindings_panel::detect_conflicts(&kb);
+            if !conflicts.is_empty() {
+                tracing::warn!(
+                    count = conflicts.len(),
+                    "saving keybindings with overlapping accels — last writer wins at install time"
+                );
+            }
             let opts = collect_options(
                 &zoom_spin,
                 &engine_drop,
                 &focus_color_btn,
                 &opacity_spin,
                 &persist_check,
+                &kb,
             );
             (on_apply)(opts);
             dialog.close();
@@ -264,6 +298,7 @@ fn collect_options(
     focus_color: &gtk::ColorDialogButton,
     opacity_spin: &gtk::SpinButton,
     persist_check: &gtk::CheckButton,
+    keybindings: &KeybindingOverrides,
 ) -> Options {
     let zoom = Options::clamp_zoom(spin.value_as_int().max(0) as u16);
     let engine = engine_options()
@@ -279,6 +314,7 @@ fn collect_options(
         focus_border_color: color_hex,
         focus_border_opacity: opacity,
         persist_browser_session: persist_check.is_active(),
+        keybindings: keybindings.clone(),
     }
 }
 
@@ -465,14 +501,29 @@ mod tests {
         let focus_color = build_focus_color_button("#abcdef");
         let opacity = build_focus_opacity_row(40);
         let persist_off = build_persist_check(false);
-        let opts = collect_options(&zoom, &engine, &focus_color, &opacity.spin, &persist_off);
+        let kb = KeybindingOverrides::default();
+        let opts = collect_options(
+            &zoom,
+            &engine,
+            &focus_color,
+            &opacity.spin,
+            &persist_off,
+            &kb,
+        );
         assert_eq!(opts.zoom_percent, 120);
         assert_eq!(opts.default_browser_engine, BrowserEngine::Firefox);
         assert_eq!(opts.focus_border_opacity, 40);
         assert!(!opts.persist_browser_session);
 
         let persist_on = build_persist_check(true);
-        let opts = collect_options(&zoom, &engine, &focus_color, &opacity.spin, &persist_on);
+        let opts = collect_options(
+            &zoom,
+            &engine,
+            &focus_color,
+            &opacity.spin,
+            &persist_on,
+            &kb,
+        );
         assert!(opts.persist_browser_session);
     }
 
