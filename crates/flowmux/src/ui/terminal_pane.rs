@@ -848,6 +848,61 @@ fn install_flatpak_ibus_nav_workaround(term: &vte::Terminal) {
     bind(gtk::gdk::Key::KP_Home, b"\x1b[H");
     bind(gtk::gdk::Key::KP_End, b"\x1b[F");
 
+    // ASCII symbol keys. With Hangul IBus active on the 22.04 host the
+    // immodule occasionally swallows these too, so opencode / tig /
+    // vim see no input for `? ! @ # $ % ^ …` until the user toggles
+    // back to English. We forward each printable byte directly so the
+    // foreground app receives it regardless of preedit state. The
+    // shortcut trigger matches the exact modifier set, so
+    // Ctrl/Alt-combined variants stay on the regular IM path.
+    let bind_byte = |keyval: gtk::gdk::Key, mods: gtk::gdk::ModifierType, byte: u8| {
+        let term_widget = term.clone();
+        let action = gtk::CallbackAction::new(move |_, _| {
+            term_widget.feed_child(&[byte]);
+            glib::Propagation::Stop
+        });
+        let trigger = gtk::KeyvalTrigger::new(keyval, mods);
+        controller.add_shortcut(gtk::Shortcut::new(Some(trigger), Some(action)));
+    };
+    let empty = gtk::gdk::ModifierType::empty();
+    let shift = gtk::gdk::ModifierType::SHIFT_MASK;
+    // Unshifted punctuation row (US layout). On other layouts these
+    // keysyms still map to the same ASCII bytes when produced.
+    bind_byte(gtk::gdk::Key::grave, empty, b'`');
+    bind_byte(gtk::gdk::Key::minus, empty, b'-');
+    bind_byte(gtk::gdk::Key::equal, empty, b'=');
+    bind_byte(gtk::gdk::Key::bracketleft, empty, b'[');
+    bind_byte(gtk::gdk::Key::bracketright, empty, b']');
+    bind_byte(gtk::gdk::Key::backslash, empty, b'\\');
+    bind_byte(gtk::gdk::Key::semicolon, empty, b';');
+    bind_byte(gtk::gdk::Key::apostrophe, empty, b'\'');
+    bind_byte(gtk::gdk::Key::comma, empty, b',');
+    bind_byte(gtk::gdk::Key::period, empty, b'.');
+    bind_byte(gtk::gdk::Key::slash, empty, b'/');
+    // Shifted punctuation. The keysym is the Shift-produced character
+    // (e.g. `Shift+1` → `exclam`), so the modifier match is SHIFT.
+    bind_byte(gtk::gdk::Key::asciitilde, shift, b'~');
+    bind_byte(gtk::gdk::Key::exclam, shift, b'!');
+    bind_byte(gtk::gdk::Key::at, shift, b'@');
+    bind_byte(gtk::gdk::Key::numbersign, shift, b'#');
+    bind_byte(gtk::gdk::Key::dollar, shift, b'$');
+    bind_byte(gtk::gdk::Key::percent, shift, b'%');
+    bind_byte(gtk::gdk::Key::asciicircum, shift, b'^');
+    bind_byte(gtk::gdk::Key::ampersand, shift, b'&');
+    bind_byte(gtk::gdk::Key::asterisk, shift, b'*');
+    bind_byte(gtk::gdk::Key::parenleft, shift, b'(');
+    bind_byte(gtk::gdk::Key::parenright, shift, b')');
+    bind_byte(gtk::gdk::Key::underscore, shift, b'_');
+    bind_byte(gtk::gdk::Key::plus, shift, b'+');
+    bind_byte(gtk::gdk::Key::braceleft, shift, b'{');
+    bind_byte(gtk::gdk::Key::braceright, shift, b'}');
+    bind_byte(gtk::gdk::Key::bar, shift, b'|');
+    bind_byte(gtk::gdk::Key::colon, shift, b':');
+    bind_byte(gtk::gdk::Key::quotedbl, shift, b'"');
+    bind_byte(gtk::gdk::Key::less, shift, b'<');
+    bind_byte(gtk::gdk::Key::greater, shift, b'>');
+    bind_byte(gtk::gdk::Key::question, shift, b'?');
+
     term.add_controller(controller);
 }
 
