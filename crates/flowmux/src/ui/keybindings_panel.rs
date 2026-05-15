@@ -48,9 +48,9 @@ pub fn build(state: SharedOverrides) -> gtk::Box {
     outer.set_margin_end(16);
 
     let hint = gtk::Label::new(Some(
-        "Changes take effect after restart. Use GTK accelerator syntax \
-         (e.g. <Ctrl><Shift>c). Separate multiple shortcuts with commas. \
-         Leave the field blank to unbind an action.",
+        "Changes take effect immediately when you click OK. Use GTK \
+         accelerator syntax (e.g. <Ctrl><Shift>c). Separate multiple \
+         shortcuts with commas. Leave the field blank to unbind an action.",
     ));
     hint.set_wrap(true);
     hint.set_max_width_chars(56);

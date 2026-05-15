@@ -76,7 +76,7 @@ window so multiple sessions don't bleed into each other.
 ### Customizable keybindings
 - Open the options dialog and switch to the **Keybindings** tab to
   rebind any pane / workspace / tab / clipboard / window shortcut.
-  Changes take effect after the next restart.
+  Changes take effect immediately on **OK** — no restart needed.
 - The same edits land in `$XDG_CONFIG_HOME/flowmux/options.json`
   under a `keybindings` field. Only the actions you change need to
   appear — anything missing keeps its default, and an empty array
