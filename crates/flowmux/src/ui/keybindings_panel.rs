@@ -66,8 +66,8 @@ pub fn build(state: SharedOverrides) -> gtk::Box {
     // refresh the visible chip after wiping the user map.
     let row_refresh: Rc<RefCell<Vec<Rc<dyn Fn()>>>> = Rc::new(RefCell::new(Vec::new()));
 
-    for action in ActionId::all() {
-        let (row, refresh) = build_row(*action, state.clone());
+    for action in ActionId::editable() {
+        let (row, refresh) = build_row(action, state.clone());
         list.append(&row);
         row_refresh.borrow_mut().push(refresh);
     }
@@ -485,17 +485,17 @@ mod tests {
     #[test]
     fn detect_conflicts_flags_duplicate_accel_across_actions() {
         let mut overrides = KeybindingOverrides::new();
-        // Bind copy and split-right to the same key; defaults already
-        // bind Ctrl+Shift+Page_Up to split-right, so reuse it for copy.
-        overrides.set(ActionId::Copy, vec!["<Ctrl><Shift>Page_Up".into()]);
+        // Bind close-surface to split-right's default key. Both actions
+        // are user-editable, so the conflict surfaces in the report.
+        overrides.set(ActionId::CloseSurface, vec!["<Ctrl><Shift>Page_Up".into()]);
         let conflicts = detect_conflicts(&overrides);
         assert!(
             conflicts.iter().any(|(accel, owners)| {
                 accel == "<Ctrl><Shift>Page_Up"
-                    && owners.contains(&ActionId::Copy)
+                    && owners.contains(&ActionId::CloseSurface)
                     && owners.contains(&ActionId::SplitRight)
             }),
-            "expected conflict between copy and split-right, got {:?}",
+            "expected conflict between close-surface and split-right, got {:?}",
             conflicts
         );
     }

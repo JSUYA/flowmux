@@ -60,6 +60,12 @@ pub fn install_accels(app: &adw::Application, options: &Options) {
     for unknown in overrides.unknown_keys() {
         tracing::warn!(action = %unknown, "unknown keybinding action key — ignoring");
     }
+    for non_editable in overrides.non_editable_keys() {
+        tracing::warn!(
+            action = %non_editable,
+            "keybinding action is not user-editable — ignoring override"
+        );
+    }
     let resolved = overrides.resolve();
 
     // accel -> first action that claimed it, for conflict warnings.
@@ -618,23 +624,23 @@ mod tests {
     #[test]
     fn user_override_replaces_default_via_resolved_accels() {
         let mut overrides = KeybindingOverrides::new();
-        overrides.set(ActionId::Copy, vec!["<Ctrl>c".into()]);
+        overrides.set(ActionId::SplitRight, vec!["<Ctrl><Alt>r".into()]);
         assert_eq!(
-            resolved_accels(&overrides, ActionId::Copy),
-            vec!["<Ctrl>c".to_string()]
+            resolved_accels(&overrides, ActionId::SplitRight),
+            vec!["<Ctrl><Alt>r".to_string()]
         );
         // Untouched action keeps its default.
         assert_eq!(
-            resolved_accels(&overrides, ActionId::SplitRight),
-            vec!["<Ctrl><Shift>Page_Up".to_string()]
+            resolved_accels(&overrides, ActionId::SplitDown),
+            vec!["<Ctrl><Shift>Page_Down".to_string()]
         );
     }
 
     #[test]
     fn empty_override_unbinds_action_in_resolved_accels() {
         let mut overrides = KeybindingOverrides::new();
-        overrides.set(ActionId::Copy, vec![]);
-        assert!(resolved_accels(&overrides, ActionId::Copy).is_empty());
+        overrides.set(ActionId::SplitRight, vec![]);
+        assert!(resolved_accels(&overrides, ActionId::SplitRight).is_empty());
     }
 
     /// Ctrl+N must create a workspace inside the current window and

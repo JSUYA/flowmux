@@ -169,6 +169,23 @@ impl ActionId {
     pub fn from_wire(s: &str) -> Option<ActionId> {
         Self::all().iter().copied().find(|a| a.as_str() == s)
     }
+
+    /// User-editable shortcuts. Copy / Paste are intentionally excluded
+    /// because they are universally `Ctrl+Shift+C` / `Ctrl+Shift+V` in
+    /// every modern terminal emulator and rebinding them through the
+    /// dialog would let the user accidentally swap them with `Ctrl+C` —
+    /// the same key that sends SIGINT to the foreground process. The
+    /// install path still applies their hard-coded defaults; only the
+    /// dialog and the override resolution skip them.
+    pub fn is_user_editable(self) -> bool {
+        !matches!(self, Self::Copy | Self::Paste)
+    }
+
+    /// Iterator over actions that should appear in the options dialog
+    /// and accept overrides from `options.json`.
+    pub fn editable() -> impl Iterator<Item = ActionId> {
+        Self::all().iter().copied().filter(|a| a.is_user_editable())
+    }
 }
 
 /// One action can carry multiple accelerators (e.g. Ctrl+Shift+Tab and
@@ -274,23 +291,43 @@ impl KeybindingOverrides {
 
     /// Partial-overlay resolution: for every known [`ActionId`] return
     /// the user override when present, otherwise the built-in default.
+    /// Overrides on non-editable actions (see [`ActionId::is_user_editable`])
+    /// are ignored so a stale `copy` / `paste` entry left over from an
+    /// earlier flowmux release cannot reroute SIGINT-sensitive keys.
     /// Unknown action keys in the user map are silently dropped (the
     /// caller may log them via [`Self::unknown_keys`]).
     pub fn resolve(&self) -> Vec<(ActionId, Vec<String>)> {
         ActionId::all()
             .iter()
             .map(|action| {
-                let accels = self
-                    .get(*action)
-                    .map(|user| user.to_vec())
-                    .unwrap_or_else(|| {
-                        default_accels(*action)
-                            .iter()
-                            .map(|s| (*s).to_string())
-                            .collect()
-                    });
+                let user_override = if action.is_user_editable() {
+                    self.get(*action).map(|user| user.to_vec())
+                } else {
+                    None
+                };
+                let accels = user_override.unwrap_or_else(|| {
+                    default_accels(*action)
+                        .iter()
+                        .map(|s| (*s).to_string())
+                        .collect()
+                });
                 (*action, accels)
             })
+            .collect()
+    }
+
+    /// Override keys present in the user file that target non-editable
+    /// actions (currently `copy` / `paste`). Logged at install time so
+    /// the user understands why their entry had no effect.
+    pub fn non_editable_keys(&self) -> Vec<String> {
+        self.map
+            .keys()
+            .filter(|k| {
+                ActionId::from_wire(k)
+                    .map(|a| !a.is_user_editable())
+                    .unwrap_or(false)
+            })
+            .cloned()
             .collect()
     }
 
@@ -351,39 +388,39 @@ mod tests {
     #[test]
     fn resolve_overlays_only_specified_actions() {
         let mut overrides = KeybindingOverrides::new();
-        overrides.set(ActionId::Copy, vec!["<Ctrl>c".to_string()]);
+        overrides.set(ActionId::SplitRight, vec!["<Ctrl><Alt>r".to_string()]);
 
         let resolved = overrides.resolve();
-        let copy = resolved
-            .iter()
-            .find(|(a, _)| *a == ActionId::Copy)
-            .unwrap();
-        assert_eq!(copy.1, vec!["<Ctrl>c".to_string()]);
-
-        // Untouched action keeps its default.
         let split = resolved
             .iter()
             .find(|(a, _)| *a == ActionId::SplitRight)
             .unwrap();
-        assert_eq!(split.1, vec!["<Ctrl><Shift>Page_Up".to_string()]);
+        assert_eq!(split.1, vec!["<Ctrl><Alt>r".to_string()]);
+
+        // Untouched action keeps its default.
+        let down = resolved
+            .iter()
+            .find(|(a, _)| *a == ActionId::SplitDown)
+            .unwrap();
+        assert_eq!(down.1, vec!["<Ctrl><Shift>Page_Down".to_string()]);
     }
 
     #[test]
     fn empty_array_unbinds_action() {
         let mut overrides = KeybindingOverrides::new();
-        overrides.set(ActionId::Copy, vec![]);
+        overrides.set(ActionId::SplitRight, vec![]);
         let resolved = overrides.resolve();
-        let copy = resolved
+        let split = resolved
             .iter()
-            .find(|(a, _)| *a == ActionId::Copy)
+            .find(|(a, _)| *a == ActionId::SplitRight)
             .unwrap();
-        assert!(copy.1.is_empty(), "empty array must mark action unbound");
+        assert!(split.1.is_empty(), "empty array must mark action unbound");
     }
 
     #[test]
     fn unknown_keys_are_listed_but_do_not_break_resolve() {
         let json = r#"{
-            "copy": ["<Ctrl>c"],
+            "split-right": ["<Ctrl><Alt>r"],
             "totally-fake-action": ["<Ctrl>x"]
         }"#;
         let overrides: KeybindingOverrides = serde_json::from_str(json).unwrap();
@@ -393,11 +430,11 @@ mod tests {
 
         // resolve() still yields the known override and all the defaults.
         let resolved = overrides.resolve();
-        let copy = resolved
+        let split = resolved
             .iter()
-            .find(|(a, _)| *a == ActionId::Copy)
+            .find(|(a, _)| *a == ActionId::SplitRight)
             .unwrap();
-        assert_eq!(copy.1, vec!["<Ctrl>c".to_string()]);
+        assert_eq!(split.1, vec!["<Ctrl><Alt>r".to_string()]);
         assert_eq!(resolved.len(), ActionId::all().len());
     }
 
@@ -427,6 +464,45 @@ mod tests {
         overrides.clear(ActionId::Copy);
         assert!(overrides.get(ActionId::Copy).is_none());
         assert!(overrides.get(ActionId::Paste).is_some());
+    }
+
+    #[test]
+    fn copy_and_paste_are_excluded_from_editable_set() {
+        let editable: Vec<ActionId> = ActionId::editable().collect();
+        assert!(!editable.contains(&ActionId::Copy));
+        assert!(!editable.contains(&ActionId::Paste));
+        // Sanity: non-clipboard actions remain editable.
+        assert!(editable.contains(&ActionId::SplitRight));
+        assert!(editable.contains(&ActionId::QuitApp));
+    }
+
+    #[test]
+    fn resolve_ignores_user_override_for_copy_and_paste() {
+        let mut overrides = KeybindingOverrides::new();
+        overrides.set(ActionId::Copy, vec!["<Ctrl>c".into()]);
+        overrides.set(ActionId::Paste, vec!["<Ctrl>v".into()]);
+
+        let resolved = overrides.resolve();
+        let copy = resolved
+            .iter()
+            .find(|(a, _)| *a == ActionId::Copy)
+            .unwrap();
+        let paste = resolved
+            .iter()
+            .find(|(a, _)| *a == ActionId::Paste)
+            .unwrap();
+        assert_eq!(copy.1, vec!["<Ctrl><Shift>c".to_string()]);
+        assert_eq!(paste.1, vec!["<Ctrl><Shift>v".to_string()]);
+    }
+
+    #[test]
+    fn non_editable_keys_lists_copy_and_paste_when_set() {
+        let mut overrides = KeybindingOverrides::new();
+        overrides.set(ActionId::Copy, vec!["<Ctrl>c".into()]);
+        overrides.set(ActionId::SplitRight, vec!["<Ctrl>r".into()]);
+        let mut keys = overrides.non_editable_keys();
+        keys.sort();
+        assert_eq!(keys, vec!["copy".to_string()]);
     }
 
     /// Multi-accel actions (Prev workspace has three) must serialize as

@@ -44,8 +44,8 @@ fn build_dialog(
     let dialog = adw::Window::builder()
         .transient_for(parent)
         .modal(true)
-        .default_width(560)
-        .default_height(540)
+        .default_width(760)
+        .default_height(620)
         .title("Options")
         .build();
 
