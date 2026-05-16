@@ -205,14 +205,7 @@ const DEFAULTS: &[(ActionId, &[&str])] = &[
     (ActionId::NextSurface, &[]),
     (ActionId::PrevSurface, &[]),
     (ActionId::NextWorkspace, &["<Ctrl>Tab"]),
-    (
-        ActionId::PrevWorkspace,
-        &[
-            "<Ctrl><Shift>Tab",
-            "<Ctrl><Shift>ISO_Left_Tab",
-            "<Ctrl>ISO_Left_Tab",
-        ],
-    ),
+    (ActionId::PrevWorkspace, &["<Ctrl><Shift>Tab"]),
     (ActionId::Workspace1, &["<Alt>1"]),
     (ActionId::Workspace2, &["<Alt>2"]),
     (ActionId::Workspace3, &["<Alt>3"]),

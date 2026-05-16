@@ -93,9 +93,24 @@ fn build_dialog(
     let kb_state = std::rc::Rc::new(std::cell::RefCell::new(current.keybindings.clone()));
     let keybindings_tab = crate::ui::keybindings_panel::build(kb_state.clone());
 
+    // Use freedesktop symbolic icon names so the switcher picks up the
+    // current Adwaita theme automatically. `preferences-system-symbolic`
+    // is the standard "settings cog" used across GNOME apps; the
+    // keyboard glyph in `input-keyboard-symbolic` matches the system
+    // Settings → Keyboard panel and reads as "shortcuts" at a glance.
     let stack = adw::ViewStack::new();
-    stack.add_titled(&general, Some("general"), "General");
-    stack.add_titled(&keybindings_tab, Some("keybindings"), "Keybindings");
+    stack.add_titled_with_icon(
+        &general,
+        Some("general"),
+        "General",
+        "preferences-system-symbolic",
+    );
+    stack.add_titled_with_icon(
+        &keybindings_tab,
+        Some("keybindings"),
+        "Keybindings",
+        "input-keyboard-symbolic",
+    );
     let switcher = adw::ViewSwitcher::new();
     switcher.set_stack(Some(&stack));
     switcher.set_policy(adw::ViewSwitcherPolicy::Wide);
