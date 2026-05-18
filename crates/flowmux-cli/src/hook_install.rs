@@ -846,6 +846,8 @@ fn opencode_plugin_source_with_argv(argv: &[String]) -> String {
 // surfacing OpenCode lifecycle events to the bell popover.
 
 import {{ spawn }} from "node:child_process";
+import * as fs from "node:fs";
+import * as path from "node:path";
 
 // `FLOWMUX_BIN` is the executable invoked from the host. Outside
 // Flatpak it is the absolute path to `flowmuxctl`. Inside Flatpak
@@ -857,39 +859,78 @@ import {{ spawn }} from "node:child_process";
 const FLOWMUX_BIN = {bin_literal};
 const FLOWMUX_ARGS_PREFIX = {trailing_literal};
 
-// Env vars flowmux's PTY exports so the in-sandbox CLI can attribute
-// a hook event to its source pane/surface. `flatpak run` resets env
-// to a minimal sandbox set, so without explicit forwarding the
-// re-entered flowmuxctl sees pane=None and the daemon's notification
-// arrives with no workspace context — the sidebar can't blink and
-// the bell click can't navigate. Forwarded as `--env=K=V` flags
-// inserted right after the `run` verb.
-const FLOWMUX_FORWARD_ENV = ["FLOWMUX_PANE_ID", "FLOWMUX_SURFACE_ID"];
+// Mirror of the Rust-side debug log path. Writing from JS here puts a
+// timestamped trace of every plugin invocation right next to the
+// `cli/hook entry` line the in-sandbox CLI emits — so when the chain
+// breaks we can see at a glance whether the plugin fired at all,
+// what its process.env looked like, and what argv it sent across the
+// `flatpak run` boundary. Append-only; both writers (JS plugin and
+// Rust CLI) can hold the file simultaneously because they only append.
+function debugLogPath() {{
+  const home = process.env.HOME;
+  if (!home) return null;
+  return path.join(home, ".cache", "flowmux", "notify-debug.log");
+}}
 
+function logDebug(line) {{
+  try {{
+    const target = debugLogPath();
+    if (!target) return;
+    fs.mkdirSync(path.dirname(target), {{ recursive: true }});
+    const stamp = new Date().toISOString();
+    fs.appendFileSync(target, "[" + stamp + "] [opencode-plugin] " + line + "\n");
+  }} catch (_) {{
+    // Logging failures must never break the hook.
+  }}
+}}
+
+// Build the final argv handed to spawn().
+//
+// Critical: `flatpak run` strips the host process's env to a minimal
+// sandbox set before invoking the in-sandbox program, so values like
+// FLOWMUX_PANE_ID never reach the in-sandbox flowmuxctl through env
+// inheritance. The daemon then receives Notify{{pane:None}} and the
+// sidebar can't blink / clicks can't navigate. We sidestep that by
+// pushing the same values as explicit `--pane` / `--surface` flags
+// at the end of the CLI invocation: argv survives the sandbox
+// boundary, so the in-sandbox CLI sees the real ids regardless of
+// what flatpak did to the environment.
 function buildSpawnArgs(event, payload) {{
   const args = [...FLOWMUX_ARGS_PREFIX];
-  if (FLOWMUX_BIN === "flatpak") {{
-    const envFlags = [];
-    for (const k of FLOWMUX_FORWARD_ENV) {{
-      const v = process.env[k];
-      if (v) envFlags.push("--env=" + k + "=" + v);
-    }}
-    const runIdx = args.indexOf("run");
-    if (runIdx >= 0) args.splice(runIdx + 1, 0, ...envFlags);
-    else args.unshift(...envFlags);
-  }}
   args.push("hooks", "opencode", event);
+  const pane = process.env.FLOWMUX_PANE_ID;
+  const surface = process.env.FLOWMUX_SURFACE_ID;
+  if (pane) args.push("--pane", pane);
+  if (surface) args.push("--surface", surface);
   if (payload) args.push(payload);
   return args;
 }}
 
 function fireFlowmuxHook(event, payload) {{
+  let args;
   try {{
-    spawn(FLOWMUX_BIN, buildSpawnArgs(event, payload), {{
+    args = buildSpawnArgs(event, payload);
+  }} catch (e) {{
+    logDebug("buildSpawnArgs ERROR event=" + event + " err=" + String(e));
+    return;
+  }}
+  logDebug(
+    "fire event=" + event +
+    " bin=" + FLOWMUX_BIN +
+    " env.FLOWMUX_PANE_ID=" + (process.env.FLOWMUX_PANE_ID || "<unset>") +
+    " env.FLOWMUX_SURFACE_ID=" + (process.env.FLOWMUX_SURFACE_ID || "<unset>") +
+    " env.FLOWMUX_SOCKET_PATH=" + (process.env.FLOWMUX_SOCKET_PATH || "<unset>") +
+    " argv=" + JSON.stringify(args)
+  );
+  try {{
+    const child = spawn(FLOWMUX_BIN, args, {{
       stdio: "ignore",
       detached: true,
-    }}).unref();
-  }} catch (_) {{
+    }});
+    child.on("error", (e) => logDebug("spawn error event=" + event + " err=" + String(e)));
+    child.unref();
+  }} catch (e) {{
+    logDebug("spawn threw event=" + event + " err=" + String(e));
     // Hook failures must never crash OpenCode.
   }}
 }}
@@ -1263,26 +1304,47 @@ hooks = true
     }
 
     #[test]
-    fn opencode_plugin_source_forwards_flowmux_env_across_flatpak_boundary() {
-        // `flatpak run` resets env to a minimal sandbox set, so without
-        // explicit `--env=K=V` flags the in-sandbox flowmuxctl loses
-        // FLOWMUX_PANE_ID / FLOWMUX_SURFACE_ID and the daemon receives
-        // a context-less Notify. Pin the JS-side forwarding so the
-        // sidebar workspace can mark attention and the bell click can
-        // navigate to the source pane.
+    fn opencode_plugin_source_passes_pane_and_surface_as_cli_args() {
+        // `flatpak run` resets env to a minimal sandbox set, so the
+        // in-sandbox flowmuxctl could not recover FLOWMUX_PANE_ID /
+        // FLOWMUX_SURFACE_ID from inherited env. Solution: push the
+        // values onto the CLI argv as explicit `--pane` / `--surface`
+        // flags — argv survives the sandbox boundary intact. Pin the
+        // JS-side argv shape so a future refactor cannot quietly
+        // regress the sidebar / click-navigation path.
         let src = opencode_plugin_source_with_argv(&[
             "flatpak".to_string(),
             "run".to_string(),
             "--command=flowmuxctl".to_string(),
             "com.flowmux.App".to_string(),
         ]);
+        // CLI argv path
         assert!(src.contains("FLOWMUX_PANE_ID"));
         assert!(src.contains("FLOWMUX_SURFACE_ID"));
-        assert!(src.contains("--env="));
-        assert!(src.contains("FLOWMUX_BIN === \"flatpak\""));
-        // Splice point must be just after the `run` verb so the
-        // `--env=` flags reach flatpak before the `--command=` switch.
-        assert!(src.contains("indexOf(\"run\")"));
+        assert!(src.contains("\"--pane\""));
+        assert!(src.contains("\"--surface\""));
+        // Diagnostic logging path so future failures are self-evident
+        // in notify-debug.log without an iterative reproduction loop.
+        assert!(src.contains("notify-debug.log"));
+        assert!(src.contains("logDebug"));
+        assert!(src.contains("appendFileSync"));
+        // The legacy `--env=` forwarding is removed; the argv path is
+        // the single source of truth across the flatpak boundary.
+        assert!(!src.contains("--env="));
+    }
+
+    #[test]
+    fn opencode_plugin_source_omits_pane_flag_outside_flatpak() {
+        // Outside Flatpak the spawn inherits env directly, so the
+        // legacy env-var path still resolves pane/surface. The plugin
+        // can stay symmetrical (always push `--pane` when the env var
+        // is set) — but it must NOT push the flag with an empty string,
+        // which would make clap fail to parse Option<PaneId>. This
+        // pins the `if (pane) args.push(...)` guard.
+        let src = opencode_plugin_source("/usr/local/bin/flowmux");
+        // The guard is what keeps empty-value pushes out.
+        assert!(src.contains("if (pane) args.push(\"--pane\""));
+        assert!(src.contains("if (surface) args.push(\"--surface\""));
     }
 
     #[test]
@@ -1361,5 +1423,22 @@ hooks = true
         let bad = dir.path().join("bad.json");
         fs::write(&bad, "{ not valid").unwrap();
         assert!(read_json_or_empty_object(&bad).is_err());
+    }
+}
+
+#[cfg(test)]
+mod render_dump {
+    use super::*;
+
+    #[test]
+    #[ignore] // run manually with `cargo test -p flowmux-cli -- --ignored render_dump::dump_plugin_source`
+    fn dump_plugin_source() {
+        let src = opencode_plugin_source_with_argv(&[
+            "flatpak".into(),
+            "run".into(),
+            "--command=flowmuxctl".into(),
+            "com.flowmux.App".into(),
+        ]);
+        eprintln!("\n----- BEGIN PLUGIN SOURCE -----\n{}\n----- END PLUGIN SOURCE -----\n", src);
     }
 }

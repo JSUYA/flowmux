@@ -398,12 +398,27 @@ enum AgentHookEvent {
     /// payload — Codex's `notify` config delivers the event JSON this
     /// way; Claude/OpenCode use stdin and leave args empty.
     Stop {
+        /// Source pane id. The Flatpak OpenCode plugin passes this
+        /// explicitly because `flatpak run` resets env to a minimal
+        /// sandbox set, dropping FLOWMUX_PANE_ID before it reaches the
+        /// in-sandbox CLI. Falls back to FLOWMUX_PANE_ID when omitted
+        /// so non-sandboxed callers still work without changes.
+        #[arg(long)]
+        pane: Option<PaneId>,
+        /// Source surface (tab) id. Same flatpak-boundary motivation
+        /// as `--pane`; falls back to FLOWMUX_SURFACE_ID.
+        #[arg(long)]
+        surface: Option<SurfaceId>,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
     /// Agent needs attention (permission prompt, error). Trailing args
     /// follow the same positional-or-stdin convention.
     Notification {
+        #[arg(long)]
+        pane: Option<PaneId>,
+        #[arg(long)]
+        surface: Option<SurfaceId>,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -915,19 +930,31 @@ async fn run_generic_agent_hook_event(
     socket: Option<PathBuf>,
 ) -> anyhow::Result<()> {
     use hooks::*;
-    let pane = pane_from_env();
-    let surface = surface_from_env();
+    let env_pane = pane_from_env();
+    let env_surface = surface_from_env();
+    let (cli_pane, cli_surface) = match event {
+        AgentHookEvent::Stop { pane, surface, .. } => (*pane, *surface),
+        AgentHookEvent::Notification { pane, surface, .. } => (*pane, *surface),
+        AgentHookEvent::SessionStart { .. } => (None, None),
+    };
+    // CLI flags win over env so the OpenCode Flatpak plugin (which
+    // passes them explicitly across the sandbox boundary) is the
+    // single source of truth for pane/surface attribution. Non-flatpak
+    // callers leave the flags unset and we recover the values from
+    // env, preserving the legacy code path.
+    let pane = cli_pane.or(env_pane);
+    let surface = cli_surface.or(env_surface);
     flowmux_config::notify_debug!(
         "cli/hook",
-        "entry agent={agent:?} event={event:?} pane={pane:?} surface={surface:?} socket_arg={socket:?}"
+        "entry agent={agent:?} event={event:?} cli_pane={cli_pane:?} cli_surface={cli_surface:?} env_pane={env_pane:?} env_surface={env_surface:?} resolved_pane={pane:?} resolved_surface={surface:?} socket_arg={socket:?}"
     );
     let req = match event {
-        AgentHookEvent::Stop { args } => {
+        AgentHookEvent::Stop { args, .. } => {
             let input = read_codex_hook_input(args);
             let body = input.last_assistant_message.as_deref();
             build_stop_notify(agent, body, pane, surface)
         }
-        AgentHookEvent::Notification { args } => {
+        AgentHookEvent::Notification { args, .. } => {
             let input = read_codex_hook_input(args);
             let msg = input.message.as_deref();
             build_notification_notify(agent, msg, pane, surface)
@@ -1739,5 +1766,131 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    // -- Agent hook event parsing -------------------------------------
+    //
+    // The OpenCode Flatpak plugin passes pane/surface as explicit
+    // `--pane` / `--surface` flags because `flatpak run` resets env
+    // before the in-sandbox CLI is reached, so the legacy
+    // FLOWMUX_PANE_ID env-var path returns None across the boundary.
+    // These tests pin the clap surface that path depends on.
+
+    #[test]
+    fn hooks_opencode_stop_accepts_pane_and_surface_flags() {
+        let pane = PaneId::new();
+        let surface = SurfaceId::new();
+        let cli = Cli::try_parse_from([
+            "flowmuxctl",
+            "hooks",
+            "opencode",
+            "stop",
+            "--pane",
+            &pane.to_string(),
+            "--surface",
+            &surface.to_string(),
+        ])
+        .expect("clap must parse the OpenCode plugin's argv shape");
+        let Cmd::Hooks {
+            op: HooksOp::Opencode {
+                event: AgentHookEvent::Stop {
+                    pane: got_pane,
+                    surface: got_surface,
+                    args,
+                },
+            },
+        } = cli.cmd
+        else {
+            panic!("expected hooks opencode stop variant");
+        };
+        assert_eq!(got_pane, Some(pane));
+        assert_eq!(got_surface, Some(surface));
+        assert!(args.is_empty(), "no trailing payload was provided");
+    }
+
+    #[test]
+    fn hooks_opencode_stop_keeps_trailing_payload_after_flags() {
+        // The plugin always emits flags before the optional JSON
+        // payload (Codex-compat) so clap can split them cleanly. Make
+        // sure that ordering still parses with the payload intact.
+        let pane = PaneId::new();
+        let payload = r#"{"message":"all done"}"#;
+        let cli = Cli::try_parse_from([
+            "flowmuxctl",
+            "hooks",
+            "opencode",
+            "notification",
+            "--pane",
+            &pane.to_string(),
+            payload,
+        ])
+        .expect("flags-before-payload must parse");
+        let Cmd::Hooks {
+            op: HooksOp::Opencode {
+                event: AgentHookEvent::Notification {
+                    pane: got_pane,
+                    surface,
+                    args,
+                },
+            },
+        } = cli.cmd
+        else {
+            panic!("expected hooks opencode notification variant");
+        };
+        assert_eq!(got_pane, Some(pane));
+        assert!(surface.is_none());
+        assert_eq!(args, vec![payload.to_string()]);
+    }
+
+    #[test]
+    fn hooks_opencode_stop_with_no_flags_parses_empty() {
+        // Backwards-compat: when no flags are present (legacy
+        // installs that never emit them) the CLI must still parse so
+        // `pane_from_env` / `surface_from_env` can resolve the values.
+        let cli = Cli::try_parse_from(["flowmuxctl", "hooks", "opencode", "stop"])
+            .expect("flag-less stop must still parse");
+        let Cmd::Hooks {
+            op: HooksOp::Opencode {
+                event: AgentHookEvent::Stop {
+                    pane,
+                    surface,
+                    args,
+                },
+            },
+        } = cli.cmd
+        else {
+            panic!("expected hooks opencode stop variant");
+        };
+        assert!(pane.is_none());
+        assert!(surface.is_none());
+        assert!(args.is_empty());
+    }
+
+    #[test]
+    fn hooks_codex_stop_inherits_the_same_pane_flag_surface() {
+        // AgentHookEvent is shared with Codex's `notify` config path;
+        // the parser surface must be symmetric so a future Codex-side
+        // sandbox forwarding patch can reuse the same flag.
+        let pane = PaneId::new();
+        let cli = Cli::try_parse_from([
+            "flowmuxctl",
+            "hooks",
+            "codex",
+            "stop",
+            "--pane",
+            &pane.to_string(),
+        ])
+        .expect("codex must accept the same flag");
+        let Cmd::Hooks {
+            op: HooksOp::Codex {
+                event: AgentHookEvent::Stop {
+                    pane: got_pane, ..
+                },
+            },
+        } = cli.cmd
+        else {
+            panic!("expected hooks codex stop variant");
+        };
+        assert_eq!(got_pane, Some(pane));
     }
 }
