@@ -1326,6 +1326,7 @@ impl WindowController {
                 let registry = self.pane_registry.clone();
                 let css_provider = self.css_provider.clone();
                 let theme = self.theme.clone();
+                let window = self.window.clone();
                 crate::ui::options_dialog::present(&self.window, current, move |opts| {
                     if let Err(e) = flowmux_config::options::save(&opts) {
                         tracing::warn!(error = %e, "options save failed");
@@ -1346,11 +1347,26 @@ impl WindowController {
                         opts.focus_border_color_or_default(),
                         opts.focus_border_alpha(),
                     ));
+                    // Re-install keybindings so the user does not have to
+                    // restart for shortcut edits to take effect.
+                    // set_accels_for_action overwrites the same keys so a
+                    // second pass on the live ApplicationWindow's app is safe.
+                    if let Some(app) = window
+                        .application()
+                        .and_then(|a| a.downcast::<adw::Application>().ok())
+                    {
+                        crate::keybindings::install_accels(&app, &opts);
+                    } else {
+                        tracing::warn!(
+                            "options applied without keybinding re-install — window had no Application; restart to pick up shortcut changes"
+                        );
+                    }
                     tracing::info!(
                         zoom_percent = opts.zoom_percent,
                         engine = ?opts.default_browser_engine,
                         focus_border_color = %opts.focus_border_color,
                         focus_border_opacity = opts.focus_border_opacity,
+                        keybindings_overrides = opts.keybindings.len(),
                         "options applied"
                     );
                 });

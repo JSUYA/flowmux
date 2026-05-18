@@ -1,26 +1,33 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Default keyboard shortcuts.
+//! Keyboard shortcut installation.
 //!
-//! Two layers:
+//! Defaults live in [`flowmux_config::keybindings`] and follow two
+//! conventions:
 //!
 //! * **Pane-tree bindings** — split / focus-direction / close-surface,
 //!   chosen to match the keys the project owner already uses
 //!   (Ctrl+Shift+PageUp/Down for splits, Alt+arrows for directional
-//!   focus, Alt+W to close). These are baked in as flowmux's own
-//!   defaults rather than read from any external terminal's config.
+//!   focus, Alt+W to close).
 //! * **Common terminal conventions** — Ctrl+Shift+C/V for copy/paste,
 //!   Ctrl+Shift+T for a new surface. Universal across modern terminal
-//!   emulators (GNOME Terminal, Tilix, kitty, foot, etc.) so they
-//!   feel native to anyone coming from those.
+//!   emulators (GNOME Terminal, Tilix, kitty, foot, etc.).
 //!
-//! Accelerator format follows GTK's `gtk_accelerator_parse` syntax.
+//! Users override either layer through the `keybindings` field of
+//! `options.json`. Resolution is a partial overlay: actions absent
+//! from the user map keep their defaults, an empty accel array marks
+//! an action as explicitly unbound. Accelerator strings follow GTK's
+//! `gtk_accelerator_parse` syntax; the install routine validates each
+//! one and skips invalid entries with a warning.
 
 use crate::bridge::{Bridge, FocusDir, GtkCommand, WsNav};
 use crate::ui::window::ClipboardToast;
 use adw::prelude::*;
+use flowmux_config::keybindings::{ActionId, KeybindingOverrides};
+use flowmux_config::options::Options;
 use flowmux_core::SplitDirection;
 use gtk::glib;
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::rc::Rc;
 use tokio::sync::oneshot;
 
@@ -28,65 +35,86 @@ use tokio::sync::oneshot;
 /// focus-direction shortcuts know where to operate.
 pub type FocusedPane = Rc<Cell<Option<flowmux_core::PaneId>>>;
 
-/// One action can have multiple accelerators (e.g. Ctrl+Shift+Tab and
-/// Ctrl+ISO_Left_Tab both move to the previous workspace).
-pub const BINDINGS: &[(&str, &[&str])] = &[
-    // Pane tree
-    ("win.split-right", &["<Ctrl><Shift>Page_Up"]),
-    ("win.split-down", &["<Ctrl><Shift>Page_Down"]),
-    ("win.focus-left", &["<Alt>Left"]),
-    ("win.focus-right", &["<Alt>Right"]),
-    ("win.focus-up", &["<Alt>Up"]),
-    ("win.focus-down", &["<Alt>Down"]),
-    ("win.close-surface", &["<Alt>w"]),
-    // Ctrl+Shift+W asks the user to confirm, then closes the entire
-    // flowmux window (which under NON_UNIQUE GApplication is the whole
-    // app process). Distinct from Alt+W (single tab/pane only) so an
-    // accidental modifier slip can't nuke the whole session.
-    ("win.quit-app", &["<Ctrl><Shift>w"]),
-    // Tab navigation. Bare Tab and Shift+Tab are reserved for the terminal
-    // (shell completion, agent shortcuts, etc.). Ctrl+Tab cycles the left
-    // workspace list.
-    ("win.next-surface", &[]),
-    ("win.prev-surface", &[]),
-    ("win.next-workspace", &["<Ctrl>Tab"]),
-    (
-        "win.prev-workspace",
-        &[
-            "<Ctrl><Shift>Tab",
-            "<Ctrl><Shift>ISO_Left_Tab",
-            "<Ctrl>ISO_Left_Tab",
-        ],
-    ),
-    ("win.workspace-1", &["<Alt>1"]),
-    ("win.workspace-2", &["<Alt>2"]),
-    ("win.workspace-3", &["<Alt>3"]),
-    ("win.workspace-4", &["<Alt>4"]),
-    ("win.workspace-5", &["<Alt>5"]),
-    ("win.workspace-6", &["<Alt>6"]),
-    ("win.workspace-7", &["<Alt>7"]),
-    ("win.workspace-8", &["<Alt>8"]),
-    // Common terminal conventions
-    ("win.copy", &["<Ctrl><Shift>c"]),
-    ("win.paste", &["<Ctrl><Shift>v"]),
-    ("win.new-surface", &["<Ctrl><Shift>t"]),
-    // Ctrl+Shift+B adds a new browser tab to the same pane. It mirrors the
-    // browser-tab add button on the right side of the tab bar and pairs with
-    // Ctrl+Shift+T for terminal tabs.
-    ("win.new-browser-surface", &["<Ctrl><Shift>b"]),
-    // Ctrl+N opens a new workspace inside this window; Ctrl+Shift+N launches
-    // a brand-new flowmux window (a separate OS process under NON_UNIQUE).
-    // The two are deliberately split so the unshifted form stays cheap and
-    // local while the shifted form is the heavier "open another app window".
-    ("win.new-workspace", &["<Ctrl>n"]),
-    ("win.new-window", &["<Ctrl><Shift>n"]),
-];
+/// Group prefix for every flowmux window action. `set_accels_for_action`
+/// and `add_action_entries` both need the namespaced name (`win.copy`)
+/// but `flowmux_config::keybindings::ActionId::as_str` returns the bare
+/// form (`copy`), so callers prepend this constant.
+const ACTION_GROUP: &str = "win.";
 
-/// Install accelerators on the application.
-pub fn install_accels(app: &adw::Application) {
-    for (action, accels) in BINDINGS {
-        app.set_accels_for_action(action, accels);
+/// Build the namespaced action name (`win.<bare>`) GTK uses for accel
+/// registration.
+fn full_action_name(action: ActionId) -> String {
+    format!("{ACTION_GROUP}{}", action.as_str())
+}
+
+/// Install accelerators on the application, layering the user overrides
+/// in `options.keybindings` on top of the built-in defaults.
+///
+/// Each accel string is validated through `gtk::accelerator_parse`.
+/// Invalid entries are logged and skipped — the rest of the action's
+/// accels still install. Duplicate accels across actions are logged
+/// (GTK keeps the last writer); the function does not refuse to install
+/// either side so the user can recover by editing `options.json` again.
+pub fn install_accels(app: &adw::Application, options: &Options) {
+    let overrides = &options.keybindings;
+    for unknown in overrides.unknown_keys() {
+        tracing::warn!(action = %unknown, "unknown keybinding action key — ignoring");
     }
+    for non_editable in overrides.non_editable_keys() {
+        tracing::warn!(
+            action = %non_editable,
+            "keybinding action is not user-editable — ignoring override"
+        );
+    }
+    let resolved = overrides.resolve();
+
+    // accel -> first action that claimed it, for conflict warnings.
+    let mut owner: HashMap<String, &'static str> = HashMap::new();
+
+    for (action, accels) in &resolved {
+        let valid: Vec<String> = accels
+            .iter()
+            .filter_map(|accel| {
+                if accel.is_empty() {
+                    tracing::warn!(action = action.as_str(), "empty accel string — skipping");
+                    return None;
+                }
+                if gtk::accelerator_parse(accel).is_none() {
+                    tracing::warn!(
+                        action = action.as_str(),
+                        accel = %accel,
+                        "invalid accel — skipping"
+                    );
+                    return None;
+                }
+                if let Some(prev) = owner.get(accel) {
+                    tracing::warn!(
+                        accel = %accel,
+                        first = %prev,
+                        second = action.as_str(),
+                        "accel bound to multiple actions — GTK will keep the last writer"
+                    );
+                } else {
+                    owner.insert(accel.clone(), action.as_str());
+                }
+                Some(accel.clone())
+            })
+            .collect();
+
+        let accel_refs: Vec<&str> = valid.iter().map(|s| s.as_str()).collect();
+        app.set_accels_for_action(&full_action_name(*action), &accel_refs);
+    }
+}
+
+/// Helper retained for tests and other callers that just want the
+/// resolved accels for a single action without the GTK install path.
+pub fn resolved_accels(overrides: &KeybindingOverrides, action: ActionId) -> Vec<String> {
+    overrides
+        .resolve()
+        .into_iter()
+        .find(|(a, _)| *a == action)
+        .map(|(_, accels)| accels)
+        .unwrap_or_default()
 }
 
 /// Pane registry handle so copy/paste can call into the focused
@@ -562,34 +590,57 @@ fn make_paste_action(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flowmux_config::keybindings::default_accels;
 
-    fn accels(action: &str) -> &'static [&'static str] {
-        BINDINGS
-            .iter()
-            .find_map(|(name, accels)| (*name == action).then_some(*accels))
-            .expect("binding should exist")
+    fn default_for(action: ActionId) -> Vec<&'static str> {
+        default_accels(action).to_vec()
     }
 
     #[test]
     fn shift_tab_is_reserved_for_terminal_and_agents() {
-        assert!(accels("win.next-surface").is_empty());
-        assert!(!accels("win.next-workspace")
+        assert!(default_for(ActionId::NextSurface).is_empty());
+        assert!(!default_for(ActionId::NextWorkspace)
             .iter()
             .any(|accel| *accel == "<Shift>Tab" || *accel == "<Shift>ISO_Left_Tab"));
     }
 
     #[test]
     fn ctrl_tab_cycles_workspace_list() {
-        assert_eq!(accels("win.next-workspace"), &["<Ctrl>Tab"]);
-        assert!(accels("win.prev-workspace")
+        assert_eq!(default_for(ActionId::NextWorkspace), vec!["<Ctrl>Tab"]);
+        assert!(default_for(ActionId::PrevWorkspace)
             .iter()
             .any(|accel| accel.contains("<Ctrl><Shift>Tab")));
     }
 
     #[test]
     fn ctrl_shift_b_opens_new_browser_surface_distinct_from_terminal_tab() {
-        assert_eq!(accels("win.new-surface"), &["<Ctrl><Shift>t"]);
-        assert_eq!(accels("win.new-browser-surface"), &["<Ctrl><Shift>b"]);
+        assert_eq!(default_for(ActionId::NewSurface), vec!["<Ctrl><Shift>t"]);
+        assert_eq!(
+            default_for(ActionId::NewBrowserSurface),
+            vec!["<Ctrl><Shift>b"]
+        );
+    }
+
+    #[test]
+    fn user_override_replaces_default_via_resolved_accels() {
+        let mut overrides = KeybindingOverrides::new();
+        overrides.set(ActionId::SplitRight, vec!["<Ctrl><Alt>r".into()]);
+        assert_eq!(
+            resolved_accels(&overrides, ActionId::SplitRight),
+            vec!["<Ctrl><Alt>r".to_string()]
+        );
+        // Untouched action keeps its default.
+        assert_eq!(
+            resolved_accels(&overrides, ActionId::SplitDown),
+            vec!["<Ctrl><Shift>Page_Down".to_string()]
+        );
+    }
+
+    #[test]
+    fn empty_override_unbinds_action_in_resolved_accels() {
+        let mut overrides = KeybindingOverrides::new();
+        overrides.set(ActionId::SplitRight, vec![]);
+        assert!(resolved_accels(&overrides, ActionId::SplitRight).is_empty());
     }
 
     /// Ctrl+N must create a workspace inside the current window and
@@ -600,17 +651,19 @@ mod tests {
     /// flip them back.
     #[test]
     fn ctrl_n_opens_new_workspace_and_ctrl_shift_n_opens_new_window() {
-        assert_eq!(accels("win.new-workspace"), &["<Ctrl>n"]);
-        assert_eq!(accels("win.new-window"), &["<Ctrl><Shift>n"]);
+        assert_eq!(default_for(ActionId::NewWorkspace), vec!["<Ctrl>n"]);
+        assert_eq!(default_for(ActionId::NewWindow), vec!["<Ctrl><Shift>n"]);
         // The two actions must not share an accelerator — sharing would
         // collapse "new workspace in this window" and "new window" onto
         // the same key.
-        let ws: std::collections::HashSet<_> =
-            accels("win.new-workspace").iter().copied().collect();
-        for accel in accels("win.new-window") {
+        let ws: std::collections::HashSet<_> = default_for(ActionId::NewWorkspace)
+            .iter()
+            .copied()
+            .collect();
+        for accel in default_for(ActionId::NewWindow) {
             assert!(
                 !ws.contains(accel),
-                "win.new-window must not share an accelerator with win.new-workspace"
+                "new-window must not share a default accel with new-workspace"
             );
         }
     }
@@ -648,18 +701,20 @@ mod tests {
     /// onto the same key.
     #[test]
     fn ctrl_shift_w_quits_app_distinct_from_alt_w_close_surface() {
-        assert_eq!(accels("win.quit-app"), &["<Ctrl><Shift>w"]);
-        assert_eq!(accels("win.close-surface"), &["<Alt>w"]);
+        assert_eq!(default_for(ActionId::QuitApp), vec!["<Ctrl><Shift>w"]);
+        assert_eq!(default_for(ActionId::CloseSurface), vec!["<Alt>w"]);
         // The two bindings must not share an accelerator — sharing
         // would mean one key both closes a tab and asks to quit the
         // whole app, which is exactly the regression the user hit on
         // Alt+W and the reason quit-app got its own modifier combo.
-        let close_set: std::collections::HashSet<_> =
-            accels("win.close-surface").iter().copied().collect();
-        for accel in accels("win.quit-app") {
+        let close_set: std::collections::HashSet<_> = default_for(ActionId::CloseSurface)
+            .iter()
+            .copied()
+            .collect();
+        for accel in default_for(ActionId::QuitApp) {
             assert!(
                 !close_set.contains(accel),
-                "win.quit-app must not share an accelerator with win.close-surface"
+                "quit-app must not share a default accel with close-surface"
             );
         }
     }

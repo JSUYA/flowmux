@@ -10,6 +10,7 @@
 //! view engine option does not affect existing browser tabs; it applies only
 //! to newly created browser tabs.
 
+use crate::keybindings::KeybindingOverrides;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -106,6 +107,15 @@ pub struct Options {
     /// Default: [`PERSIST_BROWSER_SESSION_DEFAULT`] (`true`).
     #[serde(default = "default_persist_browser_session")]
     pub persist_browser_session: bool,
+    /// User overrides for keyboard shortcuts. Partial overlay over the
+    /// built-in defaults exposed by
+    /// [`crate::keybindings::defaults`] — actions absent from this map
+    /// keep their defaults, and an empty accel array marks an action as
+    /// explicitly unbound. Unknown keys are dropped at install time
+    /// with a warning so a typo in `options.json` does not break the
+    /// rest of the config.
+    #[serde(default)]
+    pub keybindings: KeybindingOverrides,
 }
 
 fn default_zoom() -> u16 {
@@ -132,6 +142,7 @@ impl Default for Options {
             focus_border_color: default_focus_color(),
             focus_border_opacity: default_focus_border_opacity(),
             persist_browser_session: default_persist_browser_session(),
+            keybindings: KeybindingOverrides::default(),
         }
     }
 }

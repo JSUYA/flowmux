@@ -166,7 +166,6 @@ fn main() -> anyhow::Result<()> {
 
     // GTK runs on the main thread.
     let app = build_application();
-    keybindings::install_accels(&app);
     let store_for_activate = store.clone();
     let rx_for_activate = rx.clone();
     let bridge_for_activate = bridge.clone();
@@ -200,6 +199,11 @@ fn main() -> anyhow::Result<()> {
         // the current focus border options; the options dialog later reloads
         // this same provider so changes apply immediately.
         let initial_options = flowmux_config::options::load();
+        // Apply user keybinding overrides. install_accels validates each
+        // accelerator through gtk::accelerator_parse, so it must run after
+        // GTK has been initialised by the activate callback — calling it
+        // before app.run() panics with "GTK has not been initialized".
+        keybindings::install_accels(app, &initial_options);
         let provider = gtk::CssProvider::new();
         provider.load_from_string(&theme.css(
             initial_options.focus_border_color_or_default(),
