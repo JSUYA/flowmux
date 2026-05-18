@@ -241,59 +241,66 @@ fn check_codex() -> HookCheckEntry {
 }
 
 fn check_opencode() -> HookCheckEntry {
-    let home = match opencode_home() {
-        Some(h) => h,
-        None => return entry(HookTarget::OpenCode, HookCheckStatus::NoAgentHome, vec![]),
-    };
-    if !home.exists() {
-        return entry(
-            HookTarget::OpenCode,
-            HookCheckStatus::NoAgentHome,
-            vec![home.join("opencode.json")],
-        );
+    let homes: Vec<PathBuf> = opencode_homes().into_iter().filter(|h| h.exists()).collect();
+    if homes.is_empty() {
+        let stub = opencode_home()
+            .map(|h| h.join("opencode.json"))
+            .into_iter()
+            .collect();
+        return entry(HookTarget::OpenCode, HookCheckStatus::NoAgentHome, stub);
     }
-    let plugin_path = home.join("plugins").join("flowmux-session.mjs");
-    let opencode_json = home.join("opencode.json");
-    let plugin_ok = plugin_path
-        .exists()
-        .then(|| fs::read_to_string(&plugin_path).ok())
-        .flatten()
-        .map(|s| s.contains(FLOWMUX_OPENCODE_PLUGIN_MARKER))
-        .unwrap_or(false);
-    let registered = if opencode_json.exists() {
-        match read_json_or_empty_object(&opencode_json) {
-            Ok(v) => v
-                .get("plugin")
-                .and_then(|p| p.as_array())
-                .map(|arr| {
-                    arr.iter().any(|p| {
-                        p.as_str()
-                            .map(|s| s.contains("flowmux-session"))
-                            .unwrap_or(false)
+    let mut all_paths: Vec<PathBuf> = Vec::with_capacity(homes.len() * 2);
+    let mut every_installed = true;
+    let mut every_missing = true;
+    for home in &homes {
+        let plugin_path = home.join("plugins").join("flowmux-session.mjs");
+        let opencode_json = home.join("opencode.json");
+        all_paths.push(plugin_path.clone());
+        all_paths.push(opencode_json.clone());
+
+        let plugin_ok = plugin_path
+            .exists()
+            .then(|| fs::read_to_string(&plugin_path).ok())
+            .flatten()
+            .map(|s| s.contains(FLOWMUX_OPENCODE_PLUGIN_MARKER))
+            .unwrap_or(false);
+        let registered = if opencode_json.exists() {
+            match read_json_or_empty_object(&opencode_json) {
+                Ok(v) => v
+                    .get("plugin")
+                    .and_then(|p| p.as_array())
+                    .map(|arr| {
+                        arr.iter().any(|p| {
+                            p.as_str()
+                                .map(|s| s.contains("flowmux-session"))
+                                .unwrap_or(false)
+                        })
                     })
-                })
-                .unwrap_or(false),
-            Err(e) => {
-                return entry(
-                    HookTarget::OpenCode,
-                    HookCheckStatus::Error(e.to_string()),
-                    vec![plugin_path, opencode_json],
-                )
+                    .unwrap_or(false),
+                Err(e) => {
+                    return entry(
+                        HookTarget::OpenCode,
+                        HookCheckStatus::Error(e.to_string()),
+                        all_paths,
+                    )
+                }
             }
-        }
+        } else {
+            false
+        };
+        let this_installed = plugin_ok && registered;
+        let this_missing = !plugin_ok && !registered;
+        every_installed &= this_installed;
+        every_missing &= this_missing;
+    }
+    let status = if every_installed {
+        HookCheckStatus::Installed
+    } else if every_missing {
+        HookCheckStatus::Missing
     } else {
-        false
+        HookCheckStatus::Drift
     };
-    let status = match (plugin_ok, registered) {
-        (true, true) => HookCheckStatus::Installed,
-        (false, false) => HookCheckStatus::Missing,
-        _ => HookCheckStatus::Drift,
-    };
-    entry(
-        HookTarget::OpenCode,
-        status,
-        vec![plugin_path, opencode_json],
-    )
+    entry(HookTarget::OpenCode, status, all_paths)
 }
 
 fn entry(target: HookTarget, status: HookCheckStatus, paths: Vec<PathBuf>) -> HookCheckEntry {
@@ -620,6 +627,35 @@ fn opencode_home() -> Option<PathBuf> {
     flowmux_config::paths::host_config_dir_for("opencode")
 }
 
+/// Every OpenCode config root flowmux should install the plugin
+/// into. The primary `~/.config/opencode/` covers the upstream CLI
+/// and any fork that honours the default XDG layout. The
+/// `opencode-anycli` wrapper at https://github.com/JSUYA/opencode-anycli
+/// re-launches opencode with `XDG_CONFIG_HOME=~/.config/opencode-anycli`
+/// so its plugin loader only sees
+/// `~/.config/opencode-anycli/opencode/plugins/`; without an entry
+/// there the hook never reaches OpenCode and the in-app bell stays
+/// silent.
+///
+/// Only existing roots are returned — we never create the
+/// `opencode-anycli` tree on machines that don't have the wrapper
+/// installed.
+fn opencode_homes() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Some(primary) = opencode_home() {
+        out.push(primary);
+    }
+    if !flowmux_config::paths::is_flatpak_sandbox() {
+        if let Some(home) = dirs::home_dir() {
+            let anycli = home.join(".config").join("opencode-anycli").join("opencode");
+            if anycli.exists() && !out.contains(&anycli) {
+                out.push(anycli);
+            }
+        }
+    }
+    out
+}
+
 /// Host-side spawn argv the OpenCode plugin should call. Outside a
 /// Flatpak sandbox this is just `[FLOWMUX_BIN]` so spawn behaves
 /// like before. Inside the sandbox the plugin is read by host
@@ -677,62 +713,72 @@ fn shell_quote(s: &str) -> String {
 }
 
 fn install_opencode(flowmux_bin: &str) -> Result<HookInstallReport> {
-    let home = match opencode_home() {
-        Some(h) if h.exists() => h,
-        _ => return Ok(skipped(HookTarget::OpenCode)),
-    };
-    let plugin_dir = home.join("plugins");
-    fs::create_dir_all(&plugin_dir).with_context(|| format!("create {}", plugin_dir.display()))?;
-    // Older flowmux installs wrote a CommonJS `.js` plugin; OpenCode
-    // 1.14+ refuses to load it. Purge it so re-running setup is enough.
-    let _ = fs::remove_file(plugin_dir.join("flowmux-session.js"));
-    let plugin_path = plugin_dir.join("flowmux-session.mjs");
+    let homes: Vec<PathBuf> = opencode_homes().into_iter().filter(|h| h.exists()).collect();
+    if homes.is_empty() {
+        return Ok(skipped(HookTarget::OpenCode));
+    }
     let argv = opencode_spawn_argv(flowmux_bin);
     let plugin_src = opencode_plugin_source_with_argv(&argv);
-    if !plugin_path.exists()
-        || fs::read_to_string(&plugin_path).ok().as_deref() != Some(plugin_src.as_str())
-    {
-        write_atomic(&plugin_path, plugin_src.as_bytes())?;
+    let mut touched: Vec<PathBuf> = Vec::with_capacity(homes.len() * 2);
+    for home in &homes {
+        let plugin_dir = home.join("plugins");
+        fs::create_dir_all(&plugin_dir)
+            .with_context(|| format!("create {}", plugin_dir.display()))?;
+        // Older flowmux installs wrote a CommonJS `.js` plugin; OpenCode
+        // 1.14+ refuses to load it. Purge it so re-running setup is enough.
+        let _ = fs::remove_file(plugin_dir.join("flowmux-session.js"));
+        let plugin_path = plugin_dir.join("flowmux-session.mjs");
+        if !plugin_path.exists()
+            || fs::read_to_string(&plugin_path).ok().as_deref() != Some(plugin_src.as_str())
+        {
+            write_atomic(&plugin_path, plugin_src.as_bytes())?;
+        }
+
+        let opencode_json = home.join("opencode.json");
+        register_opencode_plugin(&opencode_json, "flowmux-session", &plugin_path)?;
+        touched.push(plugin_path);
+        touched.push(opencode_json);
     }
-
-    let opencode_json = home.join("opencode.json");
-    register_opencode_plugin(&opencode_json, "flowmux-session", &plugin_path)?;
-
     Ok(HookInstallReport {
         target: HookTarget::OpenCode,
         status: HookInstallStatus::Installed,
-        touched_paths: vec![plugin_path, opencode_json],
+        touched_paths: touched,
     })
 }
 
 fn uninstall_opencode() -> Result<HookInstallReport> {
-    let home = match opencode_home() {
-        Some(h) if h.exists() => h,
-        _ => return Ok(skipped(HookTarget::OpenCode)),
-    };
-    let plugin_path = home.join("plugins").join("flowmux-session.mjs");
-    let _ = fs::remove_file(&plugin_path);
+    let homes: Vec<PathBuf> = opencode_homes().into_iter().filter(|h| h.exists()).collect();
+    if homes.is_empty() {
+        return Ok(skipped(HookTarget::OpenCode));
+    }
+    let mut touched: Vec<PathBuf> = Vec::with_capacity(homes.len() * 2);
+    for home in &homes {
+        let plugin_path = home.join("plugins").join("flowmux-session.mjs");
+        let _ = fs::remove_file(&plugin_path);
 
-    let opencode_json = home.join("opencode.json");
-    if opencode_json.exists() {
-        let mut root: Value = read_json_or_empty_object(&opencode_json)?;
-        if let Some(plugins) = root
-            .as_object_mut()
-            .and_then(|o| o.get_mut("plugin"))
-            .and_then(|v| v.as_array_mut())
-        {
-            plugins.retain(|p| {
-                p.as_str()
-                    .map(|s| !s.contains("flowmux-session"))
-                    .unwrap_or(true)
-            });
+        let opencode_json = home.join("opencode.json");
+        if opencode_json.exists() {
+            let mut root: Value = read_json_or_empty_object(&opencode_json)?;
+            if let Some(plugins) = root
+                .as_object_mut()
+                .and_then(|o| o.get_mut("plugin"))
+                .and_then(|v| v.as_array_mut())
+            {
+                plugins.retain(|p| {
+                    p.as_str()
+                        .map(|s| !s.contains("flowmux-session"))
+                        .unwrap_or(true)
+                });
+            }
+            write_json(&opencode_json, &root)?;
         }
-        write_json(&opencode_json, &root)?;
+        touched.push(plugin_path);
+        touched.push(opencode_json);
     }
     Ok(HookInstallReport {
         target: HookTarget::OpenCode,
         status: HookInstallStatus::Installed,
-        touched_paths: vec![plugin_path, opencode_json],
+        touched_paths: touched,
     })
 }
 
