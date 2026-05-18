@@ -639,21 +639,43 @@ fn opencode_home() -> Option<PathBuf> {
 ///
 /// Only existing roots are returned — we never create the
 /// `opencode-anycli` tree on machines that don't have the wrapper
-/// installed.
+/// installed. The Flatpak build still installs into the anycli root
+/// because the wrapper always runs on the host, and its
+/// `$HOME/.config/opencode-anycli/` tree is bind-mounted into the
+/// sandbox via the manifest's `--filesystem=home`, so the same write
+/// path lands at the same on-disk bytes either way.
 fn opencode_homes() -> Vec<PathBuf> {
+    opencode_homes_for(opencode_home(), host_home_dir())
+}
+
+/// Pure-function core of [`opencode_homes`] — `primary` is the upstream
+/// `~/.config/opencode/` (or `host_config_dir_for("opencode")` inside
+/// Flatpak) and `host_home` is the host `$HOME` used to look up the
+/// optional `opencode-anycli` tree. Split out so tests can exercise
+/// the anycli-detection branch without touching real env vars.
+fn opencode_homes_for(primary: Option<PathBuf>, host_home: Option<PathBuf>) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    if let Some(primary) = opencode_home() {
-        out.push(primary);
+    if let Some(p) = primary {
+        out.push(p);
     }
-    if !flowmux_config::paths::is_flatpak_sandbox() {
-        if let Some(home) = dirs::home_dir() {
-            let anycli = home.join(".config").join("opencode-anycli").join("opencode");
-            if anycli.exists() && !out.contains(&anycli) {
-                out.push(anycli);
-            }
+    if let Some(home) = host_home {
+        let anycli = home.join(".config").join("opencode-anycli").join("opencode");
+        if anycli.exists() && !out.contains(&anycli) {
+            out.push(anycli);
         }
     }
     out
+}
+
+/// `$HOME` as seen on the host filesystem. Inside the Flatpak sandbox
+/// the manifest's `--filesystem=home` keeps `$HOME` pointing at the
+/// host's user dir (not the sandbox-private `~/.var/app/...`), so a
+/// plain `HOME` lookup is the right primitive for hook paths that
+/// must agree with the host-side agent's view of disk.
+fn host_home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .or_else(dirs::home_dir)
 }
 
 /// Host-side spawn argv the OpenCode plugin should call. Outside a
@@ -1231,6 +1253,37 @@ hooks = true
         // body is informative.
         assert!(src.contains("OpenCode needs your input"));
         assert!(src.contains("OpenCode session error"));
+    }
+
+    #[test]
+    fn opencode_homes_includes_anycli_tree_when_present() {
+        // The opencode-anycli wrapper sets
+        // XDG_CONFIG_HOME=~/.config/opencode-anycli, so its plugin
+        // loader only sees ~/.config/opencode-anycli/opencode/plugins/.
+        // The Flatpak build must still install there: the wrapper
+        // always runs on the host, and the tree is bind-mounted into
+        // the sandbox via --filesystem=home. Before this assertion the
+        // sandbox branch dropped the anycli root entirely and OpenCode
+        // never saw the flowmux plugin.
+        let dir = tmp();
+        let host_home = dir.path().to_path_buf();
+        let anycli_tree = host_home.join(".config").join("opencode-anycli").join("opencode");
+        fs::create_dir_all(&anycli_tree).unwrap();
+        let primary = host_home.join(".config").join("opencode");
+        let homes = opencode_homes_for(Some(primary.clone()), Some(host_home));
+        assert_eq!(homes, vec![primary, anycli_tree]);
+    }
+
+    #[test]
+    fn opencode_homes_skips_anycli_tree_when_absent() {
+        // Machines without opencode-anycli should not have the
+        // wrapper's plugin tree fabricated on disk — only the primary
+        // root is returned.
+        let dir = tmp();
+        let host_home = dir.path().to_path_buf();
+        let primary = host_home.join(".config").join("opencode");
+        let homes = opencode_homes_for(Some(primary.clone()), Some(host_home));
+        assert_eq!(homes, vec![primary]);
     }
 
     #[test]
