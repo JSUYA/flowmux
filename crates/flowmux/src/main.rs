@@ -109,6 +109,23 @@ fn main() -> anyhow::Result<()> {
     // back to the GUI that spawned them.
     let socket = paths::runtime_socket_for_pid(std::process::id());
     info!(?socket, "flowmux starting");
+    // Make sure the parent directory exists. Inside Flatpak
+    // `runtime_socket_for_pid` returns `$HOME/.cache/flowmux/…` which
+    // is not auto-created by the runtime, so the IPC server's bind
+    // would fail with ENOENT and the GUI would silently lose hooks.
+    if let Some(parent) = socket.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            tracing::warn!(error = %e, path = %parent.display(), "could not create socket parent dir");
+        }
+    }
+    // Refresh the "current" socket pointer so a host-side process
+    // (e.g. OpenCode plugin spawned with `flatpak run --command=
+    // flowmuxctl …`) can find this daemon without knowing the PID.
+    // Outside Flatpak `runtime_socket()` returns the legacy
+    // `flowmux.sock` path and points at this same daemon for the
+    // same reason — multi-window users keep using `FLOWMUX_SOCKET_PATH`
+    // to scope to the right window.
+    refresh_runtime_socket_pointer(&socket);
 
     // Tokio runtime hosts the IPC server, the state store, and any
     // async desktop-bus interactions.
@@ -269,6 +286,47 @@ fn build_application() -> adw::Application {
         .application_id(APP_ID)
         .flags(gtk::gio::ApplicationFlags::NON_UNIQUE)
         .build()
+}
+
+/// Refresh the stable "current daemon" pointer used by env-less CLI
+/// invocations and (on Flatpak) by the host-side OpenCode plugin.
+///
+/// Uses a symlink so a process opening the path follows it to the
+/// real per-PID socket atomically. Falling back to a regular text
+/// file with the path inside would force every consumer to do a
+/// two-step read-then-connect dance.
+///
+/// Last-writer wins: when two flowmux GUIs are alive at once the
+/// pointer points at whichever started most recently. Per-PID
+/// sockets keep working for terminals inside the earlier window
+/// because the PTY env carries the explicit `FLOWMUX_SOCKET_PATH`.
+/// The pointer is only consulted by callers that have no env (host
+/// plugin process, manual `flowmuxctl notify` from outside any pane).
+fn refresh_runtime_socket_pointer(target: &std::path::Path) {
+    let pointer = paths::runtime_socket();
+    if pointer == target {
+        // Outside Flatpak with no XDG runtime dir this can collapse
+        // onto the same path; nothing to do.
+        return;
+    }
+    if let Some(parent) = pointer.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            tracing::warn!(error = %e, path = %parent.display(), "could not create socket pointer parent");
+            return;
+        }
+    }
+    // Replace any prior pointer atomically. `remove_file` is fine for
+    // both real files and symlinks; ignore NotFound.
+    if let Err(e) = std::fs::remove_file(&pointer) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(error = %e, path = %pointer.display(), "could not remove stale socket pointer");
+        }
+    }
+    if let Err(e) = std::os::unix::fs::symlink(target, &pointer) {
+        tracing::warn!(error = %e, from = %pointer.display(), to = %target.display(), "could not write socket pointer symlink");
+    } else {
+        tracing::info!(pointer = %pointer.display(), target = %target.display(), "current-daemon socket pointer refreshed");
+    }
 }
 
 fn delegate_to_cli_if_needed() -> anyhow::Result<bool> {

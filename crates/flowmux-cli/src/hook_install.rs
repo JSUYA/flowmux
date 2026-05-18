@@ -417,10 +417,11 @@ const CLAUDE_EVENTS: &[ClaudeEvent] = &[
 ];
 
 fn claude_hook_entry(flowmux_bin: &str, event: ClaudeEvent) -> Value {
+    let prefix = host_invocation_shell_command(flowmux_bin);
     let cmd = format!(
         // Marker `flowmux-hook` lets us identify our own entry on
         // re-install. Whitespace before/after is intentional.
-        "{flowmux_bin} hooks claude {subcommand}  # {marker}",
+        "{prefix} hooks claude {subcommand}  # {marker}",
         subcommand = event.subcommand,
         marker = FLOWMUX_HOOK_MARKER
     );
@@ -577,8 +578,16 @@ fn set_codex_notify(config_path: &Path, flowmux_bin: &str) -> Result<()> {
         .with_context(|| format!("parse {}", config_path.display()))?;
 
     // notify = ["<flowmux-bin>", "hooks", "codex", "stop"]
+    // Outside Flatpak the prefix is just [flowmux_bin]; inside Flatpak
+    // it becomes ["flatpak", "run", "--command=flowmuxctl",
+    // "com.flowmux.App"] so the host-side Codex process spawns
+    // through the runtime instead of touching the sandbox-only binary
+    // path directly.
+    let prefix = host_invocation_argv(flowmux_bin);
     let mut arr = Array::new();
-    arr.push(flowmux_bin);
+    for p in &prefix {
+        arr.push(p.as_str());
+    }
     arr.push("hooks");
     arr.push("codex");
     arr.push("stop");
@@ -608,7 +617,63 @@ fn set_codex_notify(config_path: &Path, flowmux_bin: &str) -> Result<()> {
 // ---- OpenCode -------------------------------------------------------
 
 fn opencode_home() -> Option<PathBuf> {
-    dirs::config_dir().map(|c| c.join("opencode"))
+    flowmux_config::paths::host_config_dir_for("opencode")
+}
+
+/// Host-side spawn argv the OpenCode plugin should call. Outside a
+/// Flatpak sandbox this is just `[FLOWMUX_BIN]` so spawn behaves
+/// like before. Inside the sandbox the plugin is read by host
+/// OpenCode, so we wrap the in-sandbox `flowmuxctl` with `flatpak
+/// run --command=…` — the host has `flatpak` on PATH and the spawn
+/// crosses back into the same sandbox the daemon lives in.
+fn opencode_spawn_argv(flowmux_bin: &str) -> Vec<String> {
+    host_invocation_argv(flowmux_bin)
+}
+
+/// Shell-command string the Claude / Codex hook entries write into
+/// the agent's config file. Mirrors [`opencode_spawn_argv`] for the
+/// agents that expect a single command string rather than an argv —
+/// Claude's `settings.json` `hooks[*].command` and Codex's
+/// `config.toml` `notify` are both shell strings.
+fn host_invocation_shell_command(flowmux_bin: &str) -> String {
+    let argv = host_invocation_argv(flowmux_bin);
+    argv.iter()
+        .map(|s| shell_quote(s))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn host_invocation_argv(flowmux_bin: &str) -> Vec<String> {
+    if flowmux_config::paths::is_flatpak_sandbox() {
+        let app_id = std::env::var("FLATPAK_ID").unwrap_or_else(|_| "com.flowmux.App".to_string());
+        // `--command` accepts a name resolved against /app/bin first
+        // and an absolute path otherwise. We pass the bare name so the
+        // /app/bin/flowmuxctl symlink (added by the manifest) keeps
+        // the entry short and stable across path changes.
+        let _ = flowmux_bin; // Sandbox builds resolve via FLATPAK_ID + app PATH.
+        vec![
+            "flatpak".to_string(),
+            "run".to_string(),
+            "--command=flowmuxctl".to_string(),
+            app_id,
+        ]
+    } else {
+        vec![flowmux_bin.to_string()]
+    }
+}
+
+/// Conservative POSIX shell quoting for paths and app-ids — wraps
+/// in single quotes and escapes embedded single quotes. Used only by
+/// the hook installer so it stays close to the call site.
+fn shell_quote(s: &str) -> String {
+    if !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | '=' | ':'))
+    {
+        return s.to_string();
+    }
+    let escaped = s.replace('\'', r"'\''");
+    format!("'{escaped}'")
 }
 
 fn install_opencode(flowmux_bin: &str) -> Result<HookInstallReport> {
@@ -622,7 +687,8 @@ fn install_opencode(flowmux_bin: &str) -> Result<HookInstallReport> {
     // 1.14+ refuses to load it. Purge it so re-running setup is enough.
     let _ = fs::remove_file(plugin_dir.join("flowmux-session.js"));
     let plugin_path = plugin_dir.join("flowmux-session.mjs");
-    let plugin_src = opencode_plugin_source(flowmux_bin);
+    let argv = opencode_spawn_argv(flowmux_bin);
+    let plugin_src = opencode_plugin_source_with_argv(&argv);
     if !plugin_path.exists()
         || fs::read_to_string(&plugin_path).ok().as_deref() != Some(plugin_src.as_str())
     {
@@ -670,7 +736,22 @@ fn uninstall_opencode() -> Result<HookInstallReport> {
     })
 }
 
+/// Back-compat single-string entry point for older tests that pass a
+/// bare binary path. New call sites prefer
+/// [`opencode_plugin_source_with_argv`] so the spawn array can carry
+/// the Flatpak `flatpak run …` prefix.
 fn opencode_plugin_source(flowmux_bin: &str) -> String {
+    opencode_plugin_source_with_argv(&[flowmux_bin.to_string()])
+}
+
+fn opencode_plugin_source_with_argv(argv: &[String]) -> String {
+    let head = argv
+        .first()
+        .map(|s| s.as_str())
+        .unwrap_or("flowmux");
+    let trailing: Vec<String> = argv.iter().skip(1).cloned().collect();
+    let trailing_literal = serde_json::to_string(&trailing)
+        .unwrap_or_else(|_| "[]".into());
     // OpenCode 1.14+ plugins are ESM modules. Path-loaded plugins
     // (`file:///…`) must export an `id` so OpenCode can name them; npm
     // packages skip that because the package name is the id. The
@@ -698,11 +779,19 @@ fn opencode_plugin_source(flowmux_bin: &str) -> String {
 
 import {{ spawn }} from "node:child_process";
 
+// `FLOWMUX_BIN` is the executable invoked from the host. Outside
+// Flatpak it is the absolute path to `flowmuxctl`. Inside Flatpak
+// the hook installer rewrites it to `flatpak` and prepends the
+// runtime args (`run --command=… com.flowmux.App`) so the spawn
+// crosses back into the same sandbox the daemon lives in. Either
+// way the trailing `["hooks", "opencode", <event>]` args land at the
+// in-sandbox CLI unchanged.
 const FLOWMUX_BIN = {bin_literal};
+const FLOWMUX_ARGS_PREFIX = {trailing_literal};
 
 function fireFlowmuxHook(event, payload) {{
   try {{
-    const args = ["hooks", "opencode", event];
+    const args = [...FLOWMUX_ARGS_PREFIX, "hooks", "opencode", event];
     if (payload) args.push(payload);
     spawn(FLOWMUX_BIN, args, {{
       stdio: "ignore",
@@ -731,7 +820,8 @@ export const server = async () => ({{
 export default {{ id, server }};
 "#,
         marker = FLOWMUX_OPENCODE_PLUGIN_MARKER,
-        bin_literal = serde_json::to_string(flowmux_bin).unwrap_or_else(|_| "\"flowmux\"".into()),
+        bin_literal = serde_json::to_string(head).unwrap_or_else(|_| "\"flowmux\"".into()),
+        trailing_literal = trailing_literal,
     )
 }
 
