@@ -102,6 +102,38 @@ fn main() -> anyhow::Result<()> {
         std::env::set_var("GSK_RENDERER", "gl");
     }
 
+    // WSL2 + WSLg ships a Weston-based Wayland compositor that does not
+    // bridge the text-input protocol to a session IME the way native
+    // GNOME/KDE shells do. The GTK4 wayland immodule therefore never
+    // receives the preedit channel for CJK input, and Hangul / Hanja /
+    // Kana composition silently fails. When ibus is installed but the
+    // user has not exported the GTK IM environment (a common state on
+    // a fresh 24.04 / 26.04 WSL install — `.bashrc` exports never reach
+    // the GUI launcher), GTK4 falls back to the `simple` immodule and
+    // the VTE pane swallows every CJK keystroke.
+    //
+    // Forcing `GTK_IM_MODULE=ibus` makes GTK4 load the ibus immodule,
+    // which talks to ibus-daemon over DBus directly — bypassing the
+    // Wayland text-input path that WSLg leaves unwired. The override is
+    // triple-gated:
+    //   * only on WSL (native Linux and Flatpak stay untouched),
+    //   * only when the user has not picked an IM module already
+    //     (respecting fcitx5 / explicit `simple` setups), and
+    //   * only when ibus-daemon is actually installed (no point forcing
+    //     a module whose backend cannot run).
+    // The combination means any setup that already works keeps working
+    // bit-for-bit; the only paths that change are the ones that were
+    // already broken.
+    if is_wsl()
+        && std::env::var_os("GTK_IM_MODULE").is_none()
+        && ibus_daemon_available()
+    {
+        std::env::set_var("GTK_IM_MODULE", "ibus");
+        if std::env::var_os("XMODIFIERS").is_none() {
+            std::env::set_var("XMODIFIERS", "@im=ibus");
+        }
+    }
+
     // One socket per GUI process so several flowmux windows can run
     // side-by-side without their notifications crossing over. The
     // `FLOWMUX_SOCKET_PATH` env we inject into every PTY carries this
@@ -382,6 +414,43 @@ fn delegate_to_cli_if_needed() -> anyhow::Result<bool> {
     }
 
     Ok(true)
+}
+
+/// True when the current process is running inside WSL (any version,
+/// any distro). Detection prefers the `WSL_DISTRO_NAME` environment
+/// variable that `wslapi`-spawned shells inject, then falls back to
+/// matching the kernel release line in `/proc/version`, which always
+/// carries a "microsoft" / "WSL" marker on Microsoft's kernel builds.
+/// Both checks are cheap and have no side effects, so we run them
+/// unconditionally on every startup.
+fn is_wsl() -> bool {
+    if std::env::var_os("WSL_DISTRO_NAME").is_some() {
+        return true;
+    }
+    std::fs::read_to_string("/proc/version")
+        .map(|s| {
+            let lower = s.to_ascii_lowercase();
+            lower.contains("microsoft") || lower.contains("wsl")
+        })
+        .unwrap_or(false)
+}
+
+/// True when an `ibus-daemon` binary is reachable on the standard
+/// system paths. We do not probe `$PATH` because the GUI launcher's
+/// environment may differ from a login shell's — the file check is
+/// authoritative and matches what the GTK4 ibus immodule itself looks
+/// for. If the daemon is not installed, forcing `GTK_IM_MODULE=ibus`
+/// would only swap one broken state for another, so the caller skips
+/// the override.
+fn ibus_daemon_available() -> bool {
+    const CANDIDATES: &[&str] = &[
+        "/usr/bin/ibus-daemon",
+        "/usr/local/bin/ibus-daemon",
+        "/bin/ibus-daemon",
+    ];
+    CANDIDATES
+        .iter()
+        .any(|p| std::path::Path::new(p).exists())
 }
 
 #[cfg(test)]
