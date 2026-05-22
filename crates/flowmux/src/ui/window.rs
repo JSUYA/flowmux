@@ -1996,6 +1996,14 @@ impl WindowController {
                     }
                 }
             }
+            GtkCommand::ClearAllNotifications => {
+                let desktop_ids = self.notifications.clear_all();
+                if !desktop_ids.is_empty() {
+                    self.close_desktop_notifications(desktop_ids);
+                }
+                self.refresh_launcher_badge();
+                self.sidebar.refresh_notification_popover();
+            }
             GtkCommand::FocusWorkspaceAt { idx } => {
                 let snap = self.store.snapshot().await;
                 let target_idx = (idx as usize).saturating_sub(1);

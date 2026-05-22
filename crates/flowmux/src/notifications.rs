@@ -261,6 +261,27 @@ impl NotificationStore {
         }
     }
 
+    /// Drop every entry from the in-memory transcript. Returns the
+    /// `desktop_id`s that the FDO notifications daemon still has open
+    /// (i.e. unread entries that had been handed a toast id), so the
+    /// caller can withdraw the matching toasts in one batch via
+    /// `CloseDesktopNotifications`. Read entries had no live toast and
+    /// contribute nothing here. Used by the bell-popover "All Clear"
+    /// header button.
+    pub fn clear_all(&self) -> Vec<String> {
+        let mut entries = self.inner.borrow_mut();
+        let mut desktop_ids = Vec::new();
+        for entry in entries.iter() {
+            if !entry.read {
+                if let Some(did) = entry.desktop_id.clone() {
+                    desktop_ids.push(did);
+                }
+            }
+        }
+        entries.clear();
+        desktop_ids
+    }
+
     /// Return a fresh `Vec` snapshot in insertion order. The caller owns
     /// the list and may render newest-first.
     pub fn entries(&self) -> Vec<NotificationEntry> {
@@ -813,6 +834,56 @@ mod tests {
             vec![a, c],
             "removing a middle entry must collapse the gap without reordering survivors"
         );
+    }
+
+    #[test]
+    fn clear_all_drops_every_entry_and_returns_unread_desktop_ids() {
+        let s = store();
+        // a: unread + desktop id  → returned for toast withdrawal
+        // b: read + desktop id    → no toast to withdraw
+        // c: unread, no desktop id → silently dropped
+        let a = s.push(
+            "a".into(),
+            "".into(),
+            NotificationLevel::AttentionNeeded,
+            None,
+            None,
+            None,
+        )
+        .expect("push must record an entry");
+        let b = s.push(
+            "b".into(),
+            "".into(),
+            NotificationLevel::Info,
+            None,
+            None,
+            None,
+        )
+        .expect("push must record an entry");
+        let _c = s.push(
+            "c".into(),
+            "".into(),
+            NotificationLevel::Info,
+            None,
+            None,
+            None,
+        )
+        .expect("push must record an entry");
+        let _ = s.set_desktop_id(a, "did-a".into());
+        let _ = s.set_desktop_id(b, "did-b".into());
+        assert!(s.mark_read(b));
+
+        let ids = s.clear_all();
+        assert_eq!(ids, vec!["did-a".to_string()]);
+        assert!(s.entries().is_empty());
+        assert_eq!(s.unread_count(), 0);
+    }
+
+    #[test]
+    fn clear_all_on_empty_store_returns_empty_and_does_not_panic() {
+        let s = store();
+        assert!(s.clear_all().is_empty());
+        assert!(s.entries().is_empty());
     }
 
     #[test]

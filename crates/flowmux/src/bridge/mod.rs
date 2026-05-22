@@ -371,6 +371,10 @@ pub enum GtkCommand {
     /// focused-pane → first-leaf-pane → workspace.root_dir resolution
     /// as ShowFocusedPaneFolder.
     CopyFocusedPaneText { workspace: WorkspaceId },
+    /// Drop every notification from the in-process transcript and
+    /// withdraw their matching desktop toasts in one sweep. Fired by
+    /// the "All Clear" button at the top of the bell popover.
+    ClearAllNotifications,
 }
 
 #[derive(Clone)]

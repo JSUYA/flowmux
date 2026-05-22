@@ -384,6 +384,12 @@ fn render_notification_list(
     bridge: Bridge,
     popover: gtk::Popover,
 ) -> gtk::Widget {
+    let root = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    root.set_margin_top(6);
+    root.set_margin_bottom(6);
+    root.set_margin_start(6);
+    root.set_margin_end(6);
+
     let scroll = gtk::ScrolledWindow::new();
     scroll.set_hscrollbar_policy(gtk::PolicyType::Never);
     scroll.set_min_content_height(160);
@@ -397,8 +403,30 @@ fn render_notification_list(
         empty.set_margin_bottom(20);
         empty.add_css_class("dim-label");
         scroll.set_child(Some(&empty));
-        return scroll.upcast();
+        root.append(&scroll);
+        return root.upcast();
     }
+
+    // "All Clear" header: clears the in-process transcript and
+    // withdraws every still-open desktop toast in one sweep. Sits
+    // above the list so the user can drop the whole stack without
+    // tapping each row's trash button.
+    let header = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    header.set_halign(gtk::Align::End);
+    let clear_btn = gtk::Button::with_label("All Clear");
+    clear_btn.add_css_class("flat");
+    clear_btn.set_tooltip_text(Some("Clear every notification"));
+    let bridge_for_clear = bridge.clone();
+    let popover_for_clear = popover.clone();
+    clear_btn.connect_clicked(move |_| {
+        popover_for_clear.popdown();
+        let bridge = bridge_for_clear.clone();
+        gtk::glib::MainContext::default().spawn_local(async move {
+            let _ = bridge.tx.send(GtkCommand::ClearAllNotifications).await;
+        });
+    });
+    header.append(&clear_btn);
+    root.append(&header);
 
     let list = gtk::ListBox::new();
     list.set_selection_mode(gtk::SelectionMode::None);
@@ -409,7 +437,8 @@ fn render_notification_list(
         list.append(&notification_row(entry, bridge.clone(), popover.clone()));
     }
     scroll.set_child(Some(&list));
-    scroll.upcast()
+    root.append(&scroll);
+    root.upcast()
 }
 
 fn notification_row(
