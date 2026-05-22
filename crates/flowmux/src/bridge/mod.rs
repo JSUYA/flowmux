@@ -350,6 +350,15 @@ pub enum GtkCommand {
         cookies: Vec<flowmux_cookies::Cookie>,
         ack: oneshot::Sender<Result<usize, String>>,
     },
+    /// Open the system file manager at the cwd of the workspace's
+    /// currently-focused pane (or, if no pane in `workspace` is focused,
+    /// the workspace's first leaf pane's active terminal). Fired by the
+    /// sidebar workspace right-click "Show in folder" item.
+    ShowFocusedPaneFolder { workspace: WorkspaceId },
+    /// Open the system file manager at a specific surface's cwd. Fired
+    /// by the pane tab right-click "Show in folder" item. Only meaningful
+    /// for terminal surfaces; the caller skips browser tabs before sending.
+    ShowSurfaceFolder { pane: PaneId, surface: SurfaceId },
 }
 
 #[derive(Clone)]

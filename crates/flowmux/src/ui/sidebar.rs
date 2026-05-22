@@ -802,6 +802,27 @@ fn row_widget(
         });
         v.append(&close_btn);
 
+        v.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+
+        // Open the focused pane's cwd in the system file manager
+        // (Nautilus on a default Ubuntu/GNOME install). The dispatcher
+        // resolves "focused pane" inside this workspace and falls back
+        // to its first leaf pane.
+        let show_btn = mk("Show in folder");
+        let bridge_for_show = bridge.clone();
+        let pop = popover.clone();
+        show_btn.connect_clicked(move |_| {
+            pop.popdown();
+            let bridge = bridge_for_show.clone();
+            gtk::glib::MainContext::default().spawn_local(async move {
+                let _ = bridge
+                    .tx
+                    .send(GtkCommand::ShowFocusedPaneFolder { workspace: id })
+                    .await;
+            });
+        });
+        v.append(&show_btn);
+
         popover.set_child(Some(&v));
         popover.set_parent(&row_for_click);
         popover.set_has_arrow(false);

@@ -2025,6 +2025,53 @@ impl WindowController {
                 let result = inject_cookies_into_webkit(&cookies);
                 let _ = ack.send(result);
             }
+            GtkCommand::ShowSurfaceFolder { pane: _, surface } => {
+                let cwd = self
+                    .pane_registry
+                    .borrow()
+                    .terminals
+                    .get(&surface)
+                    .and_then(|t| t.current_dir());
+                match cwd {
+                    Some(p) => crate::ui::show_in_folder::open_directory(&p),
+                    None => {
+                        tracing::info!(%surface, "show-in-folder: surface has no resolvable cwd");
+                    }
+                }
+            }
+            GtkCommand::ShowFocusedPaneFolder { workspace } => {
+                // Resolution order:
+                //   1. Globally focused pane, if it belongs to this workspace —
+                //      its active terminal's cwd.
+                //   2. Workspace's first leaf pane — its active terminal's cwd.
+                //   3. Workspace's stored `root_dir` — guarantees we open
+                //      *something* for a workspace whose panes are all browsers
+                //      or whose terminals haven't reported a cwd yet.
+                let ws = self.store.get_workspace(workspace).await;
+                let Some(ws) = ws else {
+                    tracing::info!(%workspace, "show-in-folder: workspace not found");
+                    return;
+                };
+                let focused = self.focused_pane.get().filter(|p| {
+                    self.pane_registry.borrow().workspace_of_pane(*p) == Some(workspace)
+                });
+                let candidate_panes: Vec<PaneId> = focused
+                    .into_iter()
+                    .chain(
+                        ws.surfaces
+                            .first()
+                            .and_then(|s| s.root_pane.first_leaf_id()),
+                    )
+                    .collect();
+                let cwd = {
+                    let r = self.pane_registry.borrow();
+                    candidate_panes
+                        .iter()
+                        .find_map(|p| r.active_terminal(*p).and_then(|t| t.current_dir()))
+                };
+                let path = cwd.unwrap_or_else(|| ws.root_dir.clone());
+                crate::ui::show_in_folder::open_directory(&path);
+            }
             GtkCommand::BrowserEval { pane, source, ack } => {
                 let registry = self.pane_registry.borrow();
                 match registry.active_browser(pane) {
@@ -2886,6 +2933,18 @@ fn make_callbacks(
                     let _ = bridge
                         .tx
                         .send(GtkCommand::ShowRenameSurfaceDialog { pane, surface })
+                        .await;
+                });
+            }))
+        },
+        on_show_surface_folder: {
+            let bridge = bridge.clone();
+            Rc::new(RefCell::new(move |pane, surface| {
+                let bridge = bridge.clone();
+                glib::MainContext::default().spawn_local(async move {
+                    let _ = bridge
+                        .tx
+                        .send(GtkCommand::ShowSurfaceFolder { pane, surface })
                         .await;
                 });
             }))

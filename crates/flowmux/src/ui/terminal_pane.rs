@@ -151,6 +151,10 @@ pub struct PaneCallbacks {
     pub on_close_surface: Rc<RefCell<dyn FnMut(PaneId, SurfaceId)>>,
     /// Pane-local rename tab.
     pub on_rename_surface: Rc<RefCell<dyn FnMut(PaneId, SurfaceId)>>,
+    /// Tab right-click "Show in folder" → open file manager at the
+    /// terminal surface's current working directory. Only invoked from
+    /// terminal tab popovers; browser tabs skip the menu entirely.
+    pub on_show_surface_folder: Rc<RefCell<dyn FnMut(PaneId, SurfaceId)>>,
     /// Reorder a tab within the same pane by drag and drop. The third argument
     /// is the final 0-based index after the move, clamped if it exceeds length.
     pub on_reorder_surface: Rc<RefCell<dyn FnMut(PaneId, SurfaceId, usize)>>,
