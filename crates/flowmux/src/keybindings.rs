@@ -19,6 +19,7 @@
 //! `gtk_accelerator_parse` syntax; the install routine validates each
 //! one and skips invalid entries with a warning.
 
+use crate::asr::AsrControllerHandle;
 use crate::bridge::{Bridge, FocusDir, GtkCommand, WsNav};
 use crate::ui::window::ClipboardToast;
 use adw::prelude::*;
@@ -128,6 +129,7 @@ pub fn install_actions(
     focused: FocusedPane,
     registry: TerminalRegistry,
     clipboard_toast: ClipboardToast,
+    asr_controller: AsrControllerHandle,
 ) {
     let split_right = make_pane_action(
         "split-right",
@@ -274,6 +276,20 @@ pub fn install_actions(
             .build()
     };
 
+    // Voice push-to-talk (default Ctrl+Alt+space). GTK's action map
+    // only fires on key-press, so this acts as a toggle: first activation
+    // starts capture, second activation finishes and transcribes. The
+    // user can also pick "Hold" mode in options; a future change wires
+    // EventControllerKey on the window to drive release-based capture.
+    let voice_ptt = {
+        let asr_controller = asr_controller.clone();
+        gtk::gio::ActionEntry::builder("voice-ptt")
+            .activate(move |_, _, _| {
+                asr_controller.borrow_mut().activate();
+            })
+            .build()
+    };
+
     let [w1, w2, w3, w4, w5, w6, w7, w8] = ws_jumps;
     window.add_action_entries([
         split_right,
@@ -303,6 +319,7 @@ pub fn install_actions(
         copy,
         paste,
         copy_pane_path,
+        voice_ptt,
     ]);
 }
 
@@ -358,16 +375,26 @@ fn make_surface_nav_action(
                     return;
                 }
             };
+            // Update GTK side synchronously so the user sees the tab
+            // switch in the same frame as the key press, even under
+            // Ctrl+Shift+Right/Left autorepeat where the bridge
+            // dispatch queue can be deep with prior ActivateSurface
+            // commands. The bridge send below still happens to sync
+            // the store's active-surface + window title + workspace
+            // label; pane_registry::activate_surface is idempotent so
+            // dispatch repeating the same UI op is harmless.
             let surface = {
-                let registry = registry.borrow();
-                match dir {
-                    SurfaceNav::Next => registry.next_surface(pane),
-                    SurfaceNav::Prev => registry.previous_surface(pane),
-                }
-            };
-            let Some(surface) = surface else {
-                tracing::info!(action = name, %pane, "no pane-local surface — ignoring");
-                return;
+                let mut r = registry.borrow_mut();
+                let next = match dir {
+                    SurfaceNav::Next => r.next_surface(pane),
+                    SurfaceNav::Prev => r.previous_surface(pane),
+                };
+                let Some(next) = next else {
+                    tracing::info!(action = name, %pane, "no pane-local surface — ignoring");
+                    return;
+                };
+                r.activate_surface(pane, next);
+                next
             };
             let bridge = bridge.clone();
             glib::MainContext::default().spawn_local(async move {
@@ -645,10 +672,35 @@ mod tests {
 
     #[test]
     fn shift_tab_is_reserved_for_terminal_and_agents() {
-        assert!(default_for(ActionId::NextSurface).is_empty());
-        assert!(!default_for(ActionId::NextWorkspace)
-            .iter()
-            .any(|accel| *accel == "<Shift>Tab" || *accel == "<Shift>ISO_Left_Tab"));
+        // Shift+Tab must stay free for the focused terminal so the
+        // shell / agent in-pane keeps its native completion menu.
+        let next_ws = default_for(ActionId::NextWorkspace);
+        let next_surface = default_for(ActionId::NextSurface);
+        let prev_surface = default_for(ActionId::PrevSurface);
+        let reserved = ["<Shift>Tab", "<Shift>ISO_Left_Tab"];
+        for accels in [&next_ws, &next_surface, &prev_surface] {
+            for accel in accels.iter() {
+                assert!(
+                    !reserved.contains(accel),
+                    "Shift+Tab variants must stay reserved for the terminal — \
+                     accel `{accel}` collides"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ctrl_shift_arrows_cycle_tabs_in_pane() {
+        // Default mapping: Ctrl+Shift+Right → next tab, Ctrl+Shift+Left → prev.
+        // The arrow chord avoids the Shift+Tab path that the terminal owns.
+        assert_eq!(
+            default_for(ActionId::NextSurface),
+            vec!["<Ctrl><Shift>Right"]
+        );
+        assert_eq!(
+            default_for(ActionId::PrevSurface),
+            vec!["<Ctrl><Shift>Left"]
+        );
     }
 
     #[test]
@@ -899,10 +951,7 @@ mod tests {
 
     #[test]
     fn copy_pane_path_default_is_ctrl_shift_k() {
-        assert_eq!(
-            default_for(ActionId::CopyPanePath),
-            vec!["<Ctrl><Shift>k"]
-        );
+        assert_eq!(default_for(ActionId::CopyPanePath), vec!["<Ctrl><Shift>k"]);
     }
 
     #[test]

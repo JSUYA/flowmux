@@ -5,6 +5,7 @@
 //! tokio runtime, and wires GTK-affecting verbs to the GTK main loop
 //! through an [`async_channel`] bridge.
 
+mod asr;
 mod bridge;
 mod ipc_handler;
 mod keybindings;
@@ -124,10 +125,7 @@ fn main() -> anyhow::Result<()> {
     // The combination means any setup that already works keeps working
     // bit-for-bit; the only paths that change are the ones that were
     // already broken.
-    if is_wsl()
-        && std::env::var_os("GTK_IM_MODULE").is_none()
-        && ibus_daemon_available()
-    {
+    if is_wsl() && std::env::var_os("GTK_IM_MODULE").is_none() && ibus_daemon_available() {
         std::env::set_var("GTK_IM_MODULE", "ibus");
         if std::env::var_os("XMODIFIERS").is_none() {
             std::env::set_var("XMODIFIERS", "@im=ibus");
@@ -286,13 +284,50 @@ fn main() -> anyhow::Result<()> {
             Some(tokio_handle_for_activate.clone()),
         );
         controller.use_shared_notifier(shared_notifier_for_activate.clone());
+
+        // Voice input (push-to-talk) controller. Lives on the GTK
+        // main thread; transcribe work goes through the tokio handle
+        // passed in. The receiver is drained by a `spawn_local` that
+        // dispatches UI side-effects (toast + headerbar indicator +
+        // text injection) below.
+        let asr_controller = asr::AsrController::new(
+            initial_options.asr.clone(),
+            tokio_handle_for_activate.clone(),
+            controller.focused_pane.clone(),
+            controller.pane_registry(),
+            controller.clipboard_toast(),
+        );
+
         keybindings::install_actions(
             &controller.window,
             bridge_for_activate.clone(),
             controller.focused_pane.clone(),
             controller.pane_registry(),
             controller.clipboard_toast(),
+            asr_controller.clone(),
         );
+
+        // Drain ASR UI events on the GTK main loop. The receiver was
+        // produced when the controller was built; if some other piece
+        // of the GUI grabs it first, we no-op.
+        if let Some(rx) = asr_controller.borrow_mut().take_event_receiver() {
+            let focused = controller.focused_pane.clone();
+            let registry = controller.pane_registry();
+            let toast = controller.clipboard_toast();
+            gtk::glib::MainContext::default().spawn_local(async move {
+                // No headerbar indicator is wired yet in this milestone —
+                // use a sink that ignores the recording / busy state.
+                struct NullIndicator;
+                impl asr::AsrIndicator for NullIndicator {
+                    fn set_recording(&self, _: bool) {}
+                    fn set_busy(&self, _: bool) {}
+                }
+                let indicator = NullIndicator;
+                while let Ok(event) = rx.recv().await {
+                    asr::handle_ui_event(event, &focused, &registry, &toast, &indicator);
+                }
+            });
+        }
         spawn_dispatch_loop(rx_for_activate.clone(), controller.clone());
         let controller_for_init = controller.clone();
         gtk::glib::MainContext::default().spawn_local(async move {
@@ -448,9 +483,7 @@ fn ibus_daemon_available() -> bool {
         "/usr/local/bin/ibus-daemon",
         "/bin/ibus-daemon",
     ];
-    CANDIDATES
-        .iter()
-        .any(|p| std::path::Path::new(p).exists())
+    CANDIDATES.iter().any(|p| std::path::Path::new(p).exists())
 }
 
 #[cfg(test)]

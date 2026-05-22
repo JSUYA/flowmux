@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+pub mod asr_panel;
 pub mod browser_pane;
 pub mod keybindings_panel;
 pub mod options_dialog;

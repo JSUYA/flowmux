@@ -68,6 +68,10 @@ pub enum ActionId {
     /// Copy the focused pane's current working directory to the system
     /// clipboard and surface a toast confirming what was copied.
     CopyPanePath,
+    /// Push-to-talk voice input: hold the accelerator to record from
+    /// the microphone, release to transcribe and inject the text into
+    /// the focused terminal pane. See `flowmux-asr` for the engine.
+    VoicePushToTalk,
 }
 
 impl ActionId {
@@ -100,6 +104,7 @@ impl ActionId {
             Self::NewWorkspace => "new-workspace",
             Self::NewWindow => "new-window",
             Self::CopyPanePath => "copy-pane-path",
+            Self::VoicePushToTalk => "voice-ptt",
         }
     }
 
@@ -133,6 +138,7 @@ impl ActionId {
             Self::NewWorkspace => "New workspace",
             Self::NewWindow => "New window",
             Self::CopyPanePath => "Copy focused pane path",
+            Self::VoicePushToTalk => "Voice input (push-to-talk)",
         }
     }
 
@@ -169,6 +175,7 @@ impl ActionId {
             Self::NewWorkspace,
             Self::NewWindow,
             Self::CopyPanePath,
+            Self::VoicePushToTalk,
         ]
     }
 
@@ -208,8 +215,8 @@ const DEFAULTS: &[(ActionId, &[&str])] = &[
     (ActionId::FocusDown, &["<Alt>Down"]),
     (ActionId::CloseSurface, &["<Alt>w"]),
     (ActionId::QuitApp, &["<Ctrl><Shift>w"]),
-    (ActionId::NextSurface, &[]),
-    (ActionId::PrevSurface, &[]),
+    (ActionId::NextSurface, &["<Ctrl><Shift>Right"]),
+    (ActionId::PrevSurface, &["<Ctrl><Shift>Left"]),
     (ActionId::NextWorkspace, &["<Ctrl>Tab"]),
     (ActionId::PrevWorkspace, &["<Ctrl><Shift>Tab"]),
     (ActionId::Workspace1, &["<Alt>1"]),
@@ -227,6 +234,7 @@ const DEFAULTS: &[(ActionId, &[&str])] = &[
     (ActionId::NewWorkspace, &["<Ctrl>n"]),
     (ActionId::NewWindow, &["<Ctrl><Shift>n"]),
     (ActionId::CopyPanePath, &["<Ctrl><Shift>k"]),
+    (ActionId::VoicePushToTalk, &["<Ctrl><Alt>space"]),
 ];
 
 /// Built-in default accelerators. The first install path reads this and
@@ -380,7 +388,10 @@ mod tests {
         let resolved = overrides.resolve();
         assert_eq!(resolved.len(), ActionId::all().len());
         for (action, accels) in &resolved {
-            let want: Vec<String> = default_accels(*action).iter().map(|s| s.to_string()).collect();
+            let want: Vec<String> = default_accels(*action)
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
             assert_eq!(accels, &want, "{:?}", action);
         }
     }
@@ -483,10 +494,7 @@ mod tests {
         overrides.set(ActionId::Paste, vec!["<Ctrl>v".into()]);
 
         let resolved = overrides.resolve();
-        let copy = resolved
-            .iter()
-            .find(|(a, _)| *a == ActionId::Copy)
-            .unwrap();
+        let copy = resolved.iter().find(|(a, _)| *a == ActionId::Copy).unwrap();
         let paste = resolved
             .iter()
             .find(|(a, _)| *a == ActionId::Paste)

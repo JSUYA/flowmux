@@ -18,6 +18,7 @@ default-members = [
     "crates/flowmux-daemon",
     "crates/flowmux-cookies",
     "crates/flowmux-browser",
+    "crates/flowmux-asr",
 ]
 
 [workspace.package]
@@ -73,6 +74,19 @@ flowmux-ssh = { path = "crates/flowmux-ssh" }
 flowmux-daemon = { path = "crates/flowmux-daemon" }
 flowmux-cookies = { path = "crates/flowmux-cookies" }
 flowmux-browser = { path = "crates/flowmux-browser" }
+flowmux-asr = { path = "crates/flowmux-asr" }
+
+# ASR / voice input. `whisper-rs` is optional in `flowmux-asr` and is
+# enabled by the GTK GUI crate; the headless workspace check skips it so
+# whisper.cpp does not need to be compiled on a fresh CI box.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+sha2 = "0.10"
+cpal = "0.15"
+rubato = "0.16"
+crossbeam-channel = "0.5"
+futures-util = "0.3"
+hound = "3.5"
+whisper-rs = { version = "0.13", default-features = false }
 
 [profile.release]
 lto = "thin"

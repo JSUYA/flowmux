@@ -9,6 +9,7 @@
 //!   for fonts/colors/themes so flowmux renders consistently with their
 //!   terminal. Read-only; never written.
 
+pub mod asr;
 pub mod cmux_json;
 pub mod debug_log;
 pub mod ghostty;

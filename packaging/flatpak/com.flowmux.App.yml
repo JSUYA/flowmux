@@ -19,6 +19,14 @@ finish-args:
   # so it sees host-installed tools (git, tig, …); the helper talks to
   # this D-Bus name on the session bus.
   - --talk-name=org.freedesktop.Flatpak
+  # Voice input (push-to-talk ASR). The in-app mic capture goes through
+  # PipeWire's PulseAudio-compatible socket, which is the path cpal
+  # picks first. The Device portal grants per-app microphone access in
+  # newer xdg-desktop-portal versions; declaring the talk-name lets the
+  # portal prompt the user the first time the "Test microphone" button
+  # is pressed in the options dialog.
+  - --socket=pulseaudio
+  - --talk-name=org.freedesktop.portal.Device
 
 modules:
   # Build VTE 0.78 from source. VTE 0.80 added a hard dependency on

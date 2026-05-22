@@ -35,6 +35,12 @@ pub struct TerminalPane {
     /// **not** wrap the VTE in a `gtk::Box` — the latter approach
     /// (commit eb2d176, reverted) broke `gtk::Paned` minimum-size
     /// propagation and clipped tig / vim / htop in nested splits.
+    ///
+    /// VTE itself carries a `margin_end(12)` so the scrollbar overlay
+    /// sits in a dead strip with no terminal pixels behind it — without
+    /// the margin, fast scrolling repainted the rightmost text column
+    /// under the scrollbar thumb every frame, which manifested as
+    /// flicker / "screen breaks".
     pub container: gtk::Overlay,
     /// PID of the spawned shell.
     pub pid: Rc<Cell<Option<i32>>>,
@@ -88,6 +94,17 @@ impl TerminalPane {
 
     pub fn paste_clipboard(&self) {
         self.widget.paste_clipboard();
+    }
+
+    /// Inject already-sanitised UTF-8 text into the PTY as if the user
+    /// had typed it. `\r` is appended only by the caller (the voice
+    /// input feature has an "Auto Enter" option that controls this);
+    /// here we just forward the bytes. The caller MUST have run the
+    /// text through `flowmux_asr::session::sanitize_for_pty` first so
+    /// VT control sequences do not leak from a hostile audio prompt
+    /// into the user's shell.
+    pub fn feed_text(&self, text: &str) {
+        self.widget.feed_child(text.as_bytes());
     }
 }
 
@@ -219,6 +236,14 @@ impl TerminalPane {
         term.set_vexpand(true);
         term.set_scrollback_lines(10_000);
         term.set_audible_bell(false);
+        // Reserve the right-edge 12px for the overlaid scrollbar so VTE
+        // does not draw text under the scrollbar thumb. Without this,
+        // fast scrolling makes the scrollbar redraw on top of the
+        // rightmost text column every frame, which the user sees as
+        // "screen breaks" / flicker. The Overlay child shrinks by the
+        // margin, so the scrollbar overlay sits in a dead strip with no
+        // VTE pixels behind it.
+        term.set_margin_end(12);
 
         // Wrap the VTE in a `gtk::Overlay` so we can pin a vertical
         // `gtk::Scrollbar` to its right edge without going through a
@@ -242,10 +267,7 @@ impl TerminalPane {
         container.set_hexpand(true);
         container.set_vexpand(true);
         container.set_child(Some(&term));
-        let scrollbar = gtk::Scrollbar::new(
-            gtk::Orientation::Vertical,
-            Some(&scroll_adjustment),
-        );
+        let scrollbar = gtk::Scrollbar::new(gtk::Orientation::Vertical, Some(&scroll_adjustment));
         scrollbar.set_halign(gtk::Align::End);
         scrollbar.set_valign(gtk::Align::Fill);
         // Force the scrollbar to render unconditionally so the 22.04
@@ -495,11 +517,7 @@ impl TerminalPane {
 /// Falls back to the original argv when `flowmuxctl` cannot be
 /// located. The terminal then works exactly as before, just without
 /// OSC-driven alarms — strictly a graceful degradation.
-fn wrap_argv_with_pty_tee(
-    argv: Vec<String>,
-    pane: PaneId,
-    surface: SurfaceId,
-) -> Vec<String> {
+fn wrap_argv_with_pty_tee(argv: Vec<String>, pane: PaneId, surface: SurfaceId) -> Vec<String> {
     let Some(ctl) = flowmux_terminal::find_flowmuxctl() else {
         tracing::warn!(
             "flowmuxctl not found next to the GUI binary; OSC 9/99/777 alarms \

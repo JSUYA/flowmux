@@ -18,6 +18,7 @@
 //! dialog returns the user's intended [`Options`] through the callback.
 
 use adw::prelude::*;
+use flowmux_config::asr::AsrOptions;
 use flowmux_config::keybindings::KeybindingOverrides;
 use flowmux_config::options::{
     BrowserEngine, Options, FOCUS_BORDER_OPACITY_MAX, FOCUS_BORDER_OPACITY_MIN, ZOOM_MAX, ZOOM_MIN,
@@ -93,6 +94,11 @@ fn build_dialog(
     let kb_state = std::rc::Rc::new(std::cell::RefCell::new(current.keybindings.clone()));
     let keybindings_tab = crate::ui::keybindings_panel::build(kb_state.clone());
 
+    // Voice input tab — edits write into asr_state, picked up by
+    // collect_options when the user clicks OK.
+    let asr_state = std::rc::Rc::new(std::cell::RefCell::new(current.asr.clone()));
+    let asr_tab = crate::ui::asr_panel::build(asr_state.clone());
+
     // Use freedesktop symbolic icon names so the switcher picks up the
     // current Adwaita theme automatically. `preferences-system-symbolic`
     // is the standard "settings cog" used across GNOME apps; the
@@ -110,6 +116,12 @@ fn build_dialog(
         Some("keybindings"),
         "Keybindings",
         "input-keyboard-symbolic",
+    );
+    stack.add_titled_with_icon(
+        &asr_tab,
+        Some("voice"),
+        "Voice input",
+        "audio-input-microphone-symbolic",
     );
     let switcher = adw::ViewSwitcher::new();
     switcher.set_stack(Some(&stack));
@@ -159,6 +171,7 @@ fn build_dialog(
         let persist_check = persist_check.clone();
         let on_apply = on_apply.clone();
         let kb_state = kb_state.clone();
+        let asr_state = asr_state.clone();
         ok_btn.connect_clicked(move |_| {
             let kb = kb_state.borrow().clone();
             let conflicts = crate::ui::keybindings_panel::detect_conflicts(&kb);
@@ -168,6 +181,7 @@ fn build_dialog(
                     "saving keybindings with overlapping accels — last writer wins at install time"
                 );
             }
+            let asr = asr_state.borrow().clone();
             let opts = collect_options(
                 &zoom_spin,
                 &engine_drop,
@@ -175,6 +189,7 @@ fn build_dialog(
                 &opacity_spin,
                 &persist_check,
                 &kb,
+                asr,
             );
             (on_apply)(opts);
             dialog.close();
@@ -314,6 +329,7 @@ fn collect_options(
     opacity_spin: &gtk::SpinButton,
     persist_check: &gtk::CheckButton,
     keybindings: &KeybindingOverrides,
+    asr: AsrOptions,
 ) -> Options {
     let zoom = Options::clamp_zoom(spin.value_as_int().max(0) as u16);
     let engine = engine_options()
@@ -330,6 +346,7 @@ fn collect_options(
         focus_border_opacity: opacity,
         persist_browser_session: persist_check.is_active(),
         keybindings: keybindings.clone(),
+        asr,
     }
 }
 
@@ -524,6 +541,7 @@ mod tests {
             &opacity.spin,
             &persist_off,
             &kb,
+            AsrOptions::default(),
         );
         assert_eq!(opts.zoom_percent, 120);
         assert_eq!(opts.default_browser_engine, BrowserEngine::Firefox);
@@ -538,6 +556,7 @@ mod tests {
             &opacity.spin,
             &persist_on,
             &kb,
+            AsrOptions::default(),
         );
         assert!(opts.persist_browser_session);
     }
