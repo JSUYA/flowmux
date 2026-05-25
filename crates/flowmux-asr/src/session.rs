@@ -167,9 +167,12 @@ impl PttSession {
             "[flowmux-asr] capture levels: peak={peak:.4} rms={rms:.4}"
         );
         if peak < 0.005 {
-            return Err(AsrError::Other(
-                "오디오 입력이 무음입니다. 옵션 → Voice input → 입력 장치에서 다른 마이크를 선택하거나 시스템 사운드 설정에서 입력 소스를 확인하세요.".into(),
-            ));
+            // Silent capture — skip the recogniser (it hallucinates
+            // a fixed glyph) and return an empty transcript. The
+            // controller's `Done { delta: "" }` path is a no-op, so
+            // the user sees no toast and no text injection.
+            eprintln!("[flowmux-asr] capture silent; skipping recogniser");
+            return Ok(String::new());
         }
         let gain = self.config.input_gain.clamp(1.0, 30.0);
         let pcm: Vec<f32> = if gain > 1.001 {
