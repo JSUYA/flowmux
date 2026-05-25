@@ -44,6 +44,12 @@ window so multiple sessions don't bleed into each other.
   can be split into as many panes as you need.
 - Terminal tabs and browser tabs share the same pane tree, and you can
   jump between panes from the keyboard.
+- **Copy focused pane path** with `Ctrl+Shift+K`. The shortcut copies
+  the active terminal's working directory to the clipboard and shows a
+  toast confirming what was copied.
+- Right-click a pane tab or a sidebar workspace row to reach
+  **Copy path** / **Copy URL** — terminal tabs copy the working
+  directory, browser tabs copy the current URL.
 
 ### In-app browser
 - A browser tab lives inside flowmux next to your terminals — no need
@@ -52,6 +58,9 @@ window so multiple sessions don't bleed into each other.
   snapshot the page, click, type, scroll, and read state back.
 - Import an existing session from Firefox, Chrome, Chromium, Brave,
   Edge, or Arc so you stay logged in to the sites you already use.
+- A **Web Inspector** button next to the URL bar pops open WebKit's
+  developer tools for the focused browser tab — useful when an agent
+  flow needs DOM inspection or network tracing.
 
 ### Notifications
 - "Task complete" and "needs attention" signals from a terminal turn
@@ -59,6 +68,9 @@ window so multiple sessions don't bleed into each other.
 - Each notification is routed to the workspace that fired it, stays
   quiet while you are already looking at that pane, and the sidebar
   highlights workspaces that need your attention.
+- The bell popover ships an **All Clear** button at the top that drops
+  every transcript entry in one sweep and withdraws the matching
+  desktop toasts so the dock badge resets in the same step.
 
 ### AI agent integration
 - Claude Code, Codex, and OpenCode are wired up out of the box, so
