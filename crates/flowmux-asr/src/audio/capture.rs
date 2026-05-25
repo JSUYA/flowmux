@@ -306,10 +306,7 @@ fn pick_preferred_input_config(device: &cpal::Device) -> Option<cpal::SupportedS
         }
         s
     };
-    let best = configs
-        .iter()
-        .min_by_key(|c| score(c))?
-        .clone();
+    let best = *configs.iter().min_by_key(|c| score(c))?;
     let rate = if supports_rate(&best) {
         SampleRate(target_rate)
     } else {
@@ -347,11 +344,18 @@ fn build_stream_i16(
     err_fn: impl FnMut(cpal::StreamError) + Send + 'static,
 ) -> Result<cpal::Stream, AudioError> {
     let data_buf = buffer.clone();
+    // Scratch buffer is allocated once and reused across every
+    // callback invocation. Allocating inside the callback would let
+    // a high-priority audio thread reach into the global allocator
+    // every chunk, which is the standard recipe for clicks on
+    // realtime input streams.
+    let mut scratch: Vec<f32> = Vec::with_capacity(4096);
     device
         .build_input_stream(
             config,
             move |data: &[i16], _info: &cpal::InputCallbackInfo| {
-                let mut scratch = Vec::with_capacity(data.len());
+                scratch.clear();
+                scratch.reserve(data.len());
                 for s in data {
                     scratch.push(*s as f32 / i16::MAX as f32);
                 }
@@ -372,11 +376,13 @@ fn build_stream_u16(
     err_fn: impl FnMut(cpal::StreamError) + Send + 'static,
 ) -> Result<cpal::Stream, AudioError> {
     let data_buf = buffer.clone();
+    let mut scratch: Vec<f32> = Vec::with_capacity(4096);
     device
         .build_input_stream(
             config,
             move |data: &[u16], _info: &cpal::InputCallbackInfo| {
-                let mut scratch = Vec::with_capacity(data.len());
+                scratch.clear();
+                scratch.reserve(data.len());
                 for s in data {
                     let unit = *s as f32 / u16::MAX as f32;
                     scratch.push(unit * 2.0 - 1.0);

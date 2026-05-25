@@ -78,10 +78,10 @@ fn sanitizer_drops_control_bytes() {
     assert!(cleaned.starts_with("ls"));
 }
 
-/// Silence baseline — confirms what SenseVoice returns for an
-/// all-zero buffer. Earlier the controller saw "그." every tick and
-/// blamed the engine; this test pins down whether that string is the
-/// engine's silence hallucination or actual audio recognition.
+/// Silence baseline — pins SenseVoice's "그." hallucination on a
+/// zero buffer so the silence guard in `PttSession::finish` is
+/// justified. If a future model bump changes the hallucination, the
+/// assertion below trips and the guard threshold can be re-checked.
 #[test]
 fn engine_silence_baseline() {
     let Some(store) = ModelStore::xdg_default() else {
@@ -97,6 +97,14 @@ fn engine_silence_baseline() {
     let silence = vec![0.0_f32; 16_000 * 5];
     let text = engine.transcribe(16_000, &silence);
     eprintln!("[ko] silence -> {text:?}");
+    // The whole point of the silence guard is that the engine does
+    // emit *something* on zeros. If this assertion ever flips, the
+    // controller's `peak < 0.005` short-circuit can be reconsidered.
+    let trimmed = text.trim();
+    assert!(
+        trimmed.chars().count() <= 4,
+        "expected at most a few hallucination chars on silence, got {text:?}"
+    );
 }
 
 /// End-to-end engine smoke test: loads SenseVoice + decodes a 1-s

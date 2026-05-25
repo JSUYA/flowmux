@@ -124,6 +124,11 @@ impl AsrController {
         if model_changed || language_changed {
             *self.engine_cell.lock().unwrap() = None;
             *self.engine_signature.lock().unwrap() = None;
+            // Drop the in-flight latch too — without this a later
+            // `schedule_preload` call would see `preload_in_flight ==
+            // true` left over from the cleared-engine run and skip
+            // the reload, leaving the engine cell empty forever.
+            self.preload_in_flight.store(false, Ordering::SeqCst);
         }
         self.options = options;
     }
@@ -412,10 +417,22 @@ impl AsrController {
             // Wait (with cancel) for the engine to finish loading.
             // The capture has already stopped, so any delay here only
             // affects how long the final text takes to appear — the
-            // user's audio was preserved.
-            let engine = match wait_for_engine(&engine_cell, &cancel) {
-                Some(e) => e,
-                None => return, // cancelled
+            // user's audio was preserved. Capped so a stuck preload
+            // does not block a `spawn_blocking` slot forever.
+            let engine = match wait_for_engine(
+                &engine_cell,
+                &cancel,
+                Duration::from_secs(30),
+            ) {
+                Ok(e) => e,
+                Err(EngineWaitError::Cancelled) => return,
+                Err(EngineWaitError::Timeout) => {
+                    let _ = tx.send_blocking(AsrUiEvent::Failed(
+                        "엔진 로딩이 30초 안에 끝나지 않았습니다. 모델 다운로드 상태를 확인하세요."
+                            .into(),
+                    ));
+                    return;
+                }
             };
             let result = session.finish(&engine);
             if cancel.load(Ordering::Relaxed) {
@@ -462,18 +479,35 @@ impl AsrController {
     }
 }
 
-/// Block (with a 100 ms poll) until the engine cell is populated or
-/// the cancel flag is set. Returns `None` only when cancelled.
-fn wait_for_engine(cell: &EngineCell, cancel: &AtomicBool) -> Option<Arc<SenseVoiceEngine>> {
+/// Block (with a 100 ms poll) until the engine cell is populated,
+/// the cancel flag is set, or the timeout is hit. Returns `None` on
+/// cancel; returns `Some(Err(...))` on timeout so the caller can
+/// surface a clear "engine never finished loading" error instead of
+/// holding a blocking-thread-pool slot forever.
+fn wait_for_engine(
+    cell: &EngineCell,
+    cancel: &AtomicBool,
+    timeout: Duration,
+) -> Result<Arc<SenseVoiceEngine>, EngineWaitError> {
+    let started = std::time::Instant::now();
     loop {
         if cancel.load(Ordering::Relaxed) {
-            return None;
+            return Err(EngineWaitError::Cancelled);
         }
         if let Some(engine) = cell.lock().unwrap().clone() {
-            return Some(engine);
+            return Ok(engine);
+        }
+        if started.elapsed() >= timeout {
+            return Err(EngineWaitError::Timeout);
         }
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+#[derive(Debug)]
+enum EngineWaitError {
+    Cancelled,
+    Timeout,
 }
 
 fn build_replace_payload(previous: &str, candidate: &str) -> String {
