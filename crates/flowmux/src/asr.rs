@@ -326,6 +326,17 @@ impl AsrController {
                     tokio::time::sleep(TICK).await;
                     continue;
                 };
+                // Refuse to feed silence into the recogniser — it
+                // hallucinates a fixed glyph ("그." for the multilingual
+                // SenseVoice checkpoint) and the controller would then
+                // inject that into the terminal every tick. The same
+                // threshold is applied at finish time.
+                let peak = pcm.iter().map(|s| s.abs()).fold(0.0_f32, f32::max);
+                if peak < 0.005 {
+                    eprintln!("[flowmux-asr] pump: peak={peak:.4} below silence floor, skip");
+                    tokio::time::sleep(TICK).await;
+                    continue;
+                }
                 eprintln!("[flowmux-asr] pump tick: {dur:.2}s buffered, transcribing...");
                 let result = tokio::task::spawn_blocking(move || {
                     engine.transcribe(16_000, &pcm)
