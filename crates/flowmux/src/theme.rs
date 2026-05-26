@@ -404,3 +404,87 @@ fn shift_lightness(c: &gdk::RGBA, delta: f32) -> gdk::RGBA {
     let f = |v: f32| (v + delta).clamp(0.0, 1.0);
     gdk::RGBA::new(f(c.red()), f(c.green()), f(c.blue()), c.alpha())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper that yields a deterministic CSS string. We intentionally
+    /// construct the theme through `from_ghostty` with an empty config
+    /// so the assertions key on selectors / shorthand box-shadow values,
+    /// not on theme-derived colour bytes that depend on Ghostty's
+    /// shipped fallback palette.
+    fn sample_css() -> String {
+        let cfg = flowmux_config::ghostty::GhosttyConfig::default();
+        ResolvedTheme::from_ghostty(&cfg).css("#fff4b3", 0.5)
+    }
+
+    /// A "selected" workspace row in the side panel must be visually
+    /// distinguishable. We had a regression where the libadwaita tint
+    /// was suppressed without a replacement, leaving the active
+    /// workspace with no on-screen indicator. Lock in the left accent
+    /// stripe so a future CSS edit cannot silently drop it again.
+    #[test]
+    fn sidebar_selected_workspace_has_visible_accent() {
+        let css = sample_css();
+        let selected_block_start = css
+            .find(".navigation-sidebar row.activatable:selected")
+            .expect("selected-row rule must exist");
+        let tail = &css[selected_block_start..];
+        assert!(
+            tail.contains("box-shadow: inset 3px 0 0"),
+            "selected workspace row is missing its left-edge accent stripe"
+        );
+        // The very last `:selected` rule wins because every block in
+        // this stylesheet shares the same specificity; verify the
+        // visible block sits *after* the suppression block so the
+        // accent is what GTK actually renders.
+        let suppression_block = tail
+            .find("background-color: transparent")
+            .expect("suppression rule must still be present");
+        let accent_block = tail
+            .find("inset 3px 0 0")
+            .expect("accent rule must be present");
+        assert!(
+            accent_block > suppression_block,
+            "accent rule must follow the suppression rule so it overrides"
+        );
+    }
+
+    /// Trivial 1-pane / 1-tab workspaces hide the focus border via the
+    /// `.flowmux-solo` class. Lock in both halves of that contract so a
+    /// future CSS edit cannot silently re-enable the border in solo
+    /// workspaces or break the multi-pane / multi-tab case.
+    #[test]
+    fn focus_border_solo_override_present() {
+        let css = sample_css();
+        assert!(
+            css.contains(".flowmux-pane.focused {"),
+            "base focused-pane rule missing"
+        );
+        let solo_rule_idx = css
+            .find(".flowmux-pane.focused.flowmux-solo {")
+            .expect("solo override missing");
+        let tail = &css[solo_rule_idx..];
+        assert!(
+            tail.contains("box-shadow: none"),
+            "solo override must clear the box-shadow"
+        );
+    }
+
+    /// Multi-tab panes paint a 2px top stripe on the active tab. The
+    /// stripe is the only visual cue for "this tab is current" when the
+    /// pane has ≥2 tabs, so guard the selector against silent drops.
+    #[test]
+    fn active_tab_top_stripe_visible_in_multi_tab_pane() {
+        let css = sample_css();
+        let stripe_idx = css
+            .find(".flowmux-pane-tabs.has-multi-tabs > .flowmux-pane-tab.active")
+            .expect("multi-tab active-stripe selector missing");
+        let tail = &css[stripe_idx..];
+        assert!(
+            tail.contains("box-shadow: inset 0 2px 0"),
+            "active-tab top stripe must use a 2px inset box-shadow"
+        );
+    }
+}
