@@ -12,8 +12,8 @@ use crate::theme::ResolvedTheme;
 use crate::ui::sidebar::Sidebar;
 use crate::ui::terminal_pane::PaneCallbacks;
 use crate::ui::workspace_view::{
-    attach_surface_to_pane, build_surface, split_pane_incremental, IncrementalSplitOutcome,
-    PaneRegistry, TornOffSurface,
+    attach_surface_to_pane, build_surface, solo_workspace_pane, split_pane_incremental,
+    IncrementalSplitOutcome, PaneRegistry, TornOffSurface,
 };
 use adw::prelude::*;
 use flowmux_core::{
@@ -280,6 +280,7 @@ impl WindowController {
             self.stack.set_visible_child_name(&name);
         }
         drop(surfaces);
+        self.refresh_workspace_solo(ws);
         if activate {
             self.sidebar.select_workspace(ws.id);
             self.focus_first_leaf_of(ws);
@@ -419,6 +420,9 @@ impl WindowController {
         // other pane's TerminalPane / BrowserPane stays alive in the
         // registry and continues to render.
         self.pane_registry.borrow_mut().forget_pane(removed);
+        if let Some(ws) = self.store.get_workspace(ws_id).await {
+            self.refresh_workspace_solo(&ws);
+        }
     }
 
     /// After a pane has been removed, hand keyboard focus to a sibling so the
@@ -500,8 +504,20 @@ impl WindowController {
         surfaces.insert(ws.id, new_widget);
         self.stack.set_visible_child_name(&name);
         drop(surfaces);
+        self.refresh_workspace_solo(ws);
         self.sidebar.select_workspace(ws.id);
         self.focus_first_leaf_of(ws);
+    }
+
+    /// Stamp the `flowmux-solo` class on the single pane/tab workspace's
+    /// frame and clear it elsewhere. Must run after any layout change
+    /// (rerender, split, close pane, add tab, close tab) so the focus
+    /// border stays hidden only while the workspace is trivially small.
+    fn refresh_workspace_solo(&self, ws: &Workspace) {
+        let solo = solo_workspace_pane(ws);
+        self.pane_registry
+            .borrow()
+            .set_workspace_solo(ws.id, solo);
     }
 
     /// Update the GTK widget tree after the daemon-side split has completed.
@@ -572,9 +588,11 @@ impl WindowController {
                 // to the new widget so later drop_workspace / rerender paths do
                 // not look for the old widget in the stack.
                 self.surfaces.borrow_mut().insert(ws.id, new_root);
+                self.refresh_workspace_solo(&ws);
                 self.refresh_window_title().await;
             }
             IncrementalSplitOutcome::SucceededNested => {
+                self.refresh_workspace_solo(&ws);
                 self.refresh_window_title().await;
             }
             IncrementalSplitOutcome::Failed => {
@@ -617,6 +635,7 @@ impl WindowController {
                 self.theme.clone(),
             );
             if attached {
+                self.refresh_workspace_solo(&ws);
                 self.refresh_window_title().await;
                 // Move keyboard focus to the newly added terminal/browser tab.
                 // attach_surface_to_pane adds the widget and switches the visible
@@ -899,6 +918,7 @@ impl WindowController {
                             .borrow_mut()
                             .activate_surface(pane, active);
                     }
+                    self.refresh_workspace_solo(&ws);
                 }
                 self.refresh_window_title().await;
                 self.sync_workspace_label(workspace).await;
@@ -1575,6 +1595,7 @@ impl WindowController {
                                     .borrow_mut()
                                     .activate_surface(pane, active);
                             }
+                            self.refresh_workspace_solo(&ws);
                         }
                         self.refresh_window_title().await;
                         let _ = ack.send(Ok(()));

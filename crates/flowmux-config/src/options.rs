@@ -27,11 +27,11 @@ pub const ZOOM_DEFAULT: u16 = 100;
 pub const FOCUS_BORDER_COLOR_DEFAULT: &str = "#fff4b3";
 
 /// Focus border opacity (`0..=100` %). 100 = fully opaque, 0 = fully transparent.
-/// The default is 50% so the focus highlight is visible without dominating the
+/// The default is 30% so the focus highlight is visible without dominating the
 /// surrounding pane chrome on first launch.
 pub const FOCUS_BORDER_OPACITY_MIN: u8 = 0;
 pub const FOCUS_BORDER_OPACITY_MAX: u8 = 100;
-pub const FOCUS_BORDER_OPACITY_DEFAULT: u8 = 50;
+pub const FOCUS_BORDER_OPACITY_DEFAULT: u8 = 30;
 
 /// Default for [`Options::persist_browser_session`]. The user expectation
 /// modeled after every mainstream browser is that signing into a site once
@@ -497,15 +497,15 @@ mod tests {
     // ===== focus_border_opacity =====
 
     #[test]
-    fn default_focus_border_opacity_is_half() {
-        // First-run default is 50% so the highlight is visible without
+    fn default_focus_border_opacity_is_thirty() {
+        // First-run default is 30% so the highlight is visible without
         // overpowering surrounding pane chrome.
         assert_eq!(
             Options::default().focus_border_opacity,
             FOCUS_BORDER_OPACITY_DEFAULT
         );
-        assert_eq!(FOCUS_BORDER_OPACITY_DEFAULT, 50);
-        assert!((Options::default().focus_border_alpha() - 0.5).abs() < 1e-6);
+        assert_eq!(FOCUS_BORDER_OPACITY_DEFAULT, 30);
+        assert!((Options::default().focus_border_alpha() - 0.3).abs() < 1e-6);
     }
 
     #[test]

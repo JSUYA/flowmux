@@ -10,7 +10,7 @@ use crate::ui::browser_pane::BrowserPane;
 use crate::ui::terminal_pane::{PaneCallbacks, TerminalPane};
 use flowmux_core::{
     terminal_tab_title_for_cwd, Pane, PaneContent, PaneId, PaneSurface, SplitDirection, Surface,
-    SurfaceId, SurfaceKind, WorkspaceId,
+    SurfaceId, SurfaceKind, Workspace, WorkspaceId,
 };
 use gtk::prelude::*;
 use std::cell::{Cell, RefCell};
@@ -22,6 +22,18 @@ use webkit6::prelude::*;
 
 const TAB_DND_MIME: &str = "application/x-flowmux-tab";
 const TAB_DND_PAYLOAD_MAX: usize = 128;
+
+/// Return the leaf pane id when the workspace is "solo" — the first
+/// (rendered) surface's root is a single leaf holding a single tab.
+/// Used to suppress the focus border in a trivial 1-pane/1-tab
+/// workspace. `build_workspace_widget` already only renders
+/// `ws.surfaces.first()`, so we mirror that scope here.
+pub fn solo_workspace_pane(ws: &Workspace) -> Option<PaneId> {
+    match &ws.surfaces.first()?.root_pane {
+        Pane::Leaf { id, content } if content.surface_count() == 1 => Some(*id),
+        _ => None,
+    }
+}
 
 #[derive(Default)]
 pub struct PaneRegistry {
@@ -278,6 +290,37 @@ impl PaneRegistry {
         }
     }
 
+    /// Toggle the `has-multi-tabs` class on a pane's tab row so the active
+    /// tab grows a 2px top stripe only when the pane has ≥2 tabs.
+    pub fn refresh_tab_multi_class(&self, pane: PaneId) {
+        let Some(tabs_box) = self.pane_tab_containers.get(&pane) else {
+            return;
+        };
+        let count = self.surface_tabs.get(&pane).map(|v| v.len()).unwrap_or(0);
+        if count >= 2 {
+            tabs_box.add_css_class("has-multi-tabs");
+        } else {
+            tabs_box.remove_css_class("has-multi-tabs");
+        }
+    }
+
+    /// Stamp the `flowmux-solo` class on the single pane that owns the
+    /// whole workspace when it also has exactly one tab; clear it from any
+    /// other pane in the same workspace. Used so the focus border is
+    /// suppressed for trivial 1-pane/1-tab workspaces.
+    pub fn set_workspace_solo(&self, workspace: WorkspaceId, solo_pane: Option<PaneId>) {
+        for (pane_id, frame) in &self.pane_frames {
+            if self.pane_workspace.get(pane_id) != Some(&workspace) {
+                continue;
+            }
+            if solo_pane == Some(*pane_id) {
+                frame.add_css_class("flowmux-solo");
+            } else {
+                frame.remove_css_class("flowmux-solo");
+            }
+        }
+    }
+
     /// Drop every registry entry that belongs to `pane` and the
     /// surfaces inside it. Used by the incremental `close_pane` path
     /// — the GTK widgets themselves are re-parented (or unparented)
@@ -339,6 +382,7 @@ impl PaneRegistry {
         if self.active_browser_by_pane.get(&pane) == Some(&surface) {
             self.active_browser_by_pane.remove(&pane);
         }
+        self.refresh_tab_multi_class(pane);
     }
 
     /// Remove one surface from its pane and return the live widget so it can be
@@ -403,6 +447,7 @@ impl PaneRegistry {
         if self.active_browser_by_pane.get(&pane) == Some(&surface) {
             self.active_browser_by_pane.remove(&pane);
         }
+        self.refresh_tab_multi_class(pane);
 
         Some(TornOffSurface {
             pane,
@@ -787,6 +832,7 @@ fn build_leaf_pane(
         r.pane_tab_containers.insert(pane_id, tabs);
         r.pane_workspace.insert(pane_id, workspace);
         r.activate_surface(pane_id, active);
+        r.refresh_tab_multi_class(pane_id);
     }
 
     frame.upcast()
@@ -1325,6 +1371,7 @@ pub fn attach_surface_to_pane(
             .or_default()
             .push((surface.id, tab.upcast::<gtk::Widget>()));
         r.activate_surface(pane_id, surface.id);
+        r.refresh_tab_multi_class(pane_id);
     }
     true
 }

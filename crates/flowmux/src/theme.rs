@@ -167,6 +167,11 @@ impl ResolvedTheme {
             0.94,
         ));
         let toast_border_css = rgba_css(&blend_with_alpha(&self.fg, 0.18));
+        // Selected workspace background. Re-uses the focus border hex so
+        // the sidebar accent and pane focus border share a hue; alpha is
+        // clamped low so the row tint never dominates the workspace
+        // labels next to it.
+        let selected_bg_css = focus_border_rgba_css(focus_border_color, 0.12);
         format!(
             r#"
 .flowmux-pane {{
@@ -179,6 +184,10 @@ impl ResolvedTheme {
 .flowmux-pane.focused {{
     border-color: {focus};
     box-shadow: inset 0 0 0 1px {focus};
+}}
+.flowmux-pane.focused.flowmux-solo {{
+    border-color: {border};
+    box-shadow: none;
 }}
 .flowmux-pane .flowmux-terminal {{
     padding: 7px;
@@ -202,6 +211,9 @@ impl ResolvedTheme {
 .flowmux-pane-tab.active {{
     background-color: {tab_active};
     border-color: {border};
+}}
+.flowmux-pane-tabs.has-multi-tabs > .flowmux-pane-tab.active {{
+    box-shadow: inset 0 2px 0 {focus};
 }}
 .flowmux-pane-tab-main {{
     min-height: 22px;
@@ -282,6 +294,15 @@ paned > separator {{
     background-color: transparent;
     box-shadow: none;
 }}
+/* Visible "active workspace" indicator. Subtle background tint plus a
+   left-edge accent in the focus color so the user can see which
+   workspace is currently active without losing the flowmux-attention
+   override below (amber wins because it is layered last). */
+.navigation-sidebar row.activatable:selected,
+.navigation-sidebar > row.activatable:selected {{
+    background-color: {selected_bg};
+    box-shadow: inset 3px 0 0 {focus};
+}}
 .navigation-sidebar row.activatable:selected label,
 .navigation-sidebar row.activatable:selected label.heading,
 .navigation-sidebar row.activatable:selected label.caption {{
@@ -329,6 +350,7 @@ paned > separator {{
             sidebar = sidebar_bg,
             toast_bg = toast_bg_css,
             toast_border = toast_border_css,
+            selected_bg = selected_bg_css,
         )
     }
 }
