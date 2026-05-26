@@ -21,7 +21,7 @@
 //! (for the cookie importer), and a daemon ping that confirms a
 //! browser pane could be spawned at all.
 
-use crate::{agent, hook_install};
+use crate::{agent, desktop_install, hook_install};
 use anyhow::Result;
 use flowmux_ipc::{client::Client, protocol::Request, protocol::Response};
 use serde_json::json;
@@ -137,7 +137,11 @@ impl Report {
 /// tests with a fake `home`.
 pub fn collect_offline(home: &Path, codex_home: Option<&Path>) -> Report {
     Report {
-        sections: vec![section_agents(home, codex_home), section_browser_offline()],
+        sections: vec![
+            section_agents(home, codex_home),
+            section_browser_offline(),
+            section_desktop(),
+        ],
     }
 }
 
@@ -554,6 +558,102 @@ pub fn render_json(report: &Report) -> Result<String> {
     Ok(serde_json::to_string_pretty(&body)?)
 }
 
+// ---- Desktop entry --------------------------------------------------
+
+/// Doctor view of the per-user `.desktop` + hicolor icons. Surfaces a
+/// `fix` row when `cargo install` placed the binary on disk but the
+/// freedesktop launcher entry / icons are still missing — that pair of
+/// files lives outside `$CARGO_HOME/bin`, so a plain `cargo install`
+/// alone does not register the app with GNOME / KDE.
+fn section_desktop() -> Section {
+    let layout = match desktop_install::resolve() {
+        Ok(l) => l,
+        Err(e) => {
+            return Section {
+                title: "Desktop".into(),
+                entries: vec![Entry {
+                    name: "data dir".into(),
+                    status: Status::Warn,
+                    detail: e.to_string(),
+                }],
+            };
+        }
+    };
+    let report = desktop_install::doctor(&layout);
+
+    let desktop_path = layout.desktop_path();
+    let desktop_status = match &report.desktop {
+        desktop_install::AssetStatus::Ok => Status::Ok,
+        desktop_install::AssetStatus::Missing => Status::NeedsFix,
+        desktop_install::AssetStatus::Drift => Status::NeedsFix,
+        desktop_install::AssetStatus::Error(_) => Status::Error,
+    };
+    let desktop_detail = match &report.desktop {
+        desktop_install::AssetStatus::Ok => desktop_path.display().to_string(),
+        desktop_install::AssetStatus::Missing => {
+            format!("{} (missing — `flowmux fix` installs)", desktop_path.display())
+        }
+        desktop_install::AssetStatus::Drift => {
+            format!("{} (drift — `flowmux fix` re-syncs)", desktop_path.display())
+        }
+        desktop_install::AssetStatus::Error(e) => {
+            format!("{}: {e}", desktop_path.display())
+        }
+    };
+
+    // Aggregate the per-size icon rows into one summary line — there
+    // are nine PNGs plus the SVG; one row each would crowd the report
+    // without adding signal.
+    let icon_problems: Vec<String> = report
+        .icons
+        .iter()
+        .filter_map(|(size, status)| match status {
+            desktop_install::AssetStatus::Ok => None,
+            desktop_install::AssetStatus::Missing => Some(format!("{size}px missing")),
+            desktop_install::AssetStatus::Drift => Some(format!("{size}px drift")),
+            desktop_install::AssetStatus::Error(e) => Some(format!("{size}px error: {e}")),
+        })
+        .chain(match &report.svg {
+            desktop_install::AssetStatus::Ok => None,
+            desktop_install::AssetStatus::Missing => Some("svg missing".into()),
+            desktop_install::AssetStatus::Drift => Some("svg drift".into()),
+            desktop_install::AssetStatus::Error(e) => Some(format!("svg error: {e}")),
+        })
+        .collect();
+    let icon_status = if report.has_error() {
+        Status::Error
+    } else if icon_problems.is_empty() {
+        Status::Ok
+    } else {
+        Status::NeedsFix
+    };
+    let icon_detail = if icon_problems.is_empty() {
+        layout.icons_root.display().to_string()
+    } else {
+        format!(
+            "{}: {}",
+            layout.icons_root.display(),
+            icon_problems.join(", ")
+        )
+    };
+
+    Section {
+        title: "Desktop".into(),
+        entries: vec![
+            Entry {
+                name: "launcher entry".into(),
+                status: desktop_status,
+                detail: desktop_detail,
+            },
+            Entry {
+                name: "icons".into(),
+                status: icon_status,
+                detail: icon_detail,
+            },
+        ],
+    }
+}
+
 // ---- Fix -----------------------------------------------------------
 
 #[derive(Debug, Clone)]
@@ -620,6 +720,46 @@ pub fn run_fix(home: &Path, codex_home: Option<&Path>, flowmux_bin: &str) -> Fix
     // installs. We never touch `$CODEX_HOME` itself or anything else.
     if let Some(outcome) = run_codex_legacy_cleanup(home, codex_home) {
         outcomes.push(outcome);
+    }
+
+    // Desktop entry + icons. Mirrors what the .deb assets list installs
+    // system-wide, but writes to `$XDG_DATA_HOME` so a per-user
+    // `cargo install` is enough to make the app appear in the launcher.
+    match desktop_install::resolve() {
+        Ok(layout) => match desktop_install::install(&layout) {
+            Ok(report) if report.written.is_empty() => {
+                outcomes.push(FixOutcome {
+                    area: "desktop".into(),
+                    status: Status::Ok,
+                    detail: format!("already up-to-date: {}", layout.apps_dir.display()),
+                });
+            }
+            Ok(report) => {
+                desktop_install::refresh_caches(&layout);
+                outcomes.push(FixOutcome {
+                    area: "desktop".into(),
+                    status: Status::Ok,
+                    detail: format!(
+                        "wrote {} file(s) under {}",
+                        report.touched_count(),
+                        layout.apps_dir
+                            .parent()
+                            .unwrap_or(&layout.apps_dir)
+                            .display()
+                    ),
+                });
+            }
+            Err(e) => outcomes.push(FixOutcome {
+                area: "desktop".into(),
+                status: Status::Error,
+                detail: e.to_string(),
+            }),
+        },
+        Err(e) => outcomes.push(FixOutcome {
+            area: "desktop".into(),
+            status: Status::Warn,
+            detail: e.to_string(),
+        }),
     }
 
     // Hooks — install_install handles the "agent home missing → skip"
@@ -725,8 +865,12 @@ mod tests {
 
     /// Doctor on a totally empty fake HOME: every skill row is Warn
     /// ("agent not installed") and every hook row is Warn (NoAgentHome).
-    /// has_problems() must be false because nothing is actionable —
-    /// the user simply hasn't installed the agents yet.
+    /// The agent-driven half of the report must be problem-free because
+    /// nothing is actionable — the user simply hasn't installed the
+    /// agents yet. The Desktop section is excluded from the assertion
+    /// because it is *expected* to flag NeedsFix on a fresh per-user
+    /// install (the launcher entry + icons are not yet in
+    /// `$XDG_DATA_HOME`), which `flowmux fix` resolves.
     #[test]
     fn doctor_on_empty_home_reports_warn_not_needsfix() {
         let _lock = home_env_lock();
@@ -747,7 +891,16 @@ mod tests {
                 entry.status
             );
         }
-        assert!(!report.has_problems(), "empty HOME should not need fix");
+        let agent_driven_problem = report
+            .sections
+            .iter()
+            .filter(|s| s.title != "Desktop")
+            .flat_map(|s| &s.entries)
+            .any(|e| matches!(e.status, Status::NeedsFix | Status::Error));
+        assert!(
+            !agent_driven_problem,
+            "empty HOME should not need fix in agent / browser sections"
+        );
     }
 
     /// Doctor when the user has Claude installed but no SKILL/hooks

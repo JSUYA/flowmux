@@ -15,6 +15,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 mod agent;
+mod desktop_install;
 mod doctor;
 mod hook_install;
 mod hooks;
