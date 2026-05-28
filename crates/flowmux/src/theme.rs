@@ -160,6 +160,9 @@ impl ResolvedTheme {
             if self.is_dark() { 0.055 } else { -0.055 },
         ));
         let control_hover_css = rgba_css(&blend_with_alpha(&self.fg, 0.09));
+        // Fainter than control_hover so the active workspace row only
+        // whispers under the pointer instead of reading as a full tint.
+        let sidebar_hover_css = rgba_css(&blend_with_alpha(&self.fg, 0.045));
         let subdued_fg_css = rgba_css(&blend_with_alpha(&self.fg, 0.72));
         let sidebar_bg = rgba_css(&shift_lightness(&self.bg, -0.04));
         let toast_bg_css = rgba_css(&blend_with_alpha(
@@ -167,11 +170,6 @@ impl ResolvedTheme {
             0.94,
         ));
         let toast_border_css = rgba_css(&blend_with_alpha(&self.fg, 0.18));
-        // Selected workspace background. Re-uses the focus border hex so
-        // the sidebar accent and pane focus border share a hue; alpha is
-        // clamped low so the row tint never dominates the workspace
-        // labels next to it.
-        let selected_bg_css = focus_border_rgba_css(focus_border_color, 0.12);
         format!(
             r#"
 .flowmux-pane {{
@@ -283,6 +281,21 @@ paned > separator {{
    variant is matched explicitly with .activatable below and the inset
    border is cleared too. */
 .navigation-sidebar row.activatable:selected,
+.navigation-sidebar row.activatable:selected:focus,
+.navigation-sidebar row.activatable:selected.has-open-popup,
+.navigation-sidebar > row.activatable:selected,
+.navigation-sidebar > row.activatable:selected.has-open-popup {{
+    background-color: transparent;
+    box-shadow: none;
+}}
+/* Visible "active workspace" indicator. A left-edge accent in the focus
+   color so the user can see which workspace is currently active, with no
+   background tint, without losing the flowmux-attention override below
+   (amber wins because it is layered last). The :hover/:focus/:active/
+   .has-open-popup variants must mirror the suppression block above: those
+   selectors clear box-shadow at the same specificity, so without matching
+   variants here the stripe vanishes whenever the row is hovered. */
+.navigation-sidebar row.activatable:selected,
 .navigation-sidebar row.activatable:selected:hover,
 .navigation-sidebar row.activatable:selected:focus,
 .navigation-sidebar row.activatable:selected:active,
@@ -291,17 +304,22 @@ paned > separator {{
 .navigation-sidebar > row.activatable:selected:hover,
 .navigation-sidebar > row.activatable:selected:active,
 .navigation-sidebar > row.activatable:selected.has-open-popup {{
-    background-color: transparent;
-    box-shadow: none;
+    box-shadow: inset 5px 0 0 {focus};
 }}
-/* Visible "active workspace" indicator. Subtle background tint plus a
-   left-edge accent in the focus color so the user can see which
-   workspace is currently active without losing the flowmux-attention
-   override below (amber wins because it is layered last). */
-.navigation-sidebar row.activatable:selected,
-.navigation-sidebar > row.activatable:selected {{
-    background-color: {selected_bg};
-    box-shadow: inset 3px 0 0 {focus};
+/* Hover and press share one faint tint across every workspace row, so
+   hovering only whispers and clicking introduces no separate color step.
+   The :selected variants are spelled out to outrank libadwaita's own
+   selected-hover/active rules; the idle :selected state stays untinted
+   (handled by the suppression block above). */
+.navigation-sidebar row.activatable:hover,
+.navigation-sidebar row.activatable:active,
+.navigation-sidebar row.activatable:selected:hover,
+.navigation-sidebar row.activatable:selected:active,
+.navigation-sidebar > row.activatable:hover,
+.navigation-sidebar > row.activatable:active,
+.navigation-sidebar > row.activatable:selected:hover,
+.navigation-sidebar > row.activatable:selected:active {{
+    background-color: {sidebar_hover};
 }}
 .navigation-sidebar row.activatable:selected label,
 .navigation-sidebar row.activatable:selected label.heading,
@@ -346,11 +364,11 @@ paned > separator {{
             tabbar = tabbar_bg_css,
             tab_active = tab_active_bg_css,
             control_hover = control_hover_css,
+            sidebar_hover = sidebar_hover_css,
             subdued_fg = subdued_fg_css,
             sidebar = sidebar_bg,
             toast_bg = toast_bg_css,
             toast_border = toast_border_css,
-            selected_bg = selected_bg_css,
         )
     }
 }
@@ -432,7 +450,7 @@ mod tests {
             .expect("selected-row rule must exist");
         let tail = &css[selected_block_start..];
         assert!(
-            tail.contains("box-shadow: inset 3px 0 0"),
+            tail.contains("box-shadow: inset 5px 0 0"),
             "selected workspace row is missing its left-edge accent stripe"
         );
         // The very last `:selected` rule wins because every block in
@@ -443,7 +461,7 @@ mod tests {
             .find("background-color: transparent")
             .expect("suppression rule must still be present");
         let accent_block = tail
-            .find("inset 3px 0 0")
+            .find("inset 5px 0 0")
             .expect("accent rule must be present");
         assert!(
             accent_block > suppression_block,
