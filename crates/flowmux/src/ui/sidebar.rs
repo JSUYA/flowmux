@@ -728,34 +728,46 @@ fn row_widget(
     on_close: Rc<dyn Fn(WorkspaceId)>,
     bridge: Bridge,
 ) -> gtk::Widget {
-    let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    // Row content (color bar + text column) lives in a horizontal Box;
+    // the close button is layered on top via a `gtk::Overlay` rather than
+    // taking a slot in that Box. Keeping it out of the linear layout lets
+    // the text column claim the row's full width — otherwise the always-
+    // present (just transparent) button reserved a strip on the right
+    // that read as dead blank space whenever it was hidden. On hover the
+    // button fades in and overlaps the tail of the text.
+    let content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     // User-requested vertical margin reduction from 6 to 3px; keep start/end.
-    row.set_margin_top(3);
-    row.set_margin_bottom(3);
-    row.set_margin_start(4);
-    row.set_margin_end(6);
+    content.set_margin_top(3);
+    content.set_margin_bottom(3);
+    content.set_margin_start(4);
+    content.set_margin_end(6);
 
     if let Some(color) = ws.color.as_deref() {
-        row.append(&color_bar(color));
+        content.append(&color_bar(color));
     }
 
     let meta = build_meta_column(ws, subtitles);
     meta.set_hexpand(true);
     meta.set_margin_start(6);
-    row.append(&meta);
+    content.append(&meta);
+
+    let row = gtk::Overlay::new();
+    row.set_child(Some(&content));
 
     let close_btn = gtk::Button::from_icon_name("window-close-symbolic");
     close_btn.add_css_class("flat");
     close_btn.add_css_class("circular");
     close_btn.add_css_class("flowmux-sidebar-close");
     close_btn.set_tooltip_text(Some("Close tab"));
+    close_btn.set_halign(gtk::Align::End);
     close_btn.set_valign(gtk::Align::Center);
+    close_btn.set_margin_end(6);
     close_btn.set_opacity(0.0);
     close_btn.set_can_target(false);
     let id = ws.id;
     let on_close_for_click = on_close.clone();
     close_btn.connect_clicked(move |_| on_close_for_click(id));
-    row.append(&close_btn);
+    row.add_overlay(&close_btn);
 
     let motion = gtk::EventControllerMotion::new();
     let btn_enter = close_btn.clone();
