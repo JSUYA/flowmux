@@ -124,18 +124,17 @@ fn main() -> anyhow::Result<()> {
     // Forcing `GTK_IM_MODULE=ibus` makes GTK4 load the ibus immodule,
     // which connects to ibus-daemon over its own socket / the IBus
     // portal and reports preedit inline on every one of those setups.
-    // The override is gated so any setup that already works keeps
-    // working bit-for-bit:
-    //   * only when the user has not picked an IM module already
-    //     (respecting fcitx5 / explicit `simple` setups), and
-    //   * only when ibus is actually reachable — inside Flatpak we trust
-    //     the manifest's portal grant, otherwise we require an installed
-    //     ibus-daemon binary (no point forcing a module whose backend
-    //     cannot run).
-    if std::env::var_os("GTK_IM_MODULE").is_none()
-        && (flowmux_config::paths::is_flatpak_sandbox() || ibus_daemon_available())
-    {
+    // The override is gated so setups with another real IME such as
+    // fcitx keep working, while known non-preedit modules (`wayland`,
+    // `simple`, `xim`) are corrected when ibus is reachable. Inside
+    // Flatpak we trust the manifest's portal grant; otherwise we require
+    // an installed ibus-daemon binary.
+    let ibus_reachable = flowmux_config::paths::is_flatpak_sandbox() || ibus_daemon_available();
+    let gtk_im_module = std::env::var("GTK_IM_MODULE").ok();
+    if should_force_ibus_im_module(gtk_im_module.as_deref(), ibus_reachable) {
         std::env::set_var("GTK_IM_MODULE", "ibus");
+    }
+    if gtk_im_module_is_ibus(std::env::var("GTK_IM_MODULE").ok().as_deref()) {
         if std::env::var_os("XMODIFIERS").is_none() {
             std::env::set_var("XMODIFIERS", "@im=ibus");
         }
@@ -457,6 +456,21 @@ fn ibus_daemon_available() -> bool {
         .any(|p| std::path::Path::new(p).exists())
 }
 
+fn should_force_ibus_im_module(current: Option<&str>, ibus_reachable: bool) -> bool {
+    if !ibus_reachable {
+        return false;
+    }
+    match current.map(str::trim).filter(|s| !s.is_empty()) {
+        None => true,
+        Some("wayland" | "simple" | "xim") => true,
+        Some(_) => false,
+    }
+}
+
+fn gtk_im_module_is_ibus(current: Option<&str>) -> bool {
+    matches!(current.map(str::trim), Some("ibus"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -486,5 +500,28 @@ mod tests {
              assume this); got flags = {:?}",
             app.flags()
         );
+    }
+
+    #[test]
+    fn ibus_im_module_override_targets_only_missing_or_non_preedit_modules() {
+        assert!(should_force_ibus_im_module(None, true));
+        assert!(should_force_ibus_im_module(Some(""), true));
+        assert!(should_force_ibus_im_module(Some("wayland"), true));
+        assert!(should_force_ibus_im_module(Some("simple"), true));
+        assert!(should_force_ibus_im_module(Some("xim"), true));
+
+        assert!(!should_force_ibus_im_module(Some("ibus"), true));
+        assert!(!should_force_ibus_im_module(Some("fcitx"), true));
+        assert!(!should_force_ibus_im_module(Some("fcitx5"), true));
+        assert!(!should_force_ibus_im_module(None, false));
+        assert!(!should_force_ibus_im_module(Some("wayland"), false));
+    }
+
+    #[test]
+    fn ibus_sync_mode_applies_when_gtk_im_module_is_ibus() {
+        assert!(gtk_im_module_is_ibus(Some("ibus")));
+        assert!(gtk_im_module_is_ibus(Some(" ibus ")));
+        assert!(!gtk_im_module_is_ibus(None));
+        assert!(!gtk_im_module_is_ibus(Some("wayland")));
     }
 }

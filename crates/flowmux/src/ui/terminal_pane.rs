@@ -78,6 +78,12 @@ impl TerminalPane {
         self.widget.set_font_scale(scale);
     }
 
+    /// Replace the base terminal font. The independent font scale set by
+    /// [`Self::set_font_scale`] (global zoom) still multiplies this size.
+    pub fn set_font(&self, desc: &gtk::pango::FontDescription) {
+        self.widget.set_font(Some(desc));
+    }
+
     pub fn has_selection(&self) -> bool {
         self.widget.has_selection()
     }
@@ -257,7 +263,15 @@ impl TerminalPane {
         scrollbar.set_width_request(12);
         container.add_overlay(&scrollbar);
 
-        install_smart_page_keys(&term, &scroll_adjustment);
+        // Make inline IME preedit (e.g. a composing Hangul syllable) visible
+        // even when the foreground app has hidden the terminal cursor.
+        install_preedit_redraw_on_keystroke(&container, &term);
+
+        if terminal_capture_key_controllers_enabled(env_flag_enabled(
+            "FLOWMUX_ENABLE_VTE_CAPTURE_KEYS",
+        )) {
+            install_smart_page_keys(&term, &scroll_adjustment);
+        }
 
         // OSC 99 (Konsole-format) is not exposed as a signal on Ubuntu's
         // VTE 0.68 / 0.76 builds — the `notification-received` signal is
@@ -288,7 +302,6 @@ impl TerminalPane {
         // cursor; Ctrl+left-click opens the URL in a new browser tab in the
         // same pane. Plain clicks continue into VTE text selection.
         install_url_link_handling(&term, id, callbacks.on_open_url.clone());
-        install_shift_enter_newline_handling(&term);
         install_flatpak_ibus_nav_workaround(&term);
 
         // Process exit.
@@ -572,8 +585,8 @@ fn install_url_link_handling(
     term.match_set_cursor_name(tag, "pointer");
     tracing::debug!(%pane_id, tag, "URL match registered on terminal");
 
-    // 2) Left-click gesture. Inspect button-press in capture phase first to
-    //    determine whether Ctrl is held.
+    // 2) Left-click gesture. Keep it out of capture phase so VTE's keyboard
+    //    IMContext stays on the same path as a plain terminal widget.
     //
     //    The key trap: GtkGestureSingle automatically claims its sequence on
     //    button-press. If we do nothing, that event never reaches other
@@ -584,7 +597,7 @@ fn install_url_link_handling(
     //    Ctrl-clicks so selection does not start.
     let click = gtk::GestureClick::new();
     click.set_button(gtk::gdk::BUTTON_PRIMARY);
-    click.set_propagation_phase(gtk::PropagationPhase::Capture);
+    click.set_propagation_phase(gtk::PropagationPhase::Bubble);
 
     let term_widget = term.clone();
     click.connect_pressed(move |gesture, _n_press, x, y| {
@@ -631,64 +644,51 @@ fn install_url_link_handling(
     term.add_controller(click);
 }
 
-const ALT_ENTER_BYTES: &[u8] = b"\x1b\r";
-
-/// Intercept Shift+Enter on the VTE widget and translate it to ESC+CR — the
-/// byte sequence agent TUIs (Claude, Codex, OpenCode) already treat as
-/// "insert newline" — before VTE's own Enter handler sees the event.
+/// Make VTE redraw the inline IME preedit string (a composing Hangul
+/// syllable, Japanese kana, Chinese pinyin, …) on every keystroke, even
+/// when the foreground app has hidden the terminal cursor.
 ///
-/// ### Why a `ShortcutController` and not an `EventControllerKey`
+/// VTE paints the preedit unconditionally in `paint_im_preedit_string()`,
+/// but it only *schedules* that repaint from `invalidate_cursor_once()`,
+/// which early-returns whenever DECTCEM is off (cursor hidden, `\x1b[?25l`).
+/// Claude Code renders its own cursor and keeps the terminal cursor hidden
+/// for the entire lifetime of its input box, so each composing keystroke
+/// updates the preedit buffer without ever queuing a frame: the syllable
+/// only becomes visible when unrelated output (a commit echo, Space) forces
+/// a redraw. The result is that `ㅇ`/`아`/`안` never show while composing and
+/// Backspace decompose is invisible too. Ghostty invalidates preedit
+/// independently of cursor visibility, which is why the same Claude session
+/// composes Hangul correctly there; Codex keeps the cursor visible so VTE's
+/// own invalidation already fires.
 ///
-/// An earlier version of this hook used `gtk::EventControllerKey` in
-/// `PropagationPhase::Capture`. That sits in front of VTE's internal IM
-/// filter on every keystroke, and on Ubuntu 22.04's GTK 4.6 + VTE 0.68
-/// combination the IBus Hangul preedit handler ends up desynchronized when
-/// any capture-phase key controller is attached to the VTE widget. The
-/// reported symptom is that Backspace and the arrow keys stop reacting
-/// while a Korean syllable is being composed — IBus Hangul never receives
-/// them, so the preedit cannot be edited or committed. Plain ASCII typing,
-/// composition itself, and any key event outside of preedit are unaffected,
-/// which is why the regression slipped through.
-///
-/// `gtk::ShortcutController` only ever fires when an incoming event matches
-/// one of its `KeyvalTrigger`s. Every other keystroke — including the keys
-/// IBus Hangul cares about during preedit — propagates untouched to VTE's
-/// native IM path, so the GTK4 + IBus pipeline behaves exactly as it would
-/// on a vanilla `vte::Terminal` with no controller attached.
-fn install_shift_enter_newline_handling(term: &vte::Terminal) {
-    let controller = gtk::ShortcutController::new();
-    // Capture phase: VTE's own Shift+Enter handling sends \r to the PTY at
-    // the target phase, which would defeat the translation. Capture beats
-    // it; matching events are consumed before VTE sees them, non-matching
-    // events propagate normally.
-    controller.set_propagation_phase(gtk::PropagationPhase::Capture);
-    controller.set_scope(gtk::ShortcutScope::Local);
-
+/// Fix: attach a capture-phase `EventControllerKey` to the Overlay (an
+/// ancestor of the VTE widget). Capture phase visits ancestors before the
+/// focused VTE consumes the key, so it observes every key — including the
+/// letter / jamo / Backspace keys IBus swallows for composition — and returns
+/// `Proceed`, never touching the event, so VTE's IM path is unchanged. The
+/// immediate `queue_draw` covers the synchronous IBus path
+/// (`IBUS_ENABLE_SYNC_MODE=1`, forced in `main.rs`); a short follow-up redraw
+/// covers async input methods (fcitx, IBus without sync) whose
+/// `preedit-changed` lands just after the key event. When the cursor is
+/// visible (a normal shell, Codex, vim) the redraw is redundant with VTE's
+/// own invalidation and harmless — it is paced by human keystrokes, not
+/// terminal output.
+fn install_preedit_redraw_on_keystroke(container: &gtk::Overlay, term: &vte::Terminal) {
+    let key = gtk::EventControllerKey::new();
+    key.set_propagation_phase(gtk::PropagationPhase::Capture);
     let term_widget = term.clone();
-    let action = gtk::CallbackAction::new(move |_, _| {
-        term_widget.feed_child(ALT_ENTER_BYTES);
-        glib::Propagation::Stop
+    key.connect_key_pressed(move |_, _keyval, _keycode, _state| {
+        term_widget.queue_draw();
+        let term_follow = term_widget.clone();
+        glib::timeout_add_local_once(std::time::Duration::from_millis(16), move || {
+            term_follow.queue_draw();
+        });
+        glib::Propagation::Proceed
     });
-
-    // Cover the three keysyms a layout can produce for Enter:
-    //   - Return: the main keyboard's Enter key
-    //   - KP_Enter: numpad Enter
-    //   - ISO_Enter: keyboards that route through an ISO layout group
-    // `KeyvalTrigger` matches only when the requested modifiers are exactly
-    // present (CapsLock / NumLock latches are ignored), so Ctrl+Shift+Enter
-    // and Alt+Shift+Enter stay on VTE's native path.
-    for keyval in [
-        gtk::gdk::Key::Return,
-        gtk::gdk::Key::KP_Enter,
-        gtk::gdk::Key::ISO_Enter,
-    ] {
-        let trigger = gtk::KeyvalTrigger::new(keyval, gtk::gdk::ModifierType::SHIFT_MASK);
-        let shortcut = gtk::Shortcut::new(Some(trigger), Some(action.clone()));
-        controller.add_shortcut(shortcut);
-    }
-
-    term.add_controller(controller);
+    container.add_controller(key);
 }
+
+pub(crate) const ALT_ENTER_BYTES: &[u8] = b"\x1b\r";
 
 /// Force VTE's internal IMContext to commit any pending preedit text
 /// (e.g. a Hangul syllable still being composed) to the PTY before
@@ -714,7 +714,26 @@ fn flush_pending_preedit(term: &vte::Terminal) {
     term.grab_focus();
 }
 
-/// Smart paging for PgUp / PgDn / Shift+PgUp / Shift+PgDn.
+fn terminal_capture_key_controllers_enabled(enable_env_enabled: bool) -> bool {
+    enable_env_enabled
+}
+
+fn env_flag_enabled(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .as_deref()
+        .is_some_and(env_flag_value_enabled)
+}
+
+fn env_flag_value_enabled(value: &str) -> bool {
+    let value = value.trim();
+    value == "1"
+        || value.eq_ignore_ascii_case("true")
+        || value.eq_ignore_ascii_case("yes")
+        || value.eq_ignore_ascii_case("on")
+}
+
+/// Legacy smart paging for PgUp / PgDn / Shift+PgUp / Shift+PgDn.
 ///
 /// VTE's default binding for plain PgUp/Dn is to send the cursor-key
 /// escape `\x1b[5~` / `\x1b[6~` to the PTY. In a regular shell prompt
@@ -726,9 +745,14 @@ fn flush_pending_preedit(term: &vte::Terminal) {
 ///
 /// Heuristic: if the VTE has scrollable history (vadjustment range
 /// extends past the visible page), scroll the viewport by one page;
-/// otherwise let the keystroke fall through to VTE so the foreground
-/// app receives the escape. Shift+PgUp/Dn always scrolls — the user
-/// has signaled "scroll" by holding Shift.
+/// otherwise forward the same escape VTE would have sent so the
+/// foreground app receives the key. Shift+PgUp/Dn always scrolls —
+/// the user has signaled "scroll" by holding Shift.
+///
+/// Disabled by default because on the Ubuntu 22.04 / IBus / GTK4 path,
+/// any capture-phase key controller attached directly to VTE can prevent
+/// inline Hangul preedit from being drawn. Set
+/// `FLOWMUX_ENABLE_VTE_CAPTURE_KEYS=1` to restore the legacy paging hook.
 fn install_smart_page_keys(term: &vte::Terminal, scroll_adjustment: &gtk::Adjustment) {
     let controller = gtk::ShortcutController::new();
     controller.set_propagation_phase(gtk::PropagationPhase::Capture);
@@ -759,11 +783,9 @@ fn install_smart_page_keys(term: &vte::Terminal, scroll_adjustment: &gtk::Adjust
             if !always_scroll && !has_scrollback {
                 // Alt-screen / empty scrollback: forward the legacy
                 // PgUp/Dn escape so foreground apps (tig, vim, less,
-                // htop) can page their own buffer. We feed it
-                // directly rather than letting VTE handle the key
-                // because the capture-phase IBus bypass below would
-                // intercept the keystroke on the Flatpak 22.04 path
-                // and route it through its own table.
+                // htop) can page their own buffer. This action already
+                // owns the capture-phase decision, so forwarding the
+                // exact VTE byte sequence preserves the native outcome.
                 let bytes: &[u8] = if direction < 0 {
                     b"\x1b[5~"
                 } else {
@@ -790,65 +812,120 @@ fn install_smart_page_keys(term: &vte::Terminal, scroll_adjustment: &gtk::Adjust
     term.add_controller(controller);
 }
 
-/// Workaround for the Ubuntu 22.04 host + GNOME 48 Flatpak runtime
-/// IBus regression where plain navigation / editing keys during
-/// Hangul preedit are silently dropped. The deciding reproducer was
-/// that the same keys with `Ctrl` held down worked fine on the same
-/// setup — Ctrl takes the event past GTK's IM filter without
-/// involving IBus at all. That places the bug in the IBus daemon-
-/// path the runtime's GTK4 immodule uses for plain non-character
-/// keys, somewhere between the in-sandbox client and the host's
-/// IBus 1.5.26 daemon. Neither half is under flowmux's control, so
-/// the only available fix is to bypass that path from the
-/// application side.
+/// Legacy workaround for the Ubuntu 22.04 host + GNOME 48 Flatpak
+/// runtime IBus regression where plain navigation / editing keys
+/// during Hangul preedit are silently dropped. The deciding
+/// reproducer was that the same keys with `Ctrl` held down worked
+/// fine on the same setup — Ctrl takes the event past GTK's IM filter
+/// without involving IBus at all. That places the bug in the IBus
+/// daemon-path the runtime's GTK4 immodule uses for plain
+/// non-character keys, somewhere between the in-sandbox client and
+/// the host's IBus 1.5.26 daemon.
 ///
-/// Approach: install a capture-phase `ShortcutController` on the
-/// VTE widget for the affected plain keys. When one matches we feed
-/// a normal-mode terminal byte sequence straight to the PTY and
-/// consume the event so VTE's own IM-aware handler never sees it.
-/// `flowmuxctl pty-tee` observes smkx/rmkx on the terminal output
-/// side and rewrites cursor keys to application mode when foreground
-/// programs such as tig request it. Letter / number / punctuation
-/// keys are not intercepted, so Korean composition itself still goes
-/// through IBus and preedit keeps working for character input.
+/// Approach: install a capture-phase `ShortcutController` on the VTE
+/// widget for the affected plain keys. When one matches we feed a
+/// normal-mode terminal byte sequence straight to the PTY and consume
+/// the event so VTE's own IM-aware handler never sees it. `flowmuxctl
+/// pty-tee` observes smkx/rmkx on the terminal output side and
+/// rewrites cursor keys to application mode when foreground programs
+/// such as tig request it.
+///
+/// This remains opt-in because even a narrow capture-phase controller
+/// can suppress inline preedit drawing on some IBus/VTE paths: Claude
+/// and other terminal apps then receive committed Hangul syllables,
+/// but the in-progress composition is invisible. The default path now
+/// preserves VTE's native IM handling and relies on
+/// `IBUS_ENABLE_SYNC_MODE=1` for the 22.04 key delivery fixes that it
+/// covers.
 ///
 /// What is intentionally **not** intercepted:
 ///   * Space. Its natural role inside IBus is "commit the current
 ///     preedit + insert space", and bypassing it would feed bare
 ///     0x20 to the PTY without committing the Korean syllable,
-///     dropping the user's text on the floor. Commit with
-///     `Ctrl+Space` (which works on this setup precisely because
-///     the Ctrl modifier bypasses IBus) before pressing Space.
-///   * Letter / number / punctuation keys. IBus needs to see them.
+///     dropping the user's text on the floor.
+///   * Letter / number / punctuation keys. IBus needs to see them
+///     for preedit; bypassing them made Claude show only committed
+///     syllables instead of the in-progress Hangul composition.
 ///   * BackSpace / Delete (and KP_Delete). During preedit IBus uses
 ///     BackSpace to decompose the syllable one jamo at a time; bypassing
 ///     it committed and then deleted the whole syllable. Since
 ///     `IBUS_ENABLE_SYNC_MODE=1` delivers these keys synchronously, IBus
 ///     now receives them on the 22.04 host too, so the bypass is both
 ///     unnecessary and harmful for in-preedit editing.
-///   * Function keys F1..F12. Encoding varies enough across
-///     terminfo profiles that getting it wrong is worse than
-///     leaving them on the broken-but-rarely-used IBus path.
+///   * Enter. `IBUS_ENABLE_SYNC_MODE=1` lets VTE commit any pending
+///     Hangul preedit before the return key reaches the PTY, while a
+///     direct bypass submits the line without giving VTE a chance to
+///     draw or commit the in-progress syllable.
 ///
-/// **Enter is bypassed by user request, with the same caveat as
-/// Space would carry.** Pressing plain Enter while preedit is on
-/// screen sends only `\r` to the PTY; the in-progress Korean
-/// syllable is NOT committed first and is lost. Users who need to
-/// keep that syllable should commit it with `Ctrl+Enter` before
-/// hitting Enter, or fall back to typing the syllable + Space (no
-/// bypass) + Enter (bypass). The trade-off is deliberate: a
-/// working plain Enter is more useful than a no-op one.
+/// Active only when both conditions hold:
+///   * running inside a Flatpak sandbox (`/.flatpak-info` exists)
+///   * `FLOWMUX_ENABLE_IBUS_NAV_WORKAROUND=1` is set
 ///
-/// Active only inside a Flatpak sandbox (`/.flatpak-info` exists).
-/// Native builds talk to a matching-version IBus daemon and do
-/// not exhibit the drop, so they keep the regular path with no
-/// behavioural change. `FLOWMUX_NO_IBUS_NAV_WORKAROUND=1`
-/// disables the bypass for bisection.
-fn install_flatpak_ibus_nav_workaround(term: &vte::Terminal) {
-    if std::env::var_os("FLOWMUX_NO_IBUS_NAV_WORKAROUND").is_some() {
-        return;
+/// `FLOWMUX_NO_IBUS_NAV_WORKAROUND=1` still wins for bisection.
+fn flatpak_ibus_bypass_bytes(keyval: gtk::gdk::Key) -> Option<&'static [u8]> {
+    use gtk::gdk::Key;
+
+    if keyval == Key::Tab {
+        Some(b"\t")
+    } else if keyval == Key::Escape {
+        Some(b"\x1b")
+    } else if keyval == Key::Left || keyval == Key::KP_Left {
+        Some(b"\x1b[D")
+    } else if keyval == Key::Right || keyval == Key::KP_Right {
+        Some(b"\x1b[C")
+    } else if keyval == Key::Up || keyval == Key::KP_Up {
+        Some(b"\x1b[A")
+    } else if keyval == Key::Down || keyval == Key::KP_Down {
+        Some(b"\x1b[B")
+    } else if keyval == Key::Home || keyval == Key::KP_Home {
+        Some(b"\x1b[H")
+    } else if keyval == Key::End || keyval == Key::KP_End {
+        Some(b"\x1b[F")
+    } else if keyval == Key::Insert {
+        Some(b"\x1b[2~")
+    } else if keyval == Key::F1 {
+        Some(b"\x1bOP")
+    } else if keyval == Key::F2 {
+        Some(b"\x1bOQ")
+    } else if keyval == Key::F3 {
+        Some(b"\x1bOR")
+    } else if keyval == Key::F4 {
+        Some(b"\x1bOS")
+    } else if keyval == Key::F5 {
+        Some(b"\x1b[15~")
+    } else if keyval == Key::F6 {
+        Some(b"\x1b[17~")
+    } else if keyval == Key::F7 {
+        Some(b"\x1b[18~")
+    } else if keyval == Key::F8 {
+        Some(b"\x1b[19~")
+    } else if keyval == Key::F9 {
+        Some(b"\x1b[20~")
+    } else if keyval == Key::F10 {
+        Some(b"\x1b[21~")
+    } else if keyval == Key::F11 {
+        Some(b"\x1b[23~")
+    } else if keyval == Key::F12 {
+        Some(b"\x1b[24~")
+    } else {
+        None
     }
-    if !std::path::Path::new("/.flatpak-info").exists() {
+}
+
+fn should_install_flatpak_ibus_nav_workaround(
+    disable_env_present: bool,
+    enable_env_present: bool,
+    flatpak_info_exists: bool,
+) -> bool {
+    !disable_env_present && enable_env_present && flatpak_info_exists
+}
+
+fn install_flatpak_ibus_nav_workaround(term: &vte::Terminal) {
+    if !should_install_flatpak_ibus_nav_workaround(
+        std::env::var_os("FLOWMUX_NO_IBUS_NAV_WORKAROUND").is_some(),
+        env_flag_enabled("FLOWMUX_ENABLE_IBUS_NAV_WORKAROUND"),
+        std::path::Path::new("/.flatpak-info").exists(),
+    ) {
         return;
     }
 
@@ -866,6 +943,11 @@ fn install_flatpak_ibus_nav_workaround(term: &vte::Terminal) {
         let trigger = gtk::KeyvalTrigger::new(keyval, gtk::gdk::ModifierType::empty());
         controller.add_shortcut(gtk::Shortcut::new(Some(trigger), Some(action)));
     };
+    let bind_key = |keyval: gtk::gdk::Key| {
+        if let Some(bytes) = flatpak_ibus_bypass_bytes(keyval) {
+            bind(keyval, bytes);
+        }
+    };
 
     // Normal-mode xterm encodings. `flowmuxctl pty-tee` adjusts the
     // cursor-key subset to application mode while DECCKM is active.
@@ -880,138 +962,30 @@ fn install_flatpak_ibus_nav_workaround(term: &vte::Terminal) {
     // dropped-key reason for intercepting them is gone; letting them
     // reach IBus restores jamo-level editing. Outside preedit VTE's own
     // handler emits the identical \x7f / \x1b[3~ bytes.
-    bind(gtk::gdk::Key::Tab, b"\t");
-    bind(gtk::gdk::Key::Escape, b"\x1b");
-    // Enter: plain CR. Cost — any pending Hangul preedit is silently
-    // dropped (the GTK4 immodule does not expose an external commit
-    // hook). Documented in the function header above.
-    bind(gtk::gdk::Key::Return, b"\r");
-    bind(gtk::gdk::Key::ISO_Enter, b"\r");
-    bind(gtk::gdk::Key::Left, b"\x1b[D");
-    bind(gtk::gdk::Key::Right, b"\x1b[C");
-    bind(gtk::gdk::Key::Up, b"\x1b[A");
-    bind(gtk::gdk::Key::Down, b"\x1b[B");
-    bind(gtk::gdk::Key::Home, b"\x1b[H");
-    bind(gtk::gdk::Key::End, b"\x1b[F");
-    // Page_Up / Page_Down are handled in `install_smart_page_keys`,
-    // which decides between scrolling the viewport (primary screen
-    // with scrollback) and forwarding the escape (alt screen / empty
-    // scrollback). Including them here would double-handle the key
-    // and defeat the scroll path.
+    bind_key(gtk::gdk::Key::Tab);
+    bind_key(gtk::gdk::Key::Escape);
+    bind_key(gtk::gdk::Key::Left);
+    bind_key(gtk::gdk::Key::Right);
+    bind_key(gtk::gdk::Key::Up);
+    bind_key(gtk::gdk::Key::Down);
+    bind_key(gtk::gdk::Key::Home);
+    bind_key(gtk::gdk::Key::End);
+    // Page_Up / Page_Down stay out of this table. The legacy smart-page
+    // hook owns them when `FLOWMUX_ENABLE_VTE_CAPTURE_KEYS=1`; otherwise
+    // VTE's native path handles them. Including them here would double-handle
+    // the key and defeat the scroll path.
     // Keypad variants of the same keys — some layouts (notebook + Fn,
     // X11 with NumLock off, …) report them as the KP_* keysyms even
     // when the user hits the equivalent unshifted key.
     // KP_Delete omitted for the same reason as Delete above — IBus must
     // see it for in-preedit editing; VTE emits \x1b[3~ outside preedit.
-    bind(gtk::gdk::Key::KP_Enter, b"\r");
-    bind(gtk::gdk::Key::KP_Left, b"\x1b[D");
-    bind(gtk::gdk::Key::KP_Right, b"\x1b[C");
-    bind(gtk::gdk::Key::KP_Up, b"\x1b[A");
-    bind(gtk::gdk::Key::KP_Down, b"\x1b[B");
-    bind(gtk::gdk::Key::KP_Home, b"\x1b[H");
-    bind(gtk::gdk::Key::KP_End, b"\x1b[F");
-
-    // ASCII symbol keys. With Hangul IBus active on the 22.04 host the
-    // immodule occasionally swallows these too, so opencode / tig /
-    // vim see no input for `? ! @ # $ % ^ …` until the user toggles
-    // back to English. We forward each printable byte directly so the
-    // foreground app receives it regardless of preedit state. The
-    // shortcut trigger matches the exact modifier set, so
-    // Ctrl/Alt-combined variants stay on the regular IM path.
-    //
-    // Before feeding the byte we cycle focus on the terminal so VTE's
-    // internal IMContext commits any pending Hangul preedit ("녕")
-    // ahead of the bypass byte ("?"). Without this the PTY ends up
-    // receiving "? 녕" instead of "녕 ?", and the user sees the symbol
-    // appear in front of the syllable.
-    let bind_byte = |keyval: gtk::gdk::Key, mods: gtk::gdk::ModifierType, byte: u8| {
-        let term_widget = term.clone();
-        let action = gtk::CallbackAction::new(move |_, _| {
-            flush_pending_preedit(&term_widget);
-            term_widget.feed_child(&[byte]);
-            glib::Propagation::Stop
-        });
-        let trigger = gtk::KeyvalTrigger::new(keyval, mods);
-        controller.add_shortcut(gtk::Shortcut::new(Some(trigger), Some(action)));
-    };
-    let empty = gtk::gdk::ModifierType::empty();
-    let shift = gtk::gdk::ModifierType::SHIFT_MASK;
-    // Unshifted punctuation row (US layout). On other layouts these
-    // keysyms still map to the same ASCII bytes when produced.
-    bind_byte(gtk::gdk::Key::grave, empty, b'`');
-    bind_byte(gtk::gdk::Key::minus, empty, b'-');
-    bind_byte(gtk::gdk::Key::equal, empty, b'=');
-    bind_byte(gtk::gdk::Key::bracketleft, empty, b'[');
-    bind_byte(gtk::gdk::Key::bracketright, empty, b']');
-    bind_byte(gtk::gdk::Key::backslash, empty, b'\\');
-    bind_byte(gtk::gdk::Key::semicolon, empty, b';');
-    bind_byte(gtk::gdk::Key::apostrophe, empty, b'\'');
-    bind_byte(gtk::gdk::Key::comma, empty, b',');
-    bind_byte(gtk::gdk::Key::period, empty, b'.');
-    bind_byte(gtk::gdk::Key::slash, empty, b'/');
-    // Shifted punctuation. The keysym is the Shift-produced character
-    // (e.g. `Shift+1` → `exclam`), so the modifier match is SHIFT.
-    bind_byte(gtk::gdk::Key::asciitilde, shift, b'~');
-    bind_byte(gtk::gdk::Key::exclam, shift, b'!');
-    bind_byte(gtk::gdk::Key::at, shift, b'@');
-    bind_byte(gtk::gdk::Key::numbersign, shift, b'#');
-    bind_byte(gtk::gdk::Key::dollar, shift, b'$');
-    bind_byte(gtk::gdk::Key::percent, shift, b'%');
-    bind_byte(gtk::gdk::Key::asciicircum, shift, b'^');
-    bind_byte(gtk::gdk::Key::ampersand, shift, b'&');
-    bind_byte(gtk::gdk::Key::asterisk, shift, b'*');
-    bind_byte(gtk::gdk::Key::parenleft, shift, b'(');
-    bind_byte(gtk::gdk::Key::parenright, shift, b')');
-    bind_byte(gtk::gdk::Key::underscore, shift, b'_');
-    bind_byte(gtk::gdk::Key::plus, shift, b'+');
-    bind_byte(gtk::gdk::Key::braceleft, shift, b'{');
-    bind_byte(gtk::gdk::Key::braceright, shift, b'}');
-    bind_byte(gtk::gdk::Key::bar, shift, b'|');
-    bind_byte(gtk::gdk::Key::colon, shift, b':');
-    bind_byte(gtk::gdk::Key::quotedbl, shift, b'"');
-    bind_byte(gtk::gdk::Key::less, shift, b'<');
-    bind_byte(gtk::gdk::Key::greater, shift, b'>');
-    bind_byte(gtk::gdk::Key::question, shift, b'?');
-
-    // Digit row. IBus drops these too during Hangul preedit on
-    // 22.04 (digits do not map to Hangul jamo). Without this, typing
-    // a number into opencode / vim / less while the IME is the
-    // active one silently fails until the user switches input
-    // method off.
-    bind_byte(gtk::gdk::Key::_0, empty, b'0');
-    bind_byte(gtk::gdk::Key::_1, empty, b'1');
-    bind_byte(gtk::gdk::Key::_2, empty, b'2');
-    bind_byte(gtk::gdk::Key::_3, empty, b'3');
-    bind_byte(gtk::gdk::Key::_4, empty, b'4');
-    bind_byte(gtk::gdk::Key::_5, empty, b'5');
-    bind_byte(gtk::gdk::Key::_6, empty, b'6');
-    bind_byte(gtk::gdk::Key::_7, empty, b'7');
-    bind_byte(gtk::gdk::Key::_8, empty, b'8');
-    bind_byte(gtk::gdk::Key::_9, empty, b'9');
-
-    // Numeric keypad digit row. Some layouts report numpad digits
-    // as `KP_0..KP_9` rather than the main-row keysyms, and IBus's
-    // drop applies equally there.
-    let kp_digits = [
-        gtk::gdk::Key::KP_0,
-        gtk::gdk::Key::KP_1,
-        gtk::gdk::Key::KP_2,
-        gtk::gdk::Key::KP_3,
-        gtk::gdk::Key::KP_4,
-        gtk::gdk::Key::KP_5,
-        gtk::gdk::Key::KP_6,
-        gtk::gdk::Key::KP_7,
-        gtk::gdk::Key::KP_8,
-        gtk::gdk::Key::KP_9,
-    ];
-    for (i, key) in kp_digits.iter().enumerate() {
-        bind_byte(*key, empty, b'0' + i as u8);
-    }
-    bind_byte(gtk::gdk::Key::KP_Multiply, empty, b'*');
-    bind_byte(gtk::gdk::Key::KP_Add, empty, b'+');
-    bind_byte(gtk::gdk::Key::KP_Subtract, empty, b'-');
-    bind_byte(gtk::gdk::Key::KP_Divide, empty, b'/');
-    bind_byte(gtk::gdk::Key::KP_Decimal, empty, b'.');
+    bind_key(gtk::gdk::Key::KP_Left);
+    bind_key(gtk::gdk::Key::KP_Right);
+    bind_key(gtk::gdk::Key::KP_Up);
+    bind_key(gtk::gdk::Key::KP_Down);
+    bind_key(gtk::gdk::Key::KP_Home);
+    bind_key(gtk::gdk::Key::KP_End);
+    bind_key(gtk::gdk::Key::Insert);
 
     // Function keys F1 .. F12 using the xterm normal-mode encoding
     // that bash / vim / less / tig / opencode all expect. F1-F4 are
@@ -1019,29 +993,18 @@ fn install_flatpak_ibus_nav_workaround(term: &vte::Terminal) {
     // family (`ESC [ <digits> ~`). flowmuxctl pty-tee does not
     // rewrite these, so forwarding the literal bytes here is
     // sufficient.
-    let bind_bytes = |keyval: gtk::gdk::Key, mods: gtk::gdk::ModifierType, bytes: &'static [u8]| {
-        let term_widget = term.clone();
-        let action = gtk::CallbackAction::new(move |_, _| {
-            flush_pending_preedit(&term_widget);
-            term_widget.feed_child(bytes);
-            glib::Propagation::Stop
-        });
-        let trigger = gtk::KeyvalTrigger::new(keyval, mods);
-        controller.add_shortcut(gtk::Shortcut::new(Some(trigger), Some(action)));
-    };
-    bind_bytes(gtk::gdk::Key::F1, empty, b"\x1bOP");
-    bind_bytes(gtk::gdk::Key::F2, empty, b"\x1bOQ");
-    bind_bytes(gtk::gdk::Key::F3, empty, b"\x1bOR");
-    bind_bytes(gtk::gdk::Key::F4, empty, b"\x1bOS");
-    bind_bytes(gtk::gdk::Key::F5, empty, b"\x1b[15~");
-    bind_bytes(gtk::gdk::Key::F6, empty, b"\x1b[17~");
-    bind_bytes(gtk::gdk::Key::F7, empty, b"\x1b[18~");
-    bind_bytes(gtk::gdk::Key::F8, empty, b"\x1b[19~");
-    bind_bytes(gtk::gdk::Key::F9, empty, b"\x1b[20~");
-    bind_bytes(gtk::gdk::Key::F10, empty, b"\x1b[21~");
-    bind_bytes(gtk::gdk::Key::F11, empty, b"\x1b[23~");
-    bind_bytes(gtk::gdk::Key::F12, empty, b"\x1b[24~");
-    bind_bytes(gtk::gdk::Key::Insert, empty, b"\x1b[2~");
+    bind_key(gtk::gdk::Key::F1);
+    bind_key(gtk::gdk::Key::F2);
+    bind_key(gtk::gdk::Key::F3);
+    bind_key(gtk::gdk::Key::F4);
+    bind_key(gtk::gdk::Key::F5);
+    bind_key(gtk::gdk::Key::F6);
+    bind_key(gtk::gdk::Key::F7);
+    bind_key(gtk::gdk::Key::F8);
+    bind_key(gtk::gdk::Key::F9);
+    bind_key(gtk::gdk::Key::F10);
+    bind_key(gtk::gdk::Key::F11);
+    bind_key(gtk::gdk::Key::F12);
 
     term.add_controller(controller);
 }
@@ -1327,5 +1290,82 @@ mod tests {
         // newline". Lock the wire format so a future refactor does not turn
         // Shift+Enter into a literal newline submission again.
         assert_eq!(ALT_ENTER_BYTES, b"\x1b\r");
+    }
+
+    #[test]
+    fn vte_capture_key_controllers_are_legacy_opt_in() {
+        assert!(!terminal_capture_key_controllers_enabled(false));
+        assert!(terminal_capture_key_controllers_enabled(true));
+    }
+
+    #[test]
+    fn enable_env_flags_require_truthy_values() {
+        for value in ["1", "true", "TRUE", "yes", "on", " On "] {
+            assert!(
+                env_flag_value_enabled(value),
+                "{value:?} should enable the legacy path"
+            );
+        }
+        for value in ["", "0", "false", "no", "off", "disabled"] {
+            assert!(
+                !env_flag_value_enabled(value),
+                "{value:?} should keep the native VTE IM path"
+            );
+        }
+    }
+
+    #[test]
+    fn flatpak_ibus_bypass_leaves_text_and_enter_on_vte_im_path() {
+        use gtk::gdk::Key;
+
+        for key in [
+            Key::Return,
+            Key::ISO_Enter,
+            Key::KP_Enter,
+            Key::space,
+            Key::a,
+            Key::_1,
+            Key::question,
+            Key::period,
+            Key::KP_1,
+            Key::KP_Add,
+        ] {
+            assert!(
+                flatpak_ibus_bypass_bytes(key).is_none(),
+                "{key:?} must stay on VTE's IM path"
+            );
+        }
+    }
+
+    #[test]
+    fn flatpak_ibus_bypass_keeps_navigation_and_function_keys() {
+        use gtk::gdk::Key;
+
+        assert_eq!(flatpak_ibus_bypass_bytes(Key::Left), Some(&b"\x1b[D"[..]));
+        assert_eq!(
+            flatpak_ibus_bypass_bytes(Key::KP_Right),
+            Some(&b"\x1b[C"[..])
+        );
+        assert_eq!(
+            flatpak_ibus_bypass_bytes(Key::Insert),
+            Some(&b"\x1b[2~"[..])
+        );
+        assert_eq!(flatpak_ibus_bypass_bytes(Key::F5), Some(&b"\x1b[15~"[..]));
+    }
+
+    #[test]
+    fn flatpak_ibus_nav_workaround_is_legacy_opt_in() {
+        assert!(!should_install_flatpak_ibus_nav_workaround(
+            false, false, true
+        ));
+        assert!(should_install_flatpak_ibus_nav_workaround(
+            false, true, true
+        ));
+        assert!(!should_install_flatpak_ibus_nav_workaround(
+            true, true, true
+        ));
+        assert!(!should_install_flatpak_ibus_nav_workaround(
+            false, true, false
+        ));
     }
 }

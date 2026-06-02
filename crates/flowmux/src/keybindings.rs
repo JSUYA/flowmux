@@ -20,6 +20,7 @@
 //! one and skips invalid entries with a warning.
 
 use crate::bridge::{Bridge, FocusDir, GtkCommand, WsNav};
+use crate::ui::terminal_pane::{ALT_ENTER_BYTES, TerminalPane};
 use crate::ui::window::ClipboardToast;
 use adw::prelude::*;
 use flowmux_config::keybindings::{ActionId, KeybindingOverrides};
@@ -40,6 +41,9 @@ pub type FocusedPane = Rc<Cell<Option<flowmux_core::PaneId>>>;
 /// but `flowmux_config::keybindings::ActionId::as_str` returns the bare
 /// form (`copy`), so callers prepend this constant.
 const ACTION_GROUP: &str = "win.";
+const INSERT_NEWLINE_ACTION: &str = "insert-newline";
+const INSERT_NEWLINE_FULL_ACTION: &str = "win.insert-newline";
+const INSERT_NEWLINE_ACCELS: &[&str] = &["<Shift>Return", "<Shift>KP_Enter", "<Shift>ISO_Enter"];
 
 /// Build the namespaced action name (`win.<bare>`) GTK uses for accel
 /// registration.
@@ -104,6 +108,7 @@ pub fn install_accels(app: &adw::Application, options: &Options) {
         let accel_refs: Vec<&str> = valid.iter().map(|s| s.as_str()).collect();
         app.set_accels_for_action(&full_action_name(*action), &accel_refs);
     }
+    app.set_accels_for_action(INSERT_NEWLINE_FULL_ACTION, INSERT_NEWLINE_ACCELS);
 }
 
 /// Helper retained for tests and other callers that just want the
@@ -257,6 +262,8 @@ pub fn install_actions(
 
     let copy = make_copy_action(focused.clone(), registry.clone(), clipboard_toast.clone());
     let paste = make_paste_action(focused.clone(), registry.clone());
+    let insert_newline =
+        make_insert_newline_action(window.clone(), focused.clone(), registry.clone());
 
     // Single-chord copy: pressing the configured accel (default
     // `Ctrl+Shift+K`) writes the focused pane's cwd to the clipboard
@@ -302,6 +309,7 @@ pub fn install_actions(
         w8,
         copy,
         paste,
+        insert_newline,
         copy_pane_path,
     ]);
 }
@@ -618,6 +626,34 @@ fn make_copy_action(
         .build()
 }
 
+fn make_insert_newline_action(
+    window: adw::ApplicationWindow,
+    focused: FocusedPane,
+    registry: TerminalRegistry,
+) -> gtk::gio::ActionEntry<adw::ApplicationWindow> {
+    gtk::gio::ActionEntry::builder(INSERT_NEWLINE_ACTION)
+        .activate(move |_, _, _| {
+            let Some(pane) = focused.get() else { return };
+            let r = registry.borrow();
+            let Some(term) = r.active_terminal(pane) else {
+                return;
+            };
+            if !window_focus_is_terminal(&window, term) {
+                return;
+            }
+            term.feed(ALT_ENTER_BYTES);
+        })
+        .build()
+}
+
+fn window_focus_is_terminal(window: &adw::ApplicationWindow, term: &TerminalPane) -> bool {
+    let Some(focus) = gtk::prelude::GtkWindowExt::focus(window) else {
+        return false;
+    };
+    let terminal_widget = term.widget.clone().upcast::<gtk::Widget>();
+    focus == terminal_widget || focus.is_ancestor(&terminal_widget)
+}
+
 fn make_paste_action(
     focused: FocusedPane,
     registry: TerminalRegistry,
@@ -645,10 +681,16 @@ mod tests {
 
     #[test]
     fn shift_tab_is_reserved_for_terminal_and_agents() {
-        assert!(default_for(ActionId::NextSurface).is_empty());
-        assert!(!default_for(ActionId::NextWorkspace)
-            .iter()
-            .any(|accel| *accel == "<Shift>Tab" || *accel == "<Shift>ISO_Left_Tab"));
+        // No default cycle binding may claim Shift+Tab, so it always reaches
+        // the focused terminal / agent. NextSurface keeps its own binding
+        // (<Ctrl><Shift>Right) — the requirement is only that it is not Shift+Tab.
+        let steals_shift_tab = |action| {
+            default_for(action)
+                .iter()
+                .any(|accel| *accel == "<Shift>Tab" || *accel == "<Shift>ISO_Left_Tab")
+        };
+        assert!(!steals_shift_tab(ActionId::NextSurface));
+        assert!(!steals_shift_tab(ActionId::NextWorkspace));
     }
 
     #[test]
@@ -666,6 +708,21 @@ mod tests {
             default_for(ActionId::NewBrowserSurface),
             vec!["<Ctrl><Shift>b"]
         );
+    }
+
+    #[gtk::test]
+    fn insert_newline_accels_cover_enter_variants() {
+        adw::init().expect("libadwaita should initialize in GTK test");
+        assert_eq!(
+            INSERT_NEWLINE_ACCELS,
+            &["<Shift>Return", "<Shift>KP_Enter", "<Shift>ISO_Enter"]
+        );
+        for accel in INSERT_NEWLINE_ACCELS {
+            assert!(
+                gtk::accelerator_parse(*accel).is_some(),
+                "{accel} must be valid GTK accelerator syntax"
+            );
+        }
     }
 
     #[test]
@@ -967,6 +1024,37 @@ mod tests {
         assert!(
             fired.get(),
             "activating win.copy-pane-path must call its handler exactly once"
+        );
+    }
+
+    #[gtk::test]
+    fn insert_newline_action_is_registered_on_application_window() {
+        adw::init().expect("libadwaita should initialize in GTK test");
+        let app = adw::Application::builder()
+            .application_id("com.flowmux.App.UiTest.InsertNewlineRegistered")
+            .flags(gtk::gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(None::<&gtk::gio::Cancellable>).unwrap();
+        let window = adw::ApplicationWindow::builder()
+            .application(&app)
+            .default_width(320)
+            .default_height(240)
+            .build();
+
+        let fired = Rc::new(Cell::new(false));
+        let fired_for_action = fired.clone();
+        let entry = gtk::gio::ActionEntry::builder(INSERT_NEWLINE_ACTION)
+            .activate(move |_, _, _| {
+                fired_for_action.set(true);
+            })
+            .build();
+        window.add_action_entries([entry]);
+
+        gtk::prelude::WidgetExt::activate_action(&window, INSERT_NEWLINE_FULL_ACTION, None)
+            .expect("win.insert-newline action should be registered on the window");
+        assert!(
+            fired.get(),
+            "activating win.insert-newline must call its handler exactly once"
         );
     }
 

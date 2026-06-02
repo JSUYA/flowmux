@@ -40,6 +40,13 @@ pub struct SpawnSpec<'a> {
 /// * `FLOWMUX_SOCKET_PATH` — the daemon's Unix socket path.
 /// * `FLOWMUX_BUNDLED_CLI_PATH` — only when the caller knows where the
 ///   `flowmux` binary lives (e.g. derived from `current_exe()` in app).
+/// * `TERM_PROGRAM` / `TERM_PROGRAM_VERSION` / `COLORTERM` — terminal identity
+///   for TUIs that otherwise inherit the launcher terminal's identity or probe
+///   VTE as a generic xterm.
+/// * `CLAUDE_CODE_NATIVE_CURSOR` — asks Claude Code to leave the terminal cursor
+///   available for VTE's IMContext. Without this, Claude's custom cursor hides
+///   VTE's inline Hangul preedit on the GTK4/VTE path even though committed
+///   syllables still arrive.
 pub fn agent_pty_env(
     pane: PaneId,
     surface: SurfaceId,
@@ -50,7 +57,7 @@ pub fn agent_pty_env(
     let pane_s = pane.to_string();
     let surface_s = surface.to_string();
     let workspace_s = workspace.to_string();
-    let mut out = Vec::with_capacity(6);
+    let mut out = Vec::with_capacity(10);
     out.push(("FLOWMUX_PANE_ID".to_string(), pane_s));
     out.push(("FLOWMUX_SURFACE_ID".to_string(), surface_s));
     out.push(("FLOWMUX_WORKSPACE_ID".to_string(), workspace_s.clone()));
@@ -65,6 +72,13 @@ pub fn agent_pty_env(
             p.display().to_string(),
         ));
     }
+    out.push(("TERM_PROGRAM".to_string(), "vte-based".to_string()));
+    out.push((
+        "TERM_PROGRAM_VERSION".to_string(),
+        env!("CARGO_PKG_VERSION").to_string(),
+    ));
+    out.push(("COLORTERM".to_string(), "truecolor".to_string()));
+    out.push(("CLAUDE_CODE_NATIVE_CURSOR".to_string(), "1".to_string()));
     out
 }
 
@@ -173,6 +187,13 @@ mod tests {
             Some("/run/user/1000/flowmux.sock")
         );
         assert!(collect(&env, "FLOWMUX_BUNDLED_CLI_PATH").is_none());
+        assert_eq!(collect(&env, "TERM_PROGRAM"), Some("vte-based"));
+        assert_eq!(
+            collect(&env, "TERM_PROGRAM_VERSION"),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+        assert_eq!(collect(&env, "COLORTERM"), Some("truecolor"));
+        assert_eq!(collect(&env, "CLAUDE_CODE_NATIVE_CURSOR"), Some("1"));
     }
 
     #[test]
@@ -235,16 +256,12 @@ mod tests {
         );
         let kv = env_to_kv_strings(&env);
 
-        assert_eq!(kv.len(), 6);
+        assert_eq!(kv.len(), 10);
         for entry in &kv {
             let eq = entry.find('=').expect("envv entry must have '='");
             let key = &entry[..eq];
             let val = &entry[eq + 1..];
             assert!(!key.is_empty(), "envv key must be non-empty");
-            assert!(
-                key.starts_with("FLOWMUX_"),
-                "expected FLOWMUX_ prefix in {entry}"
-            );
             assert!(!val.is_empty(), "envv value must be non-empty");
         }
 
@@ -252,5 +269,8 @@ mod tests {
         let surface_kv = format!("FLOWMUX_SURFACE_ID={surface}");
         assert!(kv.iter().any(|e| e == &pane_kv));
         assert!(kv.iter().any(|e| e == &surface_kv));
+        assert!(kv.iter().any(|e| e == "TERM_PROGRAM=vte-based"));
+        assert!(kv.iter().any(|e| e == "COLORTERM=truecolor"));
+        assert!(kv.iter().any(|e| e == "CLAUDE_CODE_NATIVE_CURSOR=1"));
     }
 }
