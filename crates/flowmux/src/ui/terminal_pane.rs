@@ -820,6 +820,12 @@ fn install_smart_page_keys(term: &vte::Terminal, scroll_adjustment: &gtk::Adjust
 ///     `Ctrl+Space` (which works on this setup precisely because
 ///     the Ctrl modifier bypasses IBus) before pressing Space.
 ///   * Letter / number / punctuation keys. IBus needs to see them.
+///   * BackSpace / Delete (and KP_Delete). During preedit IBus uses
+///     BackSpace to decompose the syllable one jamo at a time; bypassing
+///     it committed and then deleted the whole syllable. Since
+///     `IBUS_ENABLE_SYNC_MODE=1` delivers these keys synchronously, IBus
+///     now receives them on the 22.04 host too, so the bypass is both
+///     unnecessary and harmful for in-preedit editing.
 ///   * Function keys F1..F12. Encoding varies enough across
 ///     terminfo profiles that getting it wrong is worse than
 ///     leaving them on the broken-but-rarely-used IBus path.
@@ -863,8 +869,17 @@ fn install_flatpak_ibus_nav_workaround(term: &vte::Terminal) {
 
     // Normal-mode xterm encodings. `flowmuxctl pty-tee` adjusts the
     // cursor-key subset to application mode while DECCKM is active.
-    bind(gtk::gdk::Key::BackSpace, b"\x7f");
-    bind(gtk::gdk::Key::Delete, b"\x1b[3~");
+    //
+    // BackSpace / Delete are deliberately NOT bypassed. During Hangul
+    // preedit IBus interprets BackSpace as "decompose the syllable by
+    // one jamo" (안 in progress → ㅇㅏ → ㅇ); routing it through the
+    // bypass instead flushed the preedit (committing the whole syllable)
+    // and then sent DEL, so the entire syllable vanished. With
+    // `IBUS_ENABLE_SYNC_MODE=1` (set in main.rs) IBus now receives these
+    // keys synchronously even on the 22.04 host, so the original
+    // dropped-key reason for intercepting them is gone; letting them
+    // reach IBus restores jamo-level editing. Outside preedit VTE's own
+    // handler emits the identical \x7f / \x1b[3~ bytes.
     bind(gtk::gdk::Key::Tab, b"\t");
     bind(gtk::gdk::Key::Escape, b"\x1b");
     // Enter: plain CR. Cost — any pending Hangul preedit is silently
@@ -886,7 +901,8 @@ fn install_flatpak_ibus_nav_workaround(term: &vte::Terminal) {
     // Keypad variants of the same keys — some layouts (notebook + Fn,
     // X11 with NumLock off, …) report them as the KP_* keysyms even
     // when the user hits the equivalent unshifted key.
-    bind(gtk::gdk::Key::KP_Delete, b"\x1b[3~");
+    // KP_Delete omitted for the same reason as Delete above — IBus must
+    // see it for in-preedit editing; VTE emits \x1b[3~ outside preedit.
     bind(gtk::gdk::Key::KP_Enter, b"\r");
     bind(gtk::gdk::Key::KP_Left, b"\x1b[D");
     bind(gtk::gdk::Key::KP_Right, b"\x1b[C");
