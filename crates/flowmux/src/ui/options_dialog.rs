@@ -4,6 +4,9 @@
 //! It exposes:
 //!
 //! * Global zoom percentage (10..=200% SpinButton)
+//! * Terminal font family (DropDown of installed, curated developer fonts,
+//!   plus a "System default" sentinel that inherits the theme font) and size
+//!   (SpinButton, points). Applied live to every open terminal.
 //! * Default web view engine for new browser tabs (DropDown: WebKit / Chrome / Firefox)
 //! * Focused-pane 1px border color (ColorDialogButton, default pale yellow)
 //! * Browser session persistence toggle (CheckButton, default checked) —
@@ -25,12 +28,22 @@ use flowmux_config::options::{
 
 /// Present the modal options dialog. If the user clicks OK, `on_apply` is
 /// called with the new [`Options`]. Cancel or window close does not call back.
+/// `default_font_family` / `default_font_size` are the resolved theme font,
+/// used to seed the font widgets when the user has no override.
 pub fn present(
     parent: &adw::ApplicationWindow,
     current: Options,
+    default_font_family: String,
+    default_font_size: f32,
     on_apply: impl Fn(Options) + 'static,
 ) {
-    let dialog = build_dialog(parent, &current, on_apply);
+    let dialog = build_dialog(
+        parent,
+        &current,
+        default_font_family,
+        default_font_size,
+        on_apply,
+    );
     dialog.present();
 }
 
@@ -39,11 +52,19 @@ pub fn present(
 fn build_dialog(
     parent: &adw::ApplicationWindow,
     current: &Options,
+    default_font_family: String,
+    default_font_size: f32,
     on_apply: impl Fn(Options) + 'static,
 ) -> adw::Window {
+    // Intentionally NOT modal. A modal transient dialog gets attached to its
+    // parent's titlebar by window managers that honour the "attach modal
+    // dialogs" behaviour (Mutter's `attach-modal-dialogs`, and similar),
+    // which makes the WM move the dialog and the main window together — so
+    // the user can no longer drag the options popup on its own. Keeping
+    // `transient_for` (floats above the main window, centred on it) without
+    // `modal` lets the WM treat it as an independent, freely-movable window.
     let dialog = adw::Window::builder()
         .transient_for(parent)
-        .modal(true)
         .default_width(760)
         .default_height(620)
         .title("Options")
@@ -60,6 +81,7 @@ fn build_dialog(
     header.pack_end(&ok_btn);
 
     let zoom_spin = build_zoom_spin(current.zoom_percent);
+    let font_widgets = build_font_widgets(parent, current, &default_font_family, default_font_size);
     let engine_drop = build_engine_drop(&current.default_browser_engine);
     let focus_color_btn = build_focus_color_button(current.focus_border_color_or_default());
     let opacity_widgets = build_focus_opacity_row(current.focus_border_opacity);
@@ -72,6 +94,8 @@ fn build_dialog(
     general.set_margin_start(20);
     general.set_margin_end(20);
     general.append(&row("Global zoom (%)", &zoom_spin));
+    general.append(&row("Terminal font", &font_widgets.family_drop));
+    general.append(&row("Font size (pt)", &font_widgets.size_spin));
     general.append(&row("Browser web view", &engine_drop));
     general.append(&row("Focus border color", &focus_color_btn));
     general.append(&row("Focus border opacity (%)", &opacity_widgets.row));
@@ -157,6 +181,9 @@ fn build_dialog(
         let focus_color_btn = focus_color_btn.clone();
         let opacity_spin = opacity_widgets.spin.clone();
         let persist_check = persist_check.clone();
+        let family_drop = font_widgets.family_drop.clone();
+        let font_size_spin = font_widgets.size_spin.clone();
+        let families = font_widgets.families.clone();
         let on_apply = on_apply.clone();
         let kb_state = kb_state.clone();
         ok_btn.connect_clicked(move |_| {
@@ -174,6 +201,10 @@ fn build_dialog(
                 &focus_color_btn,
                 &opacity_spin,
                 &persist_check,
+                &family_drop,
+                &font_size_spin,
+                &families,
+                default_font_size,
                 &kb,
             );
             (on_apply)(opts);
@@ -307,12 +338,17 @@ fn build_engine_drop(initial: &BrowserEngine) -> gtk::DropDown {
 /// values may be out of range due to direct text entry, so clamp zoom and
 /// opacity again. [`color_button_hex`] normalizes the focus color from GdkRGBA
 /// to six-digit `#rrggbb`.
+#[allow(clippy::too_many_arguments)]
 fn collect_options(
     spin: &gtk::SpinButton,
     drop: &gtk::DropDown,
     focus_color: &gtk::ColorDialogButton,
     opacity_spin: &gtk::SpinButton,
     persist_check: &gtk::CheckButton,
+    family_drop: &gtk::DropDown,
+    font_size_spin: &gtk::SpinButton,
+    families: &[Option<String>],
+    default_font_size: f32,
     keybindings: &KeybindingOverrides,
 ) -> Options {
     let zoom = Options::clamp_zoom(spin.value_as_int().max(0) as u16);
@@ -323,14 +359,184 @@ fn collect_options(
     let color_hex = color_button_hex(focus_color);
     let opacity =
         Options::clamp_focus_border_opacity(opacity_spin.value_as_int().clamp(0, 255) as u8);
+    // Index 0 is the "System default (theme)" sentinel → `None` (inherit the
+    // theme font). Any other index maps back to a concrete family name.
+    let font_family = families
+        .get(family_drop.selected() as usize)
+        .cloned()
+        .flatten();
+    // Leaving the size at the theme default keeps `None` so the terminal still
+    // inherits the theme size; only a deliberate change pins an explicit size.
+    let size_val = font_size_spin.value() as f32;
+    let font_size = if (size_val - default_font_size).abs() < 0.05 {
+        None
+    } else {
+        Some(size_val)
+    };
     Options {
         zoom_percent: zoom,
         default_browser_engine: engine,
         focus_border_color: color_hex,
         focus_border_opacity: opacity,
         persist_browser_session: persist_check.is_active(),
+        font_family,
+        font_size,
         keybindings: keybindings.clone(),
     }
+}
+
+/// Widgets + index→family map for the terminal font picker. `families[i]`
+/// is the [`Options::font_family`] value the DropDown's index `i` represents;
+/// index 0 is the "System default (theme)" sentinel and maps to `None`.
+struct FontWidgets {
+    family_drop: gtk::DropDown,
+    size_spin: gtk::SpinButton,
+    families: Vec<Option<String>>,
+}
+
+/// Build the font family DropDown (installed curated developer fonts + a
+/// "System default" sentinel) and the size SpinButton, seeded from the user's
+/// current override or the resolved theme font.
+fn build_font_widgets(
+    parent: &adw::ApplicationWindow,
+    current: &Options,
+    default_family: &str,
+    default_size: f32,
+) -> FontWidgets {
+    // Build the index→Option<String> map. Index 0 = inherit the theme font.
+    let mut families: Vec<Option<String>> = vec![None];
+    let mut labels: Vec<String> = vec![format!("System default ({default_family})")];
+    // Show only curated developer fonts that are actually installed, ordered
+    // by popularity, so the dropdown is not flooded with every monospace face
+    // fontconfig reports (emoji fonts, generic aliases, PostScript clones).
+    let mut shown = recommended_families(&monospace_families(parent));
+    // Keep the user's current pick even if it is not a curated dev font (e.g.
+    // a face they set by hand), so opening the dialog never drops their choice.
+    if let Some(fam) = current.font_family.as_deref() {
+        if !shown.iter().any(|f| f == fam) {
+            shown.push(fam.to_string());
+        }
+    }
+    for fam in shown {
+        labels.push(fam.clone());
+        families.push(Some(fam));
+    }
+
+    let label_refs: Vec<&str> = labels.iter().map(|s| s.as_str()).collect();
+    let family_drop = gtk::DropDown::from_strings(&label_refs);
+    let selected = current
+        .font_family
+        .as_deref()
+        .and_then(|fam| families.iter().position(|f| f.as_deref() == Some(fam)))
+        .unwrap_or(0);
+    family_drop.set_selected(selected as u32);
+    family_drop.set_enable_search(true);
+
+    let initial_size = current.font_size.unwrap_or(default_size).clamp(4.0, 96.0);
+    let adj = gtk::Adjustment::new(initial_size as f64, 4.0, 96.0, 1.0, 4.0, 0.0);
+    let size_spin = gtk::SpinButton::new(Some(&adj), 1.0, 0);
+    size_spin.set_numeric(true);
+    size_spin.set_value(initial_size as f64);
+    size_spin.set_width_chars(6);
+
+    FontWidgets {
+        family_drop,
+        size_spin,
+        families,
+    }
+}
+
+/// Curated free / open-source developer monospace families, ordered by
+/// popularity (web-researched: JetBrains Mono, Fira Code, Cascadia, Source
+/// Code Pro, Hack, IBM Plex Mono, Iosevka, …). The font dropdown shows only
+/// installed families that match one of these prefixes, so the user picks
+/// from known coding fonts instead of every monospace face fontconfig knows.
+/// Matching is by lowercase prefix, so foundry variants ("Fira Code Retina",
+/// "Iosevka Term", "JetBrains Mono NL", "Cascadia Code PL") are kept.
+const CURATED_DEV_FONTS: &[&str] = &[
+    // Mainstream coding fonts (all OFL / Apache / BSD — freely redistributable).
+    "JetBrains Mono",
+    "Fira Code",
+    "Cascadia Code",
+    "Cascadia Mono",
+    "Maple Mono",
+    "Monaspace",
+    "Geist Mono",
+    "Commit Mono",
+    "Source Code Pro",
+    "Hack",
+    "IBM Plex Mono",
+    "Iosevka",
+    "Intel One Mono",
+    "0xProto",
+    "Recursive Mono",
+    "Inconsolata",
+    "Roboto Mono",
+    "Ubuntu Mono",
+    "Red Hat Mono",
+    "Victor Mono",
+    "Fantasque Sans Mono",
+    "Hasklig",
+    "Mononoki",
+    "Hermit",
+    "Martian Mono",
+    "Spline Sans Mono",
+    "Overpass Mono",
+    "B612 Mono",
+    "Azeret Mono",
+    "Anonymous Pro",
+    "Space Mono",
+    "Go Mono",
+    "Departure Mono",
+    "Sometype Mono",
+    // CJK / Korean developer fonts (OFL) — useful for mixed Hangul + code.
+    "Sarasa Mono",
+    "Sarasa Term",
+    "Sarasa Fixed",
+    "D2Coding",
+    "Nanum Gothic Coding",
+    "NanumGothicCoding",
+    // Common Linux defaults / fallbacks.
+    "Noto Sans Mono",
+    "DejaVu Sans Mono",
+    "Liberation Mono",
+    "Cousine",
+    "Fira Mono",
+    "PT Mono",
+];
+
+/// Filter installed monospace families down to the curated developer fonts,
+/// returned in [`CURATED_DEV_FONTS`] popularity order (variants grouped under
+/// their base, in the alphabetical order `installed` already carries).
+fn recommended_families(installed: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for base in CURATED_DEV_FONTS {
+        let base = base.to_lowercase();
+        for fam in installed {
+            let lower = fam.to_lowercase();
+            let matches = lower == base || lower.starts_with(&format!("{base} "));
+            if matches && !out.iter().any(|f| f == fam) {
+                out.push(fam.clone());
+            }
+        }
+    }
+    out
+}
+
+/// System-installed monospace font families, de-duplicated and sorted
+/// case-insensitively. Pulled from the widget's Pango context so it reflects
+/// exactly what the terminal can render.
+fn monospace_families(widget: &impl IsA<gtk::Widget>) -> Vec<String> {
+    let ctx = widget.pango_context();
+    let mut names: Vec<String> = ctx
+        .list_families()
+        .into_iter()
+        .filter(|f| f.is_monospace())
+        .map(|f| f.name().to_string())
+        .collect();
+    names.sort_by_key(|s| s.to_lowercase());
+    names.dedup();
+    names
 }
 
 /// Serialize the current gtk::ColorDialogButton RGBA as `#rrggbb`.
@@ -516,6 +722,14 @@ mod tests {
         let focus_color = build_focus_color_button("#abcdef");
         let opacity = build_focus_opacity_row(40);
         let persist_off = build_persist_check(false);
+        // Two-entry font picker: index 0 = inherit, index 1 = a concrete family.
+        let family_drop = gtk::DropDown::from_strings(&["System default", "Fira Code"]);
+        let families = vec![None, Some("Fira Code".to_string())];
+        let size_spin = gtk::SpinButton::new(
+            Some(&gtk::Adjustment::new(12.0, 4.0, 96.0, 1.0, 4.0, 0.0)),
+            1.0,
+            0,
+        );
         let kb = KeybindingOverrides::default();
         let opts = collect_options(
             &zoom,
@@ -523,13 +737,23 @@ mod tests {
             &focus_color,
             &opacity.spin,
             &persist_off,
+            &family_drop,
+            &size_spin,
+            &families,
+            12.0,
             &kb,
         );
         assert_eq!(opts.zoom_percent, 120);
         assert_eq!(opts.default_browser_engine, BrowserEngine::Firefox);
         assert_eq!(opts.focus_border_opacity, 40);
         assert!(!opts.persist_browser_session);
+        // Index 0 selected + size left at the theme default → font inherits.
+        assert_eq!(opts.font_family, None);
+        assert_eq!(opts.font_size, None);
 
+        // Pick the concrete family and bump the size → both pin to overrides.
+        family_drop.set_selected(1);
+        size_spin.set_value(15.0);
         let persist_on = build_persist_check(true);
         let opts = collect_options(
             &zoom,
@@ -537,9 +761,48 @@ mod tests {
             &focus_color,
             &opacity.spin,
             &persist_on,
+            &family_drop,
+            &size_spin,
+            &families,
+            12.0,
             &kb,
         );
         assert!(opts.persist_browser_session);
+        assert_eq!(opts.font_family, Some("Fira Code".to_string()));
+        assert_eq!(opts.font_size, Some(15.0));
+    }
+
+    #[test]
+    fn recommended_families_filters_and_orders_by_popularity() {
+        // Mixed list as fontconfig would report it (alphabetical), with junk
+        // faces that must be dropped and a couple of curated variants.
+        let installed = vec![
+            "DejaVu Sans Mono".to_string(),
+            "Fira Code Retina".to_string(),
+            "JetBrains Mono".to_string(),
+            "Liberation Mono".to_string(),
+            "Monospace".to_string(),
+            "Nimbus Mono PS".to_string(),
+            "Noto Color Emoji".to_string(),
+        ];
+        let got = recommended_families(&installed);
+        // Junk (generic alias, PostScript clone, emoji) is gone; curated fonts
+        // come back in CURATED_DEV_FONTS popularity order, not alphabetical.
+        assert_eq!(
+            got,
+            vec![
+                "JetBrains Mono".to_string(),
+                "Fira Code Retina".to_string(),
+                "DejaVu Sans Mono".to_string(),
+                "Liberation Mono".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn recommended_families_dedupes_and_skips_unknown() {
+        let installed = vec!["Comic Sans MS".to_string(), "Hack".to_string()];
+        assert_eq!(recommended_families(&installed), vec!["Hack".to_string()]);
     }
 
     /// GTK init is needed to verify that the slider and SpinButton share the

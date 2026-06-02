@@ -1347,15 +1347,22 @@ impl WindowController {
                 let css_provider = self.css_provider.clone();
                 let theme = self.theme.clone();
                 let window = self.window.clone();
-                crate::ui::options_dialog::present(&self.window, current, move |opts| {
+                let default_font_family = theme.font_family();
+                let default_font_size = theme.font_size();
+                crate::ui::options_dialog::present(&self.window, current, default_font_family, default_font_size, move |opts| {
                     if let Err(e) = flowmux_config::options::save(&opts) {
                         tracing::warn!(error = %e, "options save failed");
                         return;
                     }
                     *options_cell.borrow_mut() = opts.clone();
-                    // Apply zoom immediately to all existing widgets.
+                    // Build the effective terminal font once (theme font with
+                    // the user's family / size overrides layered on) and apply
+                    // it live alongside the global zoom scale.
+                    let font =
+                        theme.font_with_overrides(opts.font_family.as_deref(), opts.font_size);
                     let registry = registry.borrow();
                     for terminal in registry.terminals.values() {
+                        terminal.set_font(&font);
                         terminal.set_font_scale(opts.zoom_factor());
                     }
                     for browser in registry.browsers.values() {

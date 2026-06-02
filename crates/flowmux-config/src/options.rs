@@ -107,6 +107,16 @@ pub struct Options {
     /// Default: [`PERSIST_BROWSER_SESSION_DEFAULT`] (`true`).
     #[serde(default = "default_persist_browser_session")]
     pub persist_browser_session: bool,
+    /// Terminal font family selected in the options dialog. `None` means
+    /// "inherit the resolved theme font" (the `font-family` from the theme
+    /// file, or the built-in `monospace` fallback). A `Some` value overrides
+    /// the theme font for all terminals live.
+    #[serde(default)]
+    pub font_family: Option<String>,
+    /// Terminal font size in points. `None` inherits the resolved theme size
+    /// (the theme file's `font-size`, or the built-in 12pt fallback).
+    #[serde(default)]
+    pub font_size: Option<f32>,
     /// User overrides for keyboard shortcuts. Partial overlay over the
     /// built-in defaults exposed by
     /// [`crate::keybindings::defaults`] — actions absent from this map
@@ -142,6 +152,8 @@ impl Default for Options {
             focus_border_color: default_focus_color(),
             focus_border_opacity: default_focus_border_opacity(),
             persist_browser_session: default_persist_browser_session(),
+            font_family: None,
+            font_size: None,
             keybindings: KeybindingOverrides::default(),
         }
     }
@@ -211,6 +223,19 @@ impl Options {
     /// Builder-style setter for the browser-session persistence flag.
     pub fn with_persist_browser_session(mut self, persist: bool) -> Self {
         self.persist_browser_session = persist;
+        self
+    }
+
+    /// Builder-style setter for the terminal font family. An empty string
+    /// resets to `None` (inherit the theme font).
+    pub fn with_font_family(mut self, family: Option<String>) -> Self {
+        self.font_family = family.filter(|s| !s.trim().is_empty());
+        self
+    }
+
+    /// Builder-style setter for the terminal font size in points.
+    pub fn with_font_size(mut self, size: Option<f32>) -> Self {
+        self.font_size = size;
         self
     }
 }
@@ -631,6 +656,51 @@ mod tests {
     fn empty_object_deserializes_persist_browser_session_default() {
         let opts: Options = serde_json::from_str("{}").unwrap();
         assert!(opts.persist_browser_session);
+    }
+
+    // ===== font_family / font_size =====
+
+    #[test]
+    fn default_font_is_inherited_from_theme() {
+        let opts = Options::default();
+        assert_eq!(opts.font_family, None);
+        assert_eq!(opts.font_size, None);
+    }
+
+    #[test]
+    fn with_font_family_drops_empty_to_none() {
+        assert_eq!(
+            Options::default()
+                .with_font_family(Some("JetBrains Mono".into()))
+                .font_family,
+            Some("JetBrains Mono".into())
+        );
+        assert_eq!(
+            Options::default()
+                .with_font_family(Some("  ".into()))
+                .font_family,
+            None
+        );
+    }
+
+    #[test]
+    fn options_save_then_load_preserves_font_overrides() {
+        with_xdg(|_| {
+            let opts = Options::default()
+                .with_font_family(Some("Fira Code".into()))
+                .with_font_size(Some(14.0));
+            save(&opts).unwrap();
+            let back = load();
+            assert_eq!(back.font_family, Some("Fira Code".into()));
+            assert_eq!(back.font_size, Some(14.0));
+        });
+    }
+
+    #[test]
+    fn missing_font_fields_load_as_none() {
+        let opts: Options = serde_json::from_str(r#"{"zoom_percent": 100}"#).unwrap();
+        assert_eq!(opts.font_family, None);
+        assert_eq!(opts.font_size, None);
     }
 
     #[test]

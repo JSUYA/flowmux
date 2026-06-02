@@ -112,6 +112,46 @@ impl ResolvedTheme {
         }
     }
 
+    /// Resolved theme font family (the `font-family` from the theme file, or
+    /// the built-in `monospace` fallback). Used to seed the options dialog
+    /// when the user has no font override.
+    pub fn font_family(&self) -> String {
+        self.font
+            .family()
+            .map(|f| f.to_string())
+            .unwrap_or_else(|| "monospace".to_string())
+    }
+
+    /// Resolved theme font size in points (the theme file's `font-size`, or
+    /// the built-in 12pt fallback).
+    pub fn font_size(&self) -> f32 {
+        let size = self.font.size();
+        if size <= 0 {
+            12.0
+        } else {
+            size as f32 / pango::SCALE as f32
+        }
+    }
+
+    /// Build the effective terminal font: start from the resolved theme font
+    /// and layer the options dialog's family / size overrides on top. `None`
+    /// for either field keeps the theme value, so a fresh install with no
+    /// overrides reproduces the theme font exactly.
+    pub fn font_with_overrides(
+        &self,
+        family: Option<&str>,
+        size: Option<f32>,
+    ) -> pango::FontDescription {
+        let mut desc = self.font.clone();
+        if let Some(family) = family.map(str::trim).filter(|f| !f.is_empty()) {
+            desc.set_family(family);
+        }
+        if let Some(size) = size.filter(|s| *s > 0.0) {
+            desc.set_size((size * pango::SCALE as f32).round() as i32);
+        }
+        desc
+    }
+
     pub fn apply_to_terminal(&self, term: &crate::ui::terminal_pane::TerminalPane) {
         let vte: &vte::Terminal = &term.widget;
         vte.set_font(Some(&self.font));

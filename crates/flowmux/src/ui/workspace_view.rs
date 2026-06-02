@@ -1460,8 +1460,11 @@ fn build_panel(
                 callbacks.clone(),
             );
             theme.apply_to_terminal(&pane);
-            // Start the new terminal widget with the current zoom option.
-            pane.set_font_scale((callbacks.read_options)().zoom_factor());
+            // Start the new terminal widget with the current font + zoom
+            // options so a freshly spawned tab matches the live ones.
+            let opts = (callbacks.read_options)();
+            pane.set_font(&theme.font_with_overrides(opts.font_family.as_deref(), opts.font_size));
+            pane.set_font_scale(opts.zoom_factor());
 
             {
                 let cb = callbacks.on_terminal_cwd_changed.clone();
