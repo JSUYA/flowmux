@@ -267,6 +267,13 @@ impl TerminalPane {
         // even when the foreground app has hidden the terminal cursor.
         install_preedit_redraw_on_keystroke(&container, &term);
 
+        // Order Enter behind a still-composing IME syllable so "안녕하세요"
+        // + Enter submits "…요\n" and never "…세\n요". Only the ibus
+        // immodule has the asynchronous-commit hazard this fixes.
+        if ibus_im_module_active() {
+            install_enter_preedit_commit_ordering(&term);
+        }
+
         let smart_page_enabled = terminal_capture_key_controllers_enabled(env_flag_enabled(
             "FLOWMUX_ENABLE_VTE_CAPTURE_KEYS",
         ));
@@ -715,6 +722,82 @@ fn flush_pending_preedit(term: &vte::Terminal) {
     term.grab_focus();
 }
 
+/// True when the active GTK IM module is the ibus immodule — the only
+/// configuration with the asynchronous-commit ordering hazard the Enter
+/// handler below works around. `main.rs` forces `GTK_IM_MODULE=ibus`
+/// when ibus is reachable, so reading the env here reflects that choice.
+fn ibus_im_module_active() -> bool {
+    std::env::var("GTK_IM_MODULE")
+        .map(|m| m.trim() == "ibus")
+        .unwrap_or(false)
+}
+
+/// Submit Enter as a carriage return, but only *after* any IME syllable
+/// still in preedit (e.g. a composing Hangul block) has been committed
+/// to the PTY. Otherwise the newline overtakes the asynchronous commit
+/// and the last syllable lands on the next line: typing "안녕하세요" and
+/// pressing Enter while "요" is still composing produces "안녕하세\n요"
+/// instead of "안녕하세요\n".
+///
+/// `IBUS_ENABLE_SYNC_MODE=1` alone does not order this on GTK4 + VTE, and
+/// feeding CR straight after `flush_pending_preedit` races the commit on
+/// both the native (24.04) and Flatpak (22.04) paths.
+///
+/// Mechanism: intercept a plain Enter, force the pending syllable to
+/// commit (focus-cycle flush), and arm a one-shot. VTE writes committed
+/// bytes to the child during the `commit` emission, so queuing CR from
+/// that handler — on an idle tick, after the emission returns — orders
+/// it behind the syllable no matter how VTE sequences feed-vs-emit. A
+/// short timeout fallback submits a bare Enter when nothing is composing
+/// (no commit fires) or for an IM that does not commit on focus-out.
+///
+/// Uses a `ShortcutController` (fires only on the Enter keysyms), not a
+/// blanket capture `EventControllerKey`, so every other key — including
+/// the jamo keys IBus needs during composition — reaches VTE untouched.
+fn install_enter_preedit_commit_ordering(term: &vte::Terminal) {
+    let armed = Rc::new(Cell::new(false));
+
+    {
+        let armed = armed.clone();
+        term.connect_commit(move |t, _text, _size| {
+            if armed.replace(false) {
+                let t = t.clone();
+                glib::idle_add_local_once(move || t.feed_child(b"\r"));
+            }
+        });
+    }
+
+    let controller = gtk::ShortcutController::new();
+    controller.set_propagation_phase(gtk::PropagationPhase::Capture);
+    controller.set_scope(gtk::ShortcutScope::Local);
+
+    let term_widget = term.clone();
+    let armed_action = armed.clone();
+    let action = gtk::CallbackAction::new(move |_, _| {
+        armed_action.set(true);
+        flush_pending_preedit(&term_widget);
+        let t = term_widget.clone();
+        let armed_fb = armed_action.clone();
+        glib::timeout_add_local_once(std::time::Duration::from_millis(20), move || {
+            if armed_fb.replace(false) {
+                t.feed_child(b"\r");
+            }
+        });
+        glib::Propagation::Stop
+    });
+
+    for keyval in [
+        gtk::gdk::Key::Return,
+        gtk::gdk::Key::ISO_Enter,
+        gtk::gdk::Key::KP_Enter,
+    ] {
+        let trigger = gtk::KeyvalTrigger::new(keyval, gtk::gdk::ModifierType::empty());
+        controller.add_shortcut(gtk::Shortcut::new(Some(trigger), Some(action.clone())));
+    }
+
+    term.add_controller(controller);
+}
+
 fn terminal_capture_key_controllers_enabled(enable_env_enabled: bool) -> bool {
     enable_env_enabled
 }
@@ -850,11 +933,11 @@ fn install_smart_page_keys(term: &vte::Terminal, scroll_adjustment: &gtk::Adjust
 ///     for preedit; bypassing them made Claude show only committed
 ///     syllables instead of the in-progress Hangul composition.
 ///
-/// BackSpace / Delete / KP_Delete and Enter (Return / ISO_Enter /
-/// KP_Enter) ARE intercepted — otherwise the 22.04 daemon-path drops
-/// them in Hangul mode (deletion stalls, Enter does not submit). See the
-/// inline notes at their `bind_key` calls; both rely on
-/// `flush_pending_preedit` to commit any composing syllable first.
+/// BackSpace / Delete / KP_Delete ARE intercepted — otherwise the 22.04
+/// daemon-path drops them in Hangul mode and deletion stalls. See the
+/// inline note at their `bind_key` calls; they rely on
+/// `flush_pending_preedit` to commit any composing syllable first. Enter
+/// is handled separately by `install_enter_preedit_commit_ordering`.
 ///
 /// Active when, and `FLOWMUX_NO_IBUS_NAV_WORKAROUND=1` overrides:
 ///   * running inside a Flatpak sandbox (`/.flatpak-info` exists), or
@@ -870,8 +953,6 @@ fn flatpak_ibus_bypass_bytes(keyval: gtk::gdk::Key) -> Option<&'static [u8]> {
         Some(b"\x7f")
     } else if keyval == Key::Delete || keyval == Key::KP_Delete {
         Some(b"\x1b[3~")
-    } else if keyval == Key::Return || keyval == Key::ISO_Enter || keyval == Key::KP_Enter {
-        Some(b"\r")
     } else if keyval == Key::Left || keyval == Key::KP_Left {
         Some(b"\x1b[D")
     } else if keyval == Key::Right || keyval == Key::KP_Right {
@@ -976,16 +1057,9 @@ fn install_flatpak_ibus_nav_workaround(term: &vte::Terminal, smart_page_enabled:
     bind_key(gtk::gdk::Key::Delete);
     bind_key(gtk::gdk::Key::Tab);
     bind_key(gtk::gdk::Key::Escape);
-    // Enter (Return / ISO_Enter / KP_Enter) is bypassed too: in Hangul
-    // mode the 22.04 daemon-path drops the forwarded key, so a plain
-    // Enter never reaches the PTY and the line is not submitted. The
-    // bypass runs `flush_pending_preedit` first, committing any syllable
-    // still composing, then sends CR. Shift+Enter (SHIFT modifier) and
-    // Alt+Enter never match these empty-modifier triggers, so their
-    // dedicated handlers are unaffected.
-    bind_key(gtk::gdk::Key::Return);
-    bind_key(gtk::gdk::Key::ISO_Enter);
-    bind_key(gtk::gdk::Key::KP_Enter);
+    // Enter (Return / ISO_Enter / KP_Enter) is handled by
+    // `install_enter_preedit_commit_ordering`, which also fixes its
+    // commit-vs-newline ordering, so it is intentionally not bound here.
     bind_key(gtk::gdk::Key::Left);
     bind_key(gtk::gdk::Key::Right);
     bind_key(gtk::gdk::Key::Up);
@@ -1349,7 +1423,8 @@ mod tests {
 
         // Character keys must reach IBus so composition works; only the
         // plain non-character / edit keys the 22.04 daemon-path drops are
-        // bypassed.
+        // bypassed. Enter is handled by the dedicated commit-ordering
+        // controller, not this table, so it stays off the bypass too.
         for key in [
             Key::space,
             Key::a,
@@ -1358,21 +1433,15 @@ mod tests {
             Key::period,
             Key::KP_1,
             Key::KP_Add,
+            Key::Return,
+            Key::ISO_Enter,
+            Key::KP_Enter,
         ] {
             assert!(
                 flatpak_ibus_bypass_bytes(key).is_none(),
                 "{key:?} must stay on VTE's IM path"
             );
         }
-    }
-
-    #[test]
-    fn flatpak_ibus_bypass_covers_enter_keys() {
-        use gtk::gdk::Key;
-
-        assert_eq!(flatpak_ibus_bypass_bytes(Key::Return), Some(&b"\r"[..]));
-        assert_eq!(flatpak_ibus_bypass_bytes(Key::ISO_Enter), Some(&b"\r"[..]));
-        assert_eq!(flatpak_ibus_bypass_bytes(Key::KP_Enter), Some(&b"\r"[..]));
     }
 
     #[test]
