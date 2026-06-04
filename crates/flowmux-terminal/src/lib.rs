@@ -143,8 +143,10 @@ pub trait TerminalBackend {
     fn close(&mut self, pane: PaneId) -> Result<(), TerminalError>;
 }
 
+pub mod engine;
 pub mod ghostty_backend;
 pub mod key_modes;
+pub mod render;
 
 pub use key_modes::TerminalInputModes;
 

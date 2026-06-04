@@ -60,6 +60,12 @@ libc = "0.2"
 # TOML editing (Codex `~/.codex/config.toml`).
 toml_edit = { version = "0.22", features = ["display"] }
 
+# Pure-Rust terminal engine (replaces the VTE widget). alacritty_terminal
+# owns the VT parser, grid, scrollback, selection model, the PTY (its `tty`
+# + `event_loop` modules) and — crucially — built-in damage/dirty-line
+# tracking the GTK renderer drives off of.
+alacritty_terminal = "0.26"
+
 # Workspace-internal
 flowmux-core = { path = "crates/flowmux-core" }
 flowmux-config = { path = "crates/flowmux-config" }

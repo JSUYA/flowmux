@@ -5,8 +5,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish = false
-description = "Libghostty-oriented terminal backend contract for flowmux."
+description = "Pure-Rust terminal backend (alacritty_terminal engine) for flowmux."
 
 [dependencies]
 flowmux-core = { workspace = true }
 thiserror = { workspace = true }
+alacritty_terminal = { workspace = true }
