@@ -16,7 +16,7 @@
 //! map to [`BrowserProfile`] values that isolate cookies, localStorage, and
 //! IndexedDB directories.
 
-use crate::ui::terminal_pane::PaneCallbacks;
+use crate::ui::pane_common::PaneCallbacks;
 use flowmux_browser::{BrowserProfile, RefScope, RefStore};
 use flowmux_config::options::BrowserEngine;
 use flowmux_core::{PaneId, SurfaceId};

@@ -7,7 +7,8 @@
 
 use crate::theme::ResolvedTheme;
 use crate::ui::browser_pane::BrowserPane;
-use crate::ui::terminal_pane::{PaneCallbacks, TerminalPane};
+use crate::ui::pane_common::PaneCallbacks;
+use crate::ui::terminal_pane_native::TerminalPaneNative;
 use flowmux_core::{
     terminal_tab_title_for_cwd, Pane, PaneContent, PaneId, PaneSurface, SplitDirection, Surface,
     SurfaceId, SurfaceKind, Workspace, WorkspaceId,
@@ -37,7 +38,7 @@ pub fn solo_workspace_pane(ws: &Workspace) -> Option<PaneId> {
 
 #[derive(Default)]
 pub struct PaneRegistry {
-    pub terminals: HashMap<SurfaceId, TerminalPane>,
+    pub terminals: HashMap<SurfaceId, TerminalPaneNative>,
     pub browsers: HashMap<SurfaceId, BrowserPane>,
     active_terminal_by_pane: HashMap<PaneId, SurfaceId>,
     active_browser_by_pane: HashMap<PaneId, SurfaceId>,
@@ -67,7 +68,7 @@ pub struct TornOffSurface {
 }
 
 impl PaneRegistry {
-    pub fn active_terminal(&self, pane: PaneId) -> Option<&TerminalPane> {
+    pub fn active_terminal(&self, pane: PaneId) -> Option<&TerminalPaneNative> {
         self.active_terminal_by_pane
             .get(&pane)
             .and_then(|surface| self.terminals.get(surface))
@@ -1451,7 +1452,7 @@ fn build_panel(
                 &socket,
                 bundled_cli.as_deref(),
             );
-            let pane = TerminalPane::spawn(
+            let pane = TerminalPaneNative::spawn(
                 pane_id,
                 surface.id,
                 argv,
@@ -1459,7 +1460,7 @@ fn build_panel(
                 extra_env,
                 callbacks.clone(),
             );
-            theme.apply_to_terminal(&pane);
+            pane.set_theme_palette(theme.native_palette());
             // Start the new terminal widget with the current font + zoom
             // options so a freshly spawned tab matches the live ones.
             let opts = (callbacks.read_options)();

@@ -10,7 +10,7 @@ use crate::keybindings::FocusedPane;
 use crate::notifications::{NotificationStore, RemoveOutcome, SetDesktopIdResult};
 use crate::theme::ResolvedTheme;
 use crate::ui::sidebar::Sidebar;
-use crate::ui::terminal_pane::PaneCallbacks;
+use crate::ui::pane_common::PaneCallbacks;
 use crate::ui::workspace_view::{
     attach_surface_to_pane, build_surface, solo_workspace_pane, split_pane_incremental,
     IncrementalSplitOutcome, PaneRegistry, TornOffSurface,
@@ -5396,7 +5396,7 @@ mod tests {
             let r = controller.pane_registry.borrow();
             r.active_terminal(original)
                 .expect("rendered workspace should expose a terminal for the only pane")
-                .widget
+                .render
                 .clone()
         };
         let original_frame_pre_split = controller
@@ -5422,7 +5422,7 @@ mod tests {
             .borrow()
             .active_terminal(original)
             .expect("original pane must still have an active terminal after split")
-            .widget
+            .render
             .clone();
         let original_frame_after_split = controller
             .pane_registry
@@ -5459,7 +5459,7 @@ mod tests {
                 "regression: closing the split sibling dropped the surviving pane's terminal entry — \
                  a fresh terminal means the running shell / agent was killed",
             )
-            .widget
+            .render
             .clone();
         let original_frame_after_close = controller
             .pane_registry
@@ -5534,7 +5534,7 @@ mod tests {
             .borrow()
             .active_terminal(pane_a)
             .expect("pane A terminal must be registered")
-            .widget
+            .render
             .clone();
         let a_frame_initial = controller
             .pane_registry
@@ -5556,7 +5556,7 @@ mod tests {
             .borrow()
             .active_terminal(pane_b)
             .expect("pane B terminal must be registered after first split")
-            .widget
+            .render
             .clone();
 
         // Second split: split B horizontally → B (top) over C (bottom).
@@ -5574,14 +5574,14 @@ mod tests {
             .borrow()
             .active_terminal(pane_a)
             .expect("pane A terminal must survive both splits")
-            .widget
+            .render
             .clone();
         let b_terminal_after_splits = controller
             .pane_registry
             .borrow()
             .active_terminal(pane_b)
             .expect("pane B terminal must survive its own split")
-            .widget
+            .render
             .clone();
         assert!(
             a_terminal_initial == a_terminal_after_splits,
@@ -5610,14 +5610,14 @@ mod tests {
                 "regression: pane A vanished from registry — the close fell back to a full \
                  rerender and any agent running in A is now dead",
             )
-            .widget
+            .render
             .clone();
         let b_terminal_after_close = controller
             .pane_registry
             .borrow()
             .active_terminal(pane_b)
             .expect("regression: pane B vanished from registry after closing inner sibling C")
-            .widget
+            .render
             .clone();
         let a_frame_after_close = controller
             .pane_registry
