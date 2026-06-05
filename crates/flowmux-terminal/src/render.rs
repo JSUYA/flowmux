@@ -348,7 +348,7 @@ fn default_named(named: NamedColor, theme: &ThemePalette) -> CellColor {
 
 /// 256-color table: 0–15 from the theme, 16–231 6×6×6 cube, 232–255
 /// grayscale ramp.
-fn default_indexed(idx: u8, theme: &ThemePalette) -> CellColor {
+pub(crate) fn default_indexed(idx: u8, theme: &ThemePalette) -> CellColor {
     match idx {
         0..=15 => theme.ansi[idx as usize],
         16..=231 => {

@@ -201,6 +201,7 @@ impl TerminalPaneNative {
         wire_scroll(&pane);
         wire_mouse_report(&pane);
         wire_mouse_motion(&pane);
+        wire_middle_paste(&pane);
         wire_url_click(&pane, &callbacks);
         wire_mouse_selection(&pane, &callbacks);
         wire_focus_and_menu(&pane, surface, &callbacks);
@@ -326,6 +327,25 @@ impl TerminalPaneNative {
                 .clipboard()
                 .read_text_async(gtk::gio::Cancellable::NONE, move |res| {
                     if let Ok(Some(text)) = res {
+                        let e = engine.borrow();
+                        e.write_keys(bracketed_paste_payload(&text, e.bracketed_paste()));
+                    }
+                });
+        }
+    }
+
+    /// Paste the PRIMARY selection (X11/Wayland middle-click paste), wrapped
+    /// in bracketed-paste markers when the app requested DECSET 2004.
+    pub fn paste_primary(&self) {
+        let engine = self.engine.clone();
+        if let Some(display) = gtk::gdk::Display::default() {
+            display
+                .primary_clipboard()
+                .read_text_async(gtk::gio::Cancellable::NONE, move |res| {
+                    if let Ok(Some(text)) = res {
+                        if text.is_empty() {
+                            return;
+                        }
                         let e = engine.borrow();
                         e.write_keys(bracketed_paste_payload(&text, e.bracketed_paste()));
                     }
@@ -739,6 +759,24 @@ fn wire_mouse_motion(pane: &TerminalPaneNative) {
     pane.render.add_controller(motion);
 }
 
+/// Middle-click pastes the PRIMARY selection (X11/Wayland convention). When
+/// the app grabbed the mouse via mouse-reporting the click is left to the
+/// click reporter instead.
+fn wire_middle_paste(pane: &TerminalPaneNative) {
+    let render = pane.render.clone();
+    let pane = pane.clone();
+    let click = gtk::GestureClick::new();
+    click.set_button(gtk::gdk::BUTTON_MIDDLE);
+    click.connect_pressed(move |gesture, _n, _x, _y| {
+        if pane.engine.borrow().mouse_report() {
+            return;
+        }
+        pane.paste_primary();
+        gesture.set_state(gtk::EventSequenceState::Claimed);
+    });
+    render.add_controller(click);
+}
+
 /// Ctrl+left-click on a URL opens it in a browser tab (via `on_open_url`).
 fn wire_url_click(pane: &TerminalPaneNative, callbacks: &PaneCallbacks) {
     let engine = pane.engine.clone();
@@ -891,12 +929,23 @@ fn wire_mouse_selection(pane: &TerminalPaneNative, callbacks: &PaneCallbacks) {
     });
     drag.connect_drag_end(move |_, _, _| {
         render_w.set_selecting(false);
-        // A click (or a drag that never covered a cell) leaves an empty
-        // selection; drop it so `has_selection()` / Copy stay accurate and no
-        // stale highlight lingers.
-        if !engine.borrow().has_selection() {
-            engine.borrow().selection_clear();
+        let e = engine.borrow();
+        if e.has_selection() {
+            // Mirror the finished selection to the PRIMARY clipboard so a
+            // middle-click pastes it (X11/Wayland convention).
+            if let (Some(text), Some(display)) = (e.selection_text(), gtk::gdk::Display::default())
+            {
+                if !text.is_empty() {
+                    display.primary_clipboard().set_text(&text);
+                }
+            }
+        } else {
+            // A click (or a drag that never covered a cell) leaves an empty
+            // selection; drop it so `has_selection()` / Copy stay accurate and
+            // no stale highlight lingers.
+            e.selection_clear();
         }
+        drop(e);
         repaint(&engine, &render_w, &theme);
     });
     pane.render.add_controller(drag);
@@ -1070,6 +1119,19 @@ fn wire_event_loop(
                 TermEvent::ClipboardStore(s) => {
                     if let Some(display) = gtk::gdk::Display::default() {
                         display.clipboard().set_text(&s);
+                    }
+                }
+                TermEvent::PtyWrite(bytes) => {
+                    // DA / DSR / cursor-position replies the terminal generated
+                    // for the app; write them straight back to the PTY.
+                    engine.borrow().write(bytes);
+                }
+                TermEvent::ColorRequest(index, responder) => {
+                    // Resolve the queried palette color and write the reply
+                    // (OSC 4/10/11/12) back so the app can detect the theme.
+                    let e = engine.borrow();
+                    if let Some(rgb) = e.resolve_osc_color(index, &theme.borrow()) {
+                        e.write(responder.0(rgb).into_bytes());
                     }
                 }
                 TermEvent::Exit => {

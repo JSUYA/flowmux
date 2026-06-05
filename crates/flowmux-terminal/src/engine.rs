@@ -29,6 +29,9 @@ use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::{Config, Term};
 use alacritty_terminal::tty::{self, Options as PtyOptions, Shell};
+use alacritty_terminal::vte::ansi::Rgb;
+
+use crate::render::{CellColor, ThemePalette};
 
 use crate::TerminalError;
 
@@ -66,8 +69,26 @@ pub enum TermEvent {
     Bell,
     /// Application asked to store text in the clipboard (OSC 52).
     ClipboardStore(String),
+    /// Terminal-generated reply that must be written back to the PTY: device
+    /// attributes (DA), cursor-position / device-status reports (DSR), etc.
+    /// Dropping these hangs TUIs that block on the response.
+    PtyWrite(Vec<u8>),
+    /// The app queried a palette color (OSC 4 / 10 / 11 / 12). The embedder
+    /// resolves the color and writes `responder(rgb)` back to the PTY.
+    ColorRequest(usize, ColorResponder),
     /// PTY child exited (or the terminal requested shutdown).
     Exit,
+}
+
+/// Wraps the `ColorRequest` reply formatter so [`TermEvent`] can keep its
+/// `Debug`/`Clone` derives (a bare `Arc<dyn Fn>` is not `Debug`).
+#[derive(Clone)]
+pub struct ColorResponder(pub Arc<dyn Fn(Rgb) -> String + Send + Sync>);
+
+impl std::fmt::Debug for ColorResponder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ColorResponder")
+    }
 }
 
 /// Sink for [`TermEvent`]s. Must be cheap to clone and thread-safe.
@@ -91,10 +112,13 @@ impl EventListener for Proxy {
             AlacEvent::ResetTitle => TermEvent::ResetTitle,
             AlacEvent::Bell => TermEvent::Bell,
             AlacEvent::ClipboardStore(_, s) => TermEvent::ClipboardStore(s),
+            AlacEvent::PtyWrite(s) => TermEvent::PtyWrite(s.into_bytes()),
+            AlacEvent::ColorRequest(index, formatter) => {
+                TermEvent::ColorRequest(index, ColorResponder(formatter))
+            }
             AlacEvent::Exit | AlacEvent::ChildExit(_) => TermEvent::Exit,
-            // MouseCursorDirty, ClipboardLoad, ColorRequest, PtyWrite,
-            // TextAreaSizeRequest, CursorBlinkingChange — not needed by
-            // the renderer yet; ignore rather than stub.
+            // MouseCursorDirty, ClipboardLoad, TextAreaSizeRequest,
+            // CursorBlinkingChange — not needed yet; ignore rather than stub.
             _ => return,
         };
         (self.sink)(mapped);
@@ -508,6 +532,33 @@ impl TermEngine {
         self.term.lock().mode().contains(TermMode::FOCUS_IN_OUT)
     }
 
+    /// Resolve an OSC color-query index (0..=255 palette, 256 = foreground,
+    /// 257 = background, 258 = cursor) to its current RGB, honoring any
+    /// app-set override (OSC 4/10/11) and otherwise falling back to the theme
+    /// and the standard xterm 256-color cube. `None` → no color to report.
+    pub fn resolve_osc_color(&self, index: usize, theme: &ThemePalette) -> Option<Rgb> {
+        // The override palette is fixed-size (indexed + named slots); anything
+        // past it has no color to report (and would panic the `Index` impl).
+        if index >= alacritty_terminal::term::color::COUNT {
+            return None;
+        }
+        if let Some(rgb) = self.term.lock().colors()[index] {
+            return Some(rgb);
+        }
+        let cc: CellColor = match index {
+            0..=255 => crate::render::default_indexed(index as u8, theme),
+            256 => theme.fg,
+            257 => theme.bg,
+            258 => theme.cursor,
+            _ => return None,
+        };
+        Some(Rgb {
+            r: cc.r,
+            g: cc.g,
+            b: cc.b,
+        })
+    }
+
     pub fn has_selection(&self) -> bool {
         self.term
             .lock()
@@ -620,6 +671,32 @@ mod tests {
             text.trim_end().ends_with("L12"),
             "selection followed the scroll: got {text:?}"
         );
+    }
+
+    #[test]
+    fn osc_color_resolves_cube_and_named() {
+        let theme = ThemePalette {
+            fg: CellColor::new(1, 2, 3),
+            bg: CellColor::new(4, 5, 6),
+            cursor: CellColor::new(7, 8, 9),
+            ansi: [CellColor::new(0, 0, 0); 16],
+            selection_bg: None,
+            selection_fg: None,
+        };
+        let engine = TermEngine::stub(5, 10);
+        // 256-cube: index 196 = pure red (5,0,0) → (255,0,0).
+        let red = engine.resolve_osc_color(196, &theme).unwrap();
+        assert_eq!((red.r, red.g, red.b), (255, 0, 0));
+        // Grayscale ramp: index 232 → 8,8,8.
+        let gray = engine.resolve_osc_color(232, &theme).unwrap();
+        assert_eq!((gray.r, gray.g, gray.b), (8, 8, 8));
+        // Named: 256 = foreground, 257 = background, 258 = cursor.
+        let fg = engine.resolve_osc_color(256, &theme).unwrap();
+        assert_eq!((fg.r, fg.g, fg.b), (1, 2, 3));
+        let bg = engine.resolve_osc_color(257, &theme).unwrap();
+        assert_eq!((bg.r, bg.g, bg.b), (4, 5, 6));
+        // Out of range → no reply.
+        assert!(engine.resolve_osc_color(999, &theme).is_none());
     }
 
     #[test]
