@@ -422,10 +422,14 @@ fn append_text_run(
         layout.set_attributes(Some(&attrs));
     }
     snapshot.save();
-    // Baseline-align: pango draws from the layout's top, which already
-    // includes the font ascent, so a plain y-offset of 0 is correct when
-    // the run node is later translated to the row's top.
-    snapshot.translate(&graphene::Point::new(x, 0.0));
+    // Baseline-align every run to the cell's ascent. pango draws from the
+    // layout's top; the distance from that top to the text baseline is the
+    // run font's own ascent, which differs between the primary monospace
+    // font and the CJK fallback used for Hangul. Translating by
+    // `cell_ascent - run_baseline` puts every run's baseline on the same
+    // line, so Latin and Hangul no longer sit at different heights.
+    let run_baseline = layout.baseline() as f32 / pango::SCALE as f32;
+    snapshot.translate(&graphene::Point::new(x, font.ascent - run_baseline));
     snapshot.append_layout(&layout, &rgba(fg));
     snapshot.restore();
 }
@@ -461,6 +465,11 @@ fn draw_preedit(
     let attrs = pango::AttrList::new();
     attrs.insert(pango::AttrInt::new_underline(pango::Underline::Single));
     layout.set_attributes(Some(&attrs));
+    // Baseline-align like committed text: the composing run's font (CJK
+    // fallback for Hangul) has its own ascent, so drawing from the top sits
+    // it low. Offset by `cell_ascent - run_baseline` to share the baseline.
+    let run_baseline = layout.baseline() as f32 / pango::SCALE as f32;
+    snapshot.translate(&graphene::Point::new(0.0, font.ascent - run_baseline));
     snapshot.append_layout(&layout, &rgba(frame.default_fg));
     snapshot.restore();
 }
