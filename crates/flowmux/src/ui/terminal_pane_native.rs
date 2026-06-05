@@ -62,6 +62,16 @@ pub struct TerminalPaneNative {
     /// programmatic-update ↔ user-drag feedback loop.
     scroll_adj: gtk::Adjustment,
     adj_updating: Rc<Cell<bool>>,
+    /// The IME context (None under the unit-test harness). Held so the
+    /// Shift+Enter "insert newline" path can flush a pending preedit
+    /// before writing the newline.
+    im: Rc<RefCell<Option<gtk::IMMulticontext>>>,
+    /// True while an IME preedit (composing) string is showing.
+    preedit_active: Rc<Cell<bool>>,
+    /// Newline bytes parked while the IME finalises a composing syllable;
+    /// written by the `commit` handler right after the syllable so the
+    /// order is "요" then newline, not newline then "요".
+    pending_newline: Rc<Cell<Option<&'static [u8]>>>,
 }
 
 impl TerminalPaneNative {
@@ -154,6 +164,9 @@ impl TerminalPaneNative {
             on_cwd_notify: on_cwd_notify.clone(),
             scroll_adj: scroll_adjustment.clone(),
             adj_updating: adj_updating.clone(),
+            im: Rc::new(RefCell::new(None)),
+            preedit_active: Rc::new(Cell::new(false)),
+            pending_newline: Rc::new(Cell::new(None)),
         };
 
         // User drags the scrollbar → scroll the viewport to match.
@@ -298,10 +311,32 @@ impl TerminalPaneNative {
         self.engine.borrow().write(bytes.to_vec());
     }
 
-    /// On the native backend there is no asynchronous IME commit hazard at
-    /// the widget level (preedit is owned by us), so this is a plain feed.
+    /// Feed `bytes` (e.g. Shift+Enter's `ESC CR`) to the PTY, but if an IME
+    /// preedit is composing, finalise it first so the committed syllable
+    /// lands *before* `bytes`. Shift+Enter arrives via a window accelerator
+    /// that bypasses the terminal's IME, so a naive write would emit the
+    /// newline ahead of the still-composing syllable ("안녕하세\n요"). We
+    /// park the newline and `reset()` the IME: its `commit` handler writes
+    /// the syllable and then the parked newline, in order. A short timeout
+    /// is the fallback for IMEs that cancel rather than commit on reset.
     pub fn feed_after_preedit_commit(&self, bytes: &'static [u8]) {
-        self.engine.borrow().write(bytes.to_vec());
+        if !self.preedit_active.get() {
+            self.engine.borrow().write(bytes.to_vec());
+            return;
+        }
+        self.pending_newline.set(Some(bytes));
+        if let Some(im) = self.im.borrow().as_ref() {
+            im.reset();
+        }
+        // Fallback: if reset() produced no commit, the parked newline is
+        // still set after a tick — flush it so Shift+Enter never no-ops.
+        let pending = self.pending_newline.clone();
+        let engine = self.engine.clone();
+        glib::timeout_add_local_once(std::time::Duration::from_millis(50), move || {
+            if let Some(nl) = pending.take() {
+                engine.borrow().write(nl.to_vec());
+            }
+        });
     }
 
     pub fn add_controller(&self, controller: impl IsA<gtk::EventController>) {
@@ -373,6 +408,7 @@ fn wire_keyboard(pane: &TerminalPaneNative) {
     if !cfg!(test) {
         im.set_client_widget(Some(&pane.render));
         key.set_im_context(Some(&im));
+        *pane.im.borrow_mut() = Some(im.clone());
         // Detach the IM context from the widget before the widget is
         // destroyed, so GTK's IM teardown never dereferences a dropped
         // client widget when a pane closes.
@@ -382,28 +418,42 @@ fn wire_keyboard(pane: &TerminalPaneNative) {
         });
     }
 
-    // commit → write the finished text to the PTY, clear preedit.
+    // commit → write the finished text to the PTY, clear preedit. If a
+    // Shift+Enter newline is parked (composing syllable being finalised),
+    // write it right after the committed text so the order is correct.
     {
         let engine = pane.engine.clone();
         let render = pane.render.clone();
+        let preedit_active = pane.preedit_active.clone();
+        let pending_newline = pane.pending_newline.clone();
         im.connect_commit(move |_, text| {
             if !text.is_empty() {
                 engine.borrow().write(text.as_bytes().to_vec());
             }
             render.set_preedit("");
+            preedit_active.set(false);
+            if let Some(nl) = pending_newline.take() {
+                engine.borrow().write(nl.to_vec());
+            }
         });
     }
     // preedit changed → show the composing string inline at the caret.
     {
         let render = pane.render.clone();
+        let preedit_active = pane.preedit_active.clone();
         im.connect_preedit_changed(move |im| {
             let (s, _attrs, _pos) = im.preedit_string();
+            preedit_active.set(!s.is_empty());
             render.set_preedit(&s);
         });
     }
     {
         let render = pane.render.clone();
-        im.connect_preedit_end(move |_| render.set_preedit(""));
+        let preedit_active = pane.preedit_active.clone();
+        im.connect_preedit_end(move |_| {
+            preedit_active.set(false);
+            render.set_preedit("");
+        });
     }
     // Keep the IM focused while the terminal is focused so candidate
     // windows position correctly.
