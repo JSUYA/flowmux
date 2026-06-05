@@ -336,6 +336,20 @@ impl TermEngine {
         }
     }
 
+    /// Select the semantic word (double-click) at viewport cell `(col, line)`.
+    /// Uses alacritty's `Semantic` selection so the range snaps to word
+    /// boundaries and follows word-wise when the drag is extended.
+    pub fn selection_word(&self, col: usize, line: usize) {
+        use alacritty_terminal::index::{Column, Line, Point, Side};
+        use alacritty_terminal::selection::{Selection, SelectionType};
+        let mut term = self.term.lock();
+        // Same viewport→absolute mapping as `selection_start`.
+        let off = term.grid().display_offset() as i32;
+        let point = Point::new(Line(line as i32 - off), Column(col));
+        let sel = Selection::new(SelectionType::Semantic, point, Side::Left);
+        term.selection = Some(sel);
+    }
+
     /// Clear any active selection.
     pub fn selection_clear(&self) {
         self.term.lock().selection = None;
@@ -539,5 +553,22 @@ mod tests {
             text.trim_end().ends_with("L12"),
             "selection followed the scroll: got {text:?}"
         );
+    }
+
+    #[test]
+    fn selection_word_snaps_to_word_boundaries() {
+        use alacritty_terminal::vte::ansi::Processor;
+
+        let engine = TermEngine::stub(3, 20);
+        {
+            let mut term = engine.term().lock();
+            let mut parser: Processor = Processor::new();
+            parser.advance(&mut *term, b"foo bar baz");
+        }
+
+        // Double-click anywhere inside "bar" (cols 4..=6) must grab the whole
+        // word, not a single cell.
+        engine.selection_word(5, 0);
+        assert_eq!(engine.selection_text().as_deref(), Some("bar"));
     }
 }

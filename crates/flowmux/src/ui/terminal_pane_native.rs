@@ -705,11 +705,27 @@ fn wire_mouse_selection(pane: &TerminalPaneNative, callbacks: &PaneCallbacks) {
     let theme = pane.theme.clone();
     let on_focus = callbacks.on_focus.clone();
     let id = pane.id;
+
+    // Press count for the in-flight gesture (1 = single, 2 = double, …).
+    // A capture-phase GestureClick stamps it *before* the drag gesture's
+    // `drag-begin` fires for the same press, so double-click can pick word
+    // selection without the drag clobbering it with a fresh 1-cell anchor.
+    let click_count = Rc::new(Cell::new(1u32));
+    {
+        let counter = gtk::GestureClick::new();
+        counter.set_button(gtk::gdk::BUTTON_PRIMARY);
+        counter.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let click_count = click_count.clone();
+        counter.connect_pressed(move |_, n, _, _| click_count.set((n as u32).max(1)));
+        pane.render.add_controller(counter);
+    }
+
     let drag = gtk::GestureDrag::new();
     drag.connect_drag_begin({
         let engine = engine.clone();
         let render_w = render_w.clone();
         let theme = theme.clone();
+        let click_count = click_count.clone();
         move |g, x, y| {
             render_w.grab_focus();
             (on_focus.borrow_mut())(id);
@@ -725,7 +741,10 @@ fn wire_mouse_selection(pane: &TerminalPaneNative, callbacks: &PaneCallbacks) {
                 let shift = g
                     .current_event_state()
                     .contains(gtk::gdk::ModifierType::SHIFT_MASK);
-                if shift && engine.borrow().has_selection() {
+                if click_count.get() >= 2 {
+                    // Double-click (or more): select the word under the cursor.
+                    engine.borrow().selection_word(col, line);
+                } else if shift && engine.borrow().has_selection() {
                     engine.borrow().selection_update(col, line, right);
                 } else {
                     engine.borrow().selection_start(col, line, right);
