@@ -352,6 +352,27 @@ impl TermEngine {
         });
     }
 
+    /// Write user-typed input (keys / IME commit / paste) to the PTY and,
+    /// if the viewport was scrolled up into scrollback, pin it back to the
+    /// bottom so the live input line is brought into view (matches xterm/
+    /// VTE). Returns `true` if it pinned, so the caller can repaint at once
+    /// instead of waiting for the echo. No-op pin on the alternate screen,
+    /// which has no scrollback.
+    pub fn write_keys(&self, bytes: impl Into<Cow<'static, [u8]>>) -> bool {
+        use alacritty_terminal::grid::Scroll;
+        let scrolled = {
+            let mut term = self.term.lock();
+            if term.grid().display_offset() != 0 {
+                term.scroll_display(Scroll::Bottom);
+                true
+            } else {
+                false
+            }
+        };
+        self.write(bytes);
+        scrolled
+    }
+
     /// Scrollback position as `(display_offset, history_lines)`:
     /// `display_offset` 0 = pinned to the bottom, `history_lines` = how
     /// many scrolled-off lines exist. Drives the scrollbar thumb.

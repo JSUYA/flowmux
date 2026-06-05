@@ -283,7 +283,8 @@ impl TerminalPaneNative {
 
     /// Paste clipboard text, wrapping it in bracketed-paste markers when
     /// the app requested DECSET 2004 so editors/shells treat it as pasted
-    /// data rather than typed commands.
+    /// data rather than typed commands. Same effect as the `paste` keybinding;
+    /// also the right-click "Paste" menu item.
     pub fn paste_clipboard(&self) {
         let engine = self.engine.clone();
         if let Some(display) = gtk::gdk::Display::default() {
@@ -292,15 +293,7 @@ impl TerminalPaneNative {
                 .read_text_async(gtk::gio::Cancellable::NONE, move |res| {
                     if let Ok(Some(text)) = res {
                         let e = engine.borrow();
-                        if e.bracketed_paste() {
-                            let mut buf = Vec::with_capacity(text.len() + 12);
-                            buf.extend_from_slice(b"\x1b[200~");
-                            buf.extend_from_slice(text.as_bytes());
-                            buf.extend_from_slice(b"\x1b[201~");
-                            e.write(buf);
-                        } else {
-                            e.write(text.as_bytes().to_vec());
-                        }
+                        e.write_keys(bracketed_paste_payload(&text, e.bracketed_paste()));
                     }
                 });
         }
@@ -321,7 +314,7 @@ impl TerminalPaneNative {
     /// is the fallback for IMEs that cancel rather than commit on reset.
     pub fn feed_after_preedit_commit(&self, bytes: &'static [u8]) {
         if !self.preedit_active.get() {
-            self.engine.borrow().write(bytes.to_vec());
+            self.engine.borrow().write_keys(bytes.to_vec());
             return;
         }
         self.pending_newline.set(Some(bytes));
@@ -334,7 +327,7 @@ impl TerminalPaneNative {
         let engine = self.engine.clone();
         glib::timeout_add_local_once(std::time::Duration::from_millis(50), move || {
             if let Some(nl) = pending.take() {
-                engine.borrow().write(nl.to_vec());
+                engine.borrow().write_keys(nl.to_vec());
             }
         });
     }
@@ -368,6 +361,22 @@ impl TerminalPaneNative {
         let frame = render::snapshot(&*term, &self.theme.borrow());
         drop(term);
         self.render.set_frame(frame);
+    }
+}
+
+/// Build the byte payload for a paste. When the app set DECSET 2004
+/// (`bracketed`), the text is wrapped in `ESC [ 200 ~` … `ESC [ 201 ~` so
+/// shells/editors treat it as pasted data rather than typed commands;
+/// otherwise the raw UTF-8 bytes are sent as-is.
+fn bracketed_paste_payload(text: &str, bracketed: bool) -> Vec<u8> {
+    if bracketed {
+        let mut buf = Vec::with_capacity(text.len() + 12);
+        buf.extend_from_slice(b"\x1b[200~");
+        buf.extend_from_slice(text.as_bytes());
+        buf.extend_from_slice(b"\x1b[201~");
+        buf
+    } else {
+        text.as_bytes().to_vec()
     }
 }
 
@@ -428,12 +437,12 @@ fn wire_keyboard(pane: &TerminalPaneNative) {
         let pending_newline = pane.pending_newline.clone();
         im.connect_commit(move |_, text| {
             if !text.is_empty() {
-                engine.borrow().write(text.as_bytes().to_vec());
+                engine.borrow().write_keys(text.as_bytes().to_vec());
             }
             render.set_preedit("");
             preedit_active.set(false);
             if let Some(nl) = pending_newline.take() {
-                engine.borrow().write(nl.to_vec());
+                engine.borrow().write_keys(nl.to_vec());
             }
         });
     }
@@ -487,7 +496,13 @@ fn wire_keyboard(pane: &TerminalPaneNative) {
         let app_cursor = engine.borrow().app_cursor_mode();
         match encode_key(keyval, state, app_cursor) {
             Some(bytes) => {
-                engine.borrow().write(bytes);
+                let e = engine.borrow();
+                let scrolled = e.write_keys(bytes);
+                if scrolled {
+                    drop(e);
+                    repaint(&engine, &render_w, &theme);
+                    sync_scrollbar(&engine, &adj, &updating);
+                }
                 glib::Propagation::Stop
             }
             None => glib::Propagation::Proceed,
@@ -950,6 +965,43 @@ fn maybe_alt(alt: bool, mut bytes: Vec<u8>) -> Vec<u8> {
         v
     } else {
         bytes
+    }
+}
+
+#[cfg(test)]
+mod paste_tests {
+    use super::bracketed_paste_payload;
+
+    #[test]
+    fn wraps_in_markers_when_bracketed() {
+        assert_eq!(
+            bracketed_paste_payload("ls -la", true),
+            b"\x1b[200~ls -la\x1b[201~".to_vec()
+        );
+    }
+
+    #[test]
+    fn raw_bytes_when_not_bracketed() {
+        assert_eq!(bracketed_paste_payload("ls -la", false), b"ls -la".to_vec());
+    }
+
+    #[test]
+    fn preserves_utf8_and_newlines() {
+        let text = "에코\n안녕";
+        assert_eq!(bracketed_paste_payload(text, false), text.as_bytes().to_vec());
+        let wrapped = bracketed_paste_payload(text, true);
+        assert!(wrapped.starts_with(b"\x1b[200~"));
+        assert!(wrapped.ends_with(b"\x1b[201~"));
+        assert_eq!(&wrapped[6..wrapped.len() - 6], text.as_bytes());
+    }
+
+    #[test]
+    fn empty_text() {
+        assert_eq!(bracketed_paste_payload("", false), Vec::<u8>::new());
+        assert_eq!(
+            bracketed_paste_payload("", true),
+            b"\x1b[200~\x1b[201~".to_vec()
+        );
     }
 }
 
