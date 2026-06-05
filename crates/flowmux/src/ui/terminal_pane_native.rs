@@ -236,9 +236,16 @@ impl TerminalPaneNative {
     }
 
     /// Best-effort shell cwd via `/proc/<pid>/cwd` (updates on `cd`).
+    ///
+    /// The engine's child is `flowmuxctl pty-tee`, a wrapper whose own cwd
+    /// never changes — reading its `/proc/<pid>/cwd` always returns the launch
+    /// directory, so new panes opened "here" kept landing on the old path.
+    /// Descend to the foreground leaf (the shell, or whatever it is running)
+    /// and read THAT cwd so `cd` is reflected.
     pub fn current_dir(&self) -> Option<PathBuf> {
         let pid = self.engine.borrow().pid()?;
-        std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
+        let leaf = foreground_leaf_pid(pid);
+        std::fs::read_link(format!("/proc/{leaf}/cwd")).ok()
     }
 
     pub fn title(&self) -> String {
@@ -731,6 +738,29 @@ fn url_at(row: &str, col: usize) -> Option<String> {
         )
     });
     (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+/// Follow the last child at each level from `root` down to a process with no
+/// children, returning that leaf pid. The terminal's real shell is a child of
+/// the `pty-tee` wrapper (and a running program is in turn a child of the
+/// shell), so the leaf's `/proc/<pid>/cwd` is the directory the user is
+/// actually in. Bounded so a pathological tree can't spin.
+fn foreground_leaf_pid(mut pid: u32) -> u32 {
+    for _ in 0..32 {
+        let path = format!("/proc/{pid}/task/{pid}/children");
+        let Ok(s) = std::fs::read_to_string(&path) else {
+            break;
+        };
+        let Some(child) = s
+            .split_whitespace()
+            .last()
+            .and_then(|t| t.parse::<u32>().ok())
+        else {
+            break;
+        };
+        pid = child;
+    }
+    pid
 }
 
 fn wire_mouse_selection(pane: &TerminalPaneNative, callbacks: &PaneCallbacks) {
