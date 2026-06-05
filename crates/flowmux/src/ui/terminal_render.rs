@@ -297,12 +297,7 @@ fn build_row_node(
             }
             row_snapshot.append_color(
                 &rgba(bg),
-                &graphene::Rect::new(
-                    col as f32 * cell_w,
-                    0.0,
-                    run_cols as f32 * cell_w,
-                    cell_h,
-                ),
+                &graphene::Rect::new(col as f32 * cell_w, 0.0, run_cols as f32 * cell_w, cell_h),
             );
             col = peek;
         } else {
@@ -448,16 +443,15 @@ fn draw_preedit(
     let x = col as f32 * font.cell_w;
     let y = line as f32 * font.cell_h;
     // Width in cells: account for wide (CJK) glyphs counting as two.
-    let cells: usize = text
-        .chars()
-        .map(|c| if is_wide(c) { 2 } else { 1 })
-        .sum();
+    let cells: usize = text.chars().map(|c| if is_wide(c) { 2 } else { 1 }).sum();
     let w = cells.max(1) as f32 * font.cell_w;
 
     snapshot.save();
     snapshot.translate(&graphene::Point::new(x, y));
     // Highlight background so the composing text is distinct from output.
-    let bg = frame.selection_bg.unwrap_or(CellColor::new(0x33, 0x44, 0x66));
+    let bg = frame
+        .selection_bg
+        .unwrap_or(CellColor::new(0x33, 0x44, 0x66));
     snapshot.append_color(&rgba(bg), &graphene::Rect::new(0.0, 0.0, w, font.cell_h));
 
     let layout = widget.create_pango_layout(Some(text));
@@ -501,9 +495,7 @@ fn draw_cursor(
     let y = cursor.line as f32 * font.cell_h;
     let color = frame.cursor_color;
     let rect = match cursor.shape {
-        CursorShape::Underline => {
-            graphene::Rect::new(x, y + font.cell_h - 2.0, font.cell_w, 2.0)
-        }
+        CursorShape::Underline => graphene::Rect::new(x, y + font.cell_h - 2.0, font.cell_w, 2.0),
         CursorShape::Beam => graphene::Rect::new(x, y, 2.0, font.cell_h),
         _ => graphene::Rect::new(x, y, font.cell_w, font.cell_h),
     };
@@ -517,25 +509,54 @@ mod render_image_tests {
 
     fn blank(fg: CellColor, bg: CellColor) -> StyledCell {
         StyledCell {
-            ch: ' ', fg, bg, bold: false, italic: false, underline: false,
-            strikeout: false, wide: false, wide_spacer: false, selected: false,
+            ch: ' ',
+            fg,
+            bg,
+            bold: false,
+            italic: false,
+            underline: false,
+            strikeout: false,
+            wide: false,
+            wide_spacer: false,
+            selected: false,
         }
     }
 
     /// Place `text` at (row, col) with `fg`/`bg`. Hangul/CJK chars take two
     /// cells (wide + spacer), matching the grid.
-    fn put(cells: &mut [StyledCell], cols: usize, row: usize, col: usize,
-           text: &str, fg: CellColor, bg: CellColor, bold: bool) {
+    fn put(
+        cells: &mut [StyledCell],
+        cols: usize,
+        row: usize,
+        col: usize,
+        text: &str,
+        fg: CellColor,
+        bg: CellColor,
+        bold: bool,
+    ) {
         let mut c = col;
         for ch in text.chars() {
             let wide = is_wide(ch);
-            if c >= cols { break; }
+            if c >= cols {
+                break;
+            }
             cells[row * cols + c] = StyledCell {
-                ch, fg, bg, bold, italic: false, underline: false,
-                strikeout: false, wide, wide_spacer: false, selected: false,
+                ch,
+                fg,
+                bg,
+                bold,
+                italic: false,
+                underline: false,
+                strikeout: false,
+                wide,
+                wide_spacer: false,
+                selected: false,
             };
             if wide && c + 1 < cols {
-                cells[row * cols + c + 1] = StyledCell { wide_spacer: true, ..blank(fg, bg) };
+                cells[row * cols + c + 1] = StyledCell {
+                    wide_spacer: true,
+                    ..blank(fg, bg)
+                };
                 c += 2;
             } else {
                 c += 1;
@@ -565,25 +586,124 @@ mod render_image_tests {
         let cols = 46;
         let rows = 8;
         let mut cells = vec![blank(fg, bg); rows * cols];
-        put(&mut cells, cols, 0, 0, "flowmux pure-Rust (alacritty) render test", fg, bg, true);
-        put(&mut cells, cols, 1, 0, "한글: 안녕하세요 訓民正音 日本語 中文", fg, bg, false);
-        put(&mut cells, cols, 2, 0, "ascii: The quick brown fox 0123456789", fg, bg, false);
-        put(&mut cells, cols, 3, 0, "빨강", CellColor::new(0xcc,0x33,0x33), bg, false);
-        put(&mut cells, cols, 3, 6, "초록", CellColor::new(0x33,0xcc,0x33), bg, false);
-        put(&mut cells, cols, 3, 12, "파랑", CellColor::new(0x55,0x88,0xff), bg, false);
-        put(&mut cells, cols, 3, 18, "노랑", CellColor::new(0xe0,0xc0,0x40), bg, false);
-        put(&mut cells, cols, 4, 0, " 초록배경 ", CellColor::new(0,0,0), CellColor::new(0x33,0xaa,0x33), false);
-        put(&mut cells, cols, 4, 12, " 파랑배경 ", CellColor::new(0xff,0xff,0xff), CellColor::new(0x33,0x55,0xcc), false);
+        put(
+            &mut cells,
+            cols,
+            0,
+            0,
+            "flowmux pure-Rust (alacritty) render test",
+            fg,
+            bg,
+            true,
+        );
+        put(
+            &mut cells,
+            cols,
+            1,
+            0,
+            "한글: 안녕하세요 訓民正音 日本語 中文",
+            fg,
+            bg,
+            false,
+        );
+        put(
+            &mut cells,
+            cols,
+            2,
+            0,
+            "ascii: The quick brown fox 0123456789",
+            fg,
+            bg,
+            false,
+        );
+        put(
+            &mut cells,
+            cols,
+            3,
+            0,
+            "빨강",
+            CellColor::new(0xcc, 0x33, 0x33),
+            bg,
+            false,
+        );
+        put(
+            &mut cells,
+            cols,
+            3,
+            6,
+            "초록",
+            CellColor::new(0x33, 0xcc, 0x33),
+            bg,
+            false,
+        );
+        put(
+            &mut cells,
+            cols,
+            3,
+            12,
+            "파랑",
+            CellColor::new(0x55, 0x88, 0xff),
+            bg,
+            false,
+        );
+        put(
+            &mut cells,
+            cols,
+            3,
+            18,
+            "노랑",
+            CellColor::new(0xe0, 0xc0, 0x40),
+            bg,
+            false,
+        );
+        put(
+            &mut cells,
+            cols,
+            4,
+            0,
+            " 초록배경 ",
+            CellColor::new(0, 0, 0),
+            CellColor::new(0x33, 0xaa, 0x33),
+            false,
+        );
+        put(
+            &mut cells,
+            cols,
+            4,
+            12,
+            " 파랑배경 ",
+            CellColor::new(0xff, 0xff, 0xff),
+            CellColor::new(0x33, 0x55, 0xcc),
+            false,
+        );
         put(&mut cells, cols, 5, 0, "볼드 bold 한글", fg, bg, true);
-        put(&mut cells, cols, 6, 0, "box ┌────┐ 한글│칸 └────┘", fg, bg, false);
+        put(
+            &mut cells,
+            cols,
+            6,
+            0,
+            "box ┌────┐ 한글│칸 └────┘",
+            fg,
+            bg,
+            false,
+        );
         put(&mut cells, cols, 7, 0, "prompt$ echo 테스트", fg, bg, false);
 
         let frame = FrameSnapshot {
-            rows, cols, cells,
-            cursor: Some(CursorState { line: 7, col: 18, shape: flowmux_terminal::render::CursorShape::Block }),
+            rows,
+            cols,
+            cells,
+            cursor: Some(CursorState {
+                line: 7,
+                col: 18,
+                shape: flowmux_terminal::render::CursorShape::Block,
+            }),
             caret: Some((7, 18)),
-            default_fg: fg, default_bg: bg, cursor_color: CellColor::new(0x80,0xc0,0x80),
-            selection_bg: None, selection_fg: None,
+            default_fg: fg,
+            default_bg: bg,
+            cursor_color: CellColor::new(0x80, 0xc0, 0x80),
+            selection_bg: None,
+            selection_fg: None,
         };
 
         let widget = TerminalRenderArea::new();
@@ -595,8 +715,10 @@ mod render_image_tests {
 
         // Assemble the frame's node using the real per-row builder.
         let snap = gtk::Snapshot::new();
-        snap.append_color(&rgba(frame.default_bg),
-            &graphene::Rect::new(0.0, 0.0, w as f32, h as f32));
+        snap.append_color(
+            &rgba(frame.default_bg),
+            &graphene::Rect::new(0.0, 0.0, w as f32, h as f32),
+        );
         for line in 0..frame.rows {
             if let Some(node) = build_row_node(&widget, &frame, &font, line) {
                 snap.save();
@@ -605,13 +727,19 @@ mod render_image_tests {
                 snap.restore();
             }
         }
-        if let Some(c) = frame.cursor { draw_cursor(&snap, &frame, &font, c); }
+        if let Some(c) = frame.cursor {
+            draw_cursor(&snap, &frame, &font, c);
+        }
         let node = snap.to_node().expect("non-empty node");
 
         let renderer = gtk::gsk::CairoRenderer::new();
-        renderer.realize(None::<&gdk::Surface>).expect("realize cairo renderer");
-        let texture = renderer.render_texture(&node,
-            Some(&graphene::Rect::new(0.0, 0.0, w as f32, h as f32)));
+        renderer
+            .realize(None::<&gdk::Surface>)
+            .expect("realize cairo renderer");
+        let texture = renderer.render_texture(
+            &node,
+            Some(&graphene::Rect::new(0.0, 0.0, w as f32, h as f32)),
+        );
         let path = "/tmp/flowmux_render_test.png";
         texture.save_to_png(path).expect("save png");
         eprintln!("wrote {path} ({w}x{h})");

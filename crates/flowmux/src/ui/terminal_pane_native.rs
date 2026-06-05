@@ -131,8 +131,7 @@ impl TerminalPaneNative {
         container.set_vexpand(true);
         container.set_child(Some(&render));
         let scroll_adjustment = gtk::Adjustment::new(0.0, 0.0, 1.0, 1.0, 1.0, 1.0);
-        let scrollbar =
-            gtk::Scrollbar::new(gtk::Orientation::Vertical, Some(&scroll_adjustment));
+        let scrollbar = gtk::Scrollbar::new(gtk::Orientation::Vertical, Some(&scroll_adjustment));
         scrollbar.set_halign(gtk::Align::End);
         scrollbar.set_valign(gtk::Align::Fill);
         scrollbar.set_can_focus(false);
@@ -146,8 +145,7 @@ impl TerminalPaneNative {
             DEFAULT_FONT_SIZE_PT,
         )));
         let scale = Rc::new(Cell::new(1.0));
-        let on_title_notify: NotifyCb<(TerminalPaneNative, String)> =
-            Rc::new(RefCell::new(None));
+        let on_title_notify: NotifyCb<(TerminalPaneNative, String)> = Rc::new(RefCell::new(None));
         let on_cwd_notify: NotifyCb<TerminalPaneNative> = Rc::new(RefCell::new(None));
         let adj_updating = Rc::new(Cell::new(false));
 
@@ -249,8 +247,12 @@ impl TerminalPaneNative {
         let effective = (size * self.scale.get()).max(1.0);
         self.render.set_font(&family, effective);
         if let Some(m) = self.render.font_metrics() {
-            let cols = (self.render.width().max(1) as f32 / m.cell_w).floor().max(1.0) as u16;
-            let rows = (self.render.height().max(1) as f32 / m.cell_h).floor().max(1.0) as u16;
+            let cols = (self.render.width().max(1) as f32 / m.cell_w)
+                .floor()
+                .max(1.0) as u16;
+            let rows = (self.render.height().max(1) as f32 / m.cell_h)
+                .floor()
+                .max(1.0) as u16;
             self.engine.borrow_mut().resize(
                 rows,
                 cols,
@@ -663,7 +665,10 @@ fn url_at(row: &str, col: usize) -> Option<String> {
         return None;
     }
     let trimmed = token.trim_end_matches(|c: char| {
-        matches!(c, '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}' | '\'' | '"' | '`')
+        matches!(
+            c,
+            '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}' | '\'' | '"' | '`'
+        )
     });
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
@@ -712,7 +717,8 @@ fn wire_focus_and_menu(pane: &TerminalPaneNative, surface: SurfaceId, callbacks:
         focus.connect_enter(move |_| (cb.borrow_mut())(id));
         pane.render.add_controller(focus);
     }
-    // Right-click menu: Split Right / Split Down / Copy path / Close Pane.
+    // Right-click menu: Copy / Paste / Split Right / Split Down / Copy path /
+    // Close Pane.
     {
         let on_focus = callbacks.on_focus.clone();
         let on_split_right = callbacks.on_split_right.clone();
@@ -721,6 +727,7 @@ fn wire_focus_and_menu(pane: &TerminalPaneNative, surface: SurfaceId, callbacks:
         let on_copy_text = callbacks.on_copy_surface_text.clone();
         let host = pane.render.clone();
         let engine = pane.engine.clone();
+        let pane_menu = pane.clone();
         let click = gtk::GestureClick::new();
         click.set_button(gtk::gdk::BUTTON_SECONDARY);
         click.connect_pressed(move |gesture, _n, x, y| {
@@ -744,6 +751,26 @@ fn wire_focus_and_menu(pane: &TerminalPaneNative, surface: SurfaceId, callbacks:
                 }
                 b
             };
+            // Copy / Paste mirror the keybindings: Copy puts the current
+            // selection on the clipboard (no-op when nothing is selected),
+            // Paste sends the clipboard text to the PTY.
+            let copy = mk("Copy");
+            let pop = popover.clone();
+            let p = pane_menu.clone();
+            copy.connect_clicked(move |_| {
+                pop.popdown();
+                p.copy_selection_to_clipboard();
+            });
+            v.append(&copy);
+            let paste = mk("Paste");
+            let pop = popover.clone();
+            let p = pane_menu.clone();
+            paste.connect_clicked(move |_| {
+                pop.popdown();
+                p.paste_clipboard();
+            });
+            v.append(&paste);
+            v.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
             let split_r = mk("Split Right");
             let pop = popover.clone();
             let cb = on_split_right.clone();
@@ -988,7 +1015,10 @@ mod paste_tests {
     #[test]
     fn preserves_utf8_and_newlines() {
         let text = "에코\n안녕";
-        assert_eq!(bracketed_paste_payload(text, false), text.as_bytes().to_vec());
+        assert_eq!(
+            bracketed_paste_payload(text, false),
+            text.as_bytes().to_vec()
+        );
         let wrapped = bracketed_paste_payload(text, true);
         assert!(wrapped.starts_with(b"\x1b[200~"));
         assert!(wrapped.ends_with(b"\x1b[201~"));

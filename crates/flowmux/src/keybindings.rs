@@ -959,10 +959,7 @@ mod tests {
 
     #[test]
     fn copy_pane_path_default_is_ctrl_shift_k() {
-        assert_eq!(
-            default_for(ActionId::CopyPanePath),
-            vec!["<Ctrl><Shift>k"]
-        );
+        assert_eq!(default_for(ActionId::CopyPanePath), vec!["<Ctrl><Shift>k"]);
     }
 
     #[test]

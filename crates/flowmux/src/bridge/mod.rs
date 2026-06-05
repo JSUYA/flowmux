@@ -219,9 +219,7 @@ pub enum GtkCommand {
     },
     /// Remove every open workspace. Triggered by the sidebar context
     /// menu's "Close all tabs" item.
-    RemoveAllWorkspaces {
-        ack: oneshot::Sender<()>,
-    },
+    RemoveAllWorkspaces { ack: oneshot::Sender<()> },
     /// Rename a workspace and refresh its sidebar row.
     RenameWorkspace {
         id: WorkspaceId,
@@ -285,9 +283,7 @@ pub enum GtkCommand {
     /// Ubuntu Dock's per-app notification counter, so the dock badge
     /// shrinks in lockstep. The dispatcher coalesces this with the
     /// store-level `mark_*_read` sweep that produced the ids.
-    CloseDesktopNotifications {
-        desktop_ids: Vec<String>,
-    },
+    CloseDesktopNotifications { desktop_ids: Vec<String> },
     /// Historic no-op. Earlier flowmux drove the dock badge directly
     /// via `com.canonical.Unity.LauncherEntry::Update`; the badge
     /// counter is now derived by the dock from
