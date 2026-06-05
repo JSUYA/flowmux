@@ -444,6 +444,33 @@ fn wire_keyboard(pane: &TerminalPaneNative) {
         pane.render.connect_unrealize(move |_| {
             im_teardown.set_client_widget(gtk::Widget::NONE);
         });
+
+        // Plain Enter while a Hangul/CJK syllable is composing: ibus-hangul
+        // commits the syllable on Enter and *swallows* the key, so the IM
+        // controller's `key-pressed` never fires and the terminal receives no
+        // newline ("한글 조합 중 Enter 무반응"). Catch Enter in the capture
+        // phase, before the IM context sees it: when composing, finalise the
+        // syllable and send exactly one CR after it (same park-then-commit
+        // path as Shift+Enter). When nothing is composing we Proceed, so
+        // normal Enter still flows through the IM + key handler untouched.
+        let enter = gtk::EventControllerKey::new();
+        enter.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let pane_for_enter = pane.clone();
+        enter.connect_key_pressed(move |_, keyval, _keycode, state| {
+            use gtk::gdk::Key;
+            let plain = !state.intersects(
+                gtk::gdk::ModifierType::CONTROL_MASK | gtk::gdk::ModifierType::ALT_MASK,
+            );
+            if plain
+                && matches!(keyval, Key::Return | Key::KP_Enter | Key::ISO_Enter)
+                && pane_for_enter.preedit_active.get()
+            {
+                pane_for_enter.feed_after_preedit_commit(b"\r");
+                return glib::Propagation::Stop;
+            }
+            glib::Propagation::Proceed
+        });
+        pane.render.add_controller(enter);
     }
 
     // commit → write the finished text to the PTY, clear preedit. If a
