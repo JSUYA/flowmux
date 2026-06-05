@@ -94,6 +94,15 @@ pub fn run(
         return Err(anyhow!("pty-tee needs a child argv after `--`"));
     }
 
+    // Normalize PATH before the shell is exec'd. The GUI already does this
+    // for itself, but `flowmuxctl pty-tee` is exec'd fresh from disk on every
+    // pane spawn, so doing it here too guarantees the child shell gets the
+    // standard system dirs (e.g. /usr/bin for xset) even when a *stale* GUI
+    // process — the single-instance app keeps the old in-memory binary alive
+    // until fully quit — never picked up the fix. The inner `bash -l` inherits
+    // this process's environment.
+    flowmux_terminal::ensure_process_path();
+
     // Resolve the daemon socket using the same precedence as the rest
     // of `flowmuxctl`: explicit --socket > FLOWMUX_SOCKET_PATH (env
     // injected by the GUI) > FLOWMUX_SOCKET (legacy) > XDG runtime.
