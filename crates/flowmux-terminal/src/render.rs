@@ -260,13 +260,13 @@ pub fn snapshot<T: EventListener>(term: &Term<T>, theme: &ThemePalette) -> Frame
             )
         })
     };
-    let cursor = if selection.is_some() {
-        // Hide the text cursor while a mouse selection is active, matching
-        // xterm/gnome-terminal/alacritty. Otherwise the block cursor sits at
-        // the selection's end cell and shimmers over thin glyphs (i/l) as it
-        // blinks/repaints, making the whole line look like it flickers.
-        None
-    } else {
+    // The cursor reflects only the app's own DECTCEM (`CursorShape::Hidden`)
+    // state here. Suppressing it *during a mouse selection* is the renderer's
+    // job, not the snapshot's: the GUI hides it only while the drag button is
+    // held (it knows the live gesture state), so a finished selection — or a
+    // stale one that was never cleared — can never strand the cursor as a
+    // `term.selection`-based gate did.
+    let cursor = {
         let c = content.cursor;
         if matches!(c.shape, CursorShape::Hidden) {
             None
@@ -492,7 +492,7 @@ mod tests {
     }
 
     #[test]
-    fn active_selection_hides_cursor() {
+    fn selection_does_not_strand_cursor() {
         use alacritty_terminal::event::VoidListener;
         use alacritty_terminal::index::{Column, Line, Point, Side};
         use alacritty_terminal::selection::{Selection, SelectionType};
@@ -505,14 +505,15 @@ mod tests {
         let mut parser: Processor = Processor::new();
         parser.advance(&mut term, b"hi");
 
-        // No selection: cursor is shown.
         let frame = snapshot(&term, &theme());
         assert!(frame.cursor.is_some(), "cursor shown without selection");
         assert!(frame.caret.is_some());
 
-        // Active selection over the first row: the block cursor is suppressed
-        // (so it can't shimmer over thin glyphs), but the caret is still
-        // tracked for IME preedit placement.
+        // A live selection must NOT remove the cursor from the snapshot.
+        // Earlier this gated on `term.selection.is_some()`, but selections are
+        // never cleared, so the first click stranded the cursor forever.
+        // Suppression during an *active drag* now lives in the GUI renderer,
+        // which knows when the button is actually held.
         let mut sel = Selection::new(
             SelectionType::Simple,
             Point::new(Line(0), Column(0)),
@@ -521,11 +522,16 @@ mod tests {
         sel.update(Point::new(Line(0), Column(1)), Side::Right);
         term.selection = Some(sel);
         let frame = snapshot(&term, &theme());
-        assert!(frame.cursor.is_none(), "cursor hidden during selection");
         assert!(
-            frame.caret.is_some(),
-            "caret still tracked during selection"
+            frame.cursor.is_some(),
+            "cursor still present while a selection exists"
         );
+        assert!(frame.caret.is_some());
+
+        // Only the app's own DECTCEM hide removes the cursor.
+        parser.advance(&mut term, b"\x1b[?25l");
+        let frame = snapshot(&term, &theme());
+        assert!(frame.cursor.is_none(), "cursor hidden by DECTCEM");
     }
 
     #[test]

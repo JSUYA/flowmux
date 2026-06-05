@@ -66,6 +66,14 @@ mod imp {
         pub(super) last_alloc: Cell<(i32, i32)>,
         /// Active IME preedit (composing) text, drawn inline at the caret.
         pub(super) preedit: RefCell<String>,
+        /// Cursor blink phase: `true` = draw the cursor this frame. Toggled
+        /// by a timer; forced back to `true` on activity so it stays solid
+        /// while typing / output is flowing.
+        pub(super) blink_on: Cell<bool>,
+        /// `true` while a mouse-selection drag is in progress. The cursor is
+        /// hidden for the duration so the block cursor can't shimmer over the
+        /// drag's end cell; cleared the instant the button is released.
+        pub(super) selecting: Cell<bool>,
     }
 
     #[glib::object_subclass]
@@ -114,7 +122,17 @@ mod imp {
             }
 
             if let Some(cursor) = frame.cursor {
-                super::draw_cursor(snapshot, frame, font, cursor);
+                // Hide during an active drag; otherwise blink only while
+                // focused (an unfocused pane shows a steady cursor, never a
+                // blinking one).
+                let blink = if obj.has_focus() {
+                    self.blink_on.get()
+                } else {
+                    true
+                };
+                if blink && !self.selecting.get() {
+                    super::draw_cursor(snapshot, frame, font, cursor);
+                }
             }
 
             // IME preedit: always drawn at the caret, even when the app
@@ -168,7 +186,30 @@ impl TerminalRenderArea {
     pub fn new() -> Self {
         let obj: Self = glib::Object::new();
         obj.set_focusable(true);
+        obj.imp().blink_on.set(true);
         obj
+    }
+
+    /// Flip the cursor blink phase and repaint. Driven by a ~530 ms timer.
+    pub fn toggle_blink(&self) {
+        let imp = self.imp();
+        imp.blink_on.set(!imp.blink_on.get());
+        self.queue_draw();
+    }
+
+    /// Force the cursor solid (blink phase on). Called on keypress / output so
+    /// the cursor never blinks away mid-activity.
+    pub fn reset_blink(&self) {
+        if !self.imp().blink_on.replace(true) {
+            self.queue_draw();
+        }
+    }
+
+    /// Mark whether a mouse-selection drag is in progress (hides the cursor).
+    pub fn set_selecting(&self, selecting: bool) {
+        if self.imp().selecting.replace(selecting) != selecting {
+            self.queue_draw();
+        }
     }
 
     /// Set the font and recompute cell geometry. Clears the row cache.
@@ -223,6 +264,8 @@ impl TerminalRenderArea {
             }
         }
         *imp.frame.borrow_mut() = Some(frame);
+        // Fresh output / cursor movement: keep the cursor solid through it.
+        imp.blink_on.set(true);
         self.queue_draw();
     }
 
@@ -332,7 +375,7 @@ fn build_row_node(
         let mut text = String::new();
         loop {
             let c = &frame.cells[line * cols + col];
-            if c.wide || c.wide_spacer || !same_text_style(c, cell) || c.ch == '\0' {
+            if c.wide || c.wide_spacer || !same_text_style(c, cell, frame) || c.ch == '\0' {
                 break;
             }
             text.push(if c.ch == '\0' { ' ' } else { c.ch });
@@ -379,13 +422,18 @@ fn eff_fg(cell: &StyledCell, frame: &FrameSnapshot) -> CellColor {
     }
 }
 
-fn same_text_style(a: &StyledCell, b: &StyledCell) -> bool {
-    a.fg == b.fg
+/// Whether two cells can share one pango layout run. Keys on the *effective*
+/// fg, not the raw `selected` flag: when the theme leaves `selection_fg`
+/// unset (the common case), a selected and an unselected cell of the same
+/// color stay in one run. Splitting on `selected` re-laid-out the two halves
+/// independently as the selection grew, so glyphs shifted by sub-pixel
+/// kerning and the text appeared to ripple under the drag.
+fn same_text_style(a: &StyledCell, b: &StyledCell, frame: &FrameSnapshot) -> bool {
+    eff_fg(a, frame) == eff_fg(b, frame)
         && a.bold == b.bold
         && a.italic == b.italic
         && a.underline == b.underline
         && a.strikeout == b.strikeout
-        && a.selected == b.selected
 }
 
 fn append_text_run(

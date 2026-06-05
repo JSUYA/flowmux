@@ -198,6 +198,23 @@ impl TerminalPaneNative {
         wire_focus_and_menu(&pane, surface, &callbacks);
         wire_event_loop(&pane, surface, rx, &callbacks);
 
+        // Cursor blink: a self-terminating ~530 ms timer flips the blink
+        // phase. The weak ref breaks the source once the pane (and its render
+        // widget) drops. Skipped under the test harness, which has no main
+        // loop and builds/destroys panes without one.
+        if !cfg!(test) {
+            let render = render.downgrade();
+            glib::timeout_add_local(std::time::Duration::from_millis(530), move || match render
+                .upgrade()
+            {
+                Some(r) => {
+                    r.toggle_blink();
+                    glib::ControlFlow::Continue
+                }
+                None => glib::ControlFlow::Break,
+            });
+        }
+
         pane
     }
 
@@ -498,12 +515,21 @@ fn wire_keyboard(pane: &TerminalPaneNative) {
         let app_cursor = engine.borrow().app_cursor_mode();
         match encode_key(keyval, state, app_cursor) {
             Some(bytes) => {
+                // Typing keeps the cursor solid and dismisses any highlight,
+                // matching every other terminal.
+                render_w.reset_blink();
                 let e = engine.borrow();
                 let scrolled = e.write_keys(bytes);
-                if scrolled {
+                let had_sel = e.has_selection();
+                if had_sel {
+                    e.selection_clear();
+                }
+                if scrolled || had_sel {
                     drop(e);
                     repaint(&engine, &render_w, &theme);
-                    sync_scrollbar(&engine, &adj, &updating);
+                    if scrolled {
+                        sync_scrollbar(&engine, &adj, &updating);
+                    }
                 }
                 glib::Propagation::Stop
             }
@@ -684,7 +710,7 @@ fn wire_mouse_selection(pane: &TerminalPaneNative, callbacks: &PaneCallbacks) {
         let engine = engine.clone();
         let render_w = render_w.clone();
         let theme = theme.clone();
-        move |_, x, y| {
+        move |g, x, y| {
             render_w.grab_focus();
             (on_focus.borrow_mut())(id);
             // App wants the mouse → don't start a local selection.
@@ -692,18 +718,44 @@ fn wire_mouse_selection(pane: &TerminalPaneNative, callbacks: &PaneCallbacks) {
                 return;
             }
             if let Some((col, line, right)) = cell_at(&render_w, x, y) {
-                engine.borrow().selection_start(col, line, right);
+                render_w.set_selecting(true);
+                // Shift+click extends the existing selection from its anchor
+                // instead of starting a fresh one; fall back to a new
+                // selection if there is nothing to extend.
+                let shift = g
+                    .current_event_state()
+                    .contains(gtk::gdk::ModifierType::SHIFT_MASK);
+                if shift && engine.borrow().has_selection() {
+                    engine.borrow().selection_update(col, line, right);
+                } else {
+                    engine.borrow().selection_start(col, line, right);
+                }
                 repaint(&engine, &render_w, &theme);
             }
         }
     });
-    drag.connect_drag_update(move |g, dx, dy| {
-        if let Some((sx, sy)) = g.start_point() {
-            if let Some((col, line, right)) = cell_at(&render_w, sx + dx, sy + dy) {
-                engine.borrow().selection_update(col, line, right);
-                repaint(&engine, &render_w, &theme);
+    drag.connect_drag_update({
+        let engine = engine.clone();
+        let render_w = render_w.clone();
+        let theme = theme.clone();
+        move |g, dx, dy| {
+            if let Some((sx, sy)) = g.start_point() {
+                if let Some((col, line, right)) = cell_at(&render_w, sx + dx, sy + dy) {
+                    engine.borrow().selection_update(col, line, right);
+                    repaint(&engine, &render_w, &theme);
+                }
             }
         }
+    });
+    drag.connect_drag_end(move |_, _, _| {
+        render_w.set_selecting(false);
+        // A click (or a drag that never covered a cell) leaves an empty
+        // selection; drop it so `has_selection()` / Copy stay accurate and no
+        // stale highlight lingers.
+        if !engine.borrow().has_selection() {
+            engine.borrow().selection_clear();
+        }
+        repaint(&engine, &render_w, &theme);
     });
     pane.render.add_controller(drag);
 }

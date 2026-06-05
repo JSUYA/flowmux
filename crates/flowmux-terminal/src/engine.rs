@@ -312,17 +312,25 @@ impl TermEngine {
         use alacritty_terminal::index::{Column, Line, Point, Side};
         use alacritty_terminal::selection::{Selection, SelectionType};
         let side = if right { Side::Right } else { Side::Left };
-        let point = Point::new(Line(line as i32), Column(col));
+        let mut term = self.term.lock();
+        // The viewport row is `abs_line + display_offset` (see `render`), so
+        // the absolute grid line is `line - display_offset`. Anchoring in
+        // absolute coordinates lets the highlight stay over the same text
+        // when the viewport is scrolled through scrollback mid-drag.
+        let off = term.grid().display_offset() as i32;
+        let point = Point::new(Line(line as i32 - off), Column(col));
         let sel = Selection::new(SelectionType::Simple, point, side);
-        self.term.lock().selection = Some(sel);
+        term.selection = Some(sel);
     }
 
     /// Extend the active selection to viewport cell `(col, line)`.
     pub fn selection_update(&self, col: usize, line: usize, right: bool) {
         use alacritty_terminal::index::{Column, Line, Point, Side};
         let side = if right { Side::Right } else { Side::Left };
-        let point = Point::new(Line(line as i32), Column(col));
         let mut term = self.term.lock();
+        // Same viewport→absolute mapping as `selection_start`.
+        let off = term.grid().display_offset() as i32;
+        let point = Point::new(Line(line as i32 - off), Column(col));
         if let Some(sel) = term.selection.as_mut() {
             sel.update(point, side);
         }
@@ -501,5 +509,35 @@ mod tests {
         }
         assert!(found, "expected HELLO to land in the grid");
         assert!(wakeups.load(Ordering::SeqCst) > 0, "expected wakeups");
+    }
+
+    #[test]
+    fn selection_anchors_in_scrollback() {
+        use alacritty_terminal::vte::ansi::Processor;
+
+        // 5-row screen; feed 20 lines so 15 land in scrollback.
+        let engine = TermEngine::stub(5, 10);
+        {
+            let mut term = engine.term().lock();
+            let mut parser: Processor = Processor::new();
+            let feed = (0..20)
+                .map(|i| format!("L{i:02}"))
+                .collect::<Vec<_>>()
+                .join("\r\n");
+            parser.advance(&mut *term, feed.as_bytes());
+        }
+
+        // Scroll up 3 → viewport top row shows L12. Selecting that viewport
+        // row must grab L12, not whatever absolute line 0 happens to be: the
+        // bug stored the viewport row as the absolute line and ignored the
+        // scroll offset.
+        engine.scroll_lines(3);
+        engine.selection_start(0, 0, false);
+        engine.selection_update(9, 0, true);
+        let text = engine.selection_text().unwrap_or_default();
+        assert!(
+            text.trim_end().ends_with("L12"),
+            "selection followed the scroll: got {text:?}"
+        );
     }
 }
