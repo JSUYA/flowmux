@@ -367,6 +367,32 @@ impl TerminalPane {
                     b
                 };
 
+                // Copy / Paste at the top, mirroring the copy/paste
+                // keybindings. Copy is a no-op with no selection so we
+                // never clobber the clipboard; Paste lets VTE bracket
+                // the text when the app set DECSET 2004.
+                let copy = mk("Copy");
+                let pop = popover.clone();
+                let term_for_copy = term_widget.clone();
+                copy.connect_clicked(move |_| {
+                    pop.popdown();
+                    if term_for_copy.has_selection() {
+                        term_for_copy.copy_clipboard_format(vte::Format::Text);
+                    }
+                });
+                v.append(&copy);
+
+                let paste = mk("Paste");
+                let pop = popover.clone();
+                let term_for_paste = term_widget.clone();
+                paste.connect_clicked(move |_| {
+                    pop.popdown();
+                    term_for_paste.paste_clipboard();
+                });
+                v.append(&paste);
+
+                v.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+
                 let split_r = mk("Split Right");
                 let pop = popover.clone();
                 let cb = on_split_right.clone();
