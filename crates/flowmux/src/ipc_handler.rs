@@ -8,7 +8,7 @@
 //! `oneshot` channel.
 
 use crate::bridge::{Bridge, BrowserActionResult, BrowserOp, GtkCommand};
-use flowmux_core::SplitDirection;
+use flowmux_core::{AgentPresence, SplitDirection};
 use flowmux_daemon::DaemonHandler;
 use flowmux_ipc::protocol::{Request, Response, RpcError};
 use flowmux_ipc::server::Handler;
@@ -387,6 +387,39 @@ impl Handler for GuiHandler {
                         Ok(()) => Response::Ok,
                         Err(e) => Response::Error(RpcError::Io(e.to_string())),
                     },
+                    None => Response::Ok,
+                },
+
+                // ---- Live agent activity (Running / NeedsInput / Idle).
+                // Hooks pass FLOWMUX_SURFACE_ID, so a surface is expected;
+                // without one we can't route the presence to a tab.
+                Request::AgentActivityUpdate {
+                    surface,
+                    agent,
+                    activity,
+                    pid,
+                    ..
+                } => match surface {
+                    Some(surface) => {
+                        let presence = activity.map(|act| AgentPresence {
+                            name: agent,
+                            activity: act,
+                            pid,
+                        });
+                        if let Some(ws_id) =
+                            self.inner.store().set_agent_activity(surface, presence).await
+                        {
+                            let _ = self
+                                .bridge
+                                .tx
+                                .send(GtkCommand::SetAgentActivity {
+                                    workspace: ws_id,
+                                    activity,
+                                })
+                                .await;
+                        }
+                        Response::Ok
+                    }
                     None => Response::Ok,
                 },
 

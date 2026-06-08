@@ -20,7 +20,7 @@
 
 use crate::bridge::{Bridge, GtkCommand};
 use crate::notifications::{NotificationEntry, NotificationStore};
-use flowmux_core::{NotificationLevel, PrState, Workspace, WorkspaceId};
+use flowmux_core::{AgentActivity, NotificationLevel, PrState, Workspace, WorkspaceId};
 use gtk::prelude::*;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -38,6 +38,11 @@ pub struct Sidebar {
     bell_popover: gtk::Popover,
     notifications: NotificationStore,
     attentions: Rc<RefCell<HashSet<WorkspaceId>>>,
+    /// Workspaces with an agent currently `Running`; their row carries
+    /// the `flowmux-agent-running` class so the color bar breathes. The
+    /// class lives on the reused `ListBoxRow`, so it survives a row
+    /// rebuild; this set just keeps the membership idempotent.
+    agent_running: Rc<RefCell<HashSet<WorkspaceId>>>,
     bridge: Bridge,
     /// Last computed subtitle lines per workspace, capped at 3 lines.
     /// Kept so paths that do not know subtitle data, such as rename or color
@@ -205,6 +210,7 @@ impl Sidebar {
             bell_popover,
             notifications,
             attentions,
+            agent_running: Rc::new(RefCell::new(HashSet::new())),
             bridge,
             subtitle_cache: Rc::new(RefCell::new(HashMap::new())),
         }
@@ -334,6 +340,37 @@ impl Sidebar {
                 .cloned()
             {
                 row.remove_css_class("flowmux-attention");
+            }
+        }
+    }
+
+    /// Reflect an AI agent's live activity on the workspace row. Only
+    /// [`AgentActivity::Running`] breathes the color bar (via the
+    /// `flowmux-agent-running` class); `NeedsInput`/`Idle`/`None` clear
+    /// it (a waiting agent still shows the separate attention tint from
+    /// its notification). The class sits on the reused `ListBoxRow`, so
+    /// it persists across row rebuilds.
+    pub fn set_agent_activity(&self, id: WorkspaceId, activity: Option<AgentActivity>) {
+        let running = matches!(activity, Some(AgentActivity::Running));
+        let changed = if running {
+            self.agent_running.borrow_mut().insert(id)
+        } else {
+            self.agent_running.borrow_mut().remove(&id)
+        };
+        if !changed {
+            return;
+        }
+        if let Some((_, row)) = self
+            .rows
+            .borrow()
+            .iter()
+            .find(|(wid, _)| *wid == id)
+            .cloned()
+        {
+            if running {
+                row.add_css_class("flowmux-agent-running");
+            } else {
+                row.remove_css_class("flowmux-agent-running");
             }
         }
     }
@@ -914,6 +951,9 @@ fn color_bar(color: &str) -> gtk::Widget {
     bar.set_size_request(4, -1);
     bar.set_vexpand(true);
     bar.set_valign(gtk::Align::Fill);
+    // Targeted by the `.flowmux-agent-running .flowmux-color-bar` CSS
+    // rule so the bar's opacity "breathes" while an agent is working.
+    bar.add_css_class("flowmux-color-bar");
     let color_owned = color.to_string();
     bar.set_draw_func(move |_, cr, w, h| {
         let rgba = gtk::gdk::RGBA::parse(&color_owned)

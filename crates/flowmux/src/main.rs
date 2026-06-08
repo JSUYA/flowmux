@@ -246,6 +246,33 @@ fn main() -> anyhow::Result<()> {
         }
     });
 
+    // Agent liveness sweep. SessionEnd clears a presence on a clean
+    // exit, but a hard kill / closed terminal never fires it; every 30s
+    // we drop any presence whose PID (from the wrapper shim) has died.
+    // Cheap `/proc` stat; cadence matches cmux.
+    {
+        let sweep_store = store.clone();
+        let sweep_tx = bridge.tx.clone();
+        rt.spawn(async move {
+            let mut tick = tokio::time::interval(tokio::time::Duration::from_secs(30));
+            tick.tick().await; // consume the immediate first tick
+            loop {
+                tick.tick().await;
+                for (workspace, surface, pid) in sweep_store.live_agent_presences().await {
+                    if !flowmux_procmon::pid_alive(pid) {
+                        sweep_store.set_agent_activity(surface, None).await;
+                        let _ = sweep_tx
+                            .send(crate::bridge::GtkCommand::SetAgentActivity {
+                                workspace,
+                                activity: None,
+                            })
+                            .await;
+                    }
+                }
+            }
+        });
+    }
+
     // GTK runs on the main thread.
     let app = build_application();
     let store_for_activate = store.clone();

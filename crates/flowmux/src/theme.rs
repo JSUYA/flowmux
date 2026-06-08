@@ -190,6 +190,9 @@ impl ResolvedTheme {
     pub fn css(&self, focus_border_color: &str, focus_border_alpha: f32) -> String {
         let bg_css = rgba_css(&self.bg);
         let focus_css = focus_border_rgba_css(focus_border_color, focus_border_alpha);
+        // Active-workspace edge stripes always paint at full opacity,
+        // independent of the focus-border opacity slider.
+        let focus_full_css = focus_border_rgba_css(focus_border_color, 1.0);
         let pane_border_css = rgba_css(&blend_with_alpha(&self.fg, 0.10));
         let tabbar_bg_css = rgba_css(&shift_lightness(
             &self.bg,
@@ -328,9 +331,11 @@ paned > separator {{
     background-color: transparent;
     box-shadow: none;
 }}
-/* Visible "active workspace" indicator. A left-edge accent in the focus
-   color so the user can see which workspace is currently active, with no
-   background tint, without losing the flowmux-attention override below
+/* Visible "active workspace" indicator. Left- and right-edge accent
+   stripes in the focus color so the user can see which workspace is
+   currently active. Always full opacity (focus_full), independent of
+   the focus-border opacity slider, with no background tint, without
+   losing the flowmux-attention override below
    (amber wins because it is layered last). The :hover/:focus/:active/
    .has-open-popup variants must mirror the suppression block above: those
    selectors clear box-shadow at the same specificity, so without matching
@@ -344,7 +349,7 @@ paned > separator {{
 .navigation-sidebar > row.activatable:selected:hover,
 .navigation-sidebar > row.activatable:selected:active,
 .navigation-sidebar > row.activatable:selected.has-open-popup {{
-    box-shadow: inset 5px 0 0 {focus};
+    box-shadow: inset 5px 0 0 {focus_full}, inset -5px 0 0 {focus_full};
 }}
 /* Hover and press share one faint tint across every workspace row, so
    hovering only whispers and clicking introduces no separate color step.
@@ -369,6 +374,15 @@ paned > separator {{
 .navigation-sidebar row.flowmux-attention {{
     background-color: rgba(245, 158, 11, 0.18);
     box-shadow: inset 3px 0 0 rgba(245, 158, 11, 0.85);
+}}
+/* Agent Running: the workspace's left color bar "breathes" by cycling
+   its opacity. The class lives on the row; the rule targets the bar. */
+@keyframes flowmux-breathe {{
+    0%, 100% {{ opacity: 1; }}
+    50% {{ opacity: 0.28; }}
+}}
+.navigation-sidebar row.flowmux-agent-running .flowmux-color-bar {{
+    animation: flowmux-breathe 2.6s ease-in-out infinite;
 }}
 .navigation-sidebar row.flowmux-dragging {{
     opacity: 0.4;
@@ -401,6 +415,7 @@ paned > separator {{
             fg = rgba_css(&self.fg),
             border = pane_border_css,
             focus = focus_css,
+            focus_full = focus_full_css,
             tabbar = tabbar_bg_css,
             tab_active = tab_active_bg_css,
             control_hover = control_hover_css,

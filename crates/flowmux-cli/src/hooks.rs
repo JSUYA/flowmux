@@ -13,7 +13,7 @@
 //! so we resolve the workspace eagerly via the daemon (already done by
 //! `Request::Notify`) and otherwise do minimal work.
 
-use flowmux_core::{NotificationLevel, PaneId, SurfaceId};
+use flowmux_core::{AgentActivity, NotificationLevel, PaneId, SurfaceId};
 use flowmux_ipc::{
     client::Client,
     protocol::{Request, Response},
@@ -109,6 +109,37 @@ pub fn surface_from_env() -> Option<SurfaceId> {
         .ok()
         .as_deref()
         .and_then(|s| SurfaceId::from_str(s).ok())
+}
+
+/// Resolve `FLOWMUX_AGENT_PID` — the agent process id exported by the
+/// wrapper shim (`scripts`/installed `flowmux-shims/<agent>`) right
+/// before it `exec`s the real agent binary. Lets the daemon sweep clear
+/// presences left stale by a hard kill where `SessionEnd` never fired.
+/// `None` when the agent was launched without the shim.
+pub fn pid_from_env() -> Option<u32> {
+    std::env::var("FLOWMUX_AGENT_PID")
+        .ok()
+        .as_deref()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .filter(|&p| p != 0)
+}
+
+/// Build a `Request::AgentActivityUpdate`. `activity: None` clears the
+/// presence (session end / teardown).
+pub fn build_activity_update(
+    agent: &str,
+    activity: Option<AgentActivity>,
+    pid: Option<u32>,
+    pane: Option<PaneId>,
+    surface: Option<SurfaceId>,
+) -> Request {
+    Request::AgentActivityUpdate {
+        pane,
+        surface,
+        agent: agent.to_ascii_lowercase(),
+        activity,
+        pid,
+    }
 }
 
 /// Trim a body string down to a single notification-friendly line.
@@ -334,6 +365,52 @@ mod tests {
     fn read_hook_input_parses_stdin_payloads_for_claude_style_hooks() {
         let parsed = read_hook_input(r#"{ "message": "approval needed" }"#.as_bytes());
         assert_eq!(parsed.message.as_deref(), Some("approval needed"));
+    }
+
+    #[test]
+    fn build_activity_update_lowercases_agent_and_carries_fields() {
+        let req = build_activity_update(
+            "Claude",
+            Some(AgentActivity::Running),
+            Some(4321),
+            None,
+            None,
+        );
+        match req {
+            Request::AgentActivityUpdate {
+                agent,
+                activity,
+                pid,
+                ..
+            } => {
+                assert_eq!(agent, "claude");
+                assert_eq!(activity, Some(AgentActivity::Running));
+                assert_eq!(pid, Some(4321));
+            }
+            other => panic!("expected AgentActivityUpdate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_activity_update_none_activity_clears() {
+        let req = build_activity_update("codex", None, None, None, None);
+        match req {
+            Request::AgentActivityUpdate { activity, pid, .. } => {
+                assert!(activity.is_none());
+                assert!(pid.is_none());
+            }
+            other => panic!("expected AgentActivityUpdate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pid_from_env_parses_and_rejects_zero() {
+        // Drive the parse logic directly (env is process-global and would
+        // race other tests). Mirrors `pid_from_env`'s filter.
+        let parse = |s: &str| s.trim().parse::<u32>().ok().filter(|&p| p != 0);
+        assert_eq!(parse(" 4321 "), Some(4321));
+        assert_eq!(parse("0"), None);
+        assert_eq!(parse("notanumber"), None);
     }
 
     #[test]

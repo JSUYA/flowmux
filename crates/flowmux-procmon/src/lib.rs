@@ -19,6 +19,15 @@ pub enum ProcError {
     NotLinux,
 }
 
+/// Report whether process `pid` is still alive, by testing for the
+/// existence of `/proc/<pid>`. Dependency-free equivalent of
+/// `kill(pid, 0)` returning anything other than `ESRCH`. Used by the
+/// daemon's agent-liveness sweep to clear a presence whose agent process
+/// vanished (hard kill / closed terminal) without firing `SessionEnd`.
+pub fn pid_alive(pid: u32) -> bool {
+    std::path::Path::new(&format!("/proc/{pid}")).exists()
+}
+
 /// Return all PIDs descended from `root` (inclusive). Walks
 /// `/proc/<pid>/status` PPid edges. O(n_procs); cheap enough to call
 /// per-second on the GTK main loop.
@@ -158,6 +167,13 @@ mod tests {
         let pid = std::process::id();
         let ds = descendants(pid).unwrap();
         assert!(ds.contains(&pid));
+    }
+
+    #[test]
+    fn pid_alive_tracks_self_and_rejects_unused_pid() {
+        assert!(pid_alive(std::process::id()));
+        // PID 0 is the scheduler swapper — never a /proc entry on Linux.
+        assert!(!pid_alive(0));
     }
 
     #[test]

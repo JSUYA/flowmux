@@ -800,6 +800,34 @@ pub fn run_fix(home: &Path, codex_home: Option<&Path>, flowmux_bin: &str) -> Fix
         }
     }
 
+    // Agent wrapper shims — let the daemon's liveness sweep see a
+    // hard-killed agent's PID. Independent of any agent being installed;
+    // the GUI only prepends the dir to PATH if it exists.
+    match hook_install::install_agent_shims() {
+        Ok(paths) if paths.is_empty() => outcomes.push(FixOutcome {
+            area: "agent shims".into(),
+            status: Status::Ok,
+            detail: "already up-to-date".into(),
+        }),
+        Ok(paths) => outcomes.push(FixOutcome {
+            area: "agent shims".into(),
+            status: Status::Ok,
+            detail: format!(
+                "wrote {}",
+                paths
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        }),
+        Err(e) => outcomes.push(FixOutcome {
+            area: "agent shims".into(),
+            status: Status::Error,
+            detail: e.to_string(),
+        }),
+    }
+
     FixReport { outcomes }
 }
 

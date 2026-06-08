@@ -22,6 +22,15 @@ pub fn data_dir() -> Option<PathBuf> {
     dirs::data_dir().map(|d| d.join("flowmux"))
 }
 
+/// Directory holding the agent wrapper shims (`claude`, `codex`, …)
+/// installed by `flowmux fix`. Each shim exports `FLOWMUX_AGENT_PID=$$`
+/// before `exec`ing the real agent binary, so the daemon's liveness
+/// sweep can detect a hard-killed agent. The GUI prepends this directory
+/// to a PTY's `PATH`; the installer writes the scripts here.
+pub fn agent_shim_dir() -> Option<PathBuf> {
+    data_dir().map(|d| d.join("shims"))
+}
+
 pub fn state_dir() -> Option<PathBuf> {
     dirs::state_dir().map(|d| d.join("flowmux"))
 }

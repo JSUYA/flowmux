@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use flowmux_core::{
-    NotificationLevel, PaneId, PlacementStrategy, SplitDirection, SurfaceId, WorkspaceId,
+    AgentActivity, NotificationLevel, PaneId, PlacementStrategy, SplitDirection, SurfaceId,
+    WorkspaceId,
 };
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -213,6 +214,26 @@ pub enum Request {
     AgentSessionForget {
         agent: String,
         surface: SurfaceId,
+    },
+
+    /// Report a change in an AI agent's live activity inside a surface,
+    /// emitted by the agent's lifecycle hooks (`flowmux hooks <agent>
+    /// <event>`). `activity: None` clears the presence (session end).
+    /// `pid` is the agent process id from the wrapper shim, used by the
+    /// daemon's liveness sweep to clear presences left stale by a hard
+    /// kill where `SessionEnd` never fired. Runtime-only; never
+    /// persisted. Falls back to `FLOWMUX_PANE_ID` / `FLOWMUX_SURFACE_ID`
+    /// when `pane` / `surface` are omitted.
+    AgentActivityUpdate {
+        #[serde(default)]
+        pane: Option<PaneId>,
+        #[serde(default)]
+        surface: Option<SurfaceId>,
+        agent: String,
+        #[serde(default)]
+        activity: Option<AgentActivity>,
+        #[serde(default)]
+        pid: Option<u32>,
     },
 
     /// `flowmux claude-teams [--count N] [-- args...]` — spin up a

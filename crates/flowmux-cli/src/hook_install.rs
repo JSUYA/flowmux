@@ -320,6 +320,77 @@ pub fn uninstall(target: HookTarget) -> Result<HookInstallReport> {
     }
 }
 
+// ---- Agent wrapper shims -------------------------------------------
+
+/// Agents that get a PID-capturing wrapper shim. The GUI prepends the
+/// shim dir to a PTY's `PATH`, so typing `claude` / `codex` resolves to
+/// these scripts first. They export `FLOWMUX_AGENT_PID=$$` (read by the
+/// hooks) and then `exec` the real binary, so they are otherwise fully
+/// transparent.
+const SHIM_AGENTS: &[&str] = &["claude", "codex"];
+
+/// Body of a wrapper shim for `agent`. Skips its own directory when
+/// resolving the real binary so it never re-execs itself.
+fn shim_script(agent: &str) -> String {
+    format!(
+        r#"#!/usr/bin/env bash
+# flowmux agent wrapper shim (managed by `flowmux fix`).
+# Records the real {agent} PID so flowmux can detect a hard kill, then
+# transparently exec's the real binary. Safe to run outside flowmux.
+if [ -n "${{FLOWMUX_SURFACE_ID:-}}" ]; then
+  export FLOWMUX_AGENT_PID=$$
+fi
+self_dir=$(cd "$(dirname "$0")" && pwd)
+real=""
+saved_ifs=$IFS
+IFS=:
+for d in $PATH; do
+  [ "$d" = "$self_dir" ] && continue
+  if [ -x "$d/{agent}" ]; then real="$d/{agent}"; break; fi
+done
+IFS=$saved_ifs
+if [ -z "$real" ]; then
+  echo "flowmux shim: {agent} not found on PATH" >&2
+  exit 127
+fi
+exec "$real" "$@"
+"#
+    )
+}
+
+/// Write/refresh the agent wrapper shims into the shim dir and mark them
+/// executable. Idempotent; returns the paths touched. `Ok(vec![])` when
+/// no data dir is resolvable (e.g. `$HOME` unset).
+pub fn install_agent_shims() -> Result<Vec<PathBuf>> {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = match flowmux_config::paths::agent_shim_dir() {
+        Some(d) => d,
+        None => return Ok(vec![]),
+    };
+    fs::create_dir_all(&dir)?;
+    let mut written = Vec::new();
+    for agent in SHIM_AGENTS {
+        let path = dir.join(agent);
+        let body = shim_script(agent);
+        let up_to_date = fs::read_to_string(&path).map(|c| c == body).unwrap_or(false);
+        if !up_to_date {
+            fs::write(&path, &body)?;
+            written.push(path.clone());
+        }
+        // Always assert the exec bit — cheap, and a non-executable shim
+        // would silently break command resolution.
+        let mut perms = fs::metadata(&path)?.permissions();
+        if perms.mode() & 0o111 != 0o111 {
+            perms.set_mode(0o755);
+            fs::set_permissions(&path, perms)?;
+            if !written.contains(&path) {
+                written.push(path);
+            }
+        }
+    }
+    Ok(written)
+}
+
 // ---- Claude Code ----------------------------------------------------
 
 fn claude_settings_path() -> Option<PathBuf> {
@@ -408,6 +479,30 @@ const CLAUDE_EVENTS: &[ClaudeEvent] = &[
         name: "Notification",
         subcommand: "notification",
         timeout_secs: 10,
+    },
+    // Live agent-activity tracking. SessionStart registers the agent's
+    // presence/PID; UserPromptSubmit + PreToolUse mark it Running;
+    // SessionEnd clears it. SessionEnd uses a tight timeout because it
+    // fires on the exit path and must not stall the shell.
+    ClaudeEvent {
+        name: "SessionStart",
+        subcommand: "session-start",
+        timeout_secs: 5,
+    },
+    ClaudeEvent {
+        name: "UserPromptSubmit",
+        subcommand: "prompt-submit",
+        timeout_secs: 5,
+    },
+    ClaudeEvent {
+        name: "PreToolUse",
+        subcommand: "pre-tool-use",
+        timeout_secs: 5,
+    },
+    ClaudeEvent {
+        name: "SessionEnd",
+        subcommand: "session-end",
+        timeout_secs: 1,
     },
 ];
 
@@ -1037,7 +1132,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_install_creates_settings_with_two_event_entries() {
+    fn claude_install_creates_settings_with_lifecycle_event_entries() {
         let dir = tmp();
         let claude_dir = dir.path().join(".claude");
         fs::create_dir_all(&claude_dir).unwrap();
@@ -1068,6 +1163,37 @@ mod tests {
         let cmd = stop["hooks"][0]["command"].as_str().unwrap();
         assert!(cmd.contains("flowmux hooks claude stop"));
         assert!(cmd.contains(FLOWMUX_HOOK_MARKER));
+
+        // The activity-tracking lifecycle events are installed alongside
+        // Stop/Notification, each mapped to its kebab-case subcommand.
+        for (name, subcommand) in [
+            ("SessionStart", "session-start"),
+            ("UserPromptSubmit", "prompt-submit"),
+            ("PreToolUse", "pre-tool-use"),
+            ("SessionEnd", "session-end"),
+        ] {
+            let cmd = written["hooks"][name][0]["hooks"][0]["command"]
+                .as_str()
+                .unwrap_or_else(|| panic!("missing hook entry for {name}"));
+            assert!(
+                cmd.contains(&format!("flowmux hooks claude {subcommand}")),
+                "event {name} should invoke `{subcommand}`, got: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn shim_script_exports_agent_pid_and_execs_real_binary() {
+        let body = shim_script("claude");
+        assert!(body.starts_with("#!/usr/bin/env bash"));
+        assert!(body.contains("export FLOWMUX_AGENT_PID=$$"));
+        // Only when inside flowmux, so it stays transparent elsewhere.
+        assert!(body.contains("FLOWMUX_SURFACE_ID"));
+        // Skips its own dir and exec's the resolved real binary.
+        assert!(body.contains("[ \"$d\" = \"$self_dir\" ] && continue"));
+        assert!(body.contains("exec \"$real\" \"$@\""));
+        // Agent name is substituted into the lookup.
+        assert!(body.contains("$d/claude"));
     }
 
     #[test]

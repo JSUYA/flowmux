@@ -775,6 +775,7 @@ impl WindowController {
             title: title.clone(),
             title_locked: false,
             kind: torn.kind.clone(),
+            agent: None,
         };
         let workspace = Workspace {
             id: workspace_id,
@@ -2082,6 +2083,14 @@ impl WindowController {
                 }
                 self.refresh_launcher_badge();
                 self.sidebar.refresh_notification_popover();
+            }
+            GtkCommand::SetAgentActivity {
+                workspace,
+                activity,
+            } => {
+                // Breathe the workspace's color bar while an agent is
+                // Running; clear it otherwise.
+                self.sidebar.set_agent_activity(workspace, activity);
             }
             GtkCommand::FocusWorkspaceAt { idx } => {
                 let snap = self.store.snapshot().await;

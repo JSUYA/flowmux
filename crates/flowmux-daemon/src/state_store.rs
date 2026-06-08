@@ -7,8 +7,9 @@
 //! boot.
 
 use flowmux_core::{
-    terminal_tab_title_for_cwd, CloseSurfaceOutcome, Pane, PaneContent, PaneId, PaneSurface,
-    RemoveOutcome, SplitDirection, Surface, SurfaceId, SurfaceKind, Workspace, WorkspaceId,
+    terminal_tab_title_for_cwd, AgentPresence, CloseSurfaceOutcome, Pane, PaneContent, PaneId,
+    PaneSurface, RemoveOutcome, SplitDirection, Surface, SurfaceId, SurfaceKind, Workspace,
+    WorkspaceId,
 };
 use flowmux_state::{State, WindowLayout};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -409,6 +410,50 @@ impl StateStore {
             }
         }
         None
+    }
+
+    /// Set (or clear, with `None`) the live AI-agent presence on the tab
+    /// surface `surface_id`. Returns the owning workspace id so the
+    /// caller can route a sidebar update. Deliberately does **not**
+    /// `mark_dirty`: agent presence is runtime-only (`#[serde(skip)]`),
+    /// so there is nothing to persist and we avoid disk churn on every
+    /// status flip.
+    pub async fn set_agent_activity(
+        &self,
+        surface_id: SurfaceId,
+        agent: Option<AgentPresence>,
+    ) -> Option<WorkspaceId> {
+        let mut s = self.inner.lock().await;
+        for ws in s.workspaces.iter_mut() {
+            for surface in ws.surfaces.iter_mut() {
+                if surface.root_pane.set_surface_agent(surface_id, agent.clone()) {
+                    return Some(ws.id);
+                }
+            }
+        }
+        None
+    }
+
+    /// Collect `(workspace, surface, pid)` for every tab surface that
+    /// currently has an agent presence with a known PID. The daemon's
+    /// liveness sweep walks this list and clears entries whose process
+    /// has died (hard kill / closed terminal where `SessionEnd` never
+    /// fired).
+    pub async fn live_agent_presences(&self) -> Vec<(WorkspaceId, SurfaceId, u32)> {
+        let s = self.inner.lock().await;
+        let mut out = Vec::new();
+        for ws in &s.workspaces {
+            let mut found = Vec::new();
+            for surface in &ws.surfaces {
+                surface.root_pane.collect_agent_presences(&mut found);
+            }
+            for (sid, presence) in found {
+                if let Some(pid) = presence.pid {
+                    out.push((ws.id, sid, pid));
+                }
+            }
+        }
+        out
     }
 
     pub async fn update_surface_cwd(

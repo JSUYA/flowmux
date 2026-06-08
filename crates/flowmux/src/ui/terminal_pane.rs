@@ -476,6 +476,26 @@ impl TerminalPane {
         let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
         let cwd_str = cwd.as_ref().and_then(|p| p.to_str());
 
+        // Prepend the agent shim dir to PATH so `claude` / `codex`
+        // resolve to the PID-capturing wrappers `flowmux fix` installs.
+        // VTE merges these entries over the inherited environment, so a
+        // PATH entry overrides the inherited one — we rebuild it as
+        // shim-dir-first to preserve prepend semantics. Transparent for
+        // every other command.
+        let mut extra_env = extra_env;
+        if let Some(shim) = flowmux_config::paths::agent_shim_dir() {
+            if shim.is_dir() {
+                let base = std::env::var("PATH").unwrap_or_default();
+                let shim = shim.to_string_lossy();
+                let value = if base.is_empty() {
+                    shim.into_owned()
+                } else {
+                    format!("{shim}:{base}")
+                };
+                extra_env.push(("PATH".to_string(), value));
+            }
+        }
+
         // VTE's spawn_async expects an envv array of `KEY=VALUE` strings,
         // or an empty slice to inherit the parent's environment. We build
         // a minimal extension on top of inheritance: parent env is

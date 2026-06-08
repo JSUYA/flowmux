@@ -382,14 +382,14 @@ enum ClaudeHookEvent {
     Stop,
     /// Claude needs the user (permission prompt, plan summary, …).
     Notification,
-    /// New session started — used to associate a session id with the
-    /// current PTY so future events can resolve back to a pane.
+    /// New session started — registers the agent's presence (and PID
+    /// from the wrapper shim) so its activity can be tracked.
     SessionStart,
-    /// Session ended — clear the cached session→pane association.
+    /// Session ended — clears the agent presence for this surface.
     SessionEnd,
-    /// Claude is about to call a tool; flowmux currently no-ops.
+    /// Claude is about to call a tool — marks the agent Running.
     PreToolUse,
-    /// User submitted a prompt; flowmux currently no-ops.
+    /// User submitted a prompt — marks the agent Running.
     PromptSubmit,
 }
 
@@ -896,31 +896,49 @@ async fn run_claude_hook_event(
     event: &ClaudeHookEvent,
     socket: Option<PathBuf>,
 ) -> anyhow::Result<()> {
+    use flowmux_core::AgentActivity::{Idle, NeedsInput, Running};
     use hooks::*;
     let input = read_claude_hook_input();
     let pane = pane_from_env();
     let surface = surface_from_env();
-    let req = match event {
+    let pid = pid_from_env();
+    // Most events carry exactly one request; Stop/Notification carry two
+    // (the user-facing toast *and* the activity flip) so the existing
+    // "ready" notification keeps firing alongside the new live-status
+    // tracking.
+    let mut reqs: Vec<_> = Vec::new();
+    match event {
         ClaudeHookEvent::Stop => {
             let body = input.last_assistant_message.as_deref();
-            build_stop_notify("Claude", body, pane, surface)
+            reqs.push(build_stop_notify("Claude", body, pane, surface));
+            reqs.push(build_activity_update("claude", Some(Idle), pid, pane, surface));
         }
         ClaudeHookEvent::Notification => {
             let msg = input.message.as_deref();
-            build_notification_notify("Claude", msg, pane, surface)
+            reqs.push(build_notification_notify("Claude", msg, pane, surface));
+            reqs.push(build_activity_update("claude", Some(NeedsInput), pid, pane, surface));
         }
-        // The remaining events are tracked by cmux as stateful
-        // (session→workspace mapping, status flips). flowmux's first
-        // notification cut keeps them as no-ops so the user gets the
-        // same "ready" toast regardless of which Claude version they
-        // run, without growing a stateful session store yet.
-        ClaudeHookEvent::SessionStart
-        | ClaudeHookEvent::SessionEnd
-        | ClaudeHookEvent::PreToolUse
-        | ClaudeHookEvent::PromptSubmit => return Ok(()),
+        // SessionStart registers the agent's presence (and PID, for the
+        // liveness sweep) without claiming it is working yet.
+        ClaudeHookEvent::SessionStart => {
+            reqs.push(build_activity_update("claude", Some(Idle), pid, pane, surface));
+        }
+        // A new prompt or an imminent tool call means the agent is
+        // actively working this turn — and clears any "needs input".
+        ClaudeHookEvent::PromptSubmit | ClaudeHookEvent::PreToolUse => {
+            reqs.push(build_activity_update("claude", Some(Running), pid, pane, surface));
+        }
+        // Real teardown (covers Ctrl+C, where Stop never fires). The
+        // daemon PID sweep is the backstop for a hard kill that skips
+        // SessionEnd too.
+        ClaudeHookEvent::SessionEnd => {
+            reqs.push(build_activity_update("claude", None, pid, pane, surface));
+        }
     };
     if let Some(client) = hooks::connect_daemon(socket).await {
-        hooks::send_best_effort(&client, req).await;
+        for req in reqs {
+            hooks::send_best_effort(&client, req).await;
+        }
     }
     Ok(())
 }
@@ -949,25 +967,34 @@ async fn run_generic_agent_hook_event(
         "cli/hook",
         "entry agent={agent:?} event={event:?} cli_pane={cli_pane:?} cli_surface={cli_surface:?} env_pane={env_pane:?} env_surface={env_surface:?} resolved_pane={pane:?} resolved_surface={surface:?} socket_arg={socket:?}"
     );
-    let req = match event {
+    use flowmux_core::AgentActivity::{Idle, NeedsInput};
+    let pid = hooks::pid_from_env();
+    let mut reqs: Vec<_> = Vec::new();
+    match event {
         AgentHookEvent::Stop { args, .. } => {
             let input = read_codex_hook_input(args);
             let body = input.last_assistant_message.as_deref();
-            build_stop_notify(agent, body, pane, surface)
+            reqs.push(build_stop_notify(agent, body, pane, surface));
+            reqs.push(build_activity_update(agent, Some(Idle), pid, pane, surface));
         }
         AgentHookEvent::Notification { args, .. } => {
             let input = read_codex_hook_input(args);
             let msg = input.message.as_deref();
-            build_notification_notify(agent, msg, pane, surface)
+            reqs.push(build_notification_notify(agent, msg, pane, surface));
+            reqs.push(build_activity_update(agent, Some(NeedsInput), pid, pane, surface));
         }
+        // Codex / OpenCode register presence on session start (no
+        // wrapper PID for these, so the daemon clears them via Stop→Idle
+        // plus the liveness sweep rather than a SessionEnd hook).
         AgentHookEvent::SessionStart { .. } => {
-            flowmux_config::notify_debug!("cli/hook", "session-start: no-op, exiting");
-            return Ok(());
+            reqs.push(build_activity_update(agent, Some(Idle), pid, pane, surface));
         }
     };
     match hooks::connect_daemon(socket).await {
         Some(client) => {
-            hooks::send_best_effort(&client, req).await;
+            for req in reqs {
+                hooks::send_best_effort(&client, req).await;
+            }
         }
         None => {
             flowmux_config::notify_debug!(

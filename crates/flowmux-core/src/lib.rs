@@ -258,6 +258,11 @@ pub struct PaneSurface {
     #[serde(default)]
     pub title_locked: bool,
     pub kind: SurfaceKind,
+    /// Live AI-agent activity, set from agent lifecycle hooks. Runtime
+    /// state only — never persisted, so resumed workspaces start with no
+    /// agent presence until the next hook fires.
+    #[serde(skip)]
+    pub agent: Option<AgentPresence>,
 }
 
 /// A pane is either a leaf (rendered content) or a binary split. This
@@ -422,6 +427,58 @@ impl Pane {
         // into a single move.
         let mut title = Some(title);
         rename_surface_descend(self, target, surface_id, &mut title)
+    }
+
+    /// Set (or clear, with `None`) the live AI-agent presence on the tab
+    /// surface identified by `surface_id`, wherever it sits in this pane
+    /// tree. Returns true when a matching surface was found. Runtime-only
+    /// state — callers must not schedule persistence for this change.
+    pub fn set_surface_agent(
+        &mut self,
+        surface_id: SurfaceId,
+        agent: Option<AgentPresence>,
+    ) -> bool {
+        match self {
+            Pane::Leaf {
+                content: PaneContent::Tabs { surfaces, .. },
+                ..
+            } => {
+                if let Some(surface) = surfaces.iter_mut().find(|s| s.id == surface_id) {
+                    surface.agent = agent;
+                    true
+                } else {
+                    false
+                }
+            }
+            Pane::Leaf { .. } => false,
+            Pane::Split { first, second, .. } => {
+                first.set_surface_agent(surface_id, agent.clone())
+                    || second.set_surface_agent(surface_id, agent)
+            }
+        }
+    }
+
+    /// Append `(surface_id, presence)` for every tab surface in this tree
+    /// that currently carries an agent presence. Used by the daemon's
+    /// PID liveness sweep.
+    pub fn collect_agent_presences(&self, out: &mut Vec<(SurfaceId, AgentPresence)>) {
+        match self {
+            Pane::Leaf {
+                content: PaneContent::Tabs { surfaces, .. },
+                ..
+            } => {
+                for surface in surfaces {
+                    if let Some(agent) = &surface.agent {
+                        out.push((surface.id, agent.clone()));
+                    }
+                }
+            }
+            Pane::Leaf { .. } => {}
+            Pane::Split { first, second, .. } => {
+                first.collect_agent_presences(out);
+                second.collect_agent_presences(out);
+            }
+        }
     }
 
     /// Update a browser surface's stored URL. Called on webview navigation so
@@ -1086,6 +1143,7 @@ impl PaneSurface {
             title: title.into(),
             title_locked: false,
             kind: SurfaceKind::Terminal { shell: None, cwd },
+            agent: None,
         }
     }
 
@@ -1097,6 +1155,7 @@ impl PaneSurface {
             kind: SurfaceKind::Browser {
                 initial_url: Some(url),
             },
+            agent: None,
         }
     }
 }
@@ -1237,6 +1296,42 @@ pub enum NotificationLevel {
     /// and the workspace bumps to the top of the unread list.
     AttentionNeeded,
     Error,
+}
+
+/// Live activity state of an AI coding agent (Claude Code, Codex,
+/// OpenCode) running inside a surface. Driven by the agent's lifecycle
+/// hooks. Runtime-only — never persisted (see [`PaneSurface::agent`]).
+///
+/// State machine mirrors cmux: `UserPromptSubmit` → [`Running`], `Stop`
+/// → [`Idle`], `Notification` → [`NeedsInput`]; `SessionEnd` or the
+/// daemon's PID liveness sweep clears the presence entirely.
+///
+/// [`Running`]: AgentActivity::Running
+/// [`Idle`]: AgentActivity::Idle
+/// [`NeedsInput`]: AgentActivity::NeedsInput
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentActivity {
+    /// Agent is actively working a turn (prompt submitted, tools running).
+    Running,
+    /// Agent is blocked waiting for the user (permission/input prompt).
+    NeedsInput,
+    /// Agent finished a turn and is present but idle.
+    Idle,
+}
+
+/// An AI agent currently occupying a surface, with its live activity and
+/// (when known) the agent process PID used for liveness sweeps.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentPresence {
+    /// Agent identity as reported by its hook (`claude`, `codex`,
+    /// `opencode`). Lowercase CLI name.
+    pub name: String,
+    pub activity: AgentActivity,
+    /// PID of the agent process (from the wrapper shim's
+    /// `FLOWMUX_AGENT_PID`). `None` for agents without a wrapper; such
+    /// presences are cleared by hooks only, not the PID sweep.
+    pub pid: Option<u32>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -2756,6 +2851,7 @@ mod tests {
                 shell: None,
                 cwd: Some(cwd.clone()),
             },
+            agent: None,
         };
         let changed = normalize_unlocked_terminal_title(&mut surface);
         assert!(changed, "stale OSC title should be reset");
@@ -2764,6 +2860,35 @@ mod tests {
             !surface.title_locked,
             "must not auto-lock — the title was never the user's intent"
         );
+    }
+
+    #[test]
+    fn agent_presence_is_never_persisted() {
+        let mut surface = PaneSurface {
+            id: SurfaceId::new(),
+            title: "Claude Code".into(),
+            title_locked: false,
+            kind: SurfaceKind::Terminal {
+                shell: None,
+                cwd: None,
+            },
+            agent: Some(AgentPresence {
+                name: "claude".into(),
+                activity: AgentActivity::Running,
+                pid: Some(4321),
+            }),
+        };
+        let json = serde_json::to_string(&surface).unwrap();
+        assert!(
+            !json.contains("agent") && !json.contains("claude"),
+            "agent presence must be skipped from serialization, got: {json}"
+        );
+        // Round-trips back with no agent (runtime-only field); the rest
+        // of the surface survives.
+        let back: PaneSurface = serde_json::from_str(&json).unwrap();
+        assert!(back.agent.is_none());
+        assert_eq!(back.id, surface.id);
+        assert_eq!(back.title, surface.title);
     }
 
     #[test]
@@ -2776,6 +2901,7 @@ mod tests {
                 shell: None,
                 cwd: Some("/tmp".into()),
             },
+            agent: None,
         };
         let changed = normalize_unlocked_terminal_title(&mut surface);
         assert!(!changed);
@@ -2795,6 +2921,7 @@ mod tests {
                 shell: None,
                 cwd: Some(cwd),
             },
+            agent: None,
         };
         let changed = normalize_unlocked_terminal_title(&mut surface);
         assert!(!changed, "no-op when title already matches cwd");
@@ -2808,6 +2935,7 @@ mod tests {
             title: "Page Title".into(),
             title_locked: false,
             kind: SurfaceKind::Browser { initial_url: None },
+            agent: None,
         };
         let changed = normalize_unlocked_terminal_title(&mut surface);
         assert!(!changed);
@@ -2824,6 +2952,7 @@ mod tests {
                 shell: None,
                 cwd: None,
             },
+            agent: None,
         };
         let changed = normalize_unlocked_terminal_title(&mut surface);
         assert!(changed);

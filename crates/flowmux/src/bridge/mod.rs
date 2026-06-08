@@ -9,8 +9,8 @@
 //! window controller.
 
 use flowmux_core::{
-    NotificationId, NotificationLevel, PaneId, PlacementStrategy, SplitDirection, SurfaceId,
-    WorkspaceId,
+    AgentActivity, NotificationId, NotificationLevel, PaneId, PlacementStrategy, SplitDirection,
+    SurfaceId, WorkspaceId,
 };
 use std::path::PathBuf;
 use tokio::sync::oneshot;
@@ -378,6 +378,14 @@ pub enum GtkCommand {
     /// withdraw their matching desktop toasts in one sweep. Fired by
     /// the "All Clear" button at the top of the bell popover.
     ClearAllNotifications,
+    /// An AI agent's live activity in `workspace` changed. Drives the
+    /// breathing opacity of the workspace's left color bar.
+    /// `activity: None` clears the presence (session end / dead PID).
+    /// Fire-and-forget — the sidebar render has no reply.
+    SetAgentActivity {
+        workspace: WorkspaceId,
+        activity: Option<AgentActivity>,
+    },
 }
 
 #[derive(Clone)]
