@@ -813,11 +813,12 @@ fn row_widget(
     });
     row.add_controller(motion);
 
-    // Right-click context menu — plain Popover + Button rows whose
-    // click closures send the right GtkCommand directly through the
-    // bridge. We deliberately avoid PopoverMenu+win.* actions because
-    // the action lookup chain has been observed to drop through some
-    // GTK versions, leaving the menu items inert.
+    // Right-click context menu. Not a Popover: popup-surface input
+    // grabs proved unreliable on X11 hosts (items intermittently dead
+    // within one process run on Ubuntu 22.04 Xorg, host GTK and
+    // Flatpak runtime alike), so the menu is drawn inside the window's
+    // content overlay instead — see `ui::overlay_menu`. Item closures
+    // send the right GtkCommand directly through the bridge.
     let click = gtk::GestureClick::new();
     click.set_button(gtk::gdk::BUTTON_SECONDARY);
     let row_for_click = row.clone();
@@ -827,161 +828,113 @@ fn row_widget(
         // and the ListBox don't also act on this press.
         gesture.set_state(gtk::EventSequenceState::Claimed);
         flowmux_config::notify_debug!("sidebar/ctxmenu", "menu opened ws={id}");
-        let popover = gtk::Popover::new();
-        let v = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        v.set_margin_top(4);
-        v.set_margin_bottom(4);
+        use crate::ui::overlay_menu::MenuItem;
 
-        let mk = |label: &str| -> gtk::Button {
-            let b = gtk::Button::with_label(label);
-            b.add_css_class("flat");
-            b.set_halign(gtk::Align::Fill);
-            b.set_hexpand(true);
-            if let Some(label) = b.child().and_downcast::<gtk::Label>() {
-                label.set_xalign(0.0);
-            }
-            b
+        let bridge_for_rename = bridge.clone();
+        let rename = MenuItem::Action {
+            label: "Change tab name",
+            activate: Box::new(move || {
+                flowmux_config::notify_debug!("sidebar/ctxmenu", "click rename ws={id}");
+                let bridge = bridge_for_rename.clone();
+                gtk::glib::MainContext::default().spawn_local(async move {
+                    let _ = bridge.tx.send(GtkCommand::ShowRenameDialog { id }).await;
+                });
+            }),
         };
 
-        let rename_btn = mk("Change tab name");
-        let bridge_for_rename = bridge.clone();
-        let pop = popover.clone();
-        rename_btn.connect_clicked(move |_| {
-            flowmux_config::notify_debug!("sidebar/ctxmenu", "click rename ws={id}");
-            pop.popdown();
-            let bridge = bridge_for_rename.clone();
-            gtk::glib::MainContext::default().spawn_local(async move {
-                let _ = bridge.tx.send(GtkCommand::ShowRenameDialog { id }).await;
-            });
-        });
-        v.append(&rename_btn);
-
-        let color_btn = mk("Change color…");
         let bridge_for_color = bridge.clone();
-        let pop = popover.clone();
-        color_btn.connect_clicked(move |_| {
-            flowmux_config::notify_debug!("sidebar/ctxmenu", "click color ws={id}");
-            pop.popdown();
-            let bridge = bridge_for_color.clone();
-            gtk::glib::MainContext::default().spawn_local(async move {
-                let _ = bridge.tx.send(GtkCommand::ShowColorDialog { id }).await;
-            });
-        });
-        v.append(&color_btn);
+        let color = MenuItem::Action {
+            label: "Change color…",
+            activate: Box::new(move || {
+                flowmux_config::notify_debug!("sidebar/ctxmenu", "click color ws={id}");
+                let bridge = bridge_for_color.clone();
+                gtk::glib::MainContext::default().spawn_local(async move {
+                    let _ = bridge.tx.send(GtkCommand::ShowColorDialog { id }).await;
+                });
+            }),
+        };
 
-        v.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-
-        let close_btn = mk("Close tab");
         let on_close_clone = on_close_for_menu.clone();
-        let pop = popover.clone();
-        close_btn.connect_clicked(move |_| {
-            flowmux_config::notify_debug!("sidebar/ctxmenu", "click close-tab ws={id}");
-            pop.popdown();
-            on_close_clone(id);
-        });
-        v.append(&close_btn);
+        let close = MenuItem::Action {
+            label: "Close tab",
+            activate: Box::new(move || {
+                flowmux_config::notify_debug!("sidebar/ctxmenu", "click close-tab ws={id}");
+                on_close_clone(id);
+            }),
+        };
 
         // Close every open workspace at once. The dispatcher shows a
         // single confirmation before tearing them all down.
-        let close_all_btn = mk("Close all tabs");
         let bridge_for_close_all = bridge.clone();
-        let pop = popover.clone();
-        close_all_btn.connect_clicked(move |_| {
-            flowmux_config::notify_debug!("sidebar/ctxmenu", "click close-all ws={id}");
-            pop.popdown();
-            let bridge = bridge_for_close_all.clone();
-            gtk::glib::MainContext::default().spawn_local(async move {
-                let (ack, rx) = tokio::sync::oneshot::channel();
-                let _ = bridge
-                    .tx
-                    .send(GtkCommand::RemoveAllWorkspaces { ack })
-                    .await;
-                let _ = rx.await;
-            });
-        });
-        v.append(&close_all_btn);
-
-        v.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+        let close_all = MenuItem::Action {
+            label: "Close all tabs",
+            activate: Box::new(move || {
+                flowmux_config::notify_debug!("sidebar/ctxmenu", "click close-all ws={id}");
+                let bridge = bridge_for_close_all.clone();
+                gtk::glib::MainContext::default().spawn_local(async move {
+                    let (ack, rx) = tokio::sync::oneshot::channel();
+                    let _ = bridge
+                        .tx
+                        .send(GtkCommand::RemoveAllWorkspaces { ack })
+                        .await;
+                    let _ = rx.await;
+                });
+            }),
+        };
 
         // Open the focused pane's cwd in the system file manager
         // (Nautilus on a default Ubuntu/GNOME install). The dispatcher
         // resolves "focused pane" inside this workspace and falls back
         // to its first leaf pane.
-        let show_btn = mk("Show in folder");
         let bridge_for_show = bridge.clone();
-        let pop = popover.clone();
-        show_btn.connect_clicked(move |_| {
-            flowmux_config::notify_debug!("sidebar/ctxmenu", "click show-folder ws={id}");
-            pop.popdown();
-            let bridge = bridge_for_show.clone();
-            gtk::glib::MainContext::default().spawn_local(async move {
-                let _ = bridge
-                    .tx
-                    .send(GtkCommand::ShowFocusedPaneFolder { workspace: id })
-                    .await;
-            });
-        });
-        v.append(&show_btn);
+        let show_folder = MenuItem::Action {
+            label: "Show in folder",
+            activate: Box::new(move || {
+                flowmux_config::notify_debug!("sidebar/ctxmenu", "click show-folder ws={id}");
+                let bridge = bridge_for_show.clone();
+                gtk::glib::MainContext::default().spawn_local(async move {
+                    let _ = bridge
+                        .tx
+                        .send(GtkCommand::ShowFocusedPaneFolder { workspace: id })
+                        .await;
+                });
+            }),
+        };
 
         // Copy the focused-pane text identifier — cwd for terminal,
         // URL for browser — to the clipboard. The dispatcher routes
         // based on the active surface kind, so one item covers both
         // cases without forcing the user to pick.
-        let copy_btn = mk("Copy path");
         let bridge_for_copy = bridge.clone();
-        let pop = popover.clone();
-        copy_btn.connect_clicked(move |_| {
-            flowmux_config::notify_debug!("sidebar/ctxmenu", "click copy-path ws={id}");
-            pop.popdown();
-            let bridge = bridge_for_copy.clone();
-            gtk::glib::MainContext::default().spawn_local(async move {
-                let _ = bridge
-                    .tx
-                    .send(GtkCommand::CopyFocusedPaneText { workspace: id })
-                    .await;
-            });
-        });
-        v.append(&copy_btn);
+        let copy_path = MenuItem::Action {
+            label: "Copy path",
+            activate: Box::new(move || {
+                flowmux_config::notify_debug!("sidebar/ctxmenu", "click copy-path ws={id}");
+                let bridge = bridge_for_copy.clone();
+                gtk::glib::MainContext::default().spawn_local(async move {
+                    let _ = bridge
+                        .tx
+                        .send(GtkCommand::CopyFocusedPaneText { workspace: id })
+                        .await;
+                });
+            }),
+        };
 
-        popover.set_child(Some(&v));
-        // Parent the popover to the long-lived ListBox, never to this
-        // row's content widget: upsert_inner() swaps the row child on
-        // every title/subtitle update, and a popover whose parent was
-        // unrooted that way stays on screen but stops receiving input
-        // on GTK 4.6 (Ubuntu 22.04) — every menu item looked dead.
-        // The terminal context menu, which works on 4.6, is likewise
-        // parented to a persistent widget. Click coords are translated
-        // from the row into the ListBox before anchoring.
-        let menu_parent: gtk::Widget = row_for_click
-            .ancestor(gtk::ListBox::static_type())
-            .unwrap_or_else(|| row_for_click.clone().upcast());
-        let click_pt = row_for_click
-            .compute_point(
-                &menu_parent,
-                &gtk::graphene::Point::new(x as f32, y as f32),
-            )
-            .unwrap_or_else(|| gtk::graphene::Point::new(x as f32, y as f32));
-        popover.set_parent(&menu_parent);
-        popover.set_has_arrow(false);
-        crate::ui::popover_pos::anchor_at_click(
-            &popover,
-            &menu_parent,
-            click_pt.x() as f64,
-            click_pt.y() as f64,
+        crate::ui::overlay_menu::show_at(
+            &row_for_click,
+            x,
+            y,
+            vec![
+                rename,
+                color,
+                MenuItem::Separator,
+                close,
+                close_all,
+                MenuItem::Separator,
+                show_folder,
+                copy_path,
+            ],
         );
-        popover.connect_closed(|p| p.unparent());
-        // Pop up synchronously, inside the press handler — exactly like
-        // the terminal context menu, which works on every host. An
-        // earlier fix deferred popup() to an idle callback, but on X11
-        // sessions an autohide popover popped up outside the input
-        // event that triggered it never acquires pointer input: the
-        // menu is visible yet every item is dead (debug traces showed
-        // "menu opened" with zero item clicks). Wayland tolerates the
-        // deferred popup, which is why only Ubuntu 22.04-on-Xorg broke.
-        // The intermittent first-click drops that motivated the idle
-        // defer were really the row-rebuild unparenting bug, fixed
-        // above by parenting the popover to the ListBox.
-        popover.popup();
     });
     row.add_controller(click);
 

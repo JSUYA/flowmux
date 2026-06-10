@@ -413,6 +413,14 @@ paned > separator {{
     box-shadow: 0 6px 18px rgba(0, 0, 0, 0.28);
     padding: 8px 14px;
 }}
+.flowmux-overlay-menu {{
+    background-color: {toast_bg};
+    color: {fg};
+    border: 1px solid {toast_border};
+    border-radius: 8px;
+    box-shadow: 0 6px 18px rgba(0, 0, 0, 0.28);
+    padding: 4px 0;
+}}
 "#,
             bg = bg_css,
             fg = rgba_css(&self.fg),
