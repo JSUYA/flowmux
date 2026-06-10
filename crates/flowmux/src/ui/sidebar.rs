@@ -944,9 +944,31 @@ fn row_widget(
         v.append(&copy_btn);
 
         popover.set_child(Some(&v));
-        popover.set_parent(&row_for_click);
+        // Parent the popover to the long-lived ListBox, never to this
+        // row's content widget: upsert_inner() swaps the row child on
+        // every title/subtitle update, and a popover whose parent was
+        // unrooted that way stays on screen but stops receiving input
+        // on GTK 4.6 (Ubuntu 22.04) — every menu item looked dead.
+        // The terminal context menu, which works on 4.6, is likewise
+        // parented to a persistent widget. Click coords are translated
+        // from the row into the ListBox before anchoring.
+        let menu_parent: gtk::Widget = row_for_click
+            .ancestor(gtk::ListBox::static_type())
+            .unwrap_or_else(|| row_for_click.clone().upcast());
+        let click_pt = row_for_click
+            .compute_point(
+                &menu_parent,
+                &gtk::graphene::Point::new(x as f32, y as f32),
+            )
+            .unwrap_or_else(|| gtk::graphene::Point::new(x as f32, y as f32));
+        popover.set_parent(&menu_parent);
         popover.set_has_arrow(false);
-        crate::ui::popover_pos::anchor_at_click(&popover, &row_for_click, x, y);
+        crate::ui::popover_pos::anchor_at_click(
+            &popover,
+            &menu_parent,
+            click_pt.x() as f64,
+            click_pt.y() as f64,
+        );
         popover.connect_closed(|p| p.unparent());
         // Pop up after the right-button press event fully settles. On
         // GTK 4.6 (Ubuntu 22.04), calling popup() synchronously inside
