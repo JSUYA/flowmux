@@ -93,6 +93,177 @@ pub struct WindowController {
     tokio_handle: Option<tokio::runtime::Handle>,
 }
 
+fn wsl_resize_handles_enabled() -> bool {
+    !crate::platform::env_flag_enabled("FLOWMUX_NO_WSL_RESIZE_HANDLES")
+        && (crate::platform::running_under_wsl()
+            || crate::platform::env_flag_enabled("FLOWMUX_WSL_RESIZE_HANDLES"))
+}
+
+fn set_window_content(window: &adw::ApplicationWindow, toolbar: &adw::ToolbarView) {
+    if wsl_resize_handles_enabled() {
+        let overlay = gtk::Overlay::new();
+        overlay.set_child(Some(toolbar));
+        window.set_content(Some(&overlay));
+        install_window_resize_handles(window, &overlay);
+    } else {
+        window.set_content(Some(toolbar));
+    }
+}
+
+fn install_window_resize_handles(window: &adw::ApplicationWindow, overlay: &gtk::Overlay) {
+    const EDGE: i32 = 14;
+    const CORNER: i32 = 30;
+
+    add_resize_handle(
+        window,
+        overlay,
+        gtk::gdk::SurfaceEdge::North,
+        "n-resize",
+        gtk::Align::Fill,
+        gtk::Align::Start,
+        -1,
+        EDGE,
+    );
+    add_resize_handle(
+        window,
+        overlay,
+        gtk::gdk::SurfaceEdge::South,
+        "s-resize",
+        gtk::Align::Fill,
+        gtk::Align::End,
+        -1,
+        EDGE,
+    );
+    add_resize_handle(
+        window,
+        overlay,
+        gtk::gdk::SurfaceEdge::West,
+        "w-resize",
+        gtk::Align::Start,
+        gtk::Align::Fill,
+        EDGE,
+        -1,
+    );
+    add_resize_handle(
+        window,
+        overlay,
+        gtk::gdk::SurfaceEdge::East,
+        "e-resize",
+        gtk::Align::End,
+        gtk::Align::Fill,
+        EDGE,
+        -1,
+    );
+
+    // Corners are added last so diagonal resize wins where edge handles overlap.
+    add_resize_handle(
+        window,
+        overlay,
+        gtk::gdk::SurfaceEdge::NorthWest,
+        "nw-resize",
+        gtk::Align::Start,
+        gtk::Align::Start,
+        CORNER,
+        CORNER,
+    );
+    add_resize_handle(
+        window,
+        overlay,
+        gtk::gdk::SurfaceEdge::NorthEast,
+        "ne-resize",
+        gtk::Align::End,
+        gtk::Align::Start,
+        CORNER,
+        CORNER,
+    );
+    add_resize_handle(
+        window,
+        overlay,
+        gtk::gdk::SurfaceEdge::SouthWest,
+        "sw-resize",
+        gtk::Align::Start,
+        gtk::Align::End,
+        CORNER,
+        CORNER,
+    );
+    add_resize_handle(
+        window,
+        overlay,
+        gtk::gdk::SurfaceEdge::SouthEast,
+        "se-resize",
+        gtk::Align::End,
+        gtk::Align::End,
+        CORNER,
+        CORNER,
+    );
+}
+
+fn add_resize_handle(
+    window: &adw::ApplicationWindow,
+    overlay: &gtk::Overlay,
+    edge: gtk::gdk::SurfaceEdge,
+    cursor: &str,
+    halign: gtk::Align,
+    valign: gtk::Align,
+    width: i32,
+    height: i32,
+) {
+    let handle = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    handle.set_halign(halign);
+    handle.set_valign(valign);
+    handle.set_can_focus(false);
+    handle.set_can_target(true);
+    handle.set_cursor_from_name(Some(cursor));
+    if width > 0 {
+        handle.set_width_request(width);
+    } else {
+        handle.set_hexpand(true);
+    }
+    if height > 0 {
+        handle.set_height_request(height);
+    } else {
+        handle.set_vexpand(true);
+    }
+
+    let gesture = gtk::GestureClick::new();
+    gesture.set_button(gtk::gdk::BUTTON_PRIMARY);
+    let window_weak = window.downgrade();
+    let handle_for_gesture = handle.clone();
+    gesture.connect_pressed(move |gesture, _n_press, x, y| {
+        let Some(window) = window_weak.upgrade() else {
+            return;
+        };
+        let Some(surface) = window.surface() else {
+            return;
+        };
+        let Ok(toplevel) = surface.downcast::<gtk::gdk::Toplevel>() else {
+            return;
+        };
+        let event = gesture.current_event();
+        let device = event.as_ref().and_then(|event| event.device());
+        let surface_point = handle_for_gesture
+            .compute_point(&window, &gtk::graphene::Point::new(x as f32, y as f32))
+            .unwrap_or_else(|| gtk::graphene::Point::new(x as f32, y as f32));
+        let timestamp = event
+            .as_ref()
+            .map(|event| event.time())
+            .unwrap_or_else(|| gesture.current_event_time());
+
+        toplevel.begin_resize(
+            edge,
+            device.as_ref(),
+            gtk::gdk::BUTTON_PRIMARY as i32,
+            surface_point.x() as f64,
+            surface_point.y() as f64,
+            timestamp,
+        );
+        gesture.set_state(gtk::EventSequenceState::Claimed);
+    });
+    handle.add_controller(gesture);
+
+    overlay.add_overlay(&handle);
+}
+
 impl WindowController {
     pub fn new(
         app: &adw::Application,
@@ -199,7 +370,7 @@ impl WindowController {
             .icon_name(crate::APP_ID)
             .title("flowmux")
             .build();
-        window.set_content(Some(&toolbar));
+        set_window_content(&window, &toolbar);
         if was_maximized {
             window.maximize();
         }
@@ -862,7 +1033,7 @@ impl WindowController {
             .icon_name(crate::APP_ID)
             .title(&window_title)
             .build();
-        window.set_content(Some(&toolbar));
+        set_window_content(&window, &toolbar);
         *window_ref.borrow_mut() = Some(window.downgrade());
         window.present();
 

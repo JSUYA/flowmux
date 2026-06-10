@@ -9,6 +9,7 @@ mod bridge;
 mod ipc_handler;
 mod keybindings;
 mod notifications;
+mod platform;
 mod theme;
 mod ui;
 
@@ -148,10 +149,13 @@ fn main() -> anyhow::Result<()> {
         // character lands on the next line ("\n한" instead of "한\n").
         // `IBUS_ENABLE_SYNC_MODE=1` makes the immodule block for the
         // daemon's reply inside the key filter, so the commit is fed
-        // ahead of the Enter and the ordering is correct. The cost is a
-        // D-Bus round-trip per keystroke — the standard trade-off other
-        // terminals (gnome-terminal, kitty) take for the same reason.
-        if std::env::var_os("IBUS_ENABLE_SYNC_MODE").is_none() {
+        // ahead of the Enter and the ordering is correct. WSLg's IBus
+        // portal path rejects the sync-mode PostProcessKeyEvent call on
+        // Ubuntu 24.04, though, so leave it async there and rely on the
+        // terminal-pane ordering/bypass workarounds below.
+        if std::env::var_os("IBUS_ENABLE_SYNC_MODE").is_none()
+            && !platform::running_under_wsl()
+        {
             std::env::set_var("IBUS_ENABLE_SYNC_MODE", "1");
         }
     }

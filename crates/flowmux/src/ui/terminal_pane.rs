@@ -332,7 +332,7 @@ impl TerminalPane {
         // cursor; Ctrl+left-click opens the URL in a new browser tab in the
         // same pane. Plain clicks continue into VTE text selection.
         install_url_link_handling(&term, id, callbacks.on_open_url.clone());
-        install_flatpak_ibus_nav_workaround(&term, smart_page_enabled);
+        install_ibus_nav_workaround(&term, smart_page_enabled);
 
         // Process exit.
         {
@@ -805,8 +805,8 @@ fn install_url_link_handling(
 /// letter / jamo / Backspace keys IBus swallows for composition — and returns
 /// `Proceed`, never touching the event, so VTE's IM path is unchanged. The
 /// immediate `queue_draw` covers the synchronous IBus path
-/// (`IBUS_ENABLE_SYNC_MODE=1`, forced in `main.rs`); a short follow-up redraw
-/// covers async input methods (fcitx, IBus without sync) whose
+/// (`IBUS_ENABLE_SYNC_MODE=1`, enabled by default outside WSL); a short
+/// follow-up redraw covers async input methods (fcitx, IBus without sync) whose
 /// `preedit-changed` lands just after the key event. When the cursor is
 /// visible (a normal shell, Codex, vim) the redraw is redundant with VTE's
 /// own invalidation and harmless — it is paced by human keystrokes, not
@@ -1133,15 +1133,13 @@ fn install_smart_page_keys(term: &vte::Terminal, scroll_adjustment: &gtk::Adjust
     term.add_controller(controller);
 }
 
-/// Legacy workaround for the Ubuntu 22.04 host + GNOME 48 Flatpak
-/// runtime IBus regression where plain navigation / editing keys
-/// during Hangul preedit are silently dropped. The deciding
-/// reproducer was that the same keys with `Ctrl` held down worked
-/// fine on the same setup — Ctrl takes the event past GTK's IM filter
-/// without involving IBus at all. That places the bug in the IBus
-/// daemon-path the runtime's GTK4 immodule uses for plain
-/// non-character keys, somewhere between the in-sandbox client and
-/// the host's IBus 1.5.26 daemon.
+/// Work around IBus daemon paths that silently drop plain navigation /
+/// editing keys during Hangul preedit. This was first needed for the
+/// Ubuntu 22.04 host + GNOME 48 Flatpak runtime path, and WSLg's IBus
+/// portal path shows the same symptom for BackSpace/Delete in Korean
+/// mode. The deciding reproducer was that the same keys with `Ctrl`
+/// held down worked fine on the same setup — Ctrl takes the event past
+/// GTK's IM filter without involving IBus at all.
 ///
 /// Approach: install a capture-phase `ShortcutController` on the VTE
 /// widget for the affected plain keys. When one matches we feed a
@@ -1178,6 +1176,7 @@ fn install_smart_page_keys(term: &vte::Terminal, scroll_adjustment: &gtk::Adjust
 ///
 /// Active when, and `FLOWMUX_NO_IBUS_NAV_WORKAROUND=1` overrides:
 ///   * running inside a Flatpak sandbox (`/.flatpak-info` exists), or
+///   * running under WSL/WSLg, or
 ///   * `FLOWMUX_ENABLE_IBUS_NAV_WORKAROUND=1` is set (force-on elsewhere).
 fn flatpak_ibus_bypass_bytes(keyval: gtk::gdk::Key) -> Option<&'static [u8]> {
     use gtk::gdk::Key;
@@ -1237,19 +1236,21 @@ fn flatpak_ibus_bypass_bytes(keyval: gtk::gdk::Key) -> Option<&'static [u8]> {
     }
 }
 
-fn should_install_flatpak_ibus_nav_workaround(
+fn should_install_ibus_nav_workaround(
     disable_env_present: bool,
     enable_env_present: bool,
     flatpak_info_exists: bool,
+    running_under_wsl: bool,
 ) -> bool {
-    !disable_env_present && (flatpak_info_exists || enable_env_present)
+    !disable_env_present && (flatpak_info_exists || running_under_wsl || enable_env_present)
 }
 
-fn install_flatpak_ibus_nav_workaround(term: &vte::Terminal, smart_page_enabled: bool) {
-    if !should_install_flatpak_ibus_nav_workaround(
+fn install_ibus_nav_workaround(term: &vte::Terminal, smart_page_enabled: bool) {
+    if !should_install_ibus_nav_workaround(
         std::env::var_os("FLOWMUX_NO_IBUS_NAV_WORKAROUND").is_some(),
         env_flag_enabled("FLOWMUX_ENABLE_IBUS_NAV_WORKAROUND"),
         std::path::Path::new("/.flatpak-info").exists(),
+        crate::platform::running_under_wsl(),
     ) {
         return;
     }
@@ -1725,25 +1726,29 @@ mod tests {
     }
 
     #[test]
-    fn flatpak_ibus_nav_workaround_defaults_on_in_flatpak() {
+    fn ibus_nav_workaround_defaults_on_in_flatpak_and_wsl() {
         // On by default inside the sandbox, with or without the enable env.
-        assert!(should_install_flatpak_ibus_nav_workaround(
-            false, false, true
+        assert!(should_install_ibus_nav_workaround(
+            false, false, true, false
         ));
-        assert!(should_install_flatpak_ibus_nav_workaround(
-            false, true, true
+        assert!(should_install_ibus_nav_workaround(
+            false, true, true, false
+        ));
+        // On by default under WSL/WSLg.
+        assert!(should_install_ibus_nav_workaround(
+            false, false, false, true
         ));
         // Force-on outside the sandbox via the enable env.
-        assert!(should_install_flatpak_ibus_nav_workaround(
-            false, true, false
+        assert!(should_install_ibus_nav_workaround(
+            false, true, false, false
         ));
         // Off when neither condition holds.
-        assert!(!should_install_flatpak_ibus_nav_workaround(
-            false, false, false
+        assert!(!should_install_ibus_nav_workaround(
+            false, false, false, false
         ));
         // The disable env wins everywhere (bisection kill switch).
-        assert!(!should_install_flatpak_ibus_nav_workaround(
-            true, true, true
+        assert!(!should_install_ibus_nav_workaround(
+            true, true, true, true
         ));
     }
 }
