@@ -13,7 +13,6 @@
 //! so we resolve the workspace eagerly via the daemon (already done by
 //! `Request::Notify`) and otherwise do minimal work.
 
-use anyhow::Context;
 use flowmux_core::{AgentActivity, NotificationLevel, PaneId, SurfaceId};
 use flowmux_ipc::{
     client::Client,
@@ -33,6 +32,9 @@ const HOOK_NOTIFY_TIMEOUT: Duration = Duration::from_millis(750);
 /// the fields we surface (event name, optional message, optional
 /// last assistant text). Unknown fields are ignored so a new agent
 /// release doesn't break us.
+// Several fields are parsed but not yet read — they document the wire
+// payload and keep `{input:?}` debug logs informative.
+#[allow(dead_code)]
 #[derive(Debug, Default, Deserialize)]
 pub struct ClaudeHookInput {
     #[serde(default)]

@@ -1007,10 +1007,10 @@ fn split_leaf_descend(
                 },
             ) = (node, original)
             {
-                *first = Box::new(Pane::Leaf {
+                **first = Pane::Leaf {
                     id: target,
                     content: orig_content,
-                });
+                };
                 let new_id = match &**second {
                     Pane::Leaf { id, .. } => *id,
                     Pane::Split { .. } => unreachable!(),
@@ -2508,7 +2508,7 @@ mod tests {
         expected_active: SurfaceId,
         expected_order: &[SurfaceId],
     ) {
-        fn find_tabs<'a>(p: &'a Pane, target: PaneId) -> Option<&'a PaneContent> {
+        fn find_tabs(p: &Pane, target: PaneId) -> Option<&PaneContent> {
             match p {
                 Pane::Leaf { id, content } if *id == target => Some(content),
                 Pane::Leaf { .. } => None,
@@ -2860,7 +2860,7 @@ mod tests {
 
     #[test]
     fn agent_presence_is_never_persisted() {
-        let mut surface = PaneSurface {
+        let surface = PaneSurface {
             id: SurfaceId::new(),
             title: "Claude Code".into(),
             title_locked: false,

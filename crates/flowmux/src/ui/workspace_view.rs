@@ -517,6 +517,7 @@ pub enum IncrementalSplitOutcome {
 ///
 /// `parent_stack_name` is supplied by the caller so a target frame that was a
 /// direct stack child can be re-added with the same name, the workspace id.
+#[allow(clippy::too_many_arguments)] // mirrors the split verb's full wire shape
 pub fn split_pane_incremental(
     workspace: WorkspaceId,
     target_pane: PaneId,
@@ -712,6 +713,7 @@ fn build_pane(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // widget construction needs the full pane context
 fn build_leaf_pane(
     workspace: WorkspaceId,
     pane_id: PaneId,
@@ -786,7 +788,6 @@ fn build_leaf_pane(
     let split_right = pane_tool_button("go-next-symbolic", "Split right");
     {
         let cb = callbacks.on_split_right.clone();
-        let pane_id = pane_id;
         split_right.connect_clicked(move |_| (cb.borrow_mut())(pane_id));
     }
     tools.append(&split_right);
@@ -794,7 +795,6 @@ fn build_leaf_pane(
     let split_down = pane_tool_button("go-down-symbolic", "Split down");
     {
         let cb = callbacks.on_split_down.clone();
-        let pane_id = pane_id;
         split_down.connect_clicked(move |_| (cb.borrow_mut())(pane_id));
     }
     tools.append(&split_down);
@@ -802,7 +802,6 @@ fn build_leaf_pane(
     let add = pane_tool_button("tab-new-symbolic", "Add tab");
     {
         let cb = callbacks.on_new_surface.clone();
-        let pane_id = pane_id;
         add.connect_clicked(move |_| (cb.borrow_mut())(pane_id));
     }
     tools.append(&add);
@@ -810,7 +809,6 @@ fn build_leaf_pane(
     let add_browser = pane_tool_button("web-browser-symbolic", "Add browser tab");
     {
         let cb = callbacks.on_new_browser_surface.clone();
-        let pane_id = pane_id;
         add_browser.connect_clicked(move |_| (cb.borrow_mut())(pane_id));
     }
     tools.append(&add_browser);
@@ -909,8 +907,8 @@ fn build_surface_tab_widget(
 }
 
 /// Build the secondary-click popover used by surface tabs. Mirrors the
-/// pattern used by `terminal_pane.rs` and `sidebar.rs`: plain `Popover`
-/// + `Button` rows whose `connect_clicked` closures route directly to
+/// pattern used by `terminal_pane.rs` and `sidebar.rs`: a plain `Popover`
+/// with `Button` rows whose `connect_clicked` closures route directly to
 /// the per-pane callbacks. PopoverMenu + `win.*` actions have been
 /// observed to drop in some GTK versions.
 fn attach_tab_context_menu(
@@ -994,66 +992,6 @@ fn parse_tab_dnd_payload(payload: &str) -> Result<(PaneId, SurfaceId), &'static 
         .parse::<SurfaceId>()
         .map_err(|_| "invalid surface id")?;
     Ok((src_pane, src_surface))
-}
-
-#[cfg(test)]
-mod tab_dnd_tests {
-    use super::*;
-
-    #[test]
-    fn parse_tab_dnd_payload_round_trips() {
-        let pane = PaneId::new();
-        let surface = SurfaceId::new();
-        let payload = format!("{pane}|{surface}");
-
-        assert_eq!(parse_tab_dnd_payload(&payload), Ok((pane, surface)));
-    }
-
-    #[test]
-    fn parse_tab_dnd_payload_rejects_plain_text() {
-        assert!(parse_tab_dnd_payload("not a tab drag").is_err());
-    }
-
-    #[gtk::test]
-    fn take_surface_for_tearoff_moves_widget_out_of_source_pane() {
-        let pane = PaneId::new();
-        let surface = SurfaceId::new();
-        let workspace = WorkspaceId::new();
-        let stack = gtk::Stack::new();
-        let content = gtk::Label::new(Some("live content")).upcast::<gtk::Widget>();
-        stack.add_named(&content, Some(&surface.to_string()));
-
-        let tab_bar = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        let tab_widget = gtk::Button::new().upcast::<gtk::Widget>();
-        tab_bar.append(&tab_widget);
-        let label = gtk::Label::new(Some("dragged tab"));
-
-        let mut registry = PaneRegistry::default();
-        registry.surface_stacks.insert(pane, stack.clone());
-        registry
-            .surface_tabs
-            .insert(pane, vec![(surface, tab_widget.clone())]);
-        registry.pane_tab_containers.insert(pane, tab_bar);
-        registry.surface_tab_labels.insert(surface, label);
-        registry.surface_workspace.insert(surface, workspace);
-        registry.active_terminal_by_pane.insert(pane, surface);
-
-        let torn = registry
-            .take_surface_for_tearoff(pane, surface, "fallback")
-            .expect("surface widget should be detached for tear-off");
-
-        assert_eq!(torn.pane, pane);
-        assert_eq!(torn.surface, surface);
-        assert_eq!(torn.title, "dragged tab");
-        assert!(torn.content.parent().is_none());
-        assert!(torn.focus.parent().is_none());
-        assert!(stack.child_by_name(&surface.to_string()).is_none());
-        assert!(tab_widget.parent().is_none());
-        assert!(registry.surface_tabs.get(&pane).unwrap().is_empty());
-        assert!(registry.surface_tab_labels.get(&surface).is_none());
-        assert!(registry.surface_workspace.get(&surface).is_none());
-        assert!(registry.active_surface(pane).is_none());
-    }
 }
 
 /// Attach controllers that reorder terminal or browser tabs left/right within
@@ -1422,6 +1360,7 @@ fn pane_tool_button(icon_name: &str, tooltip: &str) -> gtk::Button {
     button
 }
 
+#[allow(clippy::too_many_arguments)] // widget construction needs the full pane context
 fn build_panel(
     pane_id: PaneId,
     workspace: WorkspaceId,
@@ -1566,5 +1505,65 @@ fn build_panel(
             r.surface_workspace.insert(surface.id, workspace);
             widget
         }
+    }
+}
+
+#[cfg(test)]
+mod tab_dnd_tests {
+    use super::*;
+
+    #[test]
+    fn parse_tab_dnd_payload_round_trips() {
+        let pane = PaneId::new();
+        let surface = SurfaceId::new();
+        let payload = format!("{pane}|{surface}");
+
+        assert_eq!(parse_tab_dnd_payload(&payload), Ok((pane, surface)));
+    }
+
+    #[test]
+    fn parse_tab_dnd_payload_rejects_plain_text() {
+        assert!(parse_tab_dnd_payload("not a tab drag").is_err());
+    }
+
+    #[gtk::test]
+    fn take_surface_for_tearoff_moves_widget_out_of_source_pane() {
+        let pane = PaneId::new();
+        let surface = SurfaceId::new();
+        let workspace = WorkspaceId::new();
+        let stack = gtk::Stack::new();
+        let content = gtk::Label::new(Some("live content")).upcast::<gtk::Widget>();
+        stack.add_named(&content, Some(&surface.to_string()));
+
+        let tab_bar = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        let tab_widget = gtk::Button::new().upcast::<gtk::Widget>();
+        tab_bar.append(&tab_widget);
+        let label = gtk::Label::new(Some("dragged tab"));
+
+        let mut registry = PaneRegistry::default();
+        registry.surface_stacks.insert(pane, stack.clone());
+        registry
+            .surface_tabs
+            .insert(pane, vec![(surface, tab_widget.clone())]);
+        registry.pane_tab_containers.insert(pane, tab_bar);
+        registry.surface_tab_labels.insert(surface, label);
+        registry.surface_workspace.insert(surface, workspace);
+        registry.active_terminal_by_pane.insert(pane, surface);
+
+        let torn = registry
+            .take_surface_for_tearoff(pane, surface, "fallback")
+            .expect("surface widget should be detached for tear-off");
+
+        assert_eq!(torn.pane, pane);
+        assert_eq!(torn.surface, surface);
+        assert_eq!(torn.title, "dragged tab");
+        assert!(torn.content.parent().is_none());
+        assert!(torn.focus.parent().is_none());
+        assert!(stack.child_by_name(&surface.to_string()).is_none());
+        assert!(tab_widget.parent().is_none());
+        assert!(registry.surface_tabs.get(&pane).unwrap().is_empty());
+        assert!(!registry.surface_tab_labels.contains_key(&surface));
+        assert!(!registry.surface_workspace.contains_key(&surface));
+        assert!(registry.active_surface(pane).is_none());
     }
 }

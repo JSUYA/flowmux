@@ -56,9 +56,9 @@ impl Handler for GuiHandler {
     fn handle<'a>(&'a self, req: Request) -> Pin<Box<dyn Future<Output = Response> + Send + 'a>> {
         Box::pin(async move {
             match req {
-                Request::WorkspaceCreate { ref name, ref root } => {
+                Request::WorkspaceCreate { .. } => {
                     // Persist via the headless handler first so state.json is consistent...
-                    let resp = self.inner.handle(req.clone()).await;
+                    let resp = self.inner.handle(req).await;
                     let id = match &resp {
                         Response::WorkspaceCreated { id } => *id,
                         _ => return resp,
@@ -68,17 +68,7 @@ impl Handler for GuiHandler {
                     if let Err(e) = self
                         .bridge
                         .tx
-                        .send(GtkCommand::WorkspaceCreated {
-                            id,
-                            name: name.clone().unwrap_or_else(|| {
-                                root.file_name()
-                                    .and_then(|n| n.to_str())
-                                    .unwrap_or("workspace")
-                                    .into()
-                            }),
-                            root: root.clone(),
-                            ack: tx,
-                        })
+                        .send(GtkCommand::WorkspaceCreated { id, ack: tx })
                         .await
                     {
                         warn!(error = %e, "bridge closed");
@@ -226,7 +216,7 @@ impl Handler for GuiHandler {
                 }
 
                 Request::ClaudeTeams { count, args, root } => {
-                    let count = count.max(1).min(8);
+                    let count = count.clamp(1, 8);
                     let store = self.inner.store();
                     // Create a fresh workspace.
                     let ws_id = store
@@ -571,6 +561,7 @@ const _: fn() = || {
 ///   - `ref`: a stable per-snapshot id ("e1", "e2", ...) that the
 ///     caller can pass back to click/fill verbs (those land next).
 ///   - `tag`, `role`, `name`, `text` (truncated), and a flat `bbox`.
+///
 /// Hidden / off-screen / very small elements are skipped to keep the
 /// payload tractable for agent consumption.
 const BROWSER_SNAPSHOT_JS: &str = r#"

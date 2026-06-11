@@ -170,6 +170,7 @@ fn install_window_resize_handles(window: &adw::ApplicationWindow, overlay: &gtk:
     );
 }
 
+#[allow(clippy::too_many_arguments)] // one parameter per edge attribute; splitting hurts call sites
 fn add_resize_handle(
     window: &adw::ApplicationWindow,
     overlay: &gtk::Overlay,
@@ -1580,12 +1581,7 @@ impl WindowController {
                     },
                 );
             }
-            GtkCommand::WorkspaceCreated {
-                id,
-                name: _,
-                root: _,
-                ack,
-            } => {
+            GtkCommand::WorkspaceCreated { id, ack } => {
                 // Pull the authoritative workspace (with the store's
                 // pane ids) instead of fabricating new ones — otherwise
                 // `focused_pane` gets a UUID that doesn't exist in the
@@ -2279,7 +2275,7 @@ impl WindowController {
                 let result = inject_cookies_into_webkit(&cookies);
                 let _ = ack.send(result);
             }
-            GtkCommand::ShowSurfaceFolder { pane: _, surface } => {
+            GtkCommand::ShowSurfaceFolder { surface } => {
                 let cwd = self
                     .pane_registry
                     .borrow()
@@ -3025,6 +3021,7 @@ fn focused_surface_full_title(
 ///   * Active terminal surfaces without cwd are skipped to avoid caching the
 ///     first-spawn race as a subtitle.
 ///   * Active browser tabs use `Browser-{tab name}`.
+///
 /// Result length never exceeds `cap`. If MRU is empty or short, DFS over tree
 /// leaves left-first to keep side-panel subtitles populated.
 fn collect_subtitle_lines(ws: &flowmux_core::Workspace, mru: &[PaneId], cap: usize) -> Vec<String> {
@@ -3233,12 +3230,12 @@ fn make_callbacks(
         },
         on_show_surface_folder: {
             let bridge = bridge.clone();
-            Rc::new(RefCell::new(move |pane, surface| {
+            Rc::new(RefCell::new(move |_pane, surface| {
                 let bridge = bridge.clone();
                 glib::MainContext::default().spawn_local(async move {
                     let _ = bridge
                         .tx
-                        .send(GtkCommand::ShowSurfaceFolder { pane, surface })
+                        .send(GtkCommand::ShowSurfaceFolder { surface })
                         .await;
                 });
             }))
@@ -5475,20 +5472,23 @@ mod tests {
 
         // The workspace's top-level widget should now be the surviving
         // left pane's frame, not the old paned (the old paned was
-        // unparented). `surfaces` map carries that pointer.
-        let surfaces = controller.surfaces.borrow();
-        let top = surfaces
-            .get(&ws_id)
-            .expect("surfaces map has workspace widget");
-        let left_frame = controller
-            .pane_registry
-            .borrow()
-            .pane_frame(left)
-            .expect("left frame still in registry");
-        assert_eq!(
-            top, &left_frame,
-            "the workspace stack child should be the surviving left pane's frame",
-        );
+        // unparented). `surfaces` map carries that pointer. Scoped so the
+        // RefCell borrows end before the `await` below.
+        {
+            let surfaces = controller.surfaces.borrow();
+            let top = surfaces
+                .get(&ws_id)
+                .expect("surfaces map has workspace widget");
+            let left_frame = controller
+                .pane_registry
+                .borrow()
+                .pane_frame(left)
+                .expect("left frame still in registry");
+            assert_eq!(
+                top, &left_frame,
+                "the workspace stack child should be the surviving left pane's frame",
+            );
+        }
 
         // And the daemon-side state agrees: the workspace tree is now
         // a single leaf rooted at `left`, with no split node above it.

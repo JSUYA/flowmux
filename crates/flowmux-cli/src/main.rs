@@ -614,22 +614,28 @@ fn build_request(cmd: Cmd) -> anyhow::Result<Request> {
                 level: NotificationLevel::AttentionNeeded,
             }
         }
-        Cmd::Split { pane, right, down } => {
+        Cmd::Split {
+            pane,
+            right: _,
+            down,
+        } => {
+            // `--right` is the default, so only `--down` changes anything.
             let direction = if down {
                 SplitDirection::Horizontal
-            } else if right {
-                SplitDirection::Vertical
             } else {
                 SplitDirection::Vertical
             };
             Request::PaneSplit { pane, direction }
         }
         Cmd::SendKeys { pane, keys } => Request::PaneSendKeys { pane, keys },
-        Cmd::Browser { url, right, down } => {
+        Cmd::Browser {
+            url,
+            right: _,
+            down,
+        } => {
+            // `--right` is the default, so only `--down` changes anything.
             let direction = if down {
                 SplitDirection::Horizontal
-            } else if right {
-                SplitDirection::Vertical
             } else {
                 SplitDirection::Vertical
             };

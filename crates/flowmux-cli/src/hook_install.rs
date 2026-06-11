@@ -12,9 +12,9 @@
 //! Supported targets (mirroring cmux):
 //! - **Claude Code** — `~/.claude/settings.json` `hooks.{Stop,Notification}`.
 //! - **Codex CLI**   — `~/.codex/hooks.json` `Stop`, plus
-//!                     `~/.codex/config.toml` `[features] codex_hooks = true`.
+//!   `~/.codex/config.toml` `[features] codex_hooks = true`.
 //! - **OpenCode**    — `~/.config/opencode/plugins/flowmux-session.mjs`
-//!                     plus `opencode.json` `plugin` entry.
+//!   plus `opencode.json` `plugin` entry.
 
 use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
@@ -905,6 +905,7 @@ fn uninstall_opencode() -> Result<HookInstallReport> {
 /// bare binary path. New call sites prefer
 /// [`opencode_plugin_source_with_argv`] so the spawn array can carry
 /// the Flatpak `flatpak run …` prefix.
+#[cfg(test)]
 fn opencode_plugin_source(flowmux_bin: &str) -> String {
     opencode_plugin_source_with_argv(&[flowmux_bin.to_string()])
 }

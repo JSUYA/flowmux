@@ -23,7 +23,9 @@ use crate::bridge::{Bridge, FocusDir, GtkCommand, WsNav};
 use crate::ui::terminal_pane::{TerminalPane, ALT_ENTER_BYTES};
 use crate::ui::window::ClipboardToast;
 use adw::prelude::*;
-use flowmux_config::keybindings::{ActionId, KeybindingOverrides};
+use flowmux_config::keybindings::ActionId;
+#[cfg(test)]
+use flowmux_config::keybindings::KeybindingOverrides;
 use flowmux_config::options::Options;
 use flowmux_core::SplitDirection;
 use gtk::glib;
@@ -111,8 +113,9 @@ pub fn install_accels(app: &adw::Application, options: &Options) {
     app.set_accels_for_action(INSERT_NEWLINE_FULL_ACTION, INSERT_NEWLINE_ACCELS);
 }
 
-/// Helper retained for tests and other callers that just want the
-/// resolved accels for a single action without the GTK install path.
+/// Helper for tests that just want the resolved accels for a single
+/// action without the GTK install path.
+#[cfg(test)]
 pub fn resolved_accels(overrides: &KeybindingOverrides, action: ActionId) -> Vec<String> {
     overrides
         .resolve()

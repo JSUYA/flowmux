@@ -143,7 +143,9 @@ pub struct DesktopDoctor {
 
 impl DesktopDoctor {
     /// True when at least one asset is missing or drifted. Maps to
-    /// `Status::NeedsFix` in the outer doctor report.
+    /// `Status::NeedsFix` in the outer doctor report. Production code
+    /// inspects the individual statuses; only tests use this rollup.
+    #[cfg(test)]
     pub fn needs_fix(&self) -> bool {
         let dirty = |s: &AssetStatus| matches!(s, AssetStatus::Missing | AssetStatus::Drift);
         dirty(&self.desktop) || dirty(&self.svg) || self.icons.iter().any(|(_, s)| dirty(s))

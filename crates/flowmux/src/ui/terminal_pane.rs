@@ -136,9 +136,15 @@ fn hex(b: u8) -> Option<u8> {
     }
 }
 
+/// Shared per-pane callback that carries a surface id plus one value
+/// (cwd, URL, title, tab index, …).
+pub type SurfaceValueCb<T> = Rc<RefCell<dyn FnMut(PaneId, SurfaceId, T)>>;
+/// Notification callback: pane id, title, body.
+pub type NotificationCb = Rc<RefCell<dyn FnMut(PaneId, String, String)>>;
+
 #[derive(Clone)]
 pub struct PaneCallbacks {
-    pub on_notification: Rc<RefCell<dyn FnMut(PaneId, String, String)>>,
+    pub on_notification: NotificationCb,
     pub on_bell: Rc<RefCell<dyn FnMut(PaneId)>>,
     pub on_child_exited: Rc<RefCell<dyn FnMut(PaneId, i32)>>,
     pub on_focus: Rc<RefCell<dyn FnMut(PaneId)>>,
@@ -169,7 +175,7 @@ pub struct PaneCallbacks {
     pub on_copy_surface_text: Rc<RefCell<dyn FnMut(PaneId, SurfaceId)>>,
     /// Reorder a tab within the same pane by drag and drop. The third argument
     /// is the final 0-based index after the move, clamped if it exceeds length.
-    pub on_reorder_surface: Rc<RefCell<dyn FnMut(PaneId, SurfaceId, usize)>>,
+    pub on_reorder_surface: SurfaceValueCb<usize>,
     /// A tab drag ended without landing on another tab drop target. The caller
     /// moves that live surface into a new top-level window and removes it from
     /// the source pane.
@@ -179,15 +185,15 @@ pub struct PaneCallbacks {
     /// rejected drop on a known tab (self/cross-pane/invalid payload).
     pub tab_drag_drop_seen: Rc<Cell<bool>>,
     /// VTE reported that a terminal surface changed its cwd.
-    pub on_terminal_cwd_changed: Rc<RefCell<dyn FnMut(PaneId, SurfaceId, PathBuf)>>,
+    pub on_terminal_cwd_changed: SurfaceValueCb<PathBuf>,
     /// WebKit reported that a browser pane navigated to a new URL.
-    pub on_browser_uri_changed: Rc<RefCell<dyn FnMut(PaneId, SurfaceId, String)>>,
+    pub on_browser_uri_changed: SurfaceValueCb<String>,
     /// WebKit reported that a browser pane's page title changed.
-    pub on_browser_title_changed: Rc<RefCell<dyn FnMut(PaneId, SurfaceId, String)>>,
+    pub on_browser_title_changed: SurfaceValueCb<String>,
     /// VTE reported an OSC 0/2 window title, often emitted by programs such as
     /// vi, claude, codex, or tmux inside the shell. Empty titles are ignored by
     /// the caller.
-    pub on_terminal_title_changed: Rc<RefCell<dyn FnMut(PaneId, SurfaceId, String)>>,
+    pub on_terminal_title_changed: SurfaceValueCb<String>,
     /// Return the current user options. Used when creating a new BrowserPane to
     /// choose the engine and apply zoom immediately after widget creation. This
     /// cheaply clones the `Rc<RefCell<Options>>` held by WindowController, so
@@ -322,7 +328,6 @@ impl TerminalPane {
         // BEL — generic attention.
         {
             let cb = callbacks.on_bell.clone();
-            let id = id;
             term.connect_bell(move |_term| {
                 (cb.borrow_mut())(id);
             });
@@ -338,7 +343,6 @@ impl TerminalPane {
         // Process exit.
         {
             let cb = callbacks.on_child_exited.clone();
-            let id = id;
             term.connect_child_exited(move |_term, status| {
                 (cb.borrow_mut())(id, status);
             });
@@ -348,7 +352,6 @@ impl TerminalPane {
         // need to know which pane is currently focused.
         {
             let cb = callbacks.on_focus.clone();
-            let id = id;
             let focus_ctrl = gtk::EventControllerFocus::new();
             focus_ctrl.connect_enter(move |_| (cb.borrow_mut())(id));
             term.add_controller(focus_ctrl);
@@ -367,7 +370,6 @@ impl TerminalPane {
             let on_close_pane = callbacks.on_close_pane.clone();
             let on_copy_text = callbacks.on_copy_surface_text.clone();
             let surface_for_menu = surface;
-            let id = id;
             let term_widget = term.clone();
             let click = gtk::GestureClick::new();
             click.set_button(gtk::gdk::BUTTON_SECONDARY);
@@ -526,7 +528,7 @@ impl TerminalPane {
                 match result {
                     Ok(pid_value) => {
                         // glib::Pid wraps libc::pid_t (i32 on Linux).
-                        pid_for_cb.set(Some(pid_value.0 as i32));
+                        pid_for_cb.set(Some(pid_value.0));
                     }
                     Err(e) => tracing::warn!(error = %e, "vte spawn failed"),
                 }

@@ -64,7 +64,8 @@ pub fn build(state: SharedOverrides) -> gtk::Box {
 
     // Track each row's accel label so the global Reset button can
     // refresh the visible chip after wiping the user map.
-    let row_refresh: Rc<RefCell<Vec<Rc<dyn Fn()>>>> = Rc::new(RefCell::new(Vec::new()));
+    type RowRefreshers = Rc<RefCell<Vec<Rc<dyn Fn()>>>>;
+    let row_refresh: RowRefreshers = Rc::new(RefCell::new(Vec::new()));
 
     for action in ActionId::editable() {
         let (row, refresh) = build_row(action, state.clone());

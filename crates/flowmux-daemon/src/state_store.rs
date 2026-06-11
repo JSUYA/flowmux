@@ -354,6 +354,7 @@ impl StateStore {
     ///   * If trimming both ends yields an empty value, reset to
     ///     `custom_title = None` and return to automatic mode, showing `name`.
     ///   * Otherwise store `custom_title = Some(trimmed)`.
+    ///
     /// The automatic value `name` is never modified here, so separate automatic
     /// signals such as folder rename or OSC can update it. Returns `false` when
     /// no workspace matches or nothing changes.
