@@ -1255,6 +1255,11 @@ impl WindowController {
     fn install_cwd_polling_fallback(&self) {
         let controller = self.clone();
         glib::timeout_add_local(Duration::from_secs(1), move || {
+            // No terminals → nothing to poll; skip the async hop instead
+            // of spawning a task that walks an empty registry.
+            if controller.pane_registry.borrow().terminals.is_empty() {
+                return glib::ControlFlow::Continue;
+            }
             let controller = controller.clone();
             glib::MainContext::default().spawn_local(async move {
                 controller.poll_terminal_cwds().await;
@@ -1323,6 +1328,9 @@ impl WindowController {
     pub fn drop_workspace(&self, id: WorkspaceId) {
         self.sidebar.remove(id);
         self.pane_registry.borrow_mut().clear_workspace(id);
+        // Forget the workspace's MRU queue too, or the map keeps one
+        // entry per closed workspace for the lifetime of the session.
+        self.focus_mru.borrow_mut().remove(&id);
         let mut surfaces = self.surfaces.borrow_mut();
         if let Some(old) = surfaces.remove(&id) {
             self.stack.remove(&old);

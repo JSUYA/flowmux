@@ -219,9 +219,16 @@ impl BrowserPane {
             });
         }
         {
-            let v = web_view.clone();
-            let a = address.clone();
-            address.connect_activate(move |_| {
+            // Weak: a strong `web_view` here plus the strong `address` the
+            // uri-notify handler below used to hold formed an
+            // address ↔ web_view cycle that leaked the whole WebView (and
+            // its page) on every closed browser tab. The entry itself
+            // arrives as the signal argument.
+            let v = web_view.downgrade();
+            address.connect_activate(move |a| {
+                let Some(v) = v.upgrade() else {
+                    return;
+                };
                 let raw = a.text().to_string();
                 let uri = normalize_uri(&raw);
                 v.load_uri(&uri);
@@ -231,12 +238,15 @@ impl BrowserPane {
         // Reflect navigation in the address bar AND mirror the new URL
         // back to the daemon so state can restore the last page on next launch.
         {
-            let a = address.clone();
+            // Weak for the same cycle-breaking reason as `connect_activate`.
+            let a = address.downgrade();
             let uri_cb = callbacks.on_browser_uri_changed.clone();
             web_view.connect_uri_notify(move |w| {
                 if let Some(uri) = w.uri() {
                     let uri_str = uri.to_string();
-                    a.set_text(&uri_str);
+                    if let Some(a) = a.upgrade() {
+                        a.set_text(&uri_str);
+                    }
                     (uri_cb.borrow_mut())(id, surface_id, uri_str);
                 }
             });

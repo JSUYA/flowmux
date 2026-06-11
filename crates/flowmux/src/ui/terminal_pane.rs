@@ -371,10 +371,17 @@ impl TerminalPane {
             let on_copy_text = callbacks.on_copy_surface_text.clone();
             let surface_for_menu = surface;
             let id = id;
-            let term_widget = term.clone();
+            // Weak: the gesture is owned by the VTE widget itself, so a
+            // strong capture would form a term → controller → closure →
+            // term cycle that keeps closed terminal tabs (and their
+            // scrollback) alive forever.
+            let term_weak = term.downgrade();
             let click = gtk::GestureClick::new();
             click.set_button(gtk::gdk::BUTTON_SECONDARY);
             click.connect_pressed(move |gesture, _n_press, x, y| {
+                let Some(term_widget) = term_weak.upgrade() else {
+                    return;
+                };
                 (on_focus.borrow_mut())(id);
 
                 let popover = gtk::Popover::new();
@@ -397,11 +404,18 @@ impl TerminalPane {
                 // keybindings. Copy is a no-op with no selection so we
                 // never clobber the clipboard; Paste lets VTE bracket
                 // the text when the app set DECSET 2004.
+                // The buttons live inside the popover, so a strong popover
+                // capture in their click handlers would be a self-cycle:
+                // the popover (and the VTE refs its closures hold) would
+                // leak on every right-click. Weak refs let the popover be
+                // freed after `closed` unparents it.
                 let copy = mk("Copy");
-                let pop = popover.clone();
+                let pop = popover.downgrade();
                 let term_for_copy = term_widget.clone();
                 copy.connect_clicked(move |_| {
-                    pop.popdown();
+                    if let Some(pop) = pop.upgrade() {
+                        pop.popdown();
+                    }
                     if term_for_copy.has_selection() {
                         term_for_copy.copy_clipboard_format(vte::Format::Text);
                     }
@@ -409,10 +423,12 @@ impl TerminalPane {
                 v.append(&copy);
 
                 let paste = mk("Paste");
-                let pop = popover.clone();
+                let pop = popover.downgrade();
                 let term_for_paste = term_widget.clone();
                 paste.connect_clicked(move |_| {
-                    pop.popdown();
+                    if let Some(pop) = pop.upgrade() {
+                        pop.popdown();
+                    }
                     term_for_paste.paste_clipboard();
                 });
                 v.append(&paste);
@@ -420,19 +436,23 @@ impl TerminalPane {
                 v.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
 
                 let split_r = mk("Split Right");
-                let pop = popover.clone();
+                let pop = popover.downgrade();
                 let cb = on_split_right.clone();
                 split_r.connect_clicked(move |_| {
-                    pop.popdown();
+                    if let Some(pop) = pop.upgrade() {
+                        pop.popdown();
+                    }
                     (cb.borrow_mut())(id);
                 });
                 v.append(&split_r);
 
                 let split_d = mk("Split Down");
-                let pop = popover.clone();
+                let pop = popover.downgrade();
                 let cb = on_split_down.clone();
                 split_d.connect_clicked(move |_| {
-                    pop.popdown();
+                    if let Some(pop) = pop.upgrade() {
+                        pop.popdown();
+                    }
                     (cb.borrow_mut())(id);
                 });
                 v.append(&split_d);
@@ -440,10 +460,12 @@ impl TerminalPane {
                 v.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
 
                 let copy_path = mk("Copy path");
-                let pop = popover.clone();
+                let pop = popover.downgrade();
                 let cb = on_copy_text.clone();
                 copy_path.connect_clicked(move |_| {
-                    pop.popdown();
+                    if let Some(pop) = pop.upgrade() {
+                        pop.popdown();
+                    }
                     (cb.borrow_mut())(id, surface_for_menu);
                 });
                 v.append(&copy_path);
@@ -451,10 +473,12 @@ impl TerminalPane {
                 v.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
 
                 let close_p = mk("Close Pane");
-                let pop = popover.clone();
+                let pop = popover.downgrade();
                 let cb = on_close_pane.clone();
                 close_p.connect_clicked(move |_| {
-                    pop.popdown();
+                    if let Some(pop) = pop.upgrade() {
+                        pop.popdown();
+                    }
                     (cb.borrow_mut())(id);
                 });
                 v.append(&close_p);
@@ -618,21 +642,50 @@ impl TerminalPane {
         &self,
         callback: impl Fn(&Self) + Clone + 'static,
     ) -> glib::SignalHandlerId {
-        let pane = self.clone();
+        // Capturing `self.clone()` here would store a strong VTE ref in a
+        // handler the VTE itself owns — a cycle that leaks every closed
+        // terminal tab. Rebuild the pane from the signal's widget plus a
+        // weak container ref instead.
+        let id = self.id;
+        let pid = self.pid.clone();
+        let container = self.container.downgrade();
         self.widget
-            .connect_current_directory_uri_notify(move |_| callback(&pane))
+            .connect_current_directory_uri_notify(move |widget| {
+                let Some(container) = container.upgrade() else {
+                    return;
+                };
+                let pane = TerminalPane {
+                    id,
+                    widget: widget.clone(),
+                    container,
+                    pid: pid.clone(),
+                };
+                callback(&pane);
+            })
     }
 
     pub fn connect_title_notify(
         &self,
         callback: impl Fn(&Self, String) + Clone + 'static,
     ) -> glib::SignalHandlerId {
-        let pane = self.clone();
+        // Same weak-capture rationale as `connect_current_dir_notify`.
+        let id = self.id;
+        let pid = self.pid.clone();
+        let container = self.container.downgrade();
         self.widget.connect_window_title_notify(move |widget| {
+            let Some(container) = container.upgrade() else {
+                return;
+            };
             let title = widget
                 .window_title()
                 .map(|t| t.to_string())
                 .unwrap_or_default();
+            let pane = TerminalPane {
+                id,
+                widget: widget.clone(),
+                container,
+                pid: pid.clone(),
+            };
             callback(&pane, title);
         })
     }
@@ -741,8 +794,13 @@ fn install_url_link_handling(
     click.set_button(gtk::gdk::BUTTON_PRIMARY);
     click.set_propagation_phase(gtk::PropagationPhase::Bubble);
 
-    let term_widget = term.clone();
+    // Weak: the gesture is owned by the VTE widget — see the context-menu
+    // gesture above for the cycle this breaks.
+    let term_weak = term.downgrade();
     click.connect_pressed(move |gesture, _n_press, x, y| {
+        let Some(term_widget) = term_weak.upgrade() else {
+            return;
+        };
         let modifiers = gesture
             .current_event()
             .map(|e| e.modifier_state())
@@ -984,9 +1042,14 @@ fn install_enter_preedit_commit_ordering(term: &vte::Terminal) {
     controller.set_propagation_phase(gtk::PropagationPhase::Capture);
     controller.set_scope(gtk::ShortcutScope::Local);
 
-    let term_widget = term.clone();
+    // Weak: the controller is owned by the VTE widget, so a strong capture
+    // would cycle term → controller → action → term and leak the terminal.
+    let term_weak = term.downgrade();
     let armed_action = armed.clone();
     let action = gtk::CallbackAction::new(move |_, _| {
+        let Some(term_widget) = term_weak.upgrade() else {
+            return glib::Propagation::Proceed;
+        };
         scroll_terminal_to_bottom(&term_widget);
         armed_action.set(true);
         flush_pending_preedit(&term_widget);
@@ -1077,9 +1140,13 @@ fn install_shift_arrow_cursor_move(term: &vte::Terminal) {
     ];
 
     for (keyval, bytes) in bindings {
-        let term_widget = term.clone();
+        // Weak: controller is owned by the VTE — avoids a term-leaking cycle.
+        let term_weak = term.downgrade();
         let bytes: &'static [u8] = bytes;
         let action = gtk::CallbackAction::new(move |_, _| {
+            let Some(term_widget) = term_weak.upgrade() else {
+                return glib::Propagation::Proceed;
+            };
             scroll_terminal_to_bottom(&term_widget);
             term_widget.feed_child(bytes);
             glib::Propagation::Stop
@@ -1130,11 +1197,15 @@ fn install_smart_page_keys(term: &vte::Terminal, scroll_adjustment: &gtk::Adjust
     ];
 
     for (key, mods, direction, always_scroll) in bindings {
-        let term_widget = term.clone();
+        // Weak: controller is owned by the VTE — avoids a term-leaking cycle.
+        let term_weak = term.downgrade();
         let adj = scroll_adjustment.clone();
         let direction = *direction;
         let always_scroll = *always_scroll;
         let action = gtk::CallbackAction::new(move |_, _| {
+            let Some(term_widget) = term_weak.upgrade() else {
+                return glib::Propagation::Proceed;
+            };
             let upper = adj.upper();
             let page = adj.page_size().max(1.0);
             let has_scrollback = upper > page;
@@ -1297,8 +1368,12 @@ fn install_ibus_nav_workaround(term: &vte::Terminal, smart_page_enabled: bool) {
     controller.set_scope(gtk::ShortcutScope::Local);
 
     let bind = |keyval: gtk::gdk::Key, bytes: &'static [u8]| {
-        let term_widget = term.clone();
+        // Weak: controller is owned by the VTE — avoids a term-leaking cycle.
+        let term_weak = term.downgrade();
         let action = gtk::CallbackAction::new(move |_, _| {
+            let Some(term_widget) = term_weak.upgrade() else {
+                return glib::Propagation::Proceed;
+            };
             scroll_terminal_to_bottom(&term_widget);
             flush_pending_preedit(&term_widget);
             term_widget.feed_child(bytes);
