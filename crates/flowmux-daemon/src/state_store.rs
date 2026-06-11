@@ -426,7 +426,10 @@ impl StateStore {
         let mut s = self.inner.lock().await;
         for ws in s.workspaces.iter_mut() {
             for surface in ws.surfaces.iter_mut() {
-                if surface.root_pane.set_surface_agent(surface_id, agent.clone()) {
+                if surface
+                    .root_pane
+                    .set_surface_agent(surface_id, agent.clone())
+                {
                     return Some(ws.id);
                 }
             }
@@ -3093,9 +3096,7 @@ mod tests {
         // workspace_view::terminal_title_notify renames the active
         // surface to the agent name. Re-create that pre-condition here.
         assert_eq!(
-            store
-                .rename_surface(pane, surface, "OpenCode".into())
-                .await,
+            store.rename_surface(pane, surface, "OpenCode".into()).await,
             Some(ws_id)
         );
 
@@ -3114,9 +3115,7 @@ mod tests {
             .await;
         let pane = first_pane(&store.get_workspace(ws_id).await.unwrap());
         let surface = first_pane_active_surface(&store.get_workspace(ws_id).await.unwrap());
-        store
-            .rename_surface(pane, surface, "OPENCODE".into())
-            .await;
+        store.rename_surface(pane, surface, "OPENCODE".into()).await;
 
         assert!(store
             .find_pane_by_active_title_prefix("opencode")
@@ -3171,19 +3170,11 @@ mod tests {
             .await
             .expect("split must succeed");
 
-        let original_surface = store
-            .get_workspace(ws_id)
-            .await
-            .unwrap()
-            .surfaces[0]
+        let original_surface = store.get_workspace(ws_id).await.unwrap().surfaces[0]
             .root_pane
             .active_surface_id(original)
             .unwrap();
-        let sibling_surface = store
-            .get_workspace(ws_id)
-            .await
-            .unwrap()
-            .surfaces[0]
+        let sibling_surface = store.get_workspace(ws_id).await.unwrap().surfaces[0]
             .root_pane
             .active_surface_id(sibling)
             .unwrap();

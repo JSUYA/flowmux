@@ -777,8 +777,13 @@ async fn run_hooks_doctor(socket: Option<PathBuf>) {
     let resolved = env_socket
         .clone()
         .unwrap_or_else(flowmux_config::paths::runtime_socket);
-    println!("socket primary   : {resolved:?} (source={})",
-        if env_socket.is_some() { "env" } else { "fallback" }
+    println!(
+        "socket primary   : {resolved:?} (source={})",
+        if env_socket.is_some() {
+            "env"
+        } else {
+            "fallback"
+        }
     );
     println!(
         "  exists?        : {} symlink_target?={:?}",
@@ -911,22 +916,46 @@ async fn run_claude_hook_event(
         ClaudeHookEvent::Stop => {
             let body = input.last_assistant_message.as_deref();
             reqs.push(build_stop_notify("Claude", body, pane, surface));
-            reqs.push(build_activity_update("claude", Some(Idle), pid, pane, surface));
+            reqs.push(build_activity_update(
+                "claude",
+                Some(Idle),
+                pid,
+                pane,
+                surface,
+            ));
         }
         ClaudeHookEvent::Notification => {
             let msg = input.message.as_deref();
             reqs.push(build_notification_notify("Claude", msg, pane, surface));
-            reqs.push(build_activity_update("claude", Some(NeedsInput), pid, pane, surface));
+            reqs.push(build_activity_update(
+                "claude",
+                Some(NeedsInput),
+                pid,
+                pane,
+                surface,
+            ));
         }
         // SessionStart registers the agent's presence (and PID, for the
         // liveness sweep) without claiming it is working yet.
         ClaudeHookEvent::SessionStart => {
-            reqs.push(build_activity_update("claude", Some(Idle), pid, pane, surface));
+            reqs.push(build_activity_update(
+                "claude",
+                Some(Idle),
+                pid,
+                pane,
+                surface,
+            ));
         }
         // A new prompt or an imminent tool call means the agent is
         // actively working this turn — and clears any "needs input".
         ClaudeHookEvent::PromptSubmit | ClaudeHookEvent::PreToolUse => {
-            reqs.push(build_activity_update("claude", Some(Running), pid, pane, surface));
+            reqs.push(build_activity_update(
+                "claude",
+                Some(Running),
+                pid,
+                pane,
+                surface,
+            ));
         }
         // Real teardown (covers Ctrl+C, where Stop never fires). The
         // daemon PID sweep is the backstop for a hard kill that skips
@@ -981,7 +1010,13 @@ async fn run_generic_agent_hook_event(
             let input = read_codex_hook_input(args);
             let msg = input.message.as_deref();
             reqs.push(build_notification_notify(agent, msg, pane, surface));
-            reqs.push(build_activity_update(agent, Some(NeedsInput), pid, pane, surface));
+            reqs.push(build_activity_update(
+                agent,
+                Some(NeedsInput),
+                pid,
+                pane,
+                surface,
+            ));
         }
         // Codex / OpenCode register presence on session start (no
         // wrapper PID for these, so the daemon clears them via Stop→Idle
@@ -997,10 +1032,7 @@ async fn run_generic_agent_hook_event(
             }
         }
         None => {
-            flowmux_config::notify_debug!(
-                "cli/hook",
-                "daemon not reachable — request dropped"
-            );
+            flowmux_config::notify_debug!("cli/hook", "daemon not reachable — request dropped");
         }
     }
     Ok(())
@@ -1820,13 +1852,15 @@ mod tests {
         ])
         .expect("clap must parse the OpenCode plugin's argv shape");
         let Cmd::Hooks {
-            op: HooksOp::Opencode {
-                event: AgentHookEvent::Stop {
-                    pane: got_pane,
-                    surface: got_surface,
-                    args,
+            op:
+                HooksOp::Opencode {
+                    event:
+                        AgentHookEvent::Stop {
+                            pane: got_pane,
+                            surface: got_surface,
+                            args,
+                        },
                 },
-            },
         } = cli.cmd
         else {
             panic!("expected hooks opencode stop variant");
@@ -1854,13 +1888,15 @@ mod tests {
         ])
         .expect("flags-before-payload must parse");
         let Cmd::Hooks {
-            op: HooksOp::Opencode {
-                event: AgentHookEvent::Notification {
-                    pane: got_pane,
-                    surface,
-                    args,
+            op:
+                HooksOp::Opencode {
+                    event:
+                        AgentHookEvent::Notification {
+                            pane: got_pane,
+                            surface,
+                            args,
+                        },
                 },
-            },
         } = cli.cmd
         else {
             panic!("expected hooks opencode notification variant");
@@ -1878,13 +1914,15 @@ mod tests {
         let cli = Cli::try_parse_from(["flowmuxctl", "hooks", "opencode", "stop"])
             .expect("flag-less stop must still parse");
         let Cmd::Hooks {
-            op: HooksOp::Opencode {
-                event: AgentHookEvent::Stop {
-                    pane,
-                    surface,
-                    args,
+            op:
+                HooksOp::Opencode {
+                    event:
+                        AgentHookEvent::Stop {
+                            pane,
+                            surface,
+                            args,
+                        },
                 },
-            },
         } = cli.cmd
         else {
             panic!("expected hooks opencode stop variant");
@@ -1910,11 +1948,10 @@ mod tests {
         ])
         .expect("codex must accept the same flag");
         let Cmd::Hooks {
-            op: HooksOp::Codex {
-                event: AgentHookEvent::Stop {
-                    pane: got_pane, ..
+            op:
+                HooksOp::Codex {
+                    event: AgentHookEvent::Stop { pane: got_pane, .. },
                 },
-            },
         } = cli.cmd
         else {
             panic!("expected hooks codex stop variant");

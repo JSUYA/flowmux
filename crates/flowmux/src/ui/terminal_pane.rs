@@ -256,10 +256,7 @@ impl TerminalPane {
         container.set_hexpand(true);
         container.set_vexpand(true);
         container.set_child(Some(&term));
-        let scrollbar = gtk::Scrollbar::new(
-            gtk::Orientation::Vertical,
-            Some(&scroll_adjustment),
-        );
+        let scrollbar = gtk::Scrollbar::new(gtk::Orientation::Vertical, Some(&scroll_adjustment));
         scrollbar.set_halign(gtk::Align::End);
         scrollbar.set_valign(gtk::Align::Fill);
         // Force the scrollbar to render unconditionally so the 22.04
@@ -650,11 +647,7 @@ impl TerminalPane {
 /// Falls back to the original argv when `flowmuxctl` cannot be
 /// located. The terminal then works exactly as before, just without
 /// OSC-driven alarms — strictly a graceful degradation.
-fn wrap_argv_with_pty_tee(
-    argv: Vec<String>,
-    pane: PaneId,
-    surface: SurfaceId,
-) -> Vec<String> {
+fn wrap_argv_with_pty_tee(argv: Vec<String>, pane: PaneId, surface: SurfaceId) -> Vec<String> {
     let Some(ctl) = flowmux_terminal::find_flowmuxctl() else {
         tracing::warn!(
             "flowmuxctl not found next to the GUI binary; OSC 9/99/777 alarms \
@@ -858,9 +851,7 @@ fn is_plain_ctrl_c(keyval: gtk::gdk::Key, state: gtk::gdk::ModifierType) -> bool
             | ModifierType::SUPER_MASK
             | ModifierType::META_MASK);
     relevant == ModifierType::CONTROL_MASK
-        && keyval
-            .to_unicode()
-            .is_some_and(|ch| ch == 'c' || ch == 'C')
+        && keyval.to_unicode().is_some_and(|ch| ch == 'c' || ch == 'C')
 }
 
 /// Recover Shift+symbol keys that the ibus sync-mode path swallows while
@@ -887,8 +878,8 @@ fn install_ibus_shifted_symbol_passthrough(container: &gtk::Overlay, term: &vte:
     key.set_propagation_phase(gtk::PropagationPhase::Capture);
     let term_widget = term.clone();
     key.connect_key_pressed(move |_, keyval, _keycode, state| {
-        let relevant =
-            state & (ModifierType::CONTROL_MASK | ModifierType::ALT_MASK | ModifierType::SHIFT_MASK);
+        let relevant = state
+            & (ModifierType::CONTROL_MASK | ModifierType::ALT_MASK | ModifierType::SHIFT_MASK);
         if relevant != ModifierType::SHIFT_MASK {
             return glib::Propagation::Proceed;
         }
@@ -1785,9 +1776,7 @@ mod tests {
         assert!(should_install_ibus_nav_workaround(
             false, false, true, false
         ));
-        assert!(should_install_ibus_nav_workaround(
-            false, true, true, false
-        ));
+        assert!(should_install_ibus_nav_workaround(false, true, true, false));
         // On by default under WSL/WSLg.
         assert!(should_install_ibus_nav_workaround(
             false, false, false, true
@@ -1801,8 +1790,6 @@ mod tests {
             false, false, false, false
         ));
         // The disable env wins everywhere (bisection kill switch).
-        assert!(!should_install_ibus_nav_workaround(
-            true, true, true, true
-        ));
+        assert!(!should_install_ibus_nav_workaround(true, true, true, true));
     }
 }

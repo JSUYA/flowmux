@@ -153,9 +153,7 @@ fn main() -> anyhow::Result<()> {
         // portal path rejects the sync-mode PostProcessKeyEvent call on
         // Ubuntu 24.04, though, so leave it async there and rely on the
         // terminal-pane ordering/bypass workarounds below.
-        if std::env::var_os("IBUS_ENABLE_SYNC_MODE").is_none()
-            && !platform::running_under_wsl()
-        {
+        if std::env::var_os("IBUS_ENABLE_SYNC_MODE").is_none() && !platform::running_under_wsl() {
             std::env::set_var("IBUS_ENABLE_SYNC_MODE", "1");
         }
     }
@@ -482,9 +480,7 @@ fn ibus_daemon_available() -> bool {
         "/usr/local/bin/ibus-daemon",
         "/bin/ibus-daemon",
     ];
-    CANDIDATES
-        .iter()
-        .any(|p| std::path::Path::new(p).exists())
+    CANDIDATES.iter().any(|p| std::path::Path::new(p).exists())
 }
 
 fn should_force_ibus_im_module(current: Option<&str>, ibus_reachable: bool) -> bool {

@@ -406,8 +406,11 @@ impl Handler for GuiHandler {
                             activity: act,
                             pid,
                         });
-                        if let Some(ws_id) =
-                            self.inner.store().set_agent_activity(surface, presence).await
+                        if let Some(ws_id) = self
+                            .inner
+                            .store()
+                            .set_agent_activity(surface, presence)
+                            .await
                         {
                             let _ = self
                                 .bridge

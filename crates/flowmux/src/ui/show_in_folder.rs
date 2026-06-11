@@ -39,10 +39,7 @@ pub fn open_directory(dir: &Path) {
     };
     let program = argv[0].to_string_lossy().into_owned();
     let argv_refs: Vec<&OsStr> = argv.iter().map(OsString::as_os_str).collect();
-    match gio::Subprocess::newv(
-        &argv_refs,
-        gio::SubprocessFlags::NONE,
-    ) {
+    match gio::Subprocess::newv(&argv_refs, gio::SubprocessFlags::NONE) {
         Ok(_child) => {
             tracing::info!(path = %dir.display(), "show-in-folder: spawned {}", program);
         }
@@ -79,7 +76,10 @@ fn viewer_argv(dir: &Path) -> Option<Vec<OsString>> {
             dir.as_os_str().to_os_string(),
         ])
     } else {
-        Some(vec![OsString::from("xdg-open"), dir.as_os_str().to_os_string()])
+        Some(vec![
+            OsString::from("xdg-open"),
+            dir.as_os_str().to_os_string(),
+        ])
     }
 }
 
