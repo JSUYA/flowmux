@@ -61,6 +61,16 @@ enum Cmd {
     /// Daemon health probe.
     Ping,
 
+    /// Print the calling agent's flowmux context (pane, surface,
+    /// workspace, socket) resolved from the `FLOWMUX_*` env vars that
+    /// flowmux injects into every PTY. One command for an agent to
+    /// discover where it is running.
+    Identify,
+
+    /// Print what this flowmux build supports: the `browser` verb set
+    /// and the explicitly-unsupported (CDP-only) features.
+    Capabilities,
+
     /// Workspace operations.
     Workspace {
         #[command(subcommand)]
@@ -588,6 +598,11 @@ async fn main() -> anyhow::Result<()> {
             return Ok(());
         }
         Cmd::Agent { op } => return run_agent_op(op, cli.json),
+        // Context/capability probes resolve from env + static data;
+        // no daemon round-trip needed, so they work even before the GUI
+        // is up and from inside `flatpak run` sandboxes.
+        Cmd::Identify => return run_identify(cli.json),
+        Cmd::Capabilities => return run_capabilities(cli.json),
         // `Hooks` runtime handlers (Claude / Codex / Opencode events)
         // talk to the daemon themselves; `Hooks::Setup`, `Uninstall`,
         // and `Doctor` are pure file edits with no daemon round-trip.
@@ -762,6 +777,66 @@ fn browser_op_to_request(op: BrowserOp) -> Request {
     }
 }
 
+/// The calling agent's flowmux context, resolved from the `FLOWMUX_*`
+/// env vars that flowmux injects into every PTY. Empty/unset vars
+/// become `None` (e.g. when run outside a flowmux pane).
+#[derive(Debug, PartialEq, Eq)]
+struct Identity {
+    pane: Option<String>,
+    surface: Option<String>,
+    workspace: Option<String>,
+    socket: Option<String>,
+}
+
+impl Identity {
+    fn from_env() -> Self {
+        let get = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+        Identity {
+            pane: get("FLOWMUX_PANE_ID"),
+            surface: get("FLOWMUX_SURFACE_ID"),
+            workspace: get("FLOWMUX_WORKSPACE_ID"),
+            socket: get("FLOWMUX_SOCKET_PATH"),
+        }
+    }
+}
+
+fn run_identify(json: bool) -> anyhow::Result<()> {
+    let id = Identity::from_env();
+    if json {
+        let v = serde_json::json!({
+            "pane": id.pane,
+            "surface": id.surface,
+            "workspace": id.workspace,
+            "socket": id.socket,
+        });
+        println!("{}", serde_json::to_string_pretty(&v)?);
+    } else {
+        let show = |v: &Option<String>| v.clone().unwrap_or_else(|| "-".to_string());
+        println!("pane:      {}", show(&id.pane));
+        println!("surface:   {}", show(&id.surface));
+        println!("workspace: {}", show(&id.workspace));
+        println!("socket:    {}", show(&id.socket));
+    }
+    Ok(())
+}
+
+fn run_capabilities(json: bool) -> anyhow::Result<()> {
+    let caps = flowmux_ipc::protocol::capabilities();
+    if json {
+        println!("{}", serde_json::to_string_pretty(&caps)?);
+    } else {
+        println!("browser verbs:");
+        for v in &caps.browser_verbs {
+            println!("  {v}");
+        }
+        println!("unsupported (CDP-only, return not_supported):");
+        for u in &caps.unsupported {
+            println!("  {u}");
+        }
+    }
+    Ok(())
+}
+
 fn build_request(cmd: Cmd) -> anyhow::Result<Request> {
     Ok(match cmd {
         Cmd::Ping => Request::Ping,
@@ -863,6 +938,8 @@ fn build_request(cmd: Cmd) -> anyhow::Result<Request> {
         Cmd::Doctor => unreachable!("handled before request build"),
         Cmd::Fix => unreachable!("handled before request build"),
         Cmd::PtyTee { .. } => unreachable!("handled before request build"),
+        Cmd::Identify => unreachable!("handled before request build"),
+        Cmd::Capabilities => unreachable!("handled before request build"),
     })
 }
 
@@ -1587,6 +1664,44 @@ mod tests {
             parse_build!("count", &pane_arg, ".result-row"),
             Request::BrowserCount { selector, .. } if selector == ".result-row"
         ));
+    }
+
+    #[test]
+    fn identify_and_capabilities_parse_as_local_commands() {
+        assert!(matches!(
+            Cli::try_parse_from(["flowmuxctl", "identify"]).unwrap().cmd,
+            Cmd::Identify
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["flowmuxctl", "capabilities"])
+                .unwrap()
+                .cmd,
+            Cmd::Capabilities
+        ));
+    }
+
+    #[test]
+    fn identity_from_env_resolves_flowmux_context() {
+        let _g = flowmux_pane_env_lock();
+        let pane = PaneId::new();
+        unsafe {
+            std::env::set_var("FLOWMUX_PANE_ID", pane.to_string());
+            std::env::set_var("FLOWMUX_WORKSPACE_ID", "ws-1");
+            std::env::set_var("FLOWMUX_SOCKET_PATH", "/run/flowmux.sock");
+            // An empty var must read as None, not Some("").
+            std::env::set_var("FLOWMUX_SURFACE_ID", "");
+        }
+        let id = Identity::from_env();
+        unsafe {
+            std::env::remove_var("FLOWMUX_PANE_ID");
+            std::env::remove_var("FLOWMUX_WORKSPACE_ID");
+            std::env::remove_var("FLOWMUX_SOCKET_PATH");
+            std::env::remove_var("FLOWMUX_SURFACE_ID");
+        }
+        assert_eq!(id.pane.as_deref(), Some(pane.to_string().as_str()));
+        assert_eq!(id.workspace.as_deref(), Some("ws-1"));
+        assert_eq!(id.socket.as_deref(), Some("/run/flowmux.sock"));
+        assert_eq!(id.surface, None);
     }
 
     /// The hidden hyphenated aliases must keep mapping to the same

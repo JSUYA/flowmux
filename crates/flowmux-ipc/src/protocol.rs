@@ -6,6 +6,69 @@ use flowmux_core::{
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// Browser verbs exposed by `flowmux browser <op>`, in the order shown
+/// by `flowmux capabilities`. This is the authoritative list the docs
+/// and the CLI namespace both track.
+pub const BROWSER_VERBS: &[&str] = &[
+    "open",
+    "snapshot",
+    "navigate",
+    "back",
+    "forward",
+    "reload",
+    "url",
+    "title",
+    "click",
+    "fill",
+    "select",
+    "scroll",
+    "type",
+    "press",
+    "text",
+    "value",
+    "attr",
+    "dblclick",
+    "hover",
+    "focus",
+    "blur",
+    "check",
+    "uncheck",
+    "is-visible",
+    "is-enabled",
+    "is-checked",
+    "count",
+    "eval",
+];
+
+/// Browser features that are intentionally unsupported and return a
+/// `not_supported` style result. They require the Chrome DevTools
+/// Protocol, which WebKitGTK 6.0 does not expose (see `AGENTS.md`).
+pub const UNSUPPORTED_FEATURES: &[&str] = &[
+    "screenshot",
+    "wait",
+    "viewport",
+    "network-mock",
+    "screencast",
+];
+
+/// Static description of what this flowmux build can and cannot do,
+/// returned by `flowmux capabilities`. Lets an agent probe the browser
+/// verb set and the explicitly-unsupported features before attempting
+/// them, instead of discovering gaps by trial and error.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Capabilities {
+    pub browser_verbs: Vec<String>,
+    pub unsupported: Vec<String>,
+}
+
+/// Build the capability descriptor from the canonical static lists.
+pub fn capabilities() -> Capabilities {
+    Capabilities {
+        browser_verbs: BROWSER_VERBS.iter().map(|s| s.to_string()).collect(),
+        unsupported: UNSUPPORTED_FEATURES.iter().map(|s| s.to_string()).collect(),
+    }
+}
+
 /// One frame on the wire. `id` correlates a request with its response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Envelope {
@@ -377,6 +440,31 @@ mod tests {
         assert_eq!(value["verb"], "pane_split");
         assert_eq!(value["pane"], pane.to_string());
         assert_eq!(value["direction"], "vertical");
+    }
+
+    #[test]
+    fn capabilities_lists_verbs_and_unsupported_and_round_trips() {
+        let caps = capabilities();
+        // A few representative verbs the agent docs promise.
+        for v in ["open", "snapshot", "click", "is-visible", "count", "eval"] {
+            assert!(
+                caps.browser_verbs.iter().any(|s| s == v),
+                "missing browser verb {v}"
+            );
+        }
+        // The CDP-only features must be reported as unsupported.
+        for u in ["screenshot", "wait", "viewport", "screencast"] {
+            assert!(
+                caps.unsupported.iter().any(|s| s == u),
+                "missing unsupported feature {u}"
+            );
+        }
+        // No verb should appear in both lists.
+        for v in &caps.browser_verbs {
+            assert!(!caps.unsupported.contains(v), "{v} is both supported+not");
+        }
+        let json = serde_json::to_string(&caps).unwrap();
+        assert_eq!(serde_json::from_str::<Capabilities>(&json).unwrap(), caps);
     }
 
     #[test]
