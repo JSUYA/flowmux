@@ -33,6 +33,42 @@ fn pane_from_env() -> Option<PaneId> {
         .and_then(|s| PaneId::from_str(s).ok())
 }
 
+/// Resolve a pane argument: the explicit value if given, else the
+/// `FLOWMUX_PANE_ID` of the calling pane. Errors when neither is set.
+fn resolve_pane(pane: Option<PaneId>) -> anyhow::Result<PaneId> {
+    pane.or_else(pane_from_env)
+        .ok_or_else(|| anyhow::anyhow!("no pane: pass pane:<uuid> or set FLOWMUX_PANE_ID"))
+}
+
+/// Translate a named terminal key (`Enter`, `Tab`, `ArrowUp`, …) into
+/// the byte sequence a PTY expects. A single character passes through as
+/// itself. Used by `flowmux send-key` for tmux-style key-name input;
+/// raw byte/escape input still goes through `send-keys`.
+fn named_key_to_bytes(key: &str) -> anyhow::Result<String> {
+    let seq = match key {
+        "Enter" | "Return" | "CR" => "\r",
+        "Tab" => "\t",
+        "Escape" | "Esc" => "\x1b",
+        "Backspace" | "BSpace" => "\x7f",
+        "Delete" | "DC" => "\x1b[3~",
+        "Space" => " ",
+        "Up" | "ArrowUp" => "\x1b[A",
+        "Down" | "ArrowDown" => "\x1b[B",
+        "Right" | "ArrowRight" => "\x1b[C",
+        "Left" | "ArrowLeft" => "\x1b[D",
+        "Home" => "\x1b[H",
+        "End" => "\x1b[F",
+        "PageUp" | "PPage" => "\x1b[5~",
+        "PageDown" | "NPage" => "\x1b[6~",
+        // A bare single character (e.g. `a`, `:`) is sent verbatim.
+        other if other.chars().count() == 1 => return Ok(other.to_string()),
+        other => {
+            anyhow::bail!("unknown key name {other:?}; use a named key (Enter, Tab, ArrowUp, …), a single character, or `send-keys` for raw input")
+        }
+    };
+    Ok(seq.to_string())
+}
+
 #[derive(Parser)]
 #[command(
     name = "flowmux",
@@ -127,6 +163,15 @@ enum Cmd {
 
     /// Send keystrokes to a pane (escape sequences accepted).
     SendKeys { pane: PaneId, keys: String },
+
+    /// Send a single named key to a pane (`Enter`, `Tab`, `ArrowUp`, …,
+    /// or one character). `--pane` falls back to `$FLOWMUX_PANE_ID`. For
+    /// raw or multi-byte input use `send-keys`.
+    SendKey {
+        key: String,
+        #[arg(long)]
+        pane: Option<PaneId>,
+    },
 
     /// Print a terminal pane's buffer text (`pane:<uuid>` or bare uuid;
     /// falls back to `$FLOWMUX_PANE_ID`). Requires a flowmux built with
@@ -929,36 +974,27 @@ fn build_request(cmd: Cmd) -> anyhow::Result<Request> {
             Request::PaneSplit { pane, direction }
         }
         Cmd::SendKeys { pane, keys } => Request::PaneSendKeys { pane, keys },
-        Cmd::ReadScreen { pane } => {
-            let pane = pane.or_else(pane_from_env).ok_or_else(|| {
-                anyhow::anyhow!("no pane: pass pane:<uuid> or set FLOWMUX_PANE_ID")
-            })?;
-            Request::PaneReadScreen { pane }
-        }
-        Cmd::FocusPane { pane } => {
-            let pane = pane.or_else(pane_from_env).ok_or_else(|| {
-                anyhow::anyhow!("no pane: pass pane:<uuid> or set FLOWMUX_PANE_ID")
-            })?;
-            Request::PaneFocus { pane }
-        }
-        Cmd::ClosePane { pane } => {
-            let pane = pane.or_else(pane_from_env).ok_or_else(|| {
-                anyhow::anyhow!("no pane: pass pane:<uuid> or set FLOWMUX_PANE_ID")
-            })?;
-            Request::PaneClose { pane }
-        }
-        Cmd::FocusTab { surface, pane } => {
-            let pane = pane.or_else(pane_from_env).ok_or_else(|| {
-                anyhow::anyhow!("no pane: pass --pane <uuid> or set FLOWMUX_PANE_ID")
-            })?;
-            Request::SurfaceFocus { pane, surface }
-        }
-        Cmd::CloseTab { surface, pane } => {
-            let pane = pane.or_else(pane_from_env).ok_or_else(|| {
-                anyhow::anyhow!("no pane: pass --pane <uuid> or set FLOWMUX_PANE_ID")
-            })?;
-            Request::SurfaceClose { pane, surface }
-        }
+        Cmd::SendKey { pane, key } => Request::PaneSendKeys {
+            pane: resolve_pane(pane)?,
+            keys: named_key_to_bytes(&key)?,
+        },
+        Cmd::ReadScreen { pane } => Request::PaneReadScreen {
+            pane: resolve_pane(pane)?,
+        },
+        Cmd::FocusPane { pane } => Request::PaneFocus {
+            pane: resolve_pane(pane)?,
+        },
+        Cmd::ClosePane { pane } => Request::PaneClose {
+            pane: resolve_pane(pane)?,
+        },
+        Cmd::FocusTab { surface, pane } => Request::SurfaceFocus {
+            pane: resolve_pane(pane)?,
+            surface,
+        },
+        Cmd::CloseTab { surface, pane } => Request::SurfaceClose {
+            pane: resolve_pane(pane)?,
+            surface,
+        },
         Cmd::Browser { op } => browser_op_to_request(op),
         Cmd::Ssh { target } => Request::SshConnect { target },
         Cmd::NotifyStream { .. } => unreachable!("handled before request build"),
@@ -1788,6 +1824,41 @@ mod tests {
         assert!(matches!(
             parse_build!("count", &pane_arg, ".result-row"),
             Request::BrowserCount { selector, .. } if selector == ".result-row"
+        ));
+    }
+
+    #[test]
+    fn named_key_to_bytes_maps_keys_and_passthrough() {
+        assert_eq!(named_key_to_bytes("Enter").unwrap(), "\r");
+        assert_eq!(named_key_to_bytes("Tab").unwrap(), "\t");
+        assert_eq!(named_key_to_bytes("Escape").unwrap(), "\x1b");
+        assert_eq!(named_key_to_bytes("ArrowUp").unwrap(), "\x1b[A");
+        assert_eq!(named_key_to_bytes("PageDown").unwrap(), "\x1b[6~");
+        // single char passes through
+        assert_eq!(named_key_to_bytes("q").unwrap(), "q");
+        assert_eq!(named_key_to_bytes(":").unwrap(), ":");
+        // unknown multi-char name errors rather than guessing
+        assert!(named_key_to_bytes("Wat").is_err());
+    }
+
+    #[test]
+    fn send_key_parses_named_key_and_maps_to_send_keys() {
+        let _g = flowmux_pane_env_lock();
+        let pane = PaneId::new();
+        unsafe {
+            std::env::set_var("FLOWMUX_PANE_ID", pane.to_string());
+        }
+        let built = build_request(
+            Cli::try_parse_from(["flowmuxctl", "send-key", "Enter"])
+                .unwrap()
+                .cmd,
+        );
+        unsafe {
+            std::env::remove_var("FLOWMUX_PANE_ID");
+        }
+        assert!(matches!(
+            built.unwrap(),
+            Request::PaneSendKeys { pane: got, keys } if got == pane && keys == "\r"
         ));
     }
 
