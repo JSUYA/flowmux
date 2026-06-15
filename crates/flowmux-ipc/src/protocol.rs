@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use flowmux_core::{
-    AgentActivity, NotificationLevel, PaneId, PlacementStrategy, SplitDirection, SurfaceId,
-    WorkspaceId,
+    AgentActivity, NotificationLevel, Pane, PaneContent, PaneId, PlacementStrategy, SplitDirection,
+    SurfaceId, SurfaceKind, Workspace, WorkspaceId,
 };
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -69,6 +69,91 @@ pub fn capabilities() -> Capabilities {
     }
 }
 
+/// A single tab inside a leaf pane, as reported by `flowmux tree`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TreeTab {
+    pub id: SurfaceId,
+    pub title: String,
+    /// `"terminal"` or `"browser"`.
+    pub kind: String,
+    /// True for the tab currently shown in this pane.
+    pub active: bool,
+}
+
+/// A leaf pane (one slot in the split grid) and its tabs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TreePane {
+    pub id: PaneId,
+    pub tabs: Vec<TreeTab>,
+}
+
+/// A workspace flattened to its leaf panes for agent inspection. The
+/// split hierarchy is intentionally collapsed: agents target panes by
+/// id (for browser/terminal verbs), not by split position.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TreeWorkspace {
+    pub id: WorkspaceId,
+    pub name: String,
+    pub root: PathBuf,
+    pub panes: Vec<TreePane>,
+}
+
+fn surface_kind_label(kind: &SurfaceKind) -> &'static str {
+    match kind {
+        SurfaceKind::Terminal { .. } => "terminal",
+        SurfaceKind::Browser { .. } => "browser",
+    }
+}
+
+fn collect_leaf_panes(pane: &Pane, out: &mut Vec<TreePane>) {
+    match pane {
+        Pane::Leaf { id, content } => {
+            let tabs = match content {
+                PaneContent::Tabs { active, surfaces } => surfaces
+                    .iter()
+                    .map(|s| TreeTab {
+                        id: s.id,
+                        title: s.title.clone(),
+                        kind: surface_kind_label(&s.kind).to_string(),
+                        active: s.id == *active,
+                    })
+                    .collect(),
+                // Legacy content shapes are normalized into `Tabs` on
+                // load (see flowmux-daemon normalize_state), so these
+                // are unreachable in practice; report no tabs rather
+                // than fabricate ids.
+                PaneContent::Terminal { .. } | PaneContent::Browser { .. } => Vec::new(),
+            };
+            out.push(TreePane { id: *id, tabs });
+        }
+        Pane::Split { first, second, .. } => {
+            collect_leaf_panes(first, out);
+            collect_leaf_panes(second, out);
+        }
+    }
+}
+
+/// Flatten live workspace state into the `flowmux tree` view. Pure
+/// function over the persisted domain types so it is fully unit
+/// testable without a daemon or GTK.
+pub fn describe_workspaces(workspaces: &[Workspace]) -> Vec<TreeWorkspace> {
+    workspaces
+        .iter()
+        .map(|w| {
+            let mut panes = Vec::new();
+            for surface in &w.surfaces {
+                collect_leaf_panes(&surface.root_pane, &mut panes);
+            }
+            TreeWorkspace {
+                id: w.id,
+                name: w.display_title().to_string(),
+                root: w.root_dir.clone(),
+                panes,
+            }
+        })
+        .collect()
+}
+
 /// One frame on the wire. `id` correlates a request with its response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Envelope {
@@ -99,6 +184,9 @@ pub enum Request {
 
     /// `flowmux workspace ls`
     WorkspaceList,
+
+    /// `flowmux tree` — full workspace → leaf-pane → tab inspection.
+    WorkspaceTree,
 
     /// `flowmux surface new <workspace>` — opens a new surface (tab).
     SurfaceCreate {
@@ -352,6 +440,10 @@ pub enum Response {
     WorkspaceList {
         ids: Vec<WorkspaceId>,
     },
+    /// Reply to `WorkspaceTree`.
+    Tree {
+        workspaces: Vec<TreeWorkspace>,
+    },
     SurfaceCreated {
         id: SurfaceId,
     },
@@ -440,6 +532,69 @@ mod tests {
         assert_eq!(value["verb"], "pane_split");
         assert_eq!(value["pane"], pane.to_string());
         assert_eq!(value["direction"], "vertical");
+    }
+
+    #[test]
+    fn describe_workspaces_flattens_panes_and_marks_active_tab() {
+        use flowmux_core::{
+            Pane, PaneContent, PaneSurface, Surface, SurfaceKind, Workspace, WorkspaceId,
+        };
+        let term = || SurfaceKind::Terminal {
+            shell: None,
+            cwd: None,
+        };
+        let tab1 = SurfaceId::new();
+        let tab2 = SurfaceId::new();
+        let leaf_id = PaneId::new();
+        let leaf = Pane::Leaf {
+            id: leaf_id,
+            content: PaneContent::Tabs {
+                active: tab2,
+                surfaces: vec![
+                    PaneSurface {
+                        id: tab1,
+                        title: "shell".into(),
+                        title_locked: false,
+                        kind: term(),
+                        agent: None,
+                    },
+                    PaneSurface {
+                        id: tab2,
+                        title: "docs".into(),
+                        title_locked: false,
+                        kind: SurfaceKind::Browser { initial_url: None },
+                        agent: None,
+                    },
+                ],
+            },
+        };
+        let ws = Workspace {
+            id: WorkspaceId::new(),
+            name: "demo".into(),
+            custom_title: None,
+            root_dir: "/tmp/demo".into(),
+            git: None,
+            listening_ports: vec![],
+            surfaces: vec![Surface {
+                id: SurfaceId::new(),
+                kind: term(),
+                title: "s".into(),
+                root_pane: leaf,
+            }],
+            color: None,
+        };
+
+        let tree = describe_workspaces(std::slice::from_ref(&ws));
+        assert_eq!(tree.len(), 1);
+        assert_eq!(tree[0].name, "demo");
+        assert_eq!(tree[0].panes.len(), 1);
+        assert_eq!(tree[0].panes[0].id, leaf_id);
+        let tabs = &tree[0].panes[0].tabs;
+        assert_eq!(tabs.len(), 2);
+        assert_eq!(tabs[0].kind, "terminal");
+        assert_eq!(tabs[1].kind, "browser");
+        assert!(!tabs[0].active, "tab1 is not the active surface");
+        assert!(tabs[1].active, "tab2 is the active surface");
     }
 
     #[test]

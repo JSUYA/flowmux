@@ -71,6 +71,10 @@ enum Cmd {
     /// and the explicitly-unsupported (CDP-only) features.
     Capabilities,
 
+    /// Inspect the live workspace → pane → tab structure. Prints an
+    /// indented tree (or `--json` for scripts).
+    Tree,
+
     /// Workspace operations.
     Workspace {
         #[command(subcommand)]
@@ -840,6 +844,7 @@ fn run_capabilities(json: bool) -> anyhow::Result<()> {
 fn build_request(cmd: Cmd) -> anyhow::Result<Request> {
     Ok(match cmd {
         Cmd::Ping => Request::Ping,
+        Cmd::Tree => Request::WorkspaceTree,
         Cmd::Workspace {
             op: WorkspaceOp::New { name, root },
         } => Request::WorkspaceCreate {
@@ -1448,6 +1453,14 @@ fn parse_level(s: &str) -> NotificationLevel {
 }
 
 fn print_response(r: &Response, json_mode: bool) -> anyhow::Result<()> {
+    // `flowmux tree` gets a human-readable indented view in text mode;
+    // --json still emits the structured payload for scripts.
+    if !json_mode {
+        if let Response::Tree { workspaces } = r {
+            print!("{}", render_tree(workspaces));
+            return Ok(());
+        }
+    }
     let s = if json_mode {
         // Single-line JSON — easier to parse from agent scripts
         // (`jq -r .pane` etc.). Mirrors cmux's `--json` shape.
@@ -1457,6 +1470,37 @@ fn print_response(r: &Response, json_mode: bool) -> anyhow::Result<()> {
     };
     println!("{s}");
     Ok(())
+}
+
+/// Render `flowmux tree` as an indented workspace → leaf-pane → tab
+/// view. The active tab in each pane is marked with `*`.
+fn render_tree(workspaces: &[flowmux_ipc::protocol::TreeWorkspace]) -> String {
+    use std::fmt::Write as _;
+    if workspaces.is_empty() {
+        return "(no workspaces)\n".to_string();
+    }
+    let mut out = String::new();
+    for ws in workspaces {
+        let _ = writeln!(
+            out,
+            "workspace {} \"{}\" ({})",
+            ws.id,
+            ws.name,
+            ws.root.display()
+        );
+        for pane in &ws.panes {
+            let _ = writeln!(out, "  pane {}", pane.id);
+            for tab in &pane.tabs {
+                let marker = if tab.active { '*' } else { ' ' };
+                let _ = writeln!(
+                    out,
+                    "    {marker} [{}] {} \"{}\"",
+                    tab.kind, tab.id, tab.title
+                );
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1664,6 +1708,53 @@ mod tests {
             parse_build!("count", &pane_arg, ".result-row"),
             Request::BrowserCount { selector, .. } if selector == ".result-row"
         ));
+    }
+
+    #[test]
+    fn tree_parses_and_maps_to_workspace_tree_request() {
+        let cli = Cli::try_parse_from(["flowmuxctl", "tree"]).unwrap();
+        assert!(matches!(
+            build_request(cli.cmd).unwrap(),
+            Request::WorkspaceTree
+        ));
+    }
+
+    #[test]
+    fn render_tree_marks_active_tab_and_indents() {
+        use flowmux_ipc::protocol::{TreePane, TreeTab, TreeWorkspace};
+        let pane = PaneId::new();
+        let t1 = SurfaceId::new();
+        let t2 = SurfaceId::new();
+        let ws = TreeWorkspace {
+            id: flowmux_core::WorkspaceId::new(),
+            name: "demo".into(),
+            root: "/tmp/demo".into(),
+            panes: vec![TreePane {
+                id: pane,
+                tabs: vec![
+                    TreeTab {
+                        id: t1,
+                        title: "shell".into(),
+                        kind: "terminal".into(),
+                        active: false,
+                    },
+                    TreeTab {
+                        id: t2,
+                        title: "docs".into(),
+                        kind: "browser".into(),
+                        active: true,
+                    },
+                ],
+            }],
+        };
+        let out = render_tree(std::slice::from_ref(&ws));
+        assert!(out.contains("workspace "));
+        assert!(out.contains("\"demo\""));
+        assert!(out.contains(&format!("pane {pane}")));
+        // Active tab marked with '*', inactive with a space.
+        assert!(out.contains(&format!("* [browser] {t2} \"docs\"")));
+        assert!(out.contains(&format!("  [terminal] {t1} \"shell\"")));
+        assert_eq!(render_tree(&[]), "(no workspaces)\n");
     }
 
     #[test]

@@ -42,7 +42,9 @@ impl DaemonHandler {
     /// second connection silently fails to match and the dock badge /
     /// message-tray entry stays pinned. Sharing the cell makes both
     /// sides reuse the first connection that wins the lazy init race.
-    pub fn notifier_handle(&self) -> Arc<tokio::sync::Mutex<Option<flowmux_notify::DesktopNotifier>>> {
+    pub fn notifier_handle(
+        &self,
+    ) -> Arc<tokio::sync::Mutex<Option<flowmux_notify::DesktopNotifier>>> {
         self.notifier.clone()
     }
 
@@ -85,6 +87,13 @@ impl Handler for DaemonHandler {
                 Request::WorkspaceList => {
                     let ids = self.store.list_workspaces().await;
                     Response::WorkspaceList { ids }
+                }
+
+                Request::WorkspaceTree => {
+                    let state = self.store.snapshot().await;
+                    Response::Tree {
+                        workspaces: flowmux_ipc::protocol::describe_workspaces(&state.workspaces),
+                    }
                 }
 
                 Request::Notify {
@@ -201,6 +210,37 @@ mod tests {
             handler.store().get_workspace(id).await.unwrap().name,
             "demo"
         );
+    }
+
+    #[tokio::test]
+    async fn workspace_tree_reports_created_workspace_with_a_pane_and_tab() {
+        let handler = DaemonHandler::new(StateStore::new_lazy(State::default()));
+        let id = match handler
+            .handle(Request::WorkspaceCreate {
+                name: Some("demo".into()),
+                root: std::path::PathBuf::from("/tmp/flowmux-tree-test"),
+            })
+            .await
+        {
+            Response::WorkspaceCreated { id } => id,
+            other => panic!("expected workspace creation, got {other:?}"),
+        };
+
+        let tree = match handler.handle(Request::WorkspaceTree).await {
+            Response::Tree { workspaces } => workspaces,
+            other => panic!("expected tree, got {other:?}"),
+        };
+
+        assert_eq!(tree.len(), 1);
+        assert_eq!(tree[0].id, id);
+        assert_eq!(tree[0].name, "demo");
+        // A fresh workspace has one leaf pane hosting one terminal tab,
+        // and exactly one tab is marked active.
+        assert_eq!(tree[0].panes.len(), 1);
+        let tabs = &tree[0].panes[0].tabs;
+        assert_eq!(tabs.len(), 1);
+        assert_eq!(tabs[0].kind, "terminal");
+        assert!(tabs[0].active);
     }
 
     #[tokio::test]
