@@ -3,9 +3,11 @@
 # Agents working inside flowmux
 
 This file tells AI coding agents (Claude Code, Codex CLI, OpenCode,
-similar) how to drive the in-app browser that ships with `flowmux`. It
-is loaded automatically by every agent that follows the AGENTS.md
-convention; you do not need to instruct agents to read it.
+similar) how to drive `flowmux` from inside one of its panes — the
+in-app browser, plus terminal automation, layout inspection, and
+context discovery over the same `flowmux` CLI. It is loaded
+automatically by every agent that follows the AGENTS.md convention; you
+do not need to instruct agents to read it.
 
 If you (the agent) are running inside a `flowmux` PTY, **prefer the
 flowmux browser over Playwright / Puppeteer / a system Chromium** for
@@ -98,6 +100,43 @@ session **alongside** the flowmux browser, not in place of it. Even then,
 the user-facing flow (the page they are looking at) should still live
 in the flowmux pane — copy URLs / outputs back into flowmux's WebView so
 the user can see what the agent is doing.
+
+## Beyond the browser: terminal, layout & context
+
+The same `flowmux` CLI also drives terminals, panes, and tabs. Every
+pane argument accepts `pane:<uuid>` or a bare uuid, and falls back to
+`$FLOWMUX_PANE_ID` when omitted, so these are one-line calls from inside
+a pane. Add `--json` for machine-readable output.
+
+```bash
+# Context discovery — where am I, and what is supported?
+flowmux --json identify        # pane / surface / workspace / socket ids
+flowmux --json capabilities    # supported browser verbs + unsupported (CDP-only) ones
+
+# Layout inspection — what panes and tabs exist?
+flowmux --json tree            # workspace -> pane -> tab tree, with the active tab marked
+
+# Terminal automation (tmux-style) — drive another terminal pane
+flowmux send-keys pane:$OTHER 'npm run dev\n'   # type into a pane (escapes accepted)
+flowmux read-screen pane:$OTHER                 # dump that pane's buffer text*
+
+# Workspace / pane / tab control
+flowmux workspace current               # focused workspace id
+flowmux workspace focus <workspace>     # switch to a workspace
+flowmux focus-pane pane:$P              # grab keyboard focus
+flowmux close-pane  pane:$P             # close a pane (refuses the last pane)
+flowmux focus-tab  <surface> --pane $P  # activate a tab
+flowmux close-tab  <surface> --pane $P  # close a tab (refuses the last tab of the last pane)
+```
+
+The `send-keys` + `read-screen` pair is the core terminal loop: launch
+or feed a command in another pane, then read its output to decide what
+to do next. `close-*` verbs refuse the case that would destroy a
+workspace, so they never pop a confirmation dialog or block your call.
+
+*`read-screen` needs a flowmux built with the `vte-text` feature (the
+shipped install/Flatpak builds enable it); otherwise it returns an
+explicit not-supported error.
 
 ## DO NOT
 
