@@ -296,21 +296,11 @@ impl Handler for GuiHandler {
                 }
 
                 Request::BrowserSnapshot { pane } => {
-                    let (tx, rx) = oneshot::channel();
-                    let _ = self
-                        .bridge
-                        .tx
-                        .send(GtkCommand::BrowserEval {
-                            pane,
-                            source: BROWSER_SNAPSHOT_JS.to_string(),
-                            ack: tx,
-                        })
-                        .await;
-                    match rx.await {
-                        Ok(Ok(value)) => Response::BrowserResult { value },
-                        Ok(Err(e)) => Response::Error(RpcError::Internal(e)),
-                        Err(_) => Response::Error(RpcError::Internal("bridge closed".into())),
-                    }
+                    // Routed through the shared browser_action path so the
+                    // GTK side runs the non-mutating SNAPSHOT_JS and
+                    // repopulates the pane's RefStore. The response shape
+                    // (BrowserResult { value }) is unchanged.
+                    browser_action(&self.bridge, pane, BrowserOp::Snapshot).await
                 }
 
                 Request::ImportCookies { source, domain } => {
@@ -406,8 +396,11 @@ impl Handler for GuiHandler {
                             activity: act,
                             pid,
                         });
-                        if let Some(ws_id) =
-                            self.inner.store().set_agent_activity(surface, presence).await
+                        if let Some(ws_id) = self
+                            .inner
+                            .store()
+                            .set_agent_activity(surface, presence)
+                            .await
                         {
                             let _ = self
                                 .bridge
@@ -562,54 +555,6 @@ const _: fn() = || {
     fn assert_clone<T: Clone>() {}
     assert_clone::<Request>();
 };
-
-/// JS executed inside the browser pane to produce an a11y/DOM
-/// snapshot. Returns a JSON string. Each node has:
-///   - `ref`: a stable per-snapshot id ("e1", "e2", ...) that the
-///     caller can pass back to click/fill verbs (those land next).
-///   - `tag`, `role`, `name`, `text` (truncated), and a flat `bbox`.
-/// Hidden / off-screen / very small elements are skipped to keep the
-/// payload tractable for agent consumption.
-const BROWSER_SNAPSHOT_JS: &str = r#"
-(function () {
-  const out = [];
-  let counter = 0;
-  function visible(el) {
-    const r = el.getBoundingClientRect();
-    if (r.width < 4 || r.height < 4) return false;
-    const cs = window.getComputedStyle(el);
-    if (cs.visibility === 'hidden' || cs.display === 'none') return false;
-    if (Number(cs.opacity) === 0) return false;
-    return true;
-  }
-  function name(el) {
-    return (
-      el.getAttribute('aria-label') ||
-      el.getAttribute('alt') ||
-      el.getAttribute('title') ||
-      el.getAttribute('placeholder') ||
-      (el.innerText || '').trim().slice(0, 120)
-    );
-  }
-  document.querySelectorAll(
-    'a,button,input,textarea,select,[role],h1,h2,h3,label,summary'
-  ).forEach((el) => {
-    if (!visible(el)) return;
-    const r = el.getBoundingClientRect();
-    counter += 1;
-    const ref = 'e' + counter;
-    el.setAttribute('data-flowmux-ref', ref);
-    out.push({
-      ref,
-      tag: el.tagName.toLowerCase(),
-      role: el.getAttribute('role') || el.tagName.toLowerCase(),
-      name: name(el),
-      bbox: [Math.round(r.left), Math.round(r.top), Math.round(r.width), Math.round(r.height)],
-    });
-  });
-  return JSON.stringify({ url: location.href, title: document.title, nodes: out });
-})()
-"#;
 
 /// Quote a single argv element for safe `sh` re-parsing.
 fn shell_escape(arg: String) -> String {

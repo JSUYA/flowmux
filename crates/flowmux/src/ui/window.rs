@@ -666,9 +666,7 @@ impl WindowController {
     /// border stays hidden only while the workspace is trivially small.
     fn refresh_workspace_solo(&self, ws: &Workspace) {
         let solo = solo_workspace_pane(ws);
-        self.pane_registry
-            .borrow()
-            .set_workspace_solo(ws.id, solo);
+        self.pane_registry.borrow().set_workspace_solo(ws.id, solo);
     }
 
     /// Update the GTK widget tree after the daemon-side split has completed.
@@ -1527,54 +1525,60 @@ impl WindowController {
                 let window = self.window.clone();
                 let default_font_family = theme.font_family();
                 let default_font_size = theme.font_size();
-                crate::ui::options_dialog::present(&self.window, current, default_font_family, default_font_size, move |opts| {
-                    if let Err(e) = flowmux_config::options::save(&opts) {
-                        tracing::warn!(error = %e, "options save failed");
-                        return;
-                    }
-                    *options_cell.borrow_mut() = opts.clone();
-                    // Build the effective terminal font once (theme font with
-                    // the user's family / size overrides layered on) and apply
-                    // it live alongside the global zoom scale.
-                    let font =
-                        theme.font_with_overrides(opts.font_family.as_deref(), opts.font_size);
-                    let registry = registry.borrow();
-                    for terminal in registry.terminals.values() {
-                        terminal.set_font(&font);
-                        terminal.set_font_scale(opts.zoom_factor());
-                    }
-                    for browser in registry.browsers.values() {
-                        browser.web_view.set_zoom_level(opts.zoom_factor());
-                    }
-                    // Focus border color/opacity apply by reloading one CSS string
-                    // into the same CssProvider instance, so all widgets update automatically.
-                    css_provider.load_from_string(&theme.css(
-                        opts.focus_border_color_or_default(),
-                        opts.focus_border_alpha(),
-                    ));
-                    // Re-install keybindings so the user does not have to
-                    // restart for shortcut edits to take effect.
-                    // set_accels_for_action overwrites the same keys so a
-                    // second pass on the live ApplicationWindow's app is safe.
-                    if let Some(app) = window
-                        .application()
-                        .and_then(|a| a.downcast::<adw::Application>().ok())
-                    {
-                        crate::keybindings::install_accels(&app, &opts);
-                    } else {
-                        tracing::warn!(
+                crate::ui::options_dialog::present(
+                    &self.window,
+                    current,
+                    default_font_family,
+                    default_font_size,
+                    move |opts| {
+                        if let Err(e) = flowmux_config::options::save(&opts) {
+                            tracing::warn!(error = %e, "options save failed");
+                            return;
+                        }
+                        *options_cell.borrow_mut() = opts.clone();
+                        // Build the effective terminal font once (theme font with
+                        // the user's family / size overrides layered on) and apply
+                        // it live alongside the global zoom scale.
+                        let font =
+                            theme.font_with_overrides(opts.font_family.as_deref(), opts.font_size);
+                        let registry = registry.borrow();
+                        for terminal in registry.terminals.values() {
+                            terminal.set_font(&font);
+                            terminal.set_font_scale(opts.zoom_factor());
+                        }
+                        for browser in registry.browsers.values() {
+                            browser.web_view.set_zoom_level(opts.zoom_factor());
+                        }
+                        // Focus border color/opacity apply by reloading one CSS string
+                        // into the same CssProvider instance, so all widgets update automatically.
+                        css_provider.load_from_string(&theme.css(
+                            opts.focus_border_color_or_default(),
+                            opts.focus_border_alpha(),
+                        ));
+                        // Re-install keybindings so the user does not have to
+                        // restart for shortcut edits to take effect.
+                        // set_accels_for_action overwrites the same keys so a
+                        // second pass on the live ApplicationWindow's app is safe.
+                        if let Some(app) = window
+                            .application()
+                            .and_then(|a| a.downcast::<adw::Application>().ok())
+                        {
+                            crate::keybindings::install_accels(&app, &opts);
+                        } else {
+                            tracing::warn!(
                             "options applied without keybinding re-install — window had no Application; restart to pick up shortcut changes"
                         );
-                    }
-                    tracing::info!(
-                        zoom_percent = opts.zoom_percent,
-                        engine = ?opts.default_browser_engine,
-                        focus_border_color = %opts.focus_border_color,
-                        focus_border_opacity = opts.focus_border_opacity,
-                        keybindings_overrides = opts.keybindings.len(),
-                        "options applied"
-                    );
-                });
+                        }
+                        tracing::info!(
+                            zoom_percent = opts.zoom_percent,
+                            engine = ?opts.default_browser_engine,
+                            focus_border_color = %opts.focus_border_color,
+                            focus_border_opacity = opts.focus_border_opacity,
+                            keybindings_overrides = opts.keybindings.len(),
+                            "options applied"
+                        );
+                    },
+                );
             }
             GtkCommand::WorkspaceCreated {
                 id,
@@ -2067,8 +2071,7 @@ impl WindowController {
                     flowmux_core::NotificationLevel::AttentionNeeded
                         | flowmux_core::NotificationLevel::Error
                 );
-                let suppress =
-                    !pierces_focus && self.is_source_focused(pane, surface);
+                let suppress = !pierces_focus && self.is_source_focused(pane, surface);
                 tracing::info!(
                     ?pane,
                     ?surface,
@@ -2092,9 +2095,9 @@ impl WindowController {
                     let _ = ack.send(None);
                     return;
                 }
-                let Some(entry_id) =
-                    self.notifications
-                        .push(title, body, level, pane, surface, workspace)
+                let Some(entry_id) = self
+                    .notifications
+                    .push(title, body, level, pane, surface, workspace)
                 else {
                     // Near-duplicate of an entry pushed within
                     // `DUP_WINDOW`: the OSC path and the lifecycle
@@ -2294,7 +2297,8 @@ impl WindowController {
                 let text = {
                     let r = self.pane_registry.borrow();
                     if let Some(term) = r.terminals.get(&surface) {
-                        term.current_dir().map(|p| ("path", p.display().to_string()))
+                        term.current_dir()
+                            .map(|p| ("path", p.display().to_string()))
                     } else {
                         r.browsers
                             .get(&surface)
@@ -2310,8 +2314,7 @@ impl WindowController {
                     }
                     None => {
                         tracing::info!(%pane, %surface, "copy-surface-text: no path/url");
-                        self.clipboard_toast
-                            .show_with_message("Nothing to copy");
+                        self.clipboard_toast.show_with_message("Nothing to copy");
                     }
                 }
             }
@@ -2350,14 +2353,17 @@ impl WindowController {
                         None
                     })
                 };
-                let (kind, value) = resolved
-                    .unwrap_or_else(|| ("path", ws.root_dir.display().to_string()));
+                let (kind, value) =
+                    resolved.unwrap_or_else(|| ("path", ws.root_dir.display().to_string()));
                 self.window.clipboard().set_text(&value);
                 self.clipboard_toast
                     .show_with_message(&format!("Copied {kind}: {value}"));
             }
             GtkCommand::ShowFocusedPaneFolder { workspace } => {
-                flowmux_config::notify_debug!("gui/dispatch", "ShowFocusedPaneFolder ws={workspace}");
+                flowmux_config::notify_debug!(
+                    "gui/dispatch",
+                    "ShowFocusedPaneFolder ws={workspace}"
+                );
                 // Resolution order:
                 //   1. Globally focused pane, if it belongs to this workspace —
                 //      its active terminal's cwd.
@@ -2414,13 +2420,47 @@ impl WindowController {
                     return;
                 };
                 match op {
+                    BrowserOp::Snapshot => {
+                        // Run the non-mutating snapshot script, then mirror
+                        // its `refs` map into the pane's server-side
+                        // `RefStore` so subsequent `click e3` / `text e3`
+                        // calls resolve. The page DOM is never stamped.
+                        let browser2 = browser.clone();
+                        let cell = std::cell::Cell::new(Some(ack));
+                        browser.evaluate_js(flowmux_browser::scripts::SNAPSHOT_JS, move |result| {
+                            if let Some(ack) = cell.take() {
+                                let mapped = match result {
+                                    Ok(json) => {
+                                        if let Ok(snap) =
+                                            serde_json::from_str::<flowmux_browser::DomSnapshot>(
+                                                &json,
+                                            )
+                                        {
+                                            browser2
+                                                .refs
+                                                .borrow_mut()
+                                                .populate_from_snapshot(browser2.ref_scope, &snap);
+                                        }
+                                        Ok(BrowserActionResult::String(json))
+                                    }
+                                    Err(e) => Err(e),
+                                };
+                                let _ = ack.send(mapped);
+                            }
+                        });
+                    }
                     BrowserOp::Navigate { url } => {
+                        // Any navigation invalidates the current snapshot's
+                        // refs — drop them so a stale `eN` can't resolve to
+                        // an element on the old page.
+                        browser.refs.borrow_mut().clear(browser.ref_scope);
                         browser.web_view.load_uri(&url);
                         let _ = ack.send(Ok(BrowserActionResult::Ok));
                     }
                     BrowserOp::Back => {
                         let moved = browser.web_view.can_go_back();
                         if moved {
+                            browser.refs.borrow_mut().clear(browser.ref_scope);
                             browser.web_view.go_back();
                         }
                         let _ = ack.send(Ok(BrowserActionResult::Bool(moved)));
@@ -2428,11 +2468,13 @@ impl WindowController {
                     BrowserOp::Forward => {
                         let moved = browser.web_view.can_go_forward();
                         if moved {
+                            browser.refs.borrow_mut().clear(browser.ref_scope);
                             browser.web_view.go_forward();
                         }
                         let _ = ack.send(Ok(BrowserActionResult::Bool(moved)));
                     }
                     BrowserOp::Reload => {
+                        browser.refs.borrow_mut().clear(browser.ref_scope);
                         browser.web_view.reload();
                         let _ = ack.send(Ok(BrowserActionResult::Ok));
                     }
@@ -6123,9 +6165,7 @@ mod tests {
         let ws = store.get_workspace(ws_id).await.unwrap();
         let pane = ws.surfaces[0].root_pane.first_leaf_id().unwrap();
         let (bridge, _rx) = Bridge::new();
-        let app = adw::Application::builder()
-            .application_id(app_id)
-            .build();
+        let app = adw::Application::builder().application_id(app_id).build();
         app.register(None::<&gtk::gio::Cancellable>).unwrap();
         let controller = WindowController::new(
             &app,
@@ -6454,10 +6494,9 @@ mod tests {
     /// from the popover list while leaving every other entry alone.
     #[gtk::test]
     async fn delete_notification_dispatch_removes_only_targeted_unread_entry() {
-        let (controller, ws_id, pane) = build_single_workspace_controller(
-            "com.flowmux.App.UiTest.NotifTrashRemovesUnread",
-        )
-        .await;
+        let (controller, ws_id, pane) =
+            build_single_workspace_controller("com.flowmux.App.UiTest.NotifTrashRemovesUnread")
+                .await;
         let id_a = push_notification(&controller, Some(pane), Some(ws_id), "a")
             .await
             .expect("first push must record an entry");
@@ -6542,10 +6581,9 @@ mod tests {
     /// so a future refactor that removes it surfaces here.
     #[gtk::test]
     async fn delete_notification_dispatch_on_unknown_id_is_safe_noop() {
-        let (controller, ws_id, pane) = build_single_workspace_controller(
-            "com.flowmux.App.UiTest.NotifTrashUnknownIsNoop",
-        )
-        .await;
+        let (controller, ws_id, pane) =
+            build_single_workspace_controller("com.flowmux.App.UiTest.NotifTrashUnknownIsNoop")
+                .await;
         push_notification(&controller, Some(pane), Some(ws_id), "kept").await;
         let unread_before = controller.notifications.unread_count();
         let count_before = controller.notifications.entries().len();
@@ -6594,10 +6632,8 @@ mod tests {
     /// `update_launcher_count` call would carry `count = 0`.
     #[gtk::test]
     async fn popover_open_sequence_drains_single_notification_to_zero() {
-        let (controller, ws_id, pane) = build_single_workspace_controller(
-            "com.flowmux.App.UiTest.PopoverOpenSingle",
-        )
-        .await;
+        let (controller, ws_id, pane) =
+            build_single_workspace_controller("com.flowmux.App.UiTest.PopoverOpenSingle").await;
         let id = push_notification(&controller, Some(pane), Some(ws_id), "alarm")
             .await
             .expect("push must record an entry");
@@ -6628,9 +6664,7 @@ mod tests {
             })
             .await;
         // Step (3): refresh re-publishes the unread count to the dock.
-        controller
-            .dispatch(GtkCommand::RefreshLauncherBadge)
-            .await;
+        controller.dispatch(GtkCommand::RefreshLauncherBadge).await;
 
         assert_eq!(
             controller.notifications.unread_count(),
@@ -6657,10 +6691,8 @@ mod tests {
     /// its own. The ENTIRE story must end with `unread_count() = 0`.
     #[gtk::test]
     async fn popover_open_then_late_desktop_id_still_drains_badge() {
-        let (controller, ws_id, pane) = build_single_workspace_controller(
-            "com.flowmux.App.UiTest.PopoverLateRace",
-        )
-        .await;
+        let (controller, ws_id, pane) =
+            build_single_workspace_controller("com.flowmux.App.UiTest.PopoverLateRace").await;
         let id = push_notification(&controller, Some(pane), Some(ws_id), "alarm")
             .await
             .expect("push must record an entry");
@@ -6674,9 +6706,7 @@ mod tests {
             "no desktop_id was attached yet; the sweep must return an empty list \
              so the dispatcher does not send a CloseDesktopNotifications no-op",
         );
-        controller
-            .dispatch(GtkCommand::RefreshLauncherBadge)
-            .await;
+        controller.dispatch(GtkCommand::RefreshLauncherBadge).await;
         assert_eq!(controller.notifications.unread_count(), 0);
 
         // Daemon's reply arrives. set_desktop_id reports Stale; the
@@ -6694,7 +6724,12 @@ mod tests {
              the entry was already read by the popover sweep",
         );
         assert_eq!(
-            controller.notifications.find(id).unwrap().desktop_id.as_deref(),
+            controller
+                .notifications
+                .find(id)
+                .unwrap()
+                .desktop_id
+                .as_deref(),
             Some("did-4242"),
             "the late desktop_id must still be recorded so any subsequent close \
              path (e.g. an explicit DeleteNotification) has it",
@@ -6708,10 +6743,8 @@ mod tests {
     /// reaches the dispatcher later as `Stale`.
     #[gtk::test]
     async fn popover_open_with_partial_desktop_ids_still_clears_badge() {
-        let (controller, ws_id, pane) = build_single_workspace_controller(
-            "com.flowmux.App.UiTest.PopoverPartial",
-        )
-        .await;
+        let (controller, ws_id, pane) =
+            build_single_workspace_controller("com.flowmux.App.UiTest.PopoverPartial").await;
         let a = push_notification(&controller, Some(pane), Some(ws_id), "a")
             .await
             .expect("push a");
@@ -6747,9 +6780,7 @@ mod tests {
                 desktop_ids: to_close,
             })
             .await;
-        controller
-            .dispatch(GtkCommand::RefreshLauncherBadge)
-            .await;
+        controller.dispatch(GtkCommand::RefreshLauncherBadge).await;
         assert_eq!(controller.notifications.unread_count(), 0);
 
         // Late reply for c → Stale → dispatcher closes did-33 and refreshes.
@@ -6785,21 +6816,14 @@ mod tests {
     /// be marked read.
     #[gtk::test]
     async fn stress_many_notifications_with_periodic_sweeps_drains_to_zero() {
-        let (controller, ws_id, pane) = build_single_workspace_controller(
-            "com.flowmux.App.UiTest.StressManyNotif",
-        )
-        .await;
+        let (controller, ws_id, pane) =
+            build_single_workspace_controller("com.flowmux.App.UiTest.StressManyNotif").await;
         const TOTAL: usize = 200;
         let mut ids = Vec::with_capacity(TOTAL);
         for i in 0..TOTAL {
-            let id = push_notification(
-                &controller,
-                Some(pane),
-                Some(ws_id),
-                &format!("evt-{i}"),
-            )
-            .await
-            .expect("push must record an entry");
+            let id = push_notification(&controller, Some(pane), Some(ws_id), &format!("evt-{i}"))
+                .await
+                .expect("push must record an entry");
             ids.push(id);
             // Simulate the daemon's Notify reply for a subset of pushes
             // (mimicking real-world timing where some replies overtake
@@ -6865,10 +6889,8 @@ mod tests {
     /// badge" against batch arrival patterns.
     #[gtk::test]
     async fn stress_popover_open_drains_badge_across_repeated_batches() {
-        let (controller, ws_id, pane) = build_single_workspace_controller(
-            "com.flowmux.App.UiTest.StressPopoverBatches",
-        )
-        .await;
+        let (controller, ws_id, pane) =
+            build_single_workspace_controller("com.flowmux.App.UiTest.StressPopoverBatches").await;
         const BATCHES: usize = 10;
         const PER_BATCH: usize = 20;
         for batch in 0..BATCHES {
@@ -6904,9 +6926,7 @@ mod tests {
                     desktop_ids: to_close,
                 })
                 .await;
-            controller
-                .dispatch(GtkCommand::RefreshLauncherBadge)
-                .await;
+            controller.dispatch(GtkCommand::RefreshLauncherBadge).await;
             assert_eq!(
                 controller.notifications.unread_count(),
                 0,
@@ -6932,10 +6952,8 @@ mod tests {
     /// can be "ghost unread" or "ghost read".
     #[gtk::test]
     async fn stress_mixed_ack_channels_keep_unread_count_in_sync_with_entries() {
-        let (controller, ws_id, pane) = build_single_workspace_controller(
-            "com.flowmux.App.UiTest.StressMixedAcks",
-        )
-        .await;
+        let (controller, ws_id, pane) =
+            build_single_workspace_controller("com.flowmux.App.UiTest.StressMixedAcks").await;
 
         // The check we run after every dispatched command — the unread
         // count exposed to the dock must match the actual unread set.
@@ -6957,10 +6975,9 @@ mod tests {
         // Sequence a deliberately interleaved set of dispatches.
         let mut pushed = Vec::new();
         for i in 0usize..30 {
-            let id =
-                push_notification(&controller, Some(pane), Some(ws_id), &format!("x{i}"))
-                    .await
-                    .expect("push");
+            let id = push_notification(&controller, Some(pane), Some(ws_id), &format!("x{i}"))
+                .await
+                .expect("push");
             pushed.push(id);
             assert_invariant(&format!("after push {i}"));
 
@@ -6994,13 +7011,9 @@ mod tests {
                     // Popover open sweep mid-stream.
                     let ids = controller.notifications.mark_all_unread_read();
                     controller
-                        .dispatch(GtkCommand::CloseDesktopNotifications {
-                            desktop_ids: ids,
-                        })
+                        .dispatch(GtkCommand::CloseDesktopNotifications { desktop_ids: ids })
                         .await;
-                    controller
-                        .dispatch(GtkCommand::RefreshLauncherBadge)
-                        .await;
+                    controller.dispatch(GtkCommand::RefreshLauncherBadge).await;
                     assert_invariant(&format!("after popover sweep at i={i}"));
                 }
                 3 => {
@@ -7016,9 +7029,7 @@ mod tests {
                 _ => {
                     // Bare RefreshLauncherBadge — just exercise the
                     // coalescing path with no state change.
-                    controller
-                        .dispatch(GtkCommand::RefreshLauncherBadge)
-                        .await;
+                    controller.dispatch(GtkCommand::RefreshLauncherBadge).await;
                     assert_invariant(&format!("after bare refresh at i={i}"));
                 }
             }
@@ -7036,9 +7047,7 @@ mod tests {
                 desktop_ids: leftover,
             })
             .await;
-        controller
-            .dispatch(GtkCommand::RefreshLauncherBadge)
-            .await;
+        controller.dispatch(GtkCommand::RefreshLauncherBadge).await;
         assert_eq!(
             controller.notifications.unread_count(),
             0,
@@ -7058,19 +7067,15 @@ mod tests {
     /// drifts from the computed unread set.
     #[gtk::test]
     async fn stress_refresh_burst_is_safely_coalesced() {
-        let (controller, ws_id, pane) = build_single_workspace_controller(
-            "com.flowmux.App.UiTest.StressRefreshBurst",
-        )
-        .await;
+        let (controller, ws_id, pane) =
+            build_single_workspace_controller("com.flowmux.App.UiTest.StressRefreshBurst").await;
         push_notification(&controller, Some(pane), Some(ws_id), "x").await;
         // 100 back-to-back refresh commands. The publisher's internal
         // busy/dirty flag must coalesce these into "publish at most a
         // small fixed number of times" — but we don't peek at the
         // flags here; we only check the dispatcher itself stays sane.
         for _ in 0..100 {
-            controller
-                .dispatch(GtkCommand::RefreshLauncherBadge)
-                .await;
+            controller.dispatch(GtkCommand::RefreshLauncherBadge).await;
         }
         assert_eq!(
             controller.notifications.unread_count(),
@@ -7083,9 +7088,7 @@ mod tests {
             .dispatch(GtkCommand::ActivateWorkspace { id: ws_id })
             .await;
         for _ in 0..100 {
-            controller
-                .dispatch(GtkCommand::RefreshLauncherBadge)
-                .await;
+            controller.dispatch(GtkCommand::RefreshLauncherBadge).await;
         }
         assert_eq!(controller.notifications.unread_count(), 0);
     }

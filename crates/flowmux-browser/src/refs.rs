@@ -82,6 +82,21 @@ impl RefStore {
         st.refs.insert(token.into(), selector.into());
     }
 
+    /// Replace `scope`'s refs with the `token → selector` pairs from a
+    /// fresh snapshot. Clears any prior refs first, so a stale `eN` from
+    /// the previous page can never resolve. This is the one call the GTK
+    /// side makes after running [`crate::scripts::SNAPSHOT_JS`].
+    pub fn populate_from_snapshot(
+        &mut self,
+        scope: RefScope,
+        snapshot: &crate::snapshot::DomSnapshot,
+    ) {
+        self.clear(scope);
+        for (token, meta) in &snapshot.refs {
+            self.insert(scope, token.clone(), meta.selector.clone());
+        }
+    }
+
     /// Look up a ref. Accepts both `e3` and the cmux-style `@e3`.
     /// Returns `None` if the token is not bound in this scope.
     pub fn resolve<'a>(&'a self, scope: RefScope, token: &str) -> Option<&'a str> {
@@ -212,5 +227,47 @@ mod tests {
         // Agent's next call is `flowmux browser click e3`.
         let resolved = store.resolve(s, "e3");
         assert_eq!(resolved, Some("body > form > button:nth-of-type(1)"));
+    }
+
+    fn meta(role: &str, selector: &str) -> crate::snapshot::RefMeta {
+        crate::snapshot::RefMeta {
+            role: role.into(),
+            name: String::new(),
+            selector: selector.into(),
+        }
+    }
+
+    fn snapshot_with(refs: &[(&str, &str)]) -> crate::snapshot::DomSnapshot {
+        let mut s = crate::snapshot::DomSnapshot::empty("https://x.test/");
+        for (token, sel) in refs {
+            s.refs.insert((*token).into(), meta("button", sel));
+        }
+        s
+    }
+
+    #[test]
+    fn populate_from_snapshot_mirrors_every_ref() {
+        let mut store = RefStore::new();
+        let s = scope(7);
+        let snap = snapshot_with(&[("e1", "#a"), ("e2", "#b")]);
+        store.populate_from_snapshot(s, &snap);
+        assert_eq!(store.resolve(s, "e1"), Some("#a"));
+        assert_eq!(store.resolve(s, "e2"), Some("#b"));
+        assert_eq!(store.len(s), 2);
+    }
+
+    /// A fresh snapshot must drop the previous page's refs — a `eN` the
+    /// old snapshot defined but the new one omits can no longer resolve.
+    #[test]
+    fn populate_from_snapshot_invalidates_stale_refs() {
+        let mut store = RefStore::new();
+        let s = scope(7);
+        store.populate_from_snapshot(s, &snapshot_with(&[("e1", "#old"), ("e2", "#gone")]));
+        // Re-snapshot (e.g. after a navigation): only e1 survives, with a
+        // new selector; e2 is gone.
+        store.populate_from_snapshot(s, &snapshot_with(&[("e1", "#new")]));
+        assert_eq!(store.resolve(s, "e1"), Some("#new"));
+        assert_eq!(store.resolve(s, "e2"), None);
+        assert_eq!(store.len(s), 1);
     }
 }
