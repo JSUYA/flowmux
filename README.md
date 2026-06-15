@@ -51,6 +51,15 @@ while that surface is focused, and isolated per window.
 - **AI agent integration** — Claude Code, Codex, OpenCode work out of the box;
   sessions persist across restarts. `claude-teams` opens a workspace pre-split
   into per-Claude panes. `flowmux doctor` / `fix` audit and repair wiring.
+- **Agent CLI** — scripts and agents drive flowmux over its socket:
+  `flowmux browser <op>` (snapshot / click / fill / type / press /
+  is-visible / count / …), `flowmux identify` and `capabilities` for context
+  discovery, `flowmux tree` to inspect the workspace → pane → tab structure,
+  `workspace current|focus`, `focus-pane|close-pane`, `focus-tab|close-tab`,
+  `send-keys`, and `read-screen` (terminal buffer dump; needs the `vte-text`
+  build, see Build). Pane args accept `pane:<uuid>` or fall back to
+  `$FLOWMUX_PANE_ID`; `--json` everywhere. Full contract in
+  [`AGENTS.md`](AGENTS.md).
 - **Customizable keybindings** — Options → **Keybindings** rebinds any shortcut
   (applies on OK, no restart), saved to
   `$XDG_CONFIG_HOME/flowmux/options.json`. IME/scroll terminal shortcuts
@@ -123,6 +132,14 @@ Produces two binaries under `target/release/`:
 
 - `flowmux` — GTK4 GUI; also forwards CLI subcommands to `flowmuxctl`.
 - `flowmuxctl` — CLI helper invoked by the GUI and by agent hooks.
+
+`flowmux read-screen` (terminal buffer dump) needs VTE ≥ 0.76, above the
+default `v0_70` floor kept for Ubuntu 22.04, so it sits behind the opt-in
+`vte-text` cargo feature. The patched-VTE install path
+(`scripts/install-host.sh`) and the Flatpak build enable it automatically;
+to enable it in a manual build that links a VTE ≥ 0.76, add
+`--features flowmux/vte-text`. Without it, `read-screen` returns an explicit
+"not supported" error.
 
 For development:
 

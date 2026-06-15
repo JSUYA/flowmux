@@ -45,6 +45,12 @@ cargo clippy --workspace --all-targets -- -D warnings
 `flowmux-terminal`'s build script, so `zig` must be on `PATH` for any
 build that includes that crate.
 
+The `flowmux` crate has one optional feature, `vte-text`, which backs
+`flowmux read-screen` (it needs VTE ≥ 0.76, above the default `v0_70`
+floor kept for Ubuntu 22.04). It is off by default; `scripts/install-host.sh`
+and the Flatpak build enable it because they link the patched VTE 0.78.4.
+Without it, `read-screen` returns an explicit not-supported error.
+
 The Flatpak build (Ubuntu 22.04 path) is described in `README.md`
 under "Ubuntu 22.04 (jammy) support". `flowmux doctor` / `flowmux fix`
 audit and repair the on-host pieces (agent hooks, SKILL files, socket,
