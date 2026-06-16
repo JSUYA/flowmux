@@ -797,8 +797,25 @@ fn install_url_link_handling(
             gesture.set_state(gtk::EventSequenceState::Denied);
             return;
         }
-        tracing::info!(%pane_id, %url, "Ctrl+click on terminal URL → open in browser tab");
-        (on_open_url.borrow_mut())(pane_id, url);
+        if modifiers.contains(gtk::gdk::ModifierType::SHIFT_MASK) {
+            // Ctrl+Shift+click → open in the system default browser instead of
+            // an in-app browser tab.
+            tracing::info!(%pane_id, %url, "Ctrl+Shift+click on terminal URL → open in system browser");
+            let parent = term_widget.root().and_downcast::<gtk::Window>();
+            let launcher = gtk::UriLauncher::new(&url);
+            launcher.launch(
+                parent.as_ref(),
+                gtk::gio::Cancellable::NONE,
+                |res| {
+                    if let Err(e) = res {
+                        tracing::warn!(error = %e, "failed to open URL in system browser");
+                    }
+                },
+            );
+        } else {
+            tracing::info!(%pane_id, %url, "Ctrl+click on terminal URL → open in browser tab");
+            (on_open_url.borrow_mut())(pane_id, url);
+        }
         // We handled the URL, so claim the sequence to prevent VTE selection.
         gesture.set_state(gtk::EventSequenceState::Claimed);
     });
