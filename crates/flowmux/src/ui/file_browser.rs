@@ -171,7 +171,7 @@ impl FileBrowserPanel {
     pub fn show_for_root(&self, root: PathBuf) {
         self.model.borrow_mut().set_root(root);
         self.root.set_visible(true);
-        self.refresh();
+        self.refresh_reset_scroll();
     }
 
     pub fn hide(&self) {
@@ -183,6 +183,17 @@ impl FileBrowserPanel {
     }
 
     pub fn refresh(&self) {
+        let scroll_value = self.scroll.vadjustment().value();
+        self.rebuild_rows();
+        self.restore_scroll_value(scroll_value);
+    }
+
+    fn refresh_reset_scroll(&self) {
+        self.rebuild_rows();
+        self.restore_scroll_value(0.0);
+    }
+
+    fn rebuild_rows(&self) {
         while let Some(child) = self.list.first_child() {
             self.list.remove(&child);
         }
@@ -225,7 +236,6 @@ impl FileBrowserPanel {
         for row in rows {
             self.list.append(&self.build_row(&row));
         }
-        self.scroll_focused_row_into_view();
     }
 
     fn install_focus_style(&self) {
@@ -605,6 +615,12 @@ impl FileBrowserPanel {
             }
             idx += 1;
         }
+    }
+
+    fn restore_scroll_value(&self, value: f64) {
+        let adjustment = self.scroll.vadjustment();
+        set_adjustment_value(&adjustment, value);
+        glib::idle_add_local_once(move || set_adjustment_value(&adjustment, value));
     }
 
     fn scroll_focused_row_into_view(&self) {
@@ -1001,9 +1017,6 @@ impl FileBrowserModel {
         if clipboard.operation == ClipboardOperation::Cut {
             self.clipboard = None;
         }
-        if let Some(last) = pasted.last() {
-            self.focused = Some(last.clone());
-        }
         self.sync_focus();
         Ok(!pasted.is_empty())
     }
@@ -1201,6 +1214,12 @@ fn path_is_or_under(path: &Path, parent: &Path) -> bool {
     path == parent || path.starts_with(parent)
 }
 
+fn set_adjustment_value(adjustment: &gtk::Adjustment, value: f64) {
+    let lower = adjustment.lower();
+    let upper = (adjustment.upper() - adjustment.page_size()).max(lower);
+    adjustment.set_value(value.clamp(lower, upper));
+}
+
 fn move_to_trash(path: &Path) -> io::Result<()> {
     gio::File::for_path(path)
         .trash(None::<&gio::Cancellable>)
@@ -1319,6 +1338,14 @@ mod tests {
 
     fn panel_focused_path(panel: &FileBrowserPanel) -> Option<PathBuf> {
         panel.model.borrow().focused.clone()
+    }
+
+    fn set_panel_scroll(panel: &FileBrowserPanel, value: f64) {
+        let adjustment = panel.scroll.vadjustment();
+        adjustment.set_lower(0.0);
+        adjustment.set_upper(1000.0);
+        adjustment.set_page_size(100.0);
+        adjustment.set_value(value);
     }
 
     fn key(name: &str) -> gdk::Key {
@@ -1796,6 +1823,62 @@ mod tests {
         assert!(!file.exists());
         assert!(dest.join("a.txt").exists());
         assert!(panel.model.borrow().rows().iter().all(|row| !row.cut));
+    }
+
+    #[gtk::test]
+    fn behavior_rename_preserves_focus_and_scroll_level() {
+        let tmp = TestDir::new("behavior-rename-preserve");
+        let old = tmp.file("old.txt");
+        tmp.file("other.txt");
+
+        let panel = FileBrowserPanel::new();
+        panel.show_for_root(tmp.path.clone());
+        panel.focus_path(old);
+        set_panel_scroll(&panel, 320.0);
+
+        panel.rename_focused_entry("new.txt").unwrap();
+
+        assert_eq!(panel_focused_path(&panel), Some(tmp.path.join("new.txt")));
+        assert_eq!(panel.scroll.vadjustment().value(), 320.0);
+    }
+
+    #[gtk::test]
+    fn behavior_paste_preserves_focus_and_scroll_level() {
+        let tmp = TestDir::new("behavior-paste-preserve");
+        let source = tmp.file("source.txt");
+        let target = tmp.dir("target");
+
+        let panel = FileBrowserPanel::new();
+        panel.show_for_root(tmp.path.clone());
+        panel.focus_path(source);
+        panel.copy_focused();
+        panel.focus_path(target.clone());
+        set_panel_scroll(&panel, 260.0);
+
+        panel.paste_from_clipboard();
+
+        assert!(target.join("source.txt").exists());
+        assert_eq!(panel_focused_path(&panel), Some(target));
+        assert_eq!(panel.scroll.vadjustment().value(), 260.0);
+    }
+
+    #[gtk::test]
+    fn behavior_delete_preserves_scroll_level_while_moving_focus_to_neighbor() {
+        let tmp = TestDir::new("behavior-delete-preserve");
+        let file = tmp.file("a.txt");
+        tmp.file("b.txt");
+
+        let panel = FileBrowserPanel::new();
+        panel.show_for_root(tmp.path.clone());
+        panel.focus_path(file.clone());
+        set_panel_scroll(&panel, 180.0);
+    panel.set_delete_handler(|path| fs::remove_file(path));
+
+        panel.delete_focused_to_trash();
+
+        assert!(!file.exists());
+        assert_eq!(panel_focused_path(&panel), Some(tmp.path.join("b.txt")));
+        assert_eq!(panel.scroll.vadjustment().value(), 180.0);
     }
 
     #[gtk::test]
