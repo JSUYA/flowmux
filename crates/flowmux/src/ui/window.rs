@@ -5056,6 +5056,19 @@ mod tests {
     }
 
     #[gtk::test]
+    async fn file_browser_focus_out_left_restores_saved_source_focus() {
+        let (controller, _ws_id, pane) =
+            build_single_workspace_controller("com.flowmux.App.UiTest.FileBrowserFocusOut").await;
+
+        controller.file_browser_source_pane.set(Some(pane));
+        controller.focused_pane.set(None);
+
+        controller.focus_out_of_file_browser(FocusDir::Left);
+
+        assert_eq!(controller.focused_pane.get(), Some(pane));
+    }
+
+    #[gtk::test]
     async fn file_browser_escape_hides_panel_and_restores_saved_source_focus() {
         let (controller, _ws_id, pane) =
             build_single_workspace_controller("com.flowmux.App.UiTest.FileBrowserEscape").await;

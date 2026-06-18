@@ -242,79 +242,81 @@ impl FileBrowserPanel {
     fn install_keyboard(&self) {
         let key = gtk::EventControllerKey::new();
         let panel = self.clone();
-        key.connect_key_pressed(move |_, keyval, _, state| {
-            if keyval == gdk::Key::Escape {
-                if let Some(cb) = panel.on_escape.borrow().as_ref() {
-                    cb();
+        key.connect_key_pressed(move |_, keyval, _, state| panel.handle_key(keyval, state));
+        self.root.add_controller(key);
+    }
+
+    fn handle_key(&self, keyval: gdk::Key, state: gdk::ModifierType) -> glib::Propagation {
+        if keyval == gdk::Key::Escape {
+            if let Some(cb) = self.on_escape.borrow().as_ref() {
+                cb();
+            }
+            return glib::Propagation::Stop;
+        }
+
+        if state.contains(gdk::ModifierType::ALT_MASK) {
+            if let Some(dir) = key_to_focus_dir(keyval) {
+                if let Some(cb) = self.on_focus_out.borrow().as_ref() {
+                    cb(dir);
                 }
                 return glib::Propagation::Stop;
             }
+        }
 
-            if state.contains(gdk::ModifierType::ALT_MASK) {
-                if let Some(dir) = key_to_focus_dir(keyval) {
-                    if let Some(cb) = panel.on_focus_out.borrow().as_ref() {
-                        cb(dir);
-                    }
+        if state.contains(gdk::ModifierType::CONTROL_MASK)
+            && !state.intersects(gdk::ModifierType::ALT_MASK | gdk::ModifierType::SUPER_MASK)
+        {
+            match keyval.to_unicode().map(|ch| ch.to_ascii_lowercase()) {
+                Some('c') => {
+                    self.copy_focused();
                     return glib::Propagation::Stop;
                 }
-            }
-
-            if state.contains(gdk::ModifierType::CONTROL_MASK)
-                && !state.intersects(gdk::ModifierType::ALT_MASK | gdk::ModifierType::SUPER_MASK)
-            {
-                match keyval.to_unicode().map(|ch| ch.to_ascii_lowercase()) {
-                    Some('c') => {
-                        panel.copy_focused();
-                        return glib::Propagation::Stop;
-                    }
-                    Some('x') => {
-                        panel.cut_focused();
-                        return glib::Propagation::Stop;
-                    }
-                    Some('v') => {
-                        panel.paste_from_clipboard();
-                        return glib::Propagation::Stop;
-                    }
-                    _ => {}
+                Some('x') => {
+                    self.cut_focused();
+                    return glib::Propagation::Stop;
                 }
+                Some('v') => {
+                    self.paste_from_clipboard();
+                    return glib::Propagation::Stop;
+                }
+                _ => {}
             }
+        }
 
-            if state.intersects(
-                gdk::ModifierType::ALT_MASK
-                    | gdk::ModifierType::CONTROL_MASK
-                    | gdk::ModifierType::SUPER_MASK,
-            ) {
-                return glib::Propagation::Proceed;
-            }
+        if state.intersects(
+            gdk::ModifierType::ALT_MASK
+                | gdk::ModifierType::CONTROL_MASK
+                | gdk::ModifierType::SUPER_MASK,
+        ) {
+            return glib::Propagation::Proceed;
+        }
 
-            if keyval == gdk::Key::Up {
-                panel.move_focus(-1);
-                return glib::Propagation::Stop;
-            }
-            if keyval == gdk::Key::Down {
-                panel.move_focus(1);
-                return glib::Propagation::Stop;
-            }
-            if keyval == gdk::Key::Left {
-                panel.collapse_focused();
-                return glib::Propagation::Stop;
-            }
-            if keyval == gdk::Key::Right {
-                panel.expand_focused();
-                return glib::Propagation::Stop;
-            }
-            if keyval == gdk::Key::Return || keyval == gdk::Key::KP_Enter {
-                panel.activate_focused();
-                return glib::Propagation::Stop;
-            }
-            if keyval == gdk::Key::F2 {
-                panel.show_rename_dialog();
-                return glib::Propagation::Stop;
-            }
+        if keyval == gdk::Key::Up {
+            self.move_focus(-1);
+            return glib::Propagation::Stop;
+        }
+        if keyval == gdk::Key::Down {
+            self.move_focus(1);
+            return glib::Propagation::Stop;
+        }
+        if keyval == gdk::Key::Left {
+            self.collapse_focused();
+            return glib::Propagation::Stop;
+        }
+        if keyval == gdk::Key::Right {
+            self.expand_focused();
+            return glib::Propagation::Stop;
+        }
+        if keyval == gdk::Key::Return || keyval == gdk::Key::KP_Enter {
+            self.activate_focused();
+            return glib::Propagation::Stop;
+        }
+        if keyval == gdk::Key::F2 {
+            self.show_rename_dialog();
+            return glib::Propagation::Stop;
+        }
 
-            glib::Propagation::Proceed
-        });
-        self.root.add_controller(key);
+        glib::Propagation::Proceed
     }
 
     fn move_focus(&self, delta: isize) {
@@ -325,19 +327,22 @@ impl FileBrowserPanel {
     }
 
     fn expand_focused(&self) {
-        if self.model.borrow_mut().expand_focused() {
+        let changed = { self.model.borrow_mut().expand_focused() };
+        if changed {
             self.refresh();
         }
     }
 
     fn collapse_focused(&self) {
-        if self.model.borrow_mut().collapse_focused() {
+        let changed = { self.model.borrow_mut().collapse_focused() };
+        if changed {
             self.refresh();
         }
     }
 
     fn activate_focused(&self) {
-        match self.model.borrow_mut().activate_focused() {
+        let activation = { self.model.borrow_mut().activate_focused() };
+        match activation {
             FileBrowserActivation::None => {}
             FileBrowserActivation::Refresh => self.refresh(),
             FileBrowserActivation::Open(path) => open_file(&path),
@@ -1067,6 +1072,7 @@ fn normalize_root(root: PathBuf) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     struct TestDir {
@@ -1119,6 +1125,43 @@ mod tests {
 
     fn row_paths(model: &FileBrowserModel) -> Vec<PathBuf> {
         model.rows().iter().map(|row| row.path.clone()).collect()
+    }
+
+    fn panel_row_names(panel: &FileBrowserPanel) -> Vec<String> {
+        row_names(&panel.model.borrow())
+    }
+
+    fn panel_focused_path(panel: &FileBrowserPanel) -> Option<PathBuf> {
+        panel.model.borrow().focused.clone()
+    }
+
+    fn key(name: &str) -> gdk::Key {
+        gdk::Key::from_name(name).unwrap_or_else(|| panic!("missing key: {name}"))
+    }
+
+    fn find_entry(widget: &gtk::Widget) -> Option<gtk::Entry> {
+        if let Ok(entry) = widget.clone().downcast::<gtk::Entry>() {
+            return Some(entry);
+        }
+
+        let mut child = widget.first_child();
+        while let Some(widget) = child {
+            if let Some(entry) = find_entry(&widget) {
+                return Some(entry);
+            }
+            child = widget.next_sibling();
+        }
+        None
+    }
+
+    fn close_rename_windows() {
+        for widget in gtk::Window::list_toplevels() {
+            if let Ok(window) = widget.downcast::<gtk::Window>() {
+                if window.title().as_deref() == Some("Rename") {
+                    window.close();
+                }
+            }
+        }
     }
 
     #[test]
@@ -1367,5 +1410,162 @@ mod tests {
             panel.model.borrow().focused.as_ref(),
             Some(&tmp.path.join("a copy.txt"))
         );
+    }
+
+    #[gtk::test]
+    fn behavior_arrow_keys_move_custom_focus_without_listbox_selection() {
+        let tmp = TestDir::new("behavior-arrows");
+        let a = tmp.file("a.txt");
+        let b = tmp.file("b.txt");
+
+        let panel = FileBrowserPanel::new();
+        panel.show_for_root(tmp.path.clone());
+
+        assert_eq!(panel_focused_path(&panel), Some(a.clone()));
+        assert!(panel.list.selected_row().is_none());
+
+        assert_eq!(
+            panel.handle_key(gdk::Key::Down, gdk::ModifierType::empty()),
+            glib::Propagation::Stop
+        );
+        assert_eq!(panel_focused_path(&panel), Some(b.clone()));
+        assert!(panel.list.selected_row().is_none());
+
+        assert_eq!(
+            panel.handle_key(gdk::Key::Up, gdk::ModifierType::empty()),
+            glib::Propagation::Stop
+        );
+        assert_eq!(panel_focused_path(&panel), Some(a));
+        assert!(panel.list.selected_row().is_none());
+    }
+
+    #[gtk::test]
+    fn behavior_left_right_and_enter_toggle_focused_folder() {
+        let tmp = TestDir::new("behavior-toggle");
+        let src = tmp.dir("src");
+        tmp.file("src/main.rs");
+        tmp.file("top.txt");
+
+        let panel = FileBrowserPanel::new();
+        panel.show_for_root(tmp.path.clone());
+        assert_eq!(panel_focused_path(&panel), Some(src));
+        assert_eq!(panel_row_names(&panel), ["src", "top.txt"]);
+
+        assert_eq!(
+            panel.handle_key(gdk::Key::Right, gdk::ModifierType::empty()),
+            glib::Propagation::Stop
+        );
+        assert_eq!(panel_row_names(&panel), ["src", "main.rs", "top.txt"]);
+
+        assert_eq!(
+            panel.handle_key(gdk::Key::Left, gdk::ModifierType::empty()),
+            glib::Propagation::Stop
+        );
+        assert_eq!(panel_row_names(&panel), ["src", "top.txt"]);
+
+        assert_eq!(
+            panel.handle_key(gdk::Key::Return, gdk::ModifierType::empty()),
+            glib::Propagation::Stop
+        );
+        assert_eq!(panel_row_names(&panel), ["src", "main.rs", "top.txt"]);
+    }
+
+    #[gtk::test]
+    fn behavior_f2_opens_rename_popup_for_focused_entry() {
+        let tmp = TestDir::new("behavior-f2");
+        tmp.file("old.txt");
+
+        let panel = FileBrowserPanel::new();
+        panel.show_for_root(tmp.path.clone());
+
+        assert_eq!(
+            panel.handle_key(gdk::Key::F2, gdk::ModifierType::empty()),
+            glib::Propagation::Stop
+        );
+
+        let rename = gtk::Window::list_toplevels()
+            .into_iter()
+            .filter_map(|widget| widget.downcast::<gtk::Window>().ok())
+            .find(|window| window.title().as_deref() == Some("Rename"))
+            .expect("F2 should open a Rename popup");
+        let entry = find_entry(rename.upcast_ref()).expect("Rename popup should include an entry");
+        assert_eq!(entry.text().as_str(), "old.txt");
+        close_rename_windows();
+    }
+
+    #[gtk::test]
+    fn behavior_alt_arrows_and_escape_use_callbacks() {
+        let panel = FileBrowserPanel::new();
+        let focus_out = Rc::new(RefCell::new(None));
+        let closed = Rc::new(Cell::new(false));
+
+        {
+            let focus_out = focus_out.clone();
+            panel.connect_focus_out(move |dir| *focus_out.borrow_mut() = Some(dir));
+        }
+        {
+            let closed = closed.clone();
+            panel.connect_escape(move || closed.set(true));
+        }
+
+        assert_eq!(
+            panel.handle_key(gdk::Key::Left, gdk::ModifierType::ALT_MASK),
+            glib::Propagation::Stop
+        );
+        assert_eq!(*focus_out.borrow(), Some(FocusDir::Left));
+
+        assert_eq!(
+            panel.handle_key(gdk::Key::Escape, gdk::ModifierType::empty()),
+            glib::Propagation::Stop
+        );
+        assert!(closed.get());
+    }
+
+    #[gtk::test]
+    fn behavior_ctrl_copy_paste_refreshes_visible_rows() {
+        let tmp = TestDir::new("behavior-copy");
+        tmp.file("a.txt");
+
+        let panel = FileBrowserPanel::new();
+        panel.show_for_root(tmp.path.clone());
+
+        assert_eq!(
+            panel.handle_key(key("c"), gdk::ModifierType::CONTROL_MASK),
+            glib::Propagation::Stop
+        );
+        assert_eq!(
+            panel.handle_key(key("v"), gdk::ModifierType::CONTROL_MASK),
+            glib::Propagation::Stop
+        );
+
+        assert!(tmp.path.join("a copy.txt").exists());
+        assert_eq!(panel_row_names(&panel), ["a copy.txt", "a.txt"]);
+    }
+
+    #[gtk::test]
+    fn behavior_ctrl_cut_marks_row_then_paste_moves_and_clears_cut_state() {
+        let tmp = TestDir::new("behavior-cut");
+        let file = tmp.file("a.txt");
+        let dest = tmp.dir("dest");
+
+        let panel = FileBrowserPanel::new();
+        panel.show_for_root(tmp.path.clone());
+        panel.focus_path(file.clone());
+
+        assert_eq!(
+            panel.handle_key(key("x"), gdk::ModifierType::CONTROL_MASK),
+            glib::Propagation::Stop
+        );
+        assert!(panel.list.row_at_index(1).unwrap().has_css_class("cut"));
+
+        panel.focus_path(dest.clone());
+        assert_eq!(
+            panel.handle_key(key("v"), gdk::ModifierType::CONTROL_MASK),
+            glib::Propagation::Stop
+        );
+
+        assert!(!file.exists());
+        assert!(dest.join("a.txt").exists());
+        assert!(panel.model.borrow().rows().iter().all(|row| !row.cut));
     }
 }
