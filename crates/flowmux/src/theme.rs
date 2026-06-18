@@ -410,6 +410,9 @@ paned > separator {{
     color: {fg};
     border-left: 1px solid {border};
 }}
+.flowmux-file-browser.focused {{
+    box-shadow: inset 2px 0 0 {focus};
+}}
 .flowmux-file-browser-header {{
     padding: 8px 8px 6px 10px;
     border-bottom: 1px solid {border};
@@ -424,6 +427,9 @@ paned > separator {{
     background-color: {sidebar_hover};
 }}
 .flowmux-file-browser-row:selected {{
+    background-color: {control_hover};
+}}
+.flowmux-file-browser-row.focused {{
     background-color: {control_hover};
 }}
 .flowmux-clipboard-toast {{

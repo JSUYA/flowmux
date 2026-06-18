@@ -330,6 +330,13 @@ impl WindowController {
         let file_browser = FileBrowserPanel::new();
         let file_browser_for_close = file_browser.clone();
         file_browser.connect_close(move || file_browser_for_close.hide());
+        let file_browser_bridge = bridge.clone();
+        file_browser.connect_focus_out(move |dir| {
+            let bridge = file_browser_bridge.clone();
+            glib::MainContext::default().spawn_local(async move {
+                let _ = bridge.tx.send(GtkCommand::FileBrowserFocusOut { dir }).await;
+            });
+        });
 
         let file_browser_split = gtk::Paned::builder()
             .orientation(gtk::Orientation::Horizontal)
@@ -1240,6 +1247,33 @@ impl WindowController {
         }
     }
 
+    fn focus_file_browser(&self) {
+        if self.file_browser.widget().is_visible() {
+            self.file_browser.grab_focus();
+        }
+    }
+
+    fn focus_out_of_file_browser(&self, dir: FocusDir) {
+        if let Some(from) = self.focused_pane.get() {
+            let before = self.focused_pane.get();
+            self.focus_in_direction(from, dir);
+            if self.focused_pane.get() == before {
+                self.focus_pane(from);
+            }
+        }
+    }
+
+    fn focus_direction_or_file_browser(&self, from: PaneId, dir: FocusDir) {
+        let before = self.focused_pane.get();
+        self.focus_in_direction(from, dir);
+        if dir == FocusDir::Right
+            && self.file_browser.widget().is_visible()
+            && self.focused_pane.get() == before
+        {
+            self.focus_file_browser();
+        }
+    }
+
     async fn refresh_file_browser_from_focus(&self) {
         if !self.file_browser.widget().is_visible() {
             return;
@@ -1743,8 +1777,11 @@ impl WindowController {
                 }
             }
             GtkCommand::FocusDirection { from, dir } => match from {
-                Some(p) => self.focus_in_direction(p, dir),
+                Some(p) => self.focus_direction_or_file_browser(p, dir),
                 None => self.focus_first_leaf_of_active_workspace().await,
+            },
+            GtkCommand::FileBrowserFocusOut { dir } => {
+                self.focus_out_of_file_browser(dir);
             },
             GtkCommand::NewSurface { pane } => {
                 let cwd = {

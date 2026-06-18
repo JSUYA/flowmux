@@ -120,7 +120,7 @@ pub enum BrowserActionResult {
     String(String),
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FocusDir {
     Left,
     Right,
@@ -202,6 +202,8 @@ pub enum GtkCommand {
     NewBrowserSurface { pane: PaneId },
     /// Show the right-side FileBrowser rooted at `pane`'s current directory.
     ShowFileBrowser { pane: PaneId },
+    /// Move keyboard focus out of the right-side FileBrowser.
+    FileBrowserFocusOut { dir: FocusDir },
     /// Open a Ctrl-clicked terminal URL in a new browser tab in the same
     /// pane. `pane` is the source terminal pane and `url` has already had
     /// trailing punctuation trimmed.

@@ -2,13 +2,15 @@
 
 //! Right-side Finder-style file browser for the focused pane's cwd.
 
+use crate::bridge::FocusDir;
 use crate::ui::popover_pos;
 use crate::ui::show_in_folder;
-use gtk::gio;
 use gtk::prelude::*;
+use gtk::{gdk, gio, glib};
 use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::HashSet;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -17,27 +19,41 @@ pub struct FileBrowserPanel {
     root: gtk::Box,
     path_label: gtk::Label,
     list: gtk::ListBox,
+    scroll: gtk::ScrolledWindow,
     status: gtk::Label,
     close_button: gtk::Button,
-    root_dir: Rc<RefCell<Option<PathBuf>>>,
-    expanded: Rc<RefCell<HashSet<PathBuf>>>,
-    selected: Rc<RefCell<Option<PathBuf>>>,
-    rows: Rc<RefCell<Vec<FileBrowserRow>>>,
+    model: Rc<RefCell<FileBrowserModel>>,
+    on_focus_out: Rc<RefCell<Option<Box<dyn Fn(FocusDir)>>>>,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct FileBrowserRow {
     path: PathBuf,
     is_dir: bool,
     depth: usize,
     expanded: bool,
+    focused: bool,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 struct FsEntry {
     path: PathBuf,
     name: String,
     is_dir: bool,
+}
+
+#[derive(Debug, Default)]
+struct FileBrowserModel {
+    root: Option<PathBuf>,
+    expanded: HashSet<PathBuf>,
+    focused: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FileBrowserActivation {
+    None,
+    Refresh,
+    Open(PathBuf),
 }
 
 impl FileBrowserPanel {
@@ -47,93 +63,67 @@ impl FileBrowserPanel {
         root.set_size_request(300, -1);
         root.set_hexpand(false);
         root.set_vexpand(true);
+        root.set_focusable(true);
         root.set_visible(false);
 
-        let header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         header.add_css_class("flowmux-file-browser-header");
 
+        let title_box = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        title_box.set_hexpand(true);
         let title = gtk::Label::new(Some("Files"));
         title.add_css_class("heading");
         title.set_xalign(0.0);
-
         let path_label = gtk::Label::new(None);
         path_label.add_css_class("dim-label");
-        path_label.set_xalign(0.0);
         path_label.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
-        path_label.set_hexpand(true);
-
-        let title_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        title_box.set_hexpand(true);
+        path_label.set_xalign(0.0);
         title_box.append(&title);
         title_box.append(&path_label);
 
         let close_button = gtk::Button::from_icon_name("window-close-symbolic");
         close_button.add_css_class("flat");
-        close_button.set_tooltip_text(Some("Close FileBrowser"));
+        close_button.set_tooltip_text(Some("Close file browser"));
         close_button.set_focus_on_click(false);
 
         header.append(&title_box);
         header.append(&close_button);
+        root.append(&header);
 
         let list = gtk::ListBox::new();
         list.add_css_class("flowmux-file-browser-list");
-        list.set_selection_mode(gtk::SelectionMode::Single);
+        list.set_selection_mode(gtk::SelectionMode::None);
         list.set_activate_on_single_click(false);
 
         let status = gtk::Label::new(Some("No focused directory"));
         status.add_css_class("dim-label");
         status.set_margin_top(16);
-        status.set_margin_start(12);
-        status.set_margin_end(12);
+        status.set_margin_start(16);
+        status.set_margin_end(16);
         status.set_wrap(true);
-        status.set_xalign(0.0);
 
-        let scroll = gtk::ScrolledWindow::new();
-        scroll.set_hexpand(true);
-        scroll.set_vexpand(true);
-        scroll.set_child(Some(&list));
-
-        root.append(&header);
-        root.append(&status);
+        let scroll = gtk::ScrolledWindow::builder()
+            .child(&list)
+            .hexpand(true)
+            .vexpand(true)
+            .build();
         root.append(&scroll);
+        root.append(&status);
 
         let panel = Self {
             root,
             path_label,
             list,
+            scroll,
             status,
             close_button,
-            root_dir: Rc::new(RefCell::new(None)),
-            expanded: Rc::new(RefCell::new(HashSet::new())),
-            selected: Rc::new(RefCell::new(None)),
-            rows: Rc::new(RefCell::new(Vec::new())),
+            model: Rc::new(RefCell::new(FileBrowserModel::default())),
+            on_focus_out: Rc::new(RefCell::new(None)),
         };
 
-        {
-            let panel = panel.clone();
-            let list = panel.list.clone();
-            list.connect_row_selected(move |_, row| {
-                let Some(row) = row else {
-                    *panel.selected.borrow_mut() = None;
-                    return;
-                };
-                let index = row.index();
-                let selected = panel
-                    .rows
-                    .borrow()
-                    .get(index.max(0) as usize)
-                    .map(|row| row.path.clone());
-                *panel.selected.borrow_mut() = selected;
-            });
-        }
-
-        {
-            let panel = panel.clone();
-            let list = panel.list.clone();
-            list.connect_row_activated(move |_, row| {
-                panel.activate_row(row.index());
-            });
-        }
+        panel.install_focus_style();
+        panel.install_pointer_focus();
+        panel.install_keyboard();
 
         panel
     }
@@ -146,14 +136,12 @@ impl FileBrowserPanel {
         self.close_button.connect_clicked(move |_| f());
     }
 
+    pub fn connect_focus_out<F: Fn(FocusDir) + 'static>(&self, f: F) {
+        *self.on_focus_out.borrow_mut() = Some(Box::new(f));
+    }
+
     pub fn show_for_root(&self, root: PathBuf) {
-        let root = normalize_root(root);
-        let changed = self.root_dir.borrow().as_ref() != Some(&root);
-        if changed {
-            self.expanded.borrow_mut().clear();
-            *self.selected.borrow_mut() = None;
-        }
-        *self.root_dir.borrow_mut() = Some(root);
+        self.model.borrow_mut().set_root(root);
         self.root.set_visible(true);
         self.refresh();
     }
@@ -162,13 +150,21 @@ impl FileBrowserPanel {
         self.root.set_visible(false);
     }
 
+    pub fn grab_focus(&self) {
+        self.root.grab_focus();
+    }
+
     pub fn refresh(&self) {
         while let Some(child) = self.list.first_child() {
             self.list.remove(&child);
         }
-        self.rows.borrow_mut().clear();
 
-        let Some(root) = self.root_dir.borrow().clone() else {
+        let root = {
+            let model = self.model.borrow();
+            model.root.clone()
+        };
+
+        let Some(root) = root else {
             self.path_label.set_text("");
             self.status.set_text("No focused directory");
             self.status.set_visible(true);
@@ -185,8 +181,11 @@ impl FileBrowserPanel {
             return;
         }
 
-        let mut rows = Vec::new();
-        self.collect_rows(&root, 0, &mut rows);
+        let rows = {
+            let mut model = self.model.borrow_mut();
+            model.sync_focus();
+            model.rows()
+        };
 
         if rows.is_empty() {
             self.status.set_text("Directory is empty");
@@ -195,64 +194,175 @@ impl FileBrowserPanel {
         }
 
         self.status.set_visible(false);
-        *self.rows.borrow_mut() = rows.clone();
-
         for row in rows {
             self.list.append(&self.build_row(&row));
         }
+        self.scroll_focused_row_into_view();
     }
 
-    fn activate_row(&self, index: i32) {
-        let Some(row) = self.rows.borrow().get(index.max(0) as usize).cloned() else {
-            return;
-        };
+    fn install_focus_style(&self) {
+        let focus = gtk::EventControllerFocus::new();
+        let root = self.root.clone();
+        focus.connect_enter(move |_| root.add_css_class("focused"));
+        let root = self.root.clone();
+        focus.connect_leave(move |_| root.remove_css_class("focused"));
+        self.root.add_controller(focus);
+    }
 
-        if row.is_dir {
-            let mut expanded = self.expanded.borrow_mut();
-            if expanded.contains(&row.path) {
-                expanded.remove(&row.path);
-            } else {
-                expanded.insert(row.path);
+    fn install_pointer_focus(&self) {
+        let click = gtk::GestureClick::new();
+        let root = self.root.clone();
+        click.connect_pressed(move |_, _, _, _| {
+            root.grab_focus();
+        });
+        self.root.add_controller(click);
+    }
+
+    fn install_keyboard(&self) {
+        let key = gtk::EventControllerKey::new();
+        let panel = self.clone();
+        key.connect_key_pressed(move |_, keyval, _, state| {
+            if state.contains(gdk::ModifierType::ALT_MASK) {
+                if let Some(dir) = key_to_focus_dir(keyval) {
+                    if let Some(cb) = panel.on_focus_out.borrow().as_ref() {
+                        cb(dir);
+                    }
+                    return glib::Propagation::Stop;
+                }
             }
-            drop(expanded);
-            self.refresh();
-        } else {
-            open_file(&row.path);
+
+            if state.intersects(
+                gdk::ModifierType::ALT_MASK
+                    | gdk::ModifierType::CONTROL_MASK
+                    | gdk::ModifierType::SUPER_MASK,
+            ) {
+                return glib::Propagation::Proceed;
+            }
+
+            if keyval == gdk::Key::Up {
+                panel.move_focus(-1);
+                return glib::Propagation::Stop;
+            }
+            if keyval == gdk::Key::Down {
+                panel.move_focus(1);
+                return glib::Propagation::Stop;
+            }
+            if keyval == gdk::Key::Left {
+                panel.collapse_focused();
+                return glib::Propagation::Stop;
+            }
+            if keyval == gdk::Key::Right {
+                panel.expand_focused();
+                return glib::Propagation::Stop;
+            }
+            if keyval == gdk::Key::Return || keyval == gdk::Key::KP_Enter {
+                panel.activate_focused();
+                return glib::Propagation::Stop;
+            }
+
+            glib::Propagation::Proceed
+        });
+        self.root.add_controller(key);
+    }
+
+    fn move_focus(&self, delta: isize) {
+        if self.model.borrow_mut().move_focus(delta) {
+            self.sync_focus_classes();
+            self.scroll_focused_row_into_view();
         }
     }
 
-    fn collect_rows(&self, dir: &Path, depth: usize, rows: &mut Vec<FileBrowserRow>) {
-        let Ok(entries) = read_dir_entries(dir) else {
+    fn expand_focused(&self) {
+        if self.model.borrow_mut().expand_focused() {
+            self.refresh();
+        }
+    }
+
+    fn collapse_focused(&self) {
+        if self.model.borrow_mut().collapse_focused() {
+            self.refresh();
+        }
+    }
+
+    fn activate_focused(&self) {
+        match self.model.borrow_mut().activate_focused() {
+            FileBrowserActivation::None => {}
+            FileBrowserActivation::Refresh => self.refresh(),
+            FileBrowserActivation::Open(path) => open_file(&path),
+        }
+    }
+
+    fn focus_path(&self, path: PathBuf) {
+        if self.model.borrow_mut().focus_path(&path) {
+            self.root.grab_focus();
+            self.sync_focus_classes();
+            self.scroll_focused_row_into_view();
+        }
+    }
+
+    fn activate_path(&self, path: PathBuf) {
+        if self.model.borrow_mut().focus_path(&path) {
+            self.root.grab_focus();
+        }
+        self.activate_focused();
+    }
+
+    fn sync_focus_classes(&self) {
+        let rows = self.model.borrow().rows();
+        let mut child = self.list.first_child();
+        let mut idx = 0usize;
+        while let Some(widget) = child {
+            child = widget.next_sibling();
+            let Ok(row_widget) = widget.downcast::<gtk::ListBoxRow>() else {
+                continue;
+            };
+            if rows.get(idx).map(|row| row.focused).unwrap_or(false) {
+                row_widget.add_css_class("focused");
+            } else {
+                row_widget.remove_css_class("focused");
+            }
+            idx += 1;
+        }
+    }
+
+    fn scroll_focused_row_into_view(&self) {
+        let Some(index) = self.model.borrow().focused_index() else {
             return;
         };
+        let Some(row) = self.list.row_at_index(index as i32) else {
+            return;
+        };
+        let Some(bounds) = row.compute_bounds(&self.list) else {
+            return;
+        };
+        let adjustment = self.scroll.vadjustment();
+        let row_top = bounds.y() as f64;
+        let row_bottom = row_top + bounds.height() as f64;
+        let view_top = adjustment.value();
+        let view_bottom = view_top + adjustment.page_size();
 
-        for entry in entries {
-            let is_expanded = entry.is_dir && self.expanded.borrow().contains(&entry.path);
-            rows.push(FileBrowserRow {
-                path: entry.path.clone(),
-                is_dir: entry.is_dir,
-                depth,
-                expanded: is_expanded,
-            });
-
-            if is_expanded {
-                self.collect_rows(&entry.path, depth + 1, rows);
-            }
+        if row_top < view_top {
+            adjustment.set_value(row_top);
+        } else if row_bottom > view_bottom {
+            adjustment.set_value((row_bottom - adjustment.page_size()).max(0.0));
         }
     }
 
     fn build_row(&self, row: &FileBrowserRow) -> gtk::ListBoxRow {
         let list_row = gtk::ListBoxRow::new();
         list_row.add_css_class("flowmux-file-browser-row");
-        list_row.set_selectable(true);
+        if row.focused {
+            list_row.add_css_class("focused");
+        }
+        list_row.set_selectable(false);
         list_row.set_activatable(true);
         list_row.set_tooltip_text(Some(row.path.to_string_lossy().as_ref()));
 
         let content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        content.set_margin_top(2);
-        content.set_margin_bottom(2);
         content.set_margin_start(8 + (row.depth as i32 * 14));
         content.set_margin_end(8);
+        content.set_margin_top(2);
+        content.set_margin_bottom(2);
 
         let disclosure = if row.is_dir {
             let icon = if row.expanded {
@@ -276,8 +386,8 @@ impl FileBrowserPanel {
 
         let label = gtk::Label::new(Some(&display_name(&row.path)));
         label.set_xalign(0.0);
-        label.set_ellipsize(gtk::pango::EllipsizeMode::End);
         label.set_hexpand(true);
+        label.set_ellipsize(gtk::pango::EllipsizeMode::End);
 
         content.append(&disclosure);
         content.append(&icon);
@@ -285,22 +395,191 @@ impl FileBrowserPanel {
         list_row.set_child(Some(&content));
 
         let click = gtk::GestureClick::new();
-        click.set_button(gtk::gdk::BUTTON_SECONDARY);
+        click.set_button(0);
+        let panel = self.clone();
         let path = row.path.clone();
         let row_for_menu = list_row.clone();
-        click.connect_pressed(move |gesture, _n_press, x, y| {
-            gesture.set_state(gtk::EventSequenceState::Claimed);
-            show_context_menu(&row_for_menu, &path, x, y);
-        });
+        click.connect_pressed(
+            move |gesture, n_press, x, y| match gesture.current_button() {
+                gdk::BUTTON_PRIMARY => {
+                    if n_press >= 2 {
+                        panel.activate_path(path.clone());
+                    } else {
+                        panel.focus_path(path.clone());
+                    }
+                }
+                gdk::BUTTON_SECONDARY => {
+                    panel.focus_path(path.clone());
+                    show_context_menu(&row_for_menu, &path, x, y);
+                }
+                _ => {}
+            },
+        );
         list_row.add_controller(click);
 
         list_row
     }
 }
 
+impl FileBrowserModel {
+    fn set_root(&mut self, root: PathBuf) {
+        let root = normalize_root(root);
+        if self.root.as_ref() != Some(&root) {
+            self.expanded.clear();
+            self.focused = None;
+        }
+        self.root = Some(root);
+    }
+
+    fn sync_focus(&mut self) {
+        let rows = self.visible_rows();
+        if rows.is_empty() {
+            self.focused = None;
+            return;
+        }
+
+        if self
+            .focused
+            .as_ref()
+            .is_none_or(|focused| !rows.iter().any(|row| row.path == *focused))
+        {
+            self.focused = rows.first().map(|row| row.path.clone());
+        }
+    }
+
+    fn rows(&self) -> Vec<FileBrowserRow> {
+        let focused = self.focused.as_ref();
+        self.visible_rows()
+            .into_iter()
+            .map(|mut row| {
+                row.focused = focused == Some(&row.path);
+                row
+            })
+            .collect()
+    }
+
+    fn visible_rows(&self) -> Vec<FileBrowserRow> {
+        let Some(root) = self.root.as_ref() else {
+            return Vec::new();
+        };
+
+        let mut rows = Vec::new();
+        self.collect_rows(root, 0, &mut rows);
+        rows
+    }
+
+    fn collect_rows(&self, dir: &Path, depth: usize, rows: &mut Vec<FileBrowserRow>) {
+        let Ok(entries) = read_dir_entries(dir) else {
+            return;
+        };
+
+        for entry in entries {
+            let expanded = entry.is_dir && self.expanded.contains(&entry.path);
+            rows.push(FileBrowserRow {
+                path: entry.path.clone(),
+                is_dir: entry.is_dir,
+                depth,
+                expanded,
+                focused: false,
+            });
+
+            if expanded {
+                self.collect_rows(&entry.path, depth + 1, rows);
+            }
+        }
+    }
+
+    fn focus_path(&mut self, path: &Path) -> bool {
+        if self.visible_rows().iter().any(|row| row.path == path) {
+            let changed = self.focused.as_deref() != Some(path);
+            self.focused = Some(path.to_path_buf());
+            changed
+        } else {
+            false
+        }
+    }
+
+    fn move_focus(&mut self, delta: isize) -> bool {
+        self.sync_focus();
+        let rows = self.visible_rows();
+        if rows.is_empty() {
+            return false;
+        }
+
+        let current = self
+            .focused
+            .as_ref()
+            .and_then(|focused| rows.iter().position(|row| row.path == *focused))
+            .unwrap_or(0);
+        let last = rows.len() - 1;
+        let next = if delta < 0 {
+            current.saturating_sub(delta.unsigned_abs())
+        } else {
+            current.saturating_add(delta as usize).min(last)
+        };
+
+        let changed = current != next;
+        self.focused = Some(rows[next].path.clone());
+        changed
+    }
+
+    fn expand_focused(&mut self) -> bool {
+        let Some(row) = self.focused_row() else {
+            return false;
+        };
+        if !row.is_dir || row.expanded {
+            return false;
+        }
+        self.expanded.insert(row.path);
+        true
+    }
+
+    fn collapse_focused(&mut self) -> bool {
+        let Some(row) = self.focused_row() else {
+            return false;
+        };
+        if !row.is_dir || !row.expanded {
+            return false;
+        }
+        self.expanded.remove(&row.path);
+        true
+    }
+
+    fn activate_focused(&mut self) -> FileBrowserActivation {
+        let Some(row) = self.focused_row() else {
+            return FileBrowserActivation::None;
+        };
+        if !row.is_dir {
+            return FileBrowserActivation::Open(row.path);
+        }
+
+        if row.expanded {
+            self.expanded.remove(&row.path);
+        } else {
+            self.expanded.insert(row.path);
+        }
+        FileBrowserActivation::Refresh
+    }
+
+    fn focused_row(&mut self) -> Option<FileBrowserRow> {
+        self.sync_focus();
+        let focused = self.focused.as_ref()?;
+        self.visible_rows()
+            .into_iter()
+            .find(|row| row.path == *focused)
+    }
+
+    fn focused_index(&self) -> Option<usize> {
+        let focused = self.focused.as_ref()?;
+        self.visible_rows()
+            .iter()
+            .position(|row| row.path == *focused)
+    }
+}
+
 fn read_dir_entries(dir: &Path) -> std::io::Result<Vec<FsEntry>> {
     let mut entries = Vec::new();
-    for entry in std::fs::read_dir(dir)? {
+    for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().into_owned();
@@ -313,10 +592,11 @@ fn read_dir_entries(dir: &Path) -> std::io::Result<Vec<FsEntry>> {
         (false, true) => Ordering::Greater,
         _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
     });
+
     Ok(entries)
 }
 
-fn show_context_menu(parent: &gtk::ListBoxRow, path: &Path, x: f64, y: f64) {
+fn show_context_menu(parent: &impl IsA<gtk::Widget>, path: &Path, x: f64, y: f64) {
     let popover = gtk::Popover::new();
     let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
     content.set_margin_top(4);
@@ -326,18 +606,14 @@ fn show_context_menu(parent: &gtk::ListBoxRow, path: &Path, x: f64, y: f64) {
     show.add_css_class("flat");
     show.set_halign(gtk::Align::Fill);
     show.set_hexpand(true);
-    if let Some(label) = show.child().and_then(|w| w.downcast::<gtk::Label>().ok()) {
-        label.set_xalign(0.0);
-    }
-
     let target = path.to_path_buf();
     let pop = popover.clone();
     show.connect_clicked(move |_| {
-        pop.popdown();
         show_path_in_folder(&target);
+        pop.popdown();
     });
-
     content.append(&show);
+
     popover.set_child(Some(&content));
     popover.set_parent(parent);
     popover_pos::anchor_at_click(&popover, parent, x, y);
@@ -361,6 +637,20 @@ fn open_file(path: &Path) {
     }
 }
 
+fn key_to_focus_dir(key: gdk::Key) -> Option<FocusDir> {
+    if key == gdk::Key::Left {
+        Some(FocusDir::Left)
+    } else if key == gdk::Key::Right {
+        Some(FocusDir::Right)
+    } else if key == gdk::Key::Up {
+        Some(FocusDir::Up)
+    } else if key == gdk::Key::Down {
+        Some(FocusDir::Down)
+    } else {
+        None
+    }
+}
+
 fn display_name(path: &Path) -> String {
     path.file_name()
         .map(|name| name.to_string_lossy().into_owned())
@@ -373,5 +663,134 @@ fn normalize_root(root: PathBuf) -> PathBuf {
         root
     } else {
         root.parent().map(Path::to_path_buf).unwrap_or(root)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TestDir {
+        path: PathBuf,
+    }
+
+    impl TestDir {
+        fn new(name: &str) -> Self {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "flowmux-file-browser-{name}-{}-{nonce}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&path).unwrap();
+            Self { path }
+        }
+
+        fn dir(&self, rel: &str) -> PathBuf {
+            let path = self.path.join(rel);
+            fs::create_dir_all(&path).unwrap();
+            path
+        }
+
+        fn file(&self, rel: &str) -> PathBuf {
+            let path = self.path.join(rel);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(&path, rel).unwrap();
+            path
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn row_names(model: &FileBrowserModel) -> Vec<String> {
+        model
+            .rows()
+            .iter()
+            .map(|row| display_name(&row.path))
+            .collect()
+    }
+
+    #[test]
+    fn rows_are_sorted_with_directories_first() {
+        let tmp = TestDir::new("sort");
+        tmp.file("z.txt");
+        tmp.dir("b-dir");
+        tmp.file("a.txt");
+        tmp.dir("a-dir");
+
+        let mut model = FileBrowserModel::default();
+        model.set_root(tmp.path.clone());
+        model.sync_focus();
+
+        assert_eq!(row_names(&model), ["a-dir", "b-dir", "a.txt", "z.txt"]);
+        assert_eq!(
+            model.focused.as_ref(),
+            Some(&tmp.path.join("a-dir")),
+            "initial focus follows the first visible row"
+        );
+    }
+
+    #[test]
+    fn up_down_move_internal_focus_without_wrapping() {
+        let tmp = TestDir::new("move");
+        tmp.file("a.txt");
+        tmp.file("b.txt");
+        tmp.file("c.txt");
+
+        let mut model = FileBrowserModel::default();
+        model.set_root(tmp.path.clone());
+
+        assert!(model.move_focus(1));
+        assert_eq!(model.focused.as_ref(), Some(&tmp.path.join("b.txt")));
+        assert!(model.move_focus(1));
+        assert_eq!(model.focused.as_ref(), Some(&tmp.path.join("c.txt")));
+        assert!(!model.move_focus(1));
+        assert_eq!(model.focused.as_ref(), Some(&tmp.path.join("c.txt")));
+        assert!(model.move_focus(-2));
+        assert_eq!(model.focused.as_ref(), Some(&tmp.path.join("a.txt")));
+        assert!(!model.move_focus(-1));
+    }
+
+    #[test]
+    fn right_left_and_enter_expand_or_collapse_focused_folder() {
+        let tmp = TestDir::new("expand");
+        tmp.dir("src");
+        tmp.file("src/main.rs");
+        tmp.file("top.txt");
+
+        let mut model = FileBrowserModel::default();
+        model.set_root(tmp.path.clone());
+        model.sync_focus();
+
+        assert_eq!(row_names(&model), ["src", "top.txt"]);
+        assert!(model.expand_focused());
+        assert_eq!(row_names(&model), ["src", "main.rs", "top.txt"]);
+        assert!(!model.expand_focused());
+        assert!(model.collapse_focused());
+        assert_eq!(row_names(&model), ["src", "top.txt"]);
+        assert_eq!(model.activate_focused(), FileBrowserActivation::Refresh);
+        assert_eq!(row_names(&model), ["src", "main.rs", "top.txt"]);
+        assert_eq!(model.activate_focused(), FileBrowserActivation::Refresh);
+        assert_eq!(row_names(&model), ["src", "top.txt"]);
+    }
+
+    #[test]
+    fn enter_on_file_returns_open_action() {
+        let tmp = TestDir::new("open");
+        let file = tmp.file("a.txt");
+
+        let mut model = FileBrowserModel::default();
+        model.set_root(tmp.path.clone());
+
+        assert_eq!(model.activate_focused(), FileBrowserActivation::Open(file));
     }
 }
