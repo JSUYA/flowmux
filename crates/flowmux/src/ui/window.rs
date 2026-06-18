@@ -1266,14 +1266,21 @@ impl WindowController {
     }
 
     async fn show_file_browser_for_pane(&self, pane: PaneId) {
-        self.save_file_browser_state_for_source();
-        self.file_browser_source_pane.set(Some(pane));
         let root = self
             .file_browser_root_for_pane(pane)
             .await
             .or_else(|| std::env::current_dir().ok());
 
         if let Some(root) = root {
+            if self.file_browser_source_pane.get() == Some(pane)
+                && self.file_browser.is_showing_root(&root)
+            {
+                self.file_browser_active.set(true);
+                return;
+            }
+
+            self.save_file_browser_state_for_source();
+            self.file_browser_source_pane.set(Some(pane));
             self.file_browser_active.set(true);
             let width = self.window.width();
             if width > 420 {
@@ -5263,6 +5270,49 @@ mod tests {
         let state_a_again = controller.file_browser.pane_state();
         assert_eq!(state_a_again.focused, Some(root_a.join("expanded-a")));
         assert!(state_a_again.expanded.contains(&root_a.join("expanded-a")));
+    }
+
+    #[gtk::test]
+    async fn file_browser_same_pane_root_refresh_does_not_rebuild_rows() {
+        let (controller, ws_id, pane) =
+            build_single_workspace_controller("com.flowmux.App.UiTest.FileBrowserRefreshNoop")
+                .await;
+        let ws = controller.store.get_workspace(ws_id).await.unwrap();
+        let surface = ws.surfaces[0].root_pane.active_surface_id(pane).unwrap();
+        let root = std::env::temp_dir().join("flowmux-file-browser-refresh-noop");
+        let next_root = std::env::temp_dir().join("flowmux-file-browser-refresh-noop-next");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&next_root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&next_root).unwrap();
+        for index in 0..256 {
+            std::fs::write(root.join(format!("file-{index}.txt")), "file").unwrap();
+        }
+        std::fs::write(next_root.join("next.txt"), "next").unwrap();
+
+        controller
+            .store
+            .update_surface_cwd(pane, surface, root.clone())
+            .await;
+        controller
+            .pane_registry
+            .borrow_mut()
+            .terminals
+            .remove(&surface);
+
+        controller.show_file_browser_for_pane(pane).await;
+        let rebuild_count = controller.file_browser.rebuild_count();
+        assert!(rebuild_count > 0);
+
+        controller.show_file_browser_for_pane(pane).await;
+        assert_eq!(controller.file_browser.rebuild_count(), rebuild_count);
+
+        controller
+            .store
+            .update_surface_cwd(pane, surface, next_root.clone())
+            .await;
+        controller.show_file_browser_for_pane(pane).await;
+        assert!(controller.file_browser.rebuild_count() > rebuild_count);
     }
 
     #[gtk::test]

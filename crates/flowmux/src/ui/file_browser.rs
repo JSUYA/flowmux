@@ -28,6 +28,8 @@ pub struct FileBrowserPanel {
     path_clipboard_writer: Rc<RefCell<Box<dyn Fn(&str)>>>,
     on_focus_out: Rc<RefCell<Option<Box<dyn Fn(FocusDir)>>>>,
     on_escape: Rc<RefCell<Option<Box<dyn Fn()>>>>,
+    #[cfg(test)]
+    rebuild_count: Rc<std::cell::Cell<usize>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -171,6 +173,8 @@ impl FileBrowserPanel {
             }))),
             on_focus_out: Rc::new(RefCell::new(None)),
             on_escape: Rc::new(RefCell::new(None)),
+            #[cfg(test)]
+            rebuild_count: Rc::new(std::cell::Cell::new(0)),
         };
 
         panel.install_focus_style();
@@ -224,6 +228,16 @@ impl FileBrowserPanel {
         self.restore_scroll_value(scroll_value);
     }
 
+    pub(crate) fn is_showing_root(&self, root: &Path) -> bool {
+        let root = normalize_root(root.to_path_buf());
+        self.model.borrow().root.as_ref() == Some(&root)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn rebuild_count(&self) -> usize {
+        self.rebuild_count.get()
+    }
+
     pub(crate) fn pane_state(&self) -> FileBrowserPaneState {
         let model = self.model.borrow();
         FileBrowserPaneState {
@@ -257,6 +271,9 @@ impl FileBrowserPanel {
     }
 
     fn rebuild_rows(&self) {
+        #[cfg(test)]
+        self.rebuild_count.set(self.rebuild_count.get() + 1);
+
         while let Some(child) = self.list.first_child() {
             self.list.remove(&child);
         }
