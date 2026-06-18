@@ -1599,7 +1599,7 @@ mod tests {
     }
 
     #[test]
-    fn copy_paste_file_creates_unique_sibling_and_focuses_it() {
+    fn copy_paste_file_creates_unique_sibling_and_keeps_focus() {
         let tmp = TestDir::new("copy-file");
         tmp.file("a.txt");
 
@@ -1612,12 +1612,12 @@ mod tests {
         let copied = tmp.path.join("a copy.txt");
         assert!(tmp.path.join("a.txt").exists());
         assert!(copied.exists());
-        assert_eq!(model.focused.as_ref(), Some(&copied));
+        assert_eq!(model.focused.as_ref(), Some(&tmp.path.join("a.txt")));
         assert!(row_paths(&model).contains(&copied));
     }
 
     #[test]
-    fn copy_paste_folder_recursively() {
+    fn copy_paste_folder_recursively_and_keeps_focus() {
         let tmp = TestDir::new("copy-dir");
         tmp.dir("src");
         tmp.file("src/main.rs");
@@ -1633,7 +1633,7 @@ mod tests {
 
         assert!(tmp.path.join("src/main.rs").exists());
         assert!(tmp.path.join("src copy/main.rs").exists());
-        assert_eq!(model.focused.as_ref(), Some(&tmp.path.join("src copy")));
+        assert_eq!(model.focused.as_ref(), Some(&target));
     }
 
     #[test]
@@ -1712,7 +1712,7 @@ mod tests {
         assert!(tmp.path.join("a copy.txt").exists());
         assert_eq!(
             panel.model.borrow().focused.as_ref(),
-            Some(&tmp.path.join("a copy.txt"))
+            Some(&tmp.path.join("a.txt"))
         );
     }
 
