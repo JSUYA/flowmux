@@ -37,6 +37,7 @@ struct FileBrowserRow {
     depth: usize,
     expanded: bool,
     focused: bool,
+    selected: bool,
     cut: bool,
 }
 
@@ -67,6 +68,8 @@ struct FileBrowserModel {
     root: Option<PathBuf>,
     expanded: HashSet<PathBuf>,
     focused: Option<PathBuf>,
+    selected: HashSet<PathBuf>,
+    selection_anchor: Option<PathBuf>,
     clipboard: Option<FileClipboard>,
 }
 
@@ -350,6 +353,17 @@ impl FileBrowserPanel {
             return glib::Propagation::Proceed;
         }
 
+        if state.contains(gdk::ModifierType::SHIFT_MASK) {
+            if keyval == gdk::Key::Up {
+                self.extend_selection_focus(-1);
+                return glib::Propagation::Stop;
+            }
+            if keyval == gdk::Key::Down {
+                self.extend_selection_focus(1);
+                return glib::Propagation::Stop;
+            }
+        }
+
         if keyval == gdk::Key::Up {
             self.move_focus(-1);
             return glib::Propagation::Stop;
@@ -394,6 +408,13 @@ impl FileBrowserPanel {
         }
     }
 
+    fn extend_selection_focus(&self, delta: isize) {
+        if self.model.borrow_mut().extend_selection_focus(delta) {
+            self.sync_focus_classes();
+            self.scroll_focused_row_into_view();
+        }
+    }
+
     fn expand_focused(&self) {
         let changed = { self.model.borrow_mut().expand_focused() };
         if changed {
@@ -419,6 +440,21 @@ impl FileBrowserPanel {
 
     fn focus_path(&self, path: PathBuf) {
         if self.model.borrow_mut().focus_path(&path) {
+            self.root.grab_focus();
+            self.sync_focus_classes();
+            self.scroll_focused_row_into_view();
+        }
+    }
+
+    fn toggle_path_selection(&self, path: PathBuf) {
+        if self.model.borrow_mut().toggle_path_selection(&path) {
+            self.root.grab_focus();
+            self.sync_focus_classes();
+        }
+    }
+
+    fn extend_selection_to_path(&self, path: PathBuf) {
+        if self.model.borrow_mut().extend_selection_to_path(&path) {
             self.root.grab_focus();
             self.sync_focus_classes();
             self.scroll_focused_row_into_view();
@@ -652,6 +688,11 @@ impl FileBrowserPanel {
             } else {
                 row_widget.remove_css_class("focused");
             }
+            if rows.get(idx).map(|row| row.selected).unwrap_or(false) {
+                row_widget.add_css_class("selected");
+            } else {
+                row_widget.remove_css_class("selected");
+            }
             if rows.get(idx).map(|row| row.cut).unwrap_or(false) {
                 row_widget.add_css_class("cut");
             } else {
@@ -695,6 +736,9 @@ impl FileBrowserPanel {
         list_row.add_css_class("flowmux-file-browser-row");
         if row.focused {
             list_row.add_css_class("focused");
+        }
+        if row.selected {
+            list_row.add_css_class("selected");
         }
         if row.cut {
             list_row.add_css_class("cut");
@@ -745,6 +789,16 @@ impl FileBrowserPanel {
                 gdk::BUTTON_PRIMARY => {
                     if n_press >= 2 {
                         panel.activate_path(path.clone());
+                    } else if gesture
+                        .current_event_state()
+                        .contains(gdk::ModifierType::CONTROL_MASK)
+                    {
+                        panel.toggle_path_selection(path.clone());
+                    } else if gesture
+                        .current_event_state()
+                        .contains(gdk::ModifierType::SHIFT_MASK)
+                    {
+                        panel.extend_selection_to_path(path.clone());
                     } else {
                         panel.focus_path(path.clone());
                     }
@@ -768,6 +822,8 @@ impl FileBrowserModel {
         if self.root.as_ref() != Some(&root) {
             self.expanded.clear();
             self.focused = None;
+            self.selected.clear();
+            self.selection_anchor = None;
         }
         self.root = Some(root);
     }
@@ -790,11 +846,13 @@ impl FileBrowserModel {
 
     fn rows(&self) -> Vec<FileBrowserRow> {
         let focused = self.focused.as_ref();
+        let selected = &self.selected;
         let cut_paths = self.cut_paths();
         self.visible_rows()
             .into_iter()
             .map(|mut row| {
                 row.focused = focused == Some(&row.path);
+                row.selected = selected.contains(&row.path);
                 row.cut = cut_paths.contains(&row.path);
                 row
             })
@@ -824,6 +882,7 @@ impl FileBrowserModel {
                 depth,
                 expanded,
                 focused: false,
+                selected: false,
                 cut: false,
             });
 
@@ -836,11 +895,64 @@ impl FileBrowserModel {
     fn focus_path(&mut self, path: &Path) -> bool {
         if self.visible_rows().iter().any(|row| row.path == path) {
             let changed = self.focused.as_deref() != Some(path);
-            self.focused = Some(path.to_path_buf());
+            self.select_only_path(path.to_path_buf());
             changed
         } else {
             false
         }
+    }
+
+    fn toggle_path_selection(&mut self, path: &Path) -> bool {
+        if !self.visible_rows().iter().any(|row| row.path == path) {
+            return false;
+        }
+        self.focused = Some(path.to_path_buf());
+        self.selection_anchor = Some(path.to_path_buf());
+        if !self.selected.remove(path) {
+            self.selected.insert(path.to_path_buf());
+        }
+        true
+    }
+
+    fn extend_selection_to_path(&mut self, path: &Path) -> bool {
+        let rows = self.visible_rows();
+        if !rows.iter().any(|row| row.path == path) {
+            return false;
+        }
+        let anchor = self
+            .selection_anchor
+            .clone()
+            .or_else(|| self.focused.clone())
+            .unwrap_or_else(|| path.to_path_buf());
+        self.focused = Some(path.to_path_buf());
+        self.select_range(&rows, &anchor, path);
+        true
+    }
+
+    fn select_only_path(&mut self, path: PathBuf) {
+        self.focused = Some(path.clone());
+        self.selected.clear();
+        self.selected.insert(path.clone());
+        self.selection_anchor = Some(path);
+    }
+
+    fn select_range(&mut self, rows: &[FileBrowserRow], anchor: &Path, target: &Path) {
+        let Some(anchor_idx) = rows.iter().position(|row| row.path == anchor) else {
+            self.select_only_path(target.to_path_buf());
+            return;
+        };
+        let Some(target_idx) = rows.iter().position(|row| row.path == target) else {
+            return;
+        };
+        let (start, end) = if anchor_idx <= target_idx {
+            (anchor_idx, target_idx)
+        } else {
+            (target_idx, anchor_idx)
+        };
+        self.selected.clear();
+        self.selected
+            .extend(rows[start..=end].iter().map(|row| row.path.clone()));
+        self.selection_anchor = Some(anchor.to_path_buf());
     }
 
     fn focus_candidate_after_removed_path(&self, removed: &Path) -> Option<PathBuf> {
@@ -861,6 +973,15 @@ impl FileBrowserModel {
     fn forget_removed_path(&mut self, removed: &Path, next_focus: Option<PathBuf>) {
         self.expanded
             .retain(|path| !path_is_or_under(path, removed));
+        self.selected
+            .retain(|path| !path_is_or_under(path, removed));
+        if self
+            .selection_anchor
+            .as_ref()
+            .is_some_and(|path| path_is_or_under(path, removed))
+        {
+            self.selection_anchor = None;
+        }
         if let Some(clipboard) = self.clipboard.as_mut() {
             clipboard
                 .paths
@@ -874,9 +995,23 @@ impl FileBrowserModel {
             self.clipboard = None;
         }
         self.focused = next_focus;
+        if self.selected.is_empty() {
+            if let Some(focused) = self.focused.clone() {
+                self.selected.insert(focused.clone());
+                self.selection_anchor = Some(focused);
+            }
+        }
     }
 
     fn move_focus(&mut self, delta: isize) -> bool {
+        self.move_focus_with_selection(delta, false)
+    }
+
+    fn extend_selection_focus(&mut self, delta: isize) -> bool {
+        self.move_focus_with_selection(delta, true)
+    }
+
+    fn move_focus_with_selection(&mut self, delta: isize, extend_selection: bool) -> bool {
         self.sync_focus();
         let rows = self.visible_rows();
         if rows.is_empty() {
@@ -896,7 +1031,17 @@ impl FileBrowserModel {
         };
 
         let changed = current != next;
-        self.focused = Some(rows[next].path.clone());
+        if extend_selection {
+            let anchor = self
+                .selection_anchor
+                .clone()
+                .unwrap_or_else(|| rows[current].path.clone());
+            self.focused = Some(rows[next].path.clone());
+            let target = rows[next].path.clone();
+            self.select_range(&rows, &anchor, &target);
+        } else {
+            self.select_only_path(rows[next].path.clone());
+        }
         changed
     }
 
@@ -992,6 +1137,15 @@ impl FileBrowserModel {
             .iter()
             .map(|path| rewrite_path_prefix(path, old_path, new_path))
             .collect();
+        self.selected = self
+            .selected
+            .iter()
+            .map(|path| rewrite_path_prefix(path, old_path, new_path))
+            .collect();
+        self.selection_anchor = self
+            .selection_anchor
+            .as_ref()
+            .map(|path| rewrite_path_prefix(path, old_path, new_path));
     }
 
     fn copy_focused(&mut self) -> bool {
@@ -1404,6 +1558,16 @@ mod tests {
 
     fn panel_focused_path(panel: &FileBrowserPanel) -> Option<PathBuf> {
         panel.model.borrow().focused.clone()
+    }
+
+    fn panel_selected_names(panel: &FileBrowserPanel) -> Vec<String> {
+        let model = panel.model.borrow();
+        model
+            .rows()
+            .into_iter()
+            .filter(|row| row.selected)
+            .map(|row| display_name(&row.path))
+            .collect()
     }
 
     fn set_panel_scroll(panel: &FileBrowserPanel, value: f64) {
@@ -1908,6 +2072,120 @@ mod tests {
         let root_path = tmp.path.display().to_string();
         assert_eq!(copied.borrow().as_deref(), Some(file_path.as_str()));
         assert_ne!(copied.borrow().as_deref(), Some(root_path.as_str()));
+    }
+
+    #[gtk::test]
+    fn behavior_shift_arrows_extend_file_selection() {
+        let tmp = TestDir::new("behavior-shift-select");
+        tmp.file("a.txt");
+        tmp.file("b.txt");
+        tmp.file("c.txt");
+
+        let panel = FileBrowserPanel::new();
+        panel.show_for_root(tmp.path.clone());
+
+        assert_eq!(
+            panel.handle_key(gdk::Key::Down, gdk::ModifierType::SHIFT_MASK),
+            glib::Propagation::Stop
+        );
+        assert_eq!(panel_selected_names(&panel), vec!["a.txt", "b.txt"]);
+        assert_eq!(panel_focused_path(&panel), Some(tmp.path.join("b.txt")));
+        assert!(
+            panel
+                .list
+                .row_at_index(0)
+                .unwrap()
+                .has_css_class("selected")
+        );
+        assert!(
+            panel
+                .list
+                .row_at_index(1)
+                .unwrap()
+                .has_css_class("selected")
+        );
+
+        assert_eq!(
+            panel.handle_key(gdk::Key::Down, gdk::ModifierType::SHIFT_MASK),
+            glib::Propagation::Stop
+        );
+        assert_eq!(
+            panel_selected_names(&panel),
+            vec!["a.txt", "b.txt", "c.txt"]
+        );
+        assert_eq!(panel_focused_path(&panel), Some(tmp.path.join("c.txt")));
+
+        assert_eq!(
+            panel.handle_key(gdk::Key::Up, gdk::ModifierType::SHIFT_MASK),
+            glib::Propagation::Stop
+        );
+        assert_eq!(panel_selected_names(&panel), vec!["a.txt", "b.txt"]);
+        assert_eq!(panel_focused_path(&panel), Some(tmp.path.join("b.txt")));
+    }
+
+    #[gtk::test]
+    fn behavior_plain_arrow_replaces_multi_selection() {
+        let tmp = TestDir::new("behavior-plain-select");
+        tmp.file("a.txt");
+        tmp.file("b.txt");
+        tmp.file("c.txt");
+
+        let panel = FileBrowserPanel::new();
+        panel.show_for_root(tmp.path.clone());
+
+        panel.handle_key(gdk::Key::Down, gdk::ModifierType::SHIFT_MASK);
+        assert_eq!(panel_selected_names(&panel), vec!["a.txt", "b.txt"]);
+
+        assert_eq!(
+            panel.handle_key(gdk::Key::Down, gdk::ModifierType::empty()),
+            glib::Propagation::Stop
+        );
+        assert_eq!(panel_selected_names(&panel), vec!["c.txt"]);
+        assert_eq!(panel_focused_path(&panel), Some(tmp.path.join("c.txt")));
+    }
+
+    #[gtk::test]
+    fn behavior_ctrl_click_toggles_multi_selection() {
+        let tmp = TestDir::new("behavior-ctrl-click-select");
+        let a = tmp.file("a.txt");
+        let b = tmp.file("b.txt");
+
+        let panel = FileBrowserPanel::new();
+        panel.show_for_root(tmp.path.clone());
+        panel.focus_path(a.clone());
+
+        panel.toggle_path_selection(b.clone());
+        assert_eq!(panel_selected_names(&panel), vec!["a.txt", "b.txt"]);
+        assert!(
+            panel
+                .list
+                .row_at_index(1)
+                .unwrap()
+                .has_css_class("selected")
+        );
+
+        panel.toggle_path_selection(a);
+        assert_eq!(panel_selected_names(&panel), vec!["b.txt"]);
+        assert_eq!(panel_focused_path(&panel), Some(tmp.path.join("a.txt")));
+    }
+
+    #[gtk::test]
+    fn behavior_shift_click_extends_selection_range() {
+        let tmp = TestDir::new("behavior-shift-click-select");
+        let a = tmp.file("a.txt");
+        tmp.file("b.txt");
+        let c = tmp.file("c.txt");
+
+        let panel = FileBrowserPanel::new();
+        panel.show_for_root(tmp.path.clone());
+        panel.focus_path(a);
+        panel.extend_selection_to_path(c);
+
+        assert_eq!(
+            panel_selected_names(&panel),
+            vec!["a.txt", "b.txt", "c.txt"]
+        );
+        assert_eq!(panel_focused_path(&panel), Some(tmp.path.join("c.txt")));
     }
 
     #[gtk::test]

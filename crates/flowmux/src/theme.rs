@@ -429,6 +429,9 @@ paned > separator {{
 .flowmux-file-browser-row:selected {{
     background-color: {control_hover};
 }}
+.flowmux-file-browser-row.selected {{
+    background-color: {control_hover};
+}}
 .flowmux-file-browser-row.focused {{
     background-color: {control_hover};
 }}
