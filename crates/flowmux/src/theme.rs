@@ -432,6 +432,9 @@ paned > separator {{
 .flowmux-file-browser-row.focused {{
     background-color: {control_hover};
 }}
+.flowmux-file-browser-row.cut {{
+    opacity: 0.45;
+}}
 .flowmux-clipboard-toast {{
     background-color: {toast_bg};
     color: {fg};

@@ -34,6 +34,7 @@ struct FileBrowserRow {
     depth: usize,
     expanded: bool,
     focused: bool,
+    cut: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -48,6 +49,7 @@ struct FileBrowserModel {
     root: Option<PathBuf>,
     expanded: HashSet<PathBuf>,
     focused: Option<PathBuf>,
+    clipboard: Option<FileClipboard>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,6 +57,18 @@ enum FileBrowserActivation {
     None,
     Refresh,
     Open(PathBuf),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClipboardOperation {
+    Copy,
+    Cut,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileClipboard {
+    operation: ClipboardOperation,
+    paths: Vec<PathBuf>,
 }
 
 impl FileBrowserPanel {
@@ -232,6 +246,26 @@ impl FileBrowserPanel {
                 }
             }
 
+            if state.contains(gdk::ModifierType::CONTROL_MASK)
+                && !state.intersects(gdk::ModifierType::ALT_MASK | gdk::ModifierType::SUPER_MASK)
+            {
+                match keyval.to_unicode().map(|ch| ch.to_ascii_lowercase()) {
+                    Some('c') => {
+                        panel.copy_focused();
+                        return glib::Propagation::Stop;
+                    }
+                    Some('x') => {
+                        panel.cut_focused();
+                        return glib::Propagation::Stop;
+                    }
+                    Some('v') => {
+                        panel.paste_from_clipboard();
+                        return glib::Propagation::Stop;
+                    }
+                    _ => {}
+                }
+            }
+
             if state.intersects(
                 gdk::ModifierType::ALT_MASK
                     | gdk::ModifierType::CONTROL_MASK
@@ -312,6 +346,26 @@ impl FileBrowserPanel {
         self.activate_focused();
     }
 
+    fn copy_focused(&self) {
+        if self.model.borrow_mut().copy_focused() {
+            self.sync_focus_classes();
+        }
+    }
+
+    fn cut_focused(&self) {
+        if self.model.borrow_mut().cut_focused() {
+            self.sync_focus_classes();
+        }
+    }
+
+    fn paste_from_clipboard(&self) {
+        match self.model.borrow_mut().paste_from_clipboard() {
+            Ok(true) => self.refresh(),
+            Ok(false) => {}
+            Err(err) => self.show_status(&format!("Paste failed: {err}")),
+        }
+    }
+
     fn show_rename_dialog(&self) {
         let Some(path) = self.model.borrow_mut().focused_path() else {
             return;
@@ -388,6 +442,11 @@ impl FileBrowserPanel {
         entry.grab_focus();
     }
 
+    fn show_status(&self, message: &str) {
+        self.status.set_text(message);
+        self.status.set_visible(true);
+    }
+
     fn sync_focus_classes(&self) {
         let rows = self.model.borrow().rows();
         let mut child = self.list.first_child();
@@ -401,6 +460,11 @@ impl FileBrowserPanel {
                 row_widget.add_css_class("focused");
             } else {
                 row_widget.remove_css_class("focused");
+            }
+            if rows.get(idx).map(|row| row.cut).unwrap_or(false) {
+                row_widget.add_css_class("cut");
+            } else {
+                row_widget.remove_css_class("cut");
             }
             idx += 1;
         }
@@ -434,6 +498,9 @@ impl FileBrowserPanel {
         list_row.add_css_class("flowmux-file-browser-row");
         if row.focused {
             list_row.add_css_class("focused");
+        }
+        if row.cut {
+            list_row.add_css_class("cut");
         }
         list_row.set_selectable(false);
         list_row.set_activatable(true);
@@ -530,10 +597,12 @@ impl FileBrowserModel {
 
     fn rows(&self) -> Vec<FileBrowserRow> {
         let focused = self.focused.as_ref();
+        let cut_paths = self.cut_paths();
         self.visible_rows()
             .into_iter()
             .map(|mut row| {
                 row.focused = focused == Some(&row.path);
+                row.cut = cut_paths.contains(&row.path);
                 row
             })
             .collect()
@@ -562,6 +631,7 @@ impl FileBrowserModel {
                 depth,
                 expanded,
                 focused: false,
+                cut: false,
             });
 
             if expanded {
@@ -697,6 +767,95 @@ impl FileBrowserModel {
             .map(|path| rewrite_path_prefix(path, old_path, new_path))
             .collect();
     }
+
+    fn copy_focused(&mut self) -> bool {
+        let Some(path) = self.focused_path() else {
+            return false;
+        };
+        self.clipboard = Some(FileClipboard {
+            operation: ClipboardOperation::Copy,
+            paths: vec![path],
+        });
+        true
+    }
+
+    fn cut_focused(&mut self) -> bool {
+        let Some(path) = self.focused_path() else {
+            return false;
+        };
+        self.clipboard = Some(FileClipboard {
+            operation: ClipboardOperation::Cut,
+            paths: vec![path],
+        });
+        true
+    }
+
+    fn paste_from_clipboard(&mut self) -> io::Result<bool> {
+        let Some(clipboard) = self.clipboard.clone() else {
+            return Ok(false);
+        };
+        let Some(target_dir) = self.paste_target_dir() else {
+            return Ok(false);
+        };
+
+        let mut pasted = Vec::new();
+        for source in &clipboard.paths {
+            if !source.exists() {
+                continue;
+            }
+            if source.is_dir() && target_dir.starts_with(source) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "cannot paste a directory into itself",
+                ));
+            }
+
+            if clipboard.operation == ClipboardOperation::Cut
+                && source.parent() == Some(target_dir.as_path())
+            {
+                pasted.push(source.clone());
+                continue;
+            }
+
+            let destination = unique_destination(&target_dir, source)?;
+            match clipboard.operation {
+                ClipboardOperation::Copy => copy_path(source, &destination)?,
+                ClipboardOperation::Cut => {
+                    move_path(source, &destination)?;
+                    self.rewrite_tracked_paths(source, &destination);
+                }
+            }
+            pasted.push(destination);
+        }
+
+        if clipboard.operation == ClipboardOperation::Cut {
+            self.clipboard = None;
+        }
+        if let Some(last) = pasted.last() {
+            self.focused = Some(last.clone());
+        }
+        self.sync_focus();
+        Ok(!pasted.is_empty())
+    }
+
+    fn paste_target_dir(&mut self) -> Option<PathBuf> {
+        let row = self.focused_row()?;
+        if row.is_dir {
+            Some(row.path)
+        } else {
+            row.path.parent().map(Path::to_path_buf)
+        }
+    }
+
+    fn cut_paths(&self) -> HashSet<PathBuf> {
+        match &self.clipboard {
+            Some(FileClipboard {
+                operation: ClipboardOperation::Cut,
+                paths,
+            }) => paths.iter().cloned().collect(),
+            _ => HashSet::new(),
+        }
+    }
 }
 
 fn read_dir_entries(dir: &Path) -> std::io::Result<Vec<FsEntry>> {
@@ -716,6 +875,84 @@ fn read_dir_entries(dir: &Path) -> std::io::Result<Vec<FsEntry>> {
     });
 
     Ok(entries)
+}
+
+fn unique_destination(target_dir: &Path, source: &Path) -> io::Result<PathBuf> {
+    let file_name = source.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} has no file name", source.display()),
+        )
+    })?;
+    let candidate = target_dir.join(file_name);
+    if !candidate.exists() {
+        return Ok(candidate);
+    }
+
+    let stem = source
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or_else(|| file_name.to_string_lossy().into_owned());
+    let extension = source
+        .extension()
+        .map(|ext| ext.to_string_lossy().into_owned());
+
+    for idx in 1.. {
+        let suffix = if idx == 1 {
+            " copy".to_string()
+        } else {
+            format!(" copy {idx}")
+        };
+        let name = match &extension {
+            Some(ext) if source.is_file() => format!("{stem}{suffix}.{ext}"),
+            _ => format!("{stem}{suffix}"),
+        };
+        let candidate = target_dir.join(name);
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+
+    unreachable!("unbounded suffix search must return before exhausting usize")
+}
+
+fn copy_path(source: &Path, destination: &Path) -> io::Result<()> {
+    if source.is_dir() {
+        fs::create_dir(destination)?;
+        for entry in fs::read_dir(source)? {
+            let entry = entry?;
+            let child_source = entry.path();
+            let child_destination = destination.join(entry.file_name());
+            copy_path(&child_source, &child_destination)?;
+        }
+        Ok(())
+    } else {
+        fs::copy(source, destination).map(|_| ())
+    }
+}
+
+fn move_path(source: &Path, destination: &Path) -> io::Result<()> {
+    match fs::rename(source, destination) {
+        Ok(()) => Ok(()),
+        Err(rename_err) => {
+            copy_path(source, destination)?;
+            let remove_result = if source.is_dir() {
+                fs::remove_dir_all(source)
+            } else {
+                fs::remove_file(source)
+            };
+            remove_result.map_err(|remove_err| {
+                io::Error::new(
+                    remove_err.kind(),
+                    format!(
+                        "renamed by copy fallback but failed to remove {} after rename error {rename_err}: {remove_err}",
+                        source.display()
+                    ),
+                )
+            })
+        }
+    }
 }
 
 fn show_context_menu(parent: &impl IsA<gtk::Widget>, path: &Path, x: f64, y: f64) {
@@ -864,6 +1101,10 @@ mod tests {
             .collect()
     }
 
+    fn row_paths(model: &FileBrowserModel) -> Vec<PathBuf> {
+        model.rows().iter().map(|row| row.path.clone()).collect()
+    }
+
     #[test]
     fn rows_are_sorted_with_directories_first() {
         let tmp = TestDir::new("sort");
@@ -992,5 +1233,87 @@ mod tests {
         );
         assert!(tmp.path.join("old.txt").exists());
         assert_eq!(row_names(&model), ["old.txt"]);
+    }
+
+    #[test]
+    fn copy_paste_file_creates_unique_sibling_and_focuses_it() {
+        let tmp = TestDir::new("copy-file");
+        tmp.file("a.txt");
+
+        let mut model = FileBrowserModel::default();
+        model.set_root(tmp.path.clone());
+
+        assert!(model.copy_focused());
+        assert!(model.paste_from_clipboard().unwrap());
+
+        let copied = tmp.path.join("a copy.txt");
+        assert!(tmp.path.join("a.txt").exists());
+        assert!(copied.exists());
+        assert_eq!(model.focused.as_ref(), Some(&copied));
+        assert!(row_paths(&model).contains(&copied));
+    }
+
+    #[test]
+    fn copy_paste_folder_recursively() {
+        let tmp = TestDir::new("copy-dir");
+        tmp.dir("src");
+        tmp.file("src/main.rs");
+        let target = tmp.file("target.txt");
+
+        let mut model = FileBrowserModel::default();
+        model.set_root(tmp.path.clone());
+        assert!(model.focus_path(&tmp.path.join("src")));
+        assert!(model.copy_focused());
+        assert!(model.focus_path(&target));
+
+        assert!(model.paste_from_clipboard().unwrap());
+
+        assert!(tmp.path.join("src/main.rs").exists());
+        assert!(tmp.path.join("src copy/main.rs").exists());
+        assert_eq!(model.focused.as_ref(), Some(&tmp.path.join("src copy")));
+    }
+
+    #[test]
+    fn cut_marks_row_and_paste_moves_file() {
+        let tmp = TestDir::new("cut-file");
+        let file = tmp.file("a.txt");
+        let dest = tmp.dir("dest");
+
+        let mut model = FileBrowserModel::default();
+        model.set_root(tmp.path.clone());
+        assert!(model.focus_path(&file));
+
+        assert!(model.cut_focused());
+        let rows = model.rows();
+        assert!(rows.iter().any(|row| row.path == file && row.cut));
+
+        assert!(model.focus_path(&dest));
+        assert!(model.paste_from_clipboard().unwrap());
+
+        assert!(!file.exists());
+        assert!(dest.join("a.txt").exists());
+        assert!(model.clipboard.is_none());
+        assert!(model.rows().iter().all(|row| !row.cut));
+    }
+
+    #[test]
+    fn paste_into_expanded_folder_updates_visible_rows() {
+        let tmp = TestDir::new("paste-expanded");
+        let dest = tmp.dir("dest");
+        let file = tmp.file("a.txt");
+
+        let mut model = FileBrowserModel::default();
+        model.set_root(tmp.path.clone());
+        assert!(model.focus_path(&dest));
+        assert!(model.expand_focused());
+        assert!(model.focus_path(&file));
+        assert!(model.copy_focused());
+        assert!(model.focus_path(&dest));
+
+        assert!(model.paste_from_clipboard().unwrap());
+
+        let pasted = dest.join("a.txt");
+        assert!(pasted.exists());
+        assert!(row_paths(&model).contains(&pasted));
     }
 }
