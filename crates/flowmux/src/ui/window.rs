@@ -9,7 +9,7 @@ use crate::bridge::{
 use crate::keybindings::FocusedPane;
 use crate::notifications::{NotificationStore, RemoveOutcome, SetDesktopIdResult};
 use crate::theme::ResolvedTheme;
-use crate::ui::file_browser::FileBrowserPanel;
+use crate::ui::file_browser::{FileBrowserPaneState, FileBrowserPanel};
 use crate::ui::sidebar::Sidebar;
 use crate::ui::terminal_pane::PaneCallbacks;
 use crate::ui::workspace_view::{
@@ -37,6 +37,7 @@ pub struct WindowController {
     pub focused_pane: FocusedPane,
     file_browser_source_pane: FocusedPane,
     file_browser_active: Rc<Cell<bool>>,
+    file_browser_pane_states: Rc<RefCell<HashMap<PaneId, FileBrowserPaneState>>>,
     sidebar: Sidebar,
     /// Outermost `gtk::Paned` separating the side panel and content area.
     /// Its position is saved to the store on exit and restored on next launch.
@@ -261,6 +262,7 @@ impl WindowController {
         let focused_pane: FocusedPane = Rc::new(Cell::new(None));
         let file_browser_source_pane: FocusedPane = Rc::new(Cell::new(None));
         let file_browser_active = Rc::new(Cell::new(false));
+        let file_browser_pane_states = Rc::new(RefCell::new(HashMap::new()));
         let notifications = NotificationStore::new();
         let stack = gtk::Stack::new();
         stack.set_transition_type(gtk::StackTransitionType::Crossfade);
@@ -334,7 +336,14 @@ impl WindowController {
         let file_browser = FileBrowserPanel::new();
         let file_browser_for_close = file_browser.clone();
         let file_browser_active_for_close = file_browser_active.clone();
+        let file_browser_source_for_close = file_browser_source_pane.clone();
+        let file_browser_states_for_close = file_browser_pane_states.clone();
         file_browser.connect_close(move || {
+            if let Some(pane) = file_browser_source_for_close.get() {
+                file_browser_states_for_close
+                    .borrow_mut()
+                    .insert(pane, file_browser_for_close.pane_state());
+            }
             file_browser_active_for_close.set(false);
             file_browser_for_close.hide();
         });
@@ -408,6 +417,7 @@ impl WindowController {
             focused_pane,
             file_browser_source_pane,
             file_browser_active,
+            file_browser_pane_states,
             sidebar,
             sidebar_split: split,
             file_browser_split,
@@ -1256,6 +1266,7 @@ impl WindowController {
     }
 
     async fn show_file_browser_for_pane(&self, pane: PaneId) {
+        self.save_file_browser_state_for_source();
         self.file_browser_source_pane.set(Some(pane));
         let root = self
             .file_browser_root_for_pane(pane)
@@ -1268,8 +1279,18 @@ impl WindowController {
             if width > 420 {
                 self.file_browser_split.set_position((width - 320).max(240));
             }
-            self.file_browser.show_for_root(root);
+            let state = self.file_browser_pane_states.borrow().get(&pane).cloned();
+            self.file_browser.show_for_root_with_state(root, state);
         }
+    }
+
+    fn save_file_browser_state_for_source(&self) {
+        let Some(pane) = self.file_browser_source_pane.get() else {
+            return;
+        };
+        self.file_browser_pane_states
+            .borrow_mut()
+            .insert(pane, self.file_browser.pane_state());
     }
 
     fn focus_file_browser(&self) {
@@ -1283,6 +1304,7 @@ impl WindowController {
     }
 
     fn focus_out_of_file_browser(&self, dir: FocusDir) {
+        self.save_file_browser_state_for_source();
         self.file_browser_active.set(false);
         let Some(from) =
             file_browser_return_pane(self.focused_pane.get(), self.file_browser_source_pane.get())
@@ -1305,6 +1327,7 @@ impl WindowController {
     }
 
     fn close_file_browser_and_restore_focus(&self) {
+        self.save_file_browser_state_for_source();
         self.file_browser_active.set(false);
         self.file_browser.hide();
         if let Some(pane) =
@@ -5125,6 +5148,121 @@ mod tests {
 
         assert_eq!(controller.focused_pane.get(), Some(pane));
         assert!(!controller.file_browser_active.get());
+    }
+
+    #[gtk::test]
+    async fn file_browser_state_is_scoped_per_pane() {
+        let (controller, ws_id, pane_a) =
+            build_single_workspace_controller("com.flowmux.App.UiTest.FileBrowserPaneState").await;
+        let (split_ack, split_rx) = oneshot::channel();
+        controller
+            .dispatch(GtkCommand::SplitFocused {
+                pane: pane_a,
+                direction: SplitDirection::Vertical,
+                ack: split_ack,
+            })
+            .await;
+        let pane_b = split_rx
+            .await
+            .expect("split ack should be sent")
+            .expect("split should create a second pane");
+        let ws = controller.store.get_workspace(ws_id).await.unwrap();
+        let surface_a = ws.surfaces[0].root_pane.active_surface_id(pane_a).unwrap();
+        let surface_b = ws.surfaces[0].root_pane.active_surface_id(pane_b).unwrap();
+
+        let root_a = std::env::temp_dir().join("flowmux-file-browser-pane-state-a");
+        let root_b = std::env::temp_dir().join("flowmux-file-browser-pane-state-b");
+        std::fs::create_dir_all(root_a.join("expanded-a")).unwrap();
+        std::fs::write(root_a.join("expanded-a/child.txt"), "child").unwrap();
+        std::fs::write(root_a.join("a.txt"), "a").unwrap();
+        std::fs::create_dir_all(root_b.join("expanded-b")).unwrap();
+        std::fs::write(root_b.join("expanded-b/child.txt"), "child").unwrap();
+        std::fs::write(root_b.join("b.txt"), "b").unwrap();
+        controller
+            .store
+            .update_surface_cwd(pane_a, surface_a, root_a.clone())
+            .await;
+        controller
+            .store
+            .update_surface_cwd(pane_b, surface_b, root_b.clone())
+            .await;
+        let ws = controller.store.get_workspace(ws_id).await.unwrap();
+        controller.render_workspace(&ws);
+        controller
+            .dispatch(GtkCommand::TerminalCwdChanged {
+                pane: pane_a,
+                surface: surface_a,
+                cwd: root_a.clone(),
+            })
+            .await;
+        controller
+            .dispatch(GtkCommand::TerminalCwdChanged {
+                pane: pane_b,
+                surface: surface_b,
+                cwd: root_b.clone(),
+            })
+            .await;
+        let registry_surface_a = controller
+            .pane_registry
+            .borrow()
+            .active_surface(pane_a)
+            .unwrap();
+        let registry_surface_b = controller
+            .pane_registry
+            .borrow()
+            .active_surface(pane_b)
+            .unwrap();
+        controller
+            .pane_registry
+            .borrow_mut()
+            .terminals
+            .remove(&registry_surface_a);
+        controller
+            .pane_registry
+            .borrow_mut()
+            .terminals
+            .remove(&registry_surface_b);
+
+        controller.file_browser_pane_states.borrow_mut().insert(
+            pane_a,
+            FileBrowserPaneState {
+                root: Some(root_a.clone()),
+                expanded: std::collections::HashSet::from([root_a.join("expanded-a")]),
+                focused: Some(root_a.join("expanded-a")),
+                selected: std::collections::HashSet::from([root_a.join("expanded-a")]),
+                selection_anchor: Some(root_a.join("expanded-a")),
+                scroll_value: 0.0,
+            },
+        );
+        controller.file_browser_pane_states.borrow_mut().insert(
+            pane_b,
+            FileBrowserPaneState {
+                root: Some(root_b.clone()),
+                expanded: std::collections::HashSet::new(),
+                focused: Some(root_b.join("b.txt")),
+                selected: std::collections::HashSet::from([root_b.join("b.txt")]),
+                selection_anchor: Some(root_b.join("b.txt")),
+                scroll_value: 0.0,
+            },
+        );
+
+        controller.show_file_browser_for_pane(pane_a).await;
+        let state_a = controller.file_browser.pane_state();
+        assert_eq!(state_a.root, Some(root_a.clone()));
+        assert_eq!(state_a.focused, Some(root_a.join("expanded-a")));
+        assert!(state_a.expanded.contains(&root_a.join("expanded-a")));
+
+        controller.show_file_browser_for_pane(pane_b).await;
+        let state_b = controller.file_browser.pane_state();
+        assert_eq!(state_b.root, Some(root_b.clone()));
+        assert_eq!(state_b.focused, Some(root_b.join("b.txt")));
+        assert!(!state_b.expanded.contains(&root_a.join("expanded-a")));
+        assert!(!state_b.expanded.contains(&root_b.join("expanded-b")));
+
+        controller.show_file_browser_for_pane(pane_a).await;
+        let state_a_again = controller.file_browser.pane_state();
+        assert_eq!(state_a_again.focused, Some(root_a.join("expanded-a")));
+        assert!(state_a_again.expanded.contains(&root_a.join("expanded-a")));
     }
 
     #[gtk::test]

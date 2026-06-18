@@ -30,6 +30,16 @@ pub struct FileBrowserPanel {
     on_escape: Rc<RefCell<Option<Box<dyn Fn()>>>>,
 }
 
+#[derive(Clone, Debug, Default)]
+pub(crate) struct FileBrowserPaneState {
+    pub(crate) root: Option<PathBuf>,
+    pub(crate) expanded: HashSet<PathBuf>,
+    pub(crate) focused: Option<PathBuf>,
+    pub(crate) selected: HashSet<PathBuf>,
+    pub(crate) selection_anchor: Option<PathBuf>,
+    pub(crate) scroll_value: f64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FileBrowserRow {
     path: PathBuf,
@@ -196,10 +206,34 @@ impl FileBrowserPanel {
         *self.path_clipboard_writer.borrow_mut() = Box::new(f);
     }
 
-    pub fn show_for_root(&self, root: PathBuf) {
-        self.model.borrow_mut().set_root(root);
+    #[cfg(test)]
+    fn show_for_root(&self, root: PathBuf) {
+        self.model.borrow_mut().set_root(root.clone());
         self.root.set_visible(true);
         self.refresh_reset_scroll();
+    }
+
+    pub(crate) fn show_for_root_with_state(
+        &self,
+        root: PathBuf,
+        state: Option<FileBrowserPaneState>,
+    ) {
+        let scroll_value = self.model.borrow_mut().set_root_with_state(root, state);
+        self.root.set_visible(true);
+        self.rebuild_rows();
+        self.restore_scroll_value(scroll_value);
+    }
+
+    pub(crate) fn pane_state(&self) -> FileBrowserPaneState {
+        let model = self.model.borrow();
+        FileBrowserPaneState {
+            root: model.root.clone(),
+            expanded: model.expanded.clone(),
+            focused: model.focused.clone(),
+            selected: model.selected.clone(),
+            selection_anchor: model.selection_anchor.clone(),
+            scroll_value: self.scroll.vadjustment().value(),
+        }
     }
 
     pub fn hide(&self) {
@@ -216,6 +250,7 @@ impl FileBrowserPanel {
         self.restore_scroll_value(scroll_value);
     }
 
+    #[cfg(test)]
     fn refresh_reset_scroll(&self) {
         self.rebuild_rows();
         self.restore_scroll_value(0.0);
@@ -817,8 +852,22 @@ impl FileBrowserPanel {
 }
 
 impl FileBrowserModel {
+    #[cfg(test)]
     fn set_root(&mut self, root: PathBuf) {
+        self.set_root_with_state(root, None);
+    }
+
+    fn set_root_with_state(&mut self, root: PathBuf, state: Option<FileBrowserPaneState>) -> f64 {
         let root = normalize_root(root);
+        if let Some(state) = state.filter(|state| state.root.as_ref() == Some(&root)) {
+            self.root = Some(root);
+            self.expanded = state.expanded;
+            self.focused = state.focused;
+            self.selected = state.selected;
+            self.selection_anchor = state.selection_anchor;
+            return state.scroll_value;
+        }
+
         if self.root.as_ref() != Some(&root) {
             self.expanded.clear();
             self.focused = None;
@@ -826,6 +875,7 @@ impl FileBrowserModel {
             self.selection_anchor = None;
         }
         self.root = Some(root);
+        0.0
     }
 
     fn sync_focus(&mut self) {
@@ -1659,6 +1709,37 @@ mod tests {
             file_icon_for_path(&missing, true),
             FileIcon::Named("folder-symbolic")
         ));
+    }
+
+    #[gtk::test]
+    fn pane_state_restores_focus_scroll_and_expanded_paths() {
+        let tmp = TestDir::new("pane-state-a");
+        let dir = tmp.dir("folder");
+        tmp.file("folder/child.txt");
+        tmp.file("other.txt");
+        let other = TestDir::new("pane-state-b");
+        other.file("b.txt");
+
+        let panel = FileBrowserPanel::new();
+        panel.show_for_root(tmp.path.clone());
+        panel.focus_path(dir.clone());
+        panel.expand_focused();
+        set_panel_scroll(&panel, 240.0);
+        let state = panel.pane_state();
+
+        panel.show_for_root(other.path.clone());
+        assert_eq!(panel_focused_path(&panel), Some(other.path.join("b.txt")));
+        assert_eq!(panel.scroll.vadjustment().value(), 0.0);
+
+        panel.show_for_root_with_state(tmp.path.clone(), Some(state));
+
+        assert_eq!(panel_focused_path(&panel), Some(dir.clone()));
+        assert!(panel.model.borrow().expanded.contains(&dir));
+        assert_eq!(panel.scroll.vadjustment().value(), 240.0);
+        assert_eq!(
+            panel_row_names(&panel),
+            vec!["folder", "child.txt", "other.txt"]
+        );
     }
 
     #[test]
