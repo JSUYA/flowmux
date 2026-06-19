@@ -1963,6 +1963,16 @@ mod tests {
     }
 
     #[test]
+    fn ssh_parses_and_maps_to_connect_request() {
+        let cli = Cli::try_parse_from(["flowmuxctl", "ssh", "alice@example.com"]).unwrap();
+
+        assert!(matches!(
+            build_request(cli.cmd).unwrap(),
+            Request::SshConnect { target } if target == "alice@example.com"
+        ));
+    }
+
+    #[test]
     fn tree_parses_and_maps_to_workspace_tree_request() {
         let cli = Cli::try_parse_from(["flowmuxctl", "tree"]).unwrap();
         assert!(matches!(

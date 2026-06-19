@@ -275,6 +275,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn accepts_well_formed_ssh_target_before_unimplemented_transport() {
+        let handler = DaemonHandler::new(StateStore::new_lazy(State::default()));
+
+        let response = handler
+            .handle(Request::SshConnect {
+                target: "alice@example.com".into(),
+            })
+            .await;
+
+        assert!(matches!(
+            response,
+            Response::Error(RpcError::Unimplemented(message))
+                if message.contains("ssh authentication not yet wired")
+        ));
+    }
+
+    #[tokio::test]
     async fn rejects_malformed_ssh_target_before_unimplemented_transport() {
         let handler = DaemonHandler::new(StateStore::new_lazy(State::default()));
 
