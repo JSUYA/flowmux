@@ -1639,6 +1639,229 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn browser_actions_dispatch_remaining_navigation_ref_ops() {
+        let (handler, rx, pane, _tab) = single_pane_handler().await;
+
+        assert_browser_action_dispatches(
+            &handler,
+            &rx,
+            pane,
+            Request::BrowserBack { pane },
+            |op| {
+                assert!(matches!(op, BrowserOp::Back));
+            },
+        )
+        .await;
+
+        assert_browser_action_dispatches(
+            &handler,
+            &rx,
+            pane,
+            Request::BrowserForward { pane },
+            |op| assert!(matches!(op, BrowserOp::Forward)),
+        )
+        .await;
+
+        assert_browser_action_dispatches(
+            &handler,
+            &rx,
+            pane,
+            Request::BrowserReload { pane },
+            |op| assert!(matches!(op, BrowserOp::Reload)),
+        )
+        .await;
+
+        assert_browser_action_dispatches(&handler, &rx, pane, Request::BrowserUrl { pane }, |op| {
+            assert!(matches!(op, BrowserOp::Url))
+        })
+        .await;
+
+        assert_browser_action_dispatches(
+            &handler,
+            &rx,
+            pane,
+            Request::BrowserClick {
+                pane,
+                target: "button".into(),
+            },
+            |op| match op {
+                BrowserOp::Click { target } => assert_eq!(target, "button"),
+                other => panic!("expected BrowserOp::Click, got {other:?}"),
+            },
+        )
+        .await;
+
+        assert_browser_action_dispatches(
+            &handler,
+            &rx,
+            pane,
+            Request::BrowserSelect {
+                pane,
+                target: "choice".into(),
+                value: "A".into(),
+            },
+            |op| match op {
+                BrowserOp::Select { target, value } => {
+                    assert_eq!(target, "choice");
+                    assert_eq!(value, "A");
+                }
+                other => panic!("expected BrowserOp::Select, got {other:?}"),
+            },
+        )
+        .await;
+
+        assert_browser_action_dispatches(
+            &handler,
+            &rx,
+            pane,
+            Request::BrowserType {
+                pane,
+                text: "hello".into(),
+            },
+            |op| match op {
+                BrowserOp::Type { text } => assert_eq!(text, "hello"),
+                other => panic!("expected BrowserOp::Type, got {other:?}"),
+            },
+        )
+        .await;
+
+        assert_browser_action_dispatches(
+            &handler,
+            &rx,
+            pane,
+            Request::BrowserPress {
+                pane,
+                key: "Enter".into(),
+            },
+            |op| match op {
+                BrowserOp::Press { key } => assert_eq!(key, "Enter"),
+                other => panic!("expected BrowserOp::Press, got {other:?}"),
+            },
+        )
+        .await;
+
+        assert_browser_action_dispatches(
+            &handler,
+            &rx,
+            pane,
+            Request::BrowserText {
+                pane,
+                target: "label".into(),
+            },
+            |op| match op {
+                BrowserOp::Text { target } => assert_eq!(target, "label"),
+                other => panic!("expected BrowserOp::Text, got {other:?}"),
+            },
+        )
+        .await;
+
+        assert_browser_action_dispatches(
+            &handler,
+            &rx,
+            pane,
+            Request::BrowserValue {
+                pane,
+                target: "input".into(),
+            },
+            |op| match op {
+                BrowserOp::Value { target } => assert_eq!(target, "input"),
+                other => panic!("expected BrowserOp::Value, got {other:?}"),
+            },
+        )
+        .await;
+
+        assert_browser_action_dispatches(
+            &handler,
+            &rx,
+            pane,
+            Request::BrowserDblClick {
+                pane,
+                target: "row".into(),
+            },
+            |op| match op {
+                BrowserOp::DblClick { target } => assert_eq!(target, "row"),
+                other => panic!("expected BrowserOp::DblClick, got {other:?}"),
+            },
+        )
+        .await;
+
+        assert_browser_action_dispatches(
+            &handler,
+            &rx,
+            pane,
+            Request::BrowserHover {
+                pane,
+                target: "menu".into(),
+            },
+            |op| match op {
+                BrowserOp::Hover { target } => assert_eq!(target, "menu"),
+                other => panic!("expected BrowserOp::Hover, got {other:?}"),
+            },
+        )
+        .await;
+
+        assert_browser_action_dispatches(
+            &handler,
+            &rx,
+            pane,
+            Request::BrowserBlur {
+                pane,
+                target: "field".into(),
+            },
+            |op| match op {
+                BrowserOp::Blur { target } => assert_eq!(target, "field"),
+                other => panic!("expected BrowserOp::Blur, got {other:?}"),
+            },
+        )
+        .await;
+
+        assert_browser_action_dispatches(
+            &handler,
+            &rx,
+            pane,
+            Request::BrowserCheck {
+                pane,
+                target: "box".into(),
+            },
+            |op| match op {
+                BrowserOp::Check { target } => assert_eq!(target, "box"),
+                other => panic!("expected BrowserOp::Check, got {other:?}"),
+            },
+        )
+        .await;
+
+        assert_browser_action_dispatches(
+            &handler,
+            &rx,
+            pane,
+            Request::BrowserIsEnabled {
+                pane,
+                target: "submit".into(),
+            },
+            |op| match op {
+                BrowserOp::IsEnabled { target } => assert_eq!(target, "submit"),
+                other => panic!("expected BrowserOp::IsEnabled, got {other:?}"),
+            },
+        )
+        .await;
+
+        assert_browser_action_dispatches(
+            &handler,
+            &rx,
+            pane,
+            Request::BrowserIsChecked {
+                pane,
+                target: "box".into(),
+            },
+            |op| match op {
+                BrowserOp::IsChecked { target } => assert_eq!(target, "box"),
+                other => panic!("expected BrowserOp::IsChecked, got {other:?}"),
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
     async fn browser_navigate_dispatches_action_and_maps_ok_result() {
         let (handler, rx, pane, _tab) = single_pane_handler().await;
         let response = handler.handle(Request::BrowserNavigate {
