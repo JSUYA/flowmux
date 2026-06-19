@@ -985,6 +985,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn import_cookies_reports_unknown_source_without_dispatch() {
+        let (handler, rx, _pane, _tab) = single_pane_handler().await;
+
+        assert!(matches!(
+            handler
+                .handle(Request::ImportCookies {
+                    source: "unknown-browser".into(),
+                    domain: Some("example.com".into()),
+                })
+                .await,
+            Response::Error(RpcError::InvalidArgument(_))
+        ));
+        assert!(
+            rx.try_recv().is_err(),
+            "invalid cookie source must not dispatch InjectCookies"
+        );
+    }
+
+    #[tokio::test]
     async fn agent_activity_update_refreshes_store_and_sidebar() {
         let (handler, rx, pane, surface) = single_pane_handler().await;
         let expected_workspace = handler
