@@ -1753,6 +1753,18 @@ mod tests {
     }
 
     #[test]
+    fn ping_and_workspace_ls_parse_to_read_only_requests() {
+        let ping = Cli::try_parse_from(["flowmuxctl", "ping"]).unwrap();
+        assert!(matches!(build_request(ping.cmd).unwrap(), Request::Ping));
+
+        let list = Cli::try_parse_from(["flowmuxctl", "workspace", "ls"]).unwrap();
+        assert!(matches!(
+            build_request(list.cmd).unwrap(),
+            Request::WorkspaceList
+        ));
+    }
+
+    #[test]
     fn browser_and_cookie_commands_map_to_ipc_requests() {
         let pane = PaneId::new();
         let snapshot = build_request(Cmd::BrowserSnapshot { pane }).unwrap();

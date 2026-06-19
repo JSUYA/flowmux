@@ -842,6 +842,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_only_requests_delegate_without_gtk_dispatch() {
+        let (handler, rx, _pane, _tab) = single_pane_handler().await;
+
+        assert!(matches!(
+            handler.handle(Request::Ping).await,
+            Response::Pong
+        ));
+        assert!(matches!(
+            handler.handle(Request::WorkspaceList).await,
+            Response::WorkspaceList { ids } if ids.len() == 1
+        ));
+
+        assert!(
+            rx.try_recv().is_err(),
+            "read-only requests should not dispatch GTK commands"
+        );
+    }
+
+    #[tokio::test]
     async fn workspace_focus_dispatches_activate_workspace_for_known_workspace() {
         let (handler, rx, _pane, _tab) = single_pane_handler().await;
         let workspace = handler
