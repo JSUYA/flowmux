@@ -26,6 +26,14 @@ fn agent_session_store() -> Option<flowmux_state::AgentSessionStore> {
     Some(flowmux_state::AgentSessionStore::new(dir))
 }
 
+fn browser_error_response(error: String) -> Response {
+    if error.starts_with("browser pane not found:") || error.starts_with("pane not found:") {
+        Response::Error(RpcError::NotFound(error))
+    } else {
+        Response::Error(RpcError::Internal(error))
+    }
+}
+
 async fn browser_action(bridge: &Bridge, pane: flowmux_core::PaneId, op: BrowserOp) -> Response {
     let (tx, rx) = oneshot::channel();
     let _ = bridge
@@ -36,7 +44,7 @@ async fn browser_action(bridge: &Bridge, pane: flowmux_core::PaneId, op: Browser
         Ok(Ok(BrowserActionResult::Ok)) => Response::BrowserOk,
         Ok(Ok(BrowserActionResult::Bool(value))) => Response::BrowserBoolResult { value },
         Ok(Ok(BrowserActionResult::String(value))) => Response::BrowserResult { value },
-        Ok(Err(e)) => Response::Error(RpcError::Internal(e)),
+        Ok(Err(e)) => browser_error_response(e),
         Err(_) => Response::Error(RpcError::Internal("bridge closed".into())),
     }
 }
@@ -537,7 +545,7 @@ impl Handler for GuiHandler {
                         .await;
                     match rx.await {
                         Ok(Ok(value)) => Response::BrowserResult { value },
-                        Ok(Err(e)) => Response::Error(RpcError::Internal(e)),
+                        Ok(Err(e)) => browser_error_response(e),
                         Err(_) => Response::Error(RpcError::Internal("bridge closed".into())),
                     }
                 }
@@ -1247,6 +1255,96 @@ mod tests {
         };
         assert_eq!(target_pane, Some(missing));
         ack.send(Err(format!("pane not found: {missing}"))).unwrap();
+
+        assert!(matches!(
+            response.await,
+            Response::Error(RpcError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn browser_action_reports_not_found_for_missing_browser_pane() {
+        let (handler, rx, pane, _tab) = single_pane_handler().await;
+        let response = handler.handle(Request::BrowserUrl { pane });
+        tokio::pin!(response);
+
+        let command = tokio::select! {
+            response = &mut response => panic!("browser action completed before bridge ack: {response:?}"),
+            command = rx.recv() => command.expect("browser action should dispatch to GTK"),
+        };
+        let GtkCommand::BrowserAction {
+            pane: command_pane,
+            op,
+            ack,
+        } = command
+        else {
+            panic!("expected BrowserAction command");
+        };
+        assert_eq!(command_pane, pane);
+        assert!(matches!(op, BrowserOp::Url));
+        ack.send(Err(format!("browser pane not found: {pane}")))
+            .unwrap();
+
+        assert!(matches!(
+            response.await,
+            Response::Error(RpcError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn browser_snapshot_reports_not_found_for_missing_browser_pane() {
+        let (handler, rx, pane, _tab) = single_pane_handler().await;
+        let response = handler.handle(Request::BrowserSnapshot { pane });
+        tokio::pin!(response);
+
+        let command = tokio::select! {
+            response = &mut response => panic!("browser snapshot completed before bridge ack: {response:?}"),
+            command = rx.recv() => command.expect("browser snapshot should dispatch to GTK"),
+        };
+        let GtkCommand::BrowserAction {
+            pane: command_pane,
+            op,
+            ack,
+        } = command
+        else {
+            panic!("expected BrowserAction command");
+        };
+        assert_eq!(command_pane, pane);
+        assert!(matches!(op, BrowserOp::Snapshot));
+        ack.send(Err(format!("browser pane not found: {pane}")))
+            .unwrap();
+
+        assert!(matches!(
+            response.await,
+            Response::Error(RpcError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn browser_eval_reports_not_found_for_missing_browser_pane() {
+        let (handler, rx, pane, _tab) = single_pane_handler().await;
+        let response = handler.handle(Request::BrowserEval {
+            pane,
+            source: "document.title".into(),
+        });
+        tokio::pin!(response);
+
+        let command = tokio::select! {
+            response = &mut response => panic!("browser eval completed before bridge ack: {response:?}"),
+            command = rx.recv() => command.expect("browser eval should dispatch to GTK"),
+        };
+        let GtkCommand::BrowserEval {
+            pane: command_pane,
+            source,
+            ack,
+        } = command
+        else {
+            panic!("expected BrowserEval command");
+        };
+        assert_eq!(command_pane, pane);
+        assert_eq!(source, "document.title");
+        ack.send(Err(format!("browser pane not found: {pane}")))
+            .unwrap();
 
         assert!(matches!(
             response.await,
