@@ -1410,6 +1410,100 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn browser_navigate_dispatches_action_and_maps_ok_result() {
+        let (handler, rx, pane, _tab) = single_pane_handler().await;
+        let response = handler.handle(Request::BrowserNavigate {
+            pane,
+            url: "https://example.com".into(),
+        });
+        tokio::pin!(response);
+
+        let command = tokio::select! {
+            response = &mut response => panic!("browser navigate completed before bridge ack: {response:?}"),
+            command = rx.recv() => command.expect("browser navigate should dispatch to GTK"),
+        };
+        let GtkCommand::BrowserAction {
+            pane: command_pane,
+            op,
+            ack,
+        } = command
+        else {
+            panic!("expected BrowserAction command");
+        };
+        assert_eq!(command_pane, pane);
+        match op {
+            BrowserOp::Navigate { url } => assert_eq!(url, "https://example.com"),
+            _ => panic!("expected BrowserOp::Navigate"),
+        }
+        ack.send(Ok(BrowserActionResult::Ok)).unwrap();
+
+        assert!(matches!(response.await, Response::BrowserOk));
+    }
+
+    #[tokio::test]
+    async fn browser_title_dispatches_action_and_maps_string_result() {
+        let (handler, rx, pane, _tab) = single_pane_handler().await;
+        let response = handler.handle(Request::BrowserTitle { pane });
+        tokio::pin!(response);
+
+        let command = tokio::select! {
+            response = &mut response => panic!("browser title completed before bridge ack: {response:?}"),
+            command = rx.recv() => command.expect("browser title should dispatch to GTK"),
+        };
+        let GtkCommand::BrowserAction {
+            pane: command_pane,
+            op,
+            ack,
+        } = command
+        else {
+            panic!("expected BrowserAction command");
+        };
+        assert_eq!(command_pane, pane);
+        assert!(matches!(op, BrowserOp::Title));
+        ack.send(Ok(BrowserActionResult::String("Example".into())))
+            .unwrap();
+
+        assert!(matches!(
+            response.await,
+            Response::BrowserResult { value } if value == "Example"
+        ));
+    }
+
+    #[tokio::test]
+    async fn browser_is_visible_dispatches_action_and_maps_bool_result() {
+        let (handler, rx, pane, _tab) = single_pane_handler().await;
+        let response = handler.handle(Request::BrowserIsVisible {
+            pane,
+            target: "e3".into(),
+        });
+        tokio::pin!(response);
+
+        let command = tokio::select! {
+            response = &mut response => panic!("browser is-visible completed before bridge ack: {response:?}"),
+            command = rx.recv() => command.expect("browser is-visible should dispatch to GTK"),
+        };
+        let GtkCommand::BrowserAction {
+            pane: command_pane,
+            op,
+            ack,
+        } = command
+        else {
+            panic!("expected BrowserAction command");
+        };
+        assert_eq!(command_pane, pane);
+        match op {
+            BrowserOp::IsVisible { target } => assert_eq!(target, "e3"),
+            _ => panic!("expected BrowserOp::IsVisible"),
+        }
+        ack.send(Ok(BrowserActionResult::Bool(true))).unwrap();
+
+        assert!(matches!(
+            response.await,
+            Response::BrowserBoolResult { value: true }
+        ));
+    }
+
+    #[tokio::test]
     async fn browser_action_reports_not_found_for_missing_browser_pane() {
         let (handler, rx, pane, _tab) = single_pane_handler().await;
         let response = handler.handle(Request::BrowserUrl { pane });
