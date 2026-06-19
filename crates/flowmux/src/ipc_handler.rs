@@ -857,6 +857,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pane_send_keys_dispatches_terminal_command_and_waits_for_ack() {
+        let (handler, rx, pane, _tab) = single_pane_handler().await;
+        let response = handler.handle(Request::PaneSendKeys {
+            pane,
+            keys: "abc".into(),
+        });
+        tokio::pin!(response);
+
+        let command = tokio::select! {
+            response = &mut response => panic!("send-keys completed before bridge ack: {response:?}"),
+            command = rx.recv() => command.expect("send-keys should dispatch to GTK"),
+        };
+        let GtkCommand::PaneSendKeys {
+            pane: command_pane,
+            keys,
+            ack,
+        } = command
+        else {
+            panic!("expected PaneSendKeys command");
+        };
+        assert_eq!(command_pane, pane);
+        assert_eq!(keys, "abc");
+        ack.send(Ok(())).unwrap();
+
+        assert!(matches!(response.await, Response::Ok));
+    }
+
+    #[tokio::test]
+    async fn pane_read_screen_dispatches_terminal_command_and_waits_for_ack() {
+        let (handler, rx, pane, _tab) = single_pane_handler().await;
+        let response = handler.handle(Request::PaneReadScreen { pane });
+        tokio::pin!(response);
+
+        let command = tokio::select! {
+            response = &mut response => panic!("read-screen completed before bridge ack: {response:?}"),
+            command = rx.recv() => command.expect("read-screen should dispatch to GTK"),
+        };
+        let GtkCommand::PaneReadScreen {
+            pane: command_pane,
+            ack,
+        } = command
+        else {
+            panic!("expected PaneReadScreen command");
+        };
+        assert_eq!(command_pane, pane);
+        ack.send(Ok(Some("screen".into()))).unwrap();
+
+        assert!(matches!(
+            response.await,
+            Response::ScreenContents { text } if text == "screen"
+        ));
+    }
+
+    #[tokio::test]
     async fn pane_split_dispatches_incremental_apply_command() {
         let (handler, rx, pane, _tab) = single_pane_handler().await;
         let response = handler.handle(Request::PaneSplit {
@@ -920,6 +974,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn close_pane_dispatches_close_focused_and_waits_for_ack() {
+        let (handler, rx, pane, _tab) = single_pane_handler().await;
+        handler
+            .inner
+            .store()
+            .split_pane(pane, SplitDirection::Vertical)
+            .await
+            .expect("second pane should be created");
+        let response = handler.handle(Request::PaneClose { pane });
+        tokio::pin!(response);
+
+        let command = tokio::select! {
+            response = &mut response => panic!("close-pane completed before bridge ack: {response:?}"),
+            command = rx.recv() => command.expect("close-pane should dispatch to GTK"),
+        };
+        let GtkCommand::CloseFocused {
+            pane: command_pane,
+            ack,
+        } = command
+        else {
+            panic!("expected CloseFocused command");
+        };
+        assert_eq!(command_pane, pane);
+        ack.send(Ok(())).unwrap();
+
+        assert!(matches!(response.await, Response::Ok));
+    }
+
+    #[tokio::test]
     async fn close_pane_reports_not_found_for_unknown_pane() {
         let (handler, _rx, _pane, _tab) = single_pane_handler().await;
         assert!(matches!(
@@ -943,6 +1026,37 @@ mod tests {
                 .await,
             Response::Error(RpcError::InvalidArgument(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn close_tab_dispatches_close_surface_and_waits_for_ack() {
+        let (handler, rx, pane, _tab) = single_pane_handler().await;
+        let (_, surface) = handler
+            .inner
+            .store()
+            .add_terminal_surface_to_pane(pane, None)
+            .await
+            .expect("second tab should be created");
+        let response = handler.handle(Request::SurfaceClose { pane, surface });
+        tokio::pin!(response);
+
+        let command = tokio::select! {
+            response = &mut response => panic!("close-tab completed before bridge ack: {response:?}"),
+            command = rx.recv() => command.expect("close-tab should dispatch to GTK"),
+        };
+        let GtkCommand::CloseSurface {
+            pane: command_pane,
+            surface: command_surface,
+            ack,
+        } = command
+        else {
+            panic!("expected CloseSurface command");
+        };
+        assert_eq!(command_pane, pane);
+        assert_eq!(command_surface, surface);
+        ack.send(Ok(())).unwrap();
+
+        assert!(matches!(response.await, Response::Ok));
     }
 
     #[tokio::test]
