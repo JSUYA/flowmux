@@ -770,7 +770,9 @@ fn shell_escape(arg: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flowmux_core::{AgentActivity, NotificationLevel, PaneId, SurfaceId, WorkspaceId};
+    use flowmux_core::{
+        AgentActivity, NotificationLevel, PaneId, PlacementStrategy, SurfaceId, WorkspaceId,
+    };
     use flowmux_daemon::StateStore;
     use flowmux_state::State;
 
@@ -1367,6 +1369,49 @@ mod tests {
             rx.try_recv().is_err(),
             "invalid focus-tab must not dispatch ActivateSurface"
         );
+    }
+
+    #[tokio::test]
+    async fn browser_open_dispatches_split_and_maps_success_outcome() {
+        let (handler, rx, pane, _tab) = single_pane_handler().await;
+        let opened = PaneId::new();
+        let response = handler.handle(Request::BrowserOpen {
+            url: "https://example.com".into(),
+            target_pane: Some(pane),
+            direction: SplitDirection::Vertical,
+        });
+        tokio::pin!(response);
+
+        let command = tokio::select! {
+            response = &mut response => panic!("browser open returned before bridge dispatch: {response:?}"),
+            command = rx.recv() => command.expect("browser open should dispatch to GTK"),
+        };
+        let GtkCommand::BrowserOpenSplit {
+            target_pane,
+            url,
+            direction,
+            ack,
+        } = command
+        else {
+            panic!("expected BrowserOpenSplit command");
+        };
+        assert_eq!(target_pane, Some(pane));
+        assert_eq!(url, "https://example.com");
+        assert_eq!(direction, SplitDirection::Vertical);
+
+        ack.send(Ok(crate::bridge::BrowserOpenOutcome {
+            pane: opened,
+            placement_strategy: PlacementStrategy::SplitRight,
+        }))
+        .unwrap();
+
+        assert!(matches!(
+            response.await,
+            Response::BrowserPaneOpened {
+                pane: got,
+                placement_strategy: PlacementStrategy::SplitRight,
+            } if got == opened
+        ));
     }
 
     #[tokio::test]
