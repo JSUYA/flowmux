@@ -1803,6 +1803,17 @@ impl WindowController {
                 }
                 let _ = ack.send(());
             }
+            GtkCommand::PaneSplitApplied {
+                id,
+                pane,
+                new_pane,
+                direction,
+                ack,
+            } => {
+                self.apply_split_incremental_or_rerender(id, pane, new_pane, direction)
+                    .await;
+                let _ = ack.send(());
+            }
             GtkCommand::SplitFocused {
                 pane,
                 direction,
@@ -6160,6 +6171,52 @@ mod tests {
         assert!(
             top == &original_frame_after_close,
             "workspace stack child should now be the surviving pane's frame, not the old paned"
+        );
+    }
+
+    #[gtk::test]
+    async fn pane_split_applied_preserves_existing_terminal_widget_identity() {
+        let (controller, ws_id, pane) =
+            build_single_workspace_controller("com.flowmux.App.UiTest.PaneSplitApplied").await;
+        let original_terminal = {
+            let registry = controller.pane_registry.borrow();
+            registry
+                .active_terminal(pane)
+                .expect("source pane should have an active terminal")
+                .widget
+                .clone()
+        };
+
+        let (split_ws, new_pane) = controller
+            .store
+            .split_pane(pane, SplitDirection::Vertical)
+            .await
+            .expect("split should succeed");
+        assert_eq!(split_ws, ws_id);
+
+        let (ack_tx, ack_rx) = oneshot::channel();
+        controller
+            .dispatch(GtkCommand::PaneSplitApplied {
+                id: ws_id,
+                pane,
+                new_pane,
+                direction: SplitDirection::Vertical,
+                ack: ack_tx,
+            })
+            .await;
+        ack_rx.await.unwrap();
+
+        let registry = controller.pane_registry.borrow();
+        let current_terminal = registry
+            .active_terminal(pane)
+            .expect("source pane terminal should survive the split");
+        assert!(
+            current_terminal.widget == original_terminal,
+            "CLI-applied split must reuse the existing terminal widget"
+        );
+        assert!(
+            registry.active_terminal(new_pane).is_some(),
+            "new split pane should get its own terminal"
         );
     }
 

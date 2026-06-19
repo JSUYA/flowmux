@@ -94,7 +94,13 @@ impl Handler for GuiHandler {
                             let _ = self
                                 .bridge
                                 .tx
-                                .send(GtkCommand::WorkspaceRerender { id: ws_id, ack: tx })
+                                .send(GtkCommand::PaneSplitApplied {
+                                    id: ws_id,
+                                    pane,
+                                    new_pane,
+                                    direction,
+                                    ack: tx,
+                                })
                                 .await;
                             let _ = rx.await;
                             Response::PaneSplitDone { new_pane }

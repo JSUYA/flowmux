@@ -156,6 +156,14 @@ pub enum GtkCommand {
         id: WorkspaceId,
         ack: oneshot::Sender<()>,
     },
+    /// Apply a split that was already committed to the store.
+    PaneSplitApplied {
+        id: WorkspaceId,
+        pane: PaneId,
+        new_pane: PaneId,
+        direction: SplitDirection,
+        ack: oneshot::Sender<()>,
+    },
     /// Send keystrokes to a pane.
     PaneSendKeys {
         pane: PaneId,
