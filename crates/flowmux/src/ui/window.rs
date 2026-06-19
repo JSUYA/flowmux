@@ -1415,15 +1415,9 @@ impl WindowController {
             return;
         };
 
-        if dir == FocusDir::Left {
-            self.focused_pane.set(Some(from));
-            self.focus_pane(from);
-            return;
-        }
-
         let before = self.focused_pane.get();
-        self.focus_in_direction(from, dir);
-        if self.focused_pane.get() == before || self.focused_pane.get().is_none() {
+        let moved = self.focus_in_direction(from, dir).is_some();
+        if !moved || self.focused_pane.get() == before || self.focused_pane.get().is_none() {
             self.focused_pane.set(Some(from));
             self.focus_pane(from);
         }
@@ -1457,11 +1451,10 @@ impl WindowController {
     }
 
     fn focus_direction_or_file_browser(&self, from: PaneId, dir: FocusDir) {
-        let before = self.focused_pane.get();
-        self.focus_in_direction(from, dir);
+        let moved = self.focus_in_direction(from, dir).is_some();
         if dir == FocusDir::Right
             && self.file_browser.widget().is_visible()
-            && self.focused_pane.get() == before
+            && !moved
         {
             self.file_browser_source_pane.set(Some(from));
             self.focus_file_browser();
@@ -3199,24 +3192,24 @@ impl WindowController {
     /// the pane currently identified by `from`. Bbox computation is
     /// in the stack's coordinate space so split orientation doesn't
     /// matter.
-    fn focus_in_direction(&self, from: PaneId, dir: FocusDir) {
+    fn focus_in_direction(&self, from: PaneId, dir: FocusDir) -> Option<PaneId> {
         use gtk::graphene::Rect;
 
         let registry = self.pane_registry.borrow();
         let from_widget = match registry.pane_frame(from) {
             Some(p) => p,
-            None => return,
+            None => return None,
         };
         // Alt+arrow moves only within the same workspace. GtkStack can keep
         // inactive workspace widgets overlapping at the same coordinates, where
         // compute_bounds may return non-zero values; without the workspace
         // filter, focus could leak into another workspace.
         let Some(workspace) = registry.workspace_of_pane(from) else {
-            return;
+            return None;
         };
         let stack = &self.stack;
         let Some(from_bbox) = from_widget.compute_bounds(stack) else {
-            return;
+            return None;
         };
         let from_center = (
             from_bbox.x() + from_bbox.width() / 2.0,
@@ -3260,14 +3253,20 @@ impl WindowController {
             // Previously only active_terminal was tried, so browser panes could
             // not be reached with Alt+arrow.
             if let Some(term) = registry.active_terminal(id) {
+                self.focused_pane.set(Some(id));
                 term.grab_focus();
+                Some(id)
             } else if let Some(browser) = registry.active_browser(id) {
+                self.focused_pane.set(Some(id));
                 browser.web_view.grab_focus();
+                Some(id)
             } else {
                 tracing::debug!(target_pane = %id, "no active surface to focus");
+                None
             }
         } else {
             tracing::debug!(?dir, "no pane in that direction");
+            None
         }
     }
 
@@ -5730,6 +5729,37 @@ mod tests {
             .await;
 
         assert_eq!(controller.focused_pane.get(), Some(pane));
+        assert!(!controller.file_browser_active.get());
+    }
+
+    #[gtk::test]
+    async fn file_browser_alt_left_moves_to_left_neighbor_without_second_press() {
+        let (controller, _ws_id, pane_a) =
+            build_single_workspace_controller("com.flowmux.App.UiTest.FileBrowserAltLeft").await;
+        let (split_ack, split_rx) = oneshot::channel();
+        controller
+            .dispatch(GtkCommand::SplitFocused {
+                pane: pane_a,
+                direction: SplitDirection::Vertical,
+                ack: split_ack,
+            })
+            .await;
+        let pane_b = split_rx
+            .await
+            .expect("split ack should be sent")
+            .expect("split should succeed");
+
+        controller.window.set_default_size(900, 600);
+        controller.window.present();
+        glib::timeout_future(std::time::Duration::from_millis(50)).await;
+
+        controller.file_browser_source_pane.set(Some(pane_b));
+        controller.file_browser_active.set(true);
+        controller.focused_pane.set(Some(pane_b));
+
+        controller.focus_out_of_file_browser(FocusDir::Left);
+
+        assert_eq!(controller.focused_pane.get(), Some(pane_a));
         assert!(!controller.file_browser_active.get());
     }
 
