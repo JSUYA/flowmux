@@ -1791,6 +1791,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn browser_eval_dispatches_eval_and_maps_string_result() {
+        let (handler, rx, pane, _tab) = single_pane_handler().await;
+        let response = handler.handle(Request::BrowserEval {
+            pane,
+            source: "document.title".into(),
+        });
+        tokio::pin!(response);
+
+        let command = tokio::select! {
+            response = &mut response => panic!("browser eval completed before bridge ack: {response:?}"),
+            command = rx.recv() => command.expect("browser eval should dispatch to GTK"),
+        };
+        let GtkCommand::BrowserEval {
+            pane: command_pane,
+            source,
+            ack,
+        } = command
+        else {
+            panic!("expected BrowserEval command");
+        };
+
+        assert_eq!(command_pane, pane);
+        assert_eq!(source, "document.title");
+        ack.send(Ok("Example".into())).unwrap();
+
+        assert!(matches!(
+            response.await,
+            Response::BrowserResult { value } if value == "Example"
+        ));
+    }
+
+    #[tokio::test]
     async fn browser_eval_reports_not_found_for_missing_browser_pane() {
         let (handler, rx, pane, _tab) = single_pane_handler().await;
         let response = handler.handle(Request::BrowserEval {
