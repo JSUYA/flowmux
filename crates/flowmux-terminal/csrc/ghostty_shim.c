@@ -395,6 +395,25 @@ void fxvt_scroll(FxvtCtx *ctx, long delta) {
     ghostty_terminal_scroll_viewport(ctx->terminal, behavior);
 }
 
+int fxvt_scrollbar(FxvtCtx *ctx, unsigned long long *out_total,
+                   unsigned long long *out_offset, unsigned long long *out_len) {
+    if (ctx == NULL || out_total == NULL || out_offset == NULL || out_len == NULL) {
+        return -1;
+    }
+    GhosttyTerminalScrollbar sb;
+    sb.total = 0;
+    sb.offset = 0;
+    sb.len = 0;
+    if (ghostty_terminal_get(ctx->terminal, GHOSTTY_TERMINAL_DATA_SCROLLBAR, &sb)
+        != GHOSTTY_SUCCESS) {
+        return -1;
+    }
+    *out_total = (unsigned long long)sb.total;
+    *out_offset = (unsigned long long)sb.offset;
+    *out_len = (unsigned long long)sb.len;
+    return 0;
+}
+
 int fxvt_mouse_enabled(FxvtCtx *ctx) {
     if (ctx == NULL) {
         return 0;

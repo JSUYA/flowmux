@@ -107,6 +107,12 @@ void fxvt_clear_selection(FxvtCtx *ctx);
 /* Scroll the viewport by `delta` rows through scrollback (up = negative). */
 void fxvt_scroll(FxvtCtx *ctx, long delta);
 
+/* Read scrollbar geometry: *out_total scrollable rows, *out_offset of the
+ * viewport into that area, *out_len visible rows. Returns 0 on success.
+ * (Somewhat costly — call only after output/scroll, not every frame.) */
+int fxvt_scrollbar(FxvtCtx *ctx, unsigned long long *out_total,
+                   unsigned long long *out_offset, unsigned long long *out_len);
+
 /* Copy the terminal's current OSC title / working directory (as set by escape
  * sequences) into `buf` (NUL-terminated when cap > 0). Returns the byte length
  * written excluding the NUL (0 if unset). */

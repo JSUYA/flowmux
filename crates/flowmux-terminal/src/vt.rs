@@ -77,6 +77,12 @@ extern "C" {
     ) -> c_int;
     fn fxvt_clear_selection(ctx: *mut FxvtCtx);
     fn fxvt_scroll(ctx: *mut FxvtCtx, delta: c_long);
+    fn fxvt_scrollbar(
+        ctx: *mut FxvtCtx,
+        total: *mut u64,
+        offset: *mut u64,
+        len: *mut u64,
+    ) -> c_int;
     fn fxvt_title(ctx: *mut FxvtCtx, buf: *mut c_char, cap: usize) -> usize;
     fn fxvt_pwd(ctx: *mut FxvtCtx, buf: *mut c_char, cap: usize) -> usize;
     fn fxvt_encode_key(
@@ -450,6 +456,18 @@ impl Vt {
         }
     }
 
+    /// Scrollbar geometry as `(total, offset, len)`: total scrollable rows, the
+    /// viewport's offset into them, and the visible row count. Maps to a
+    /// scrollbar adjustment (value=offset, upper=total, page=len). Call only
+    /// after output/scroll — it can be costly to compute.
+    pub fn scrollbar(&self) -> Option<(u64, u64, u64)> {
+        let mut total = 0u64;
+        let mut offset = 0u64;
+        let mut len = 0u64;
+        let ok = unsafe { fxvt_scrollbar(self.ctx, &mut total, &mut offset, &mut len) == 0 };
+        ok.then_some((total, offset, len))
+    }
+
     /// The terminal's OSC 0/2 title, if one has been set.
     pub fn title(&self) -> Option<String> {
         read_c_string(|buf, cap| unsafe { fxvt_title(self.ctx, buf, cap) })
@@ -740,6 +758,26 @@ mod tests {
         // pwd() is best-effort (OSC 7); current_dir falls back to /proc, so we
         // only assert it does not error here.
         let _ = vt.pwd();
+    }
+
+    #[test]
+    fn scrollbar_geometry_tracks_scrollback_and_position() {
+        let mut vt = Vt::new(20, 5, 500).expect("vt");
+        for i in 0..60 {
+            vt.write(format!("line{i}\r\n").as_bytes());
+        }
+        assert!(vt.update());
+        let (total, offset, len) = vt.scrollbar().expect("scrollbar");
+        assert_eq!(len, 5, "visible len == viewport rows");
+        assert!(total >= 60, "total covers scrollback, got {total}");
+        // At the bottom the viewport sits at the end of the scrollable area.
+        assert_eq!(offset, total - len, "live viewport pinned to bottom");
+
+        // Scroll up: the offset must move toward the top.
+        vt.scroll(-20);
+        assert!(vt.update());
+        let (_t2, offset2, _l2) = vt.scrollbar().expect("scrollbar");
+        assert!(offset2 < offset, "scrolling up lowers the offset");
     }
 
     #[test]

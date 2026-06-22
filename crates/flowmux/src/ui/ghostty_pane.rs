@@ -95,6 +95,12 @@ pub struct GhosttyPane {
     area: gtk::DrawingArea,
     state: Rc<RefCell<State>>,
     pid: Rc<Cell<Option<i32>>>,
+    /// Overlaid vertical scrollbar + its adjustment, shown only when scrollback
+    /// exists. `syncing` suppresses the value-changed handler while we push the
+    /// terminal's own scroll position into the adjustment.
+    scrollbar: gtk::Scrollbar,
+    adj: gtk::Adjustment,
+    syncing: Rc<Cell<bool>>,
 }
 
 impl GhosttyPane {
@@ -167,6 +173,17 @@ impl GhosttyPane {
         container.set_vexpand(true);
         container.set_child(Some(&area));
 
+        // Vertical scrollbar pinned to the right edge, like the VTE pane. Hidden
+        // until there is scrollback to show.
+        let adj = gtk::Adjustment::new(0.0, 0.0, 1.0, 1.0, 1.0, 1.0);
+        let scrollbar = gtk::Scrollbar::new(gtk::Orientation::Vertical, Some(&adj));
+        scrollbar.set_halign(gtk::Align::End);
+        scrollbar.set_valign(gtk::Align::Fill);
+        scrollbar.set_can_focus(false);
+        scrollbar.set_width_request(12);
+        scrollbar.set_visible(false);
+        container.add_overlay(&scrollbar);
+
         let pane = GhosttyPane {
             id,
             surface,
@@ -174,6 +191,9 @@ impl GhosttyPane {
             area: area.clone(),
             state: state.clone(),
             pid: pid.clone(),
+            scrollbar,
+            adj,
+            syncing: Rc::new(Cell::new(false)),
         };
 
         pane.install_draw();
@@ -182,6 +202,7 @@ impl GhosttyPane {
         pane.install_input();
         pane.install_mouse(callbacks.clone());
         pane.install_focus(callbacks);
+        pane.install_scrollbar();
 
         pane
     }
@@ -196,6 +217,9 @@ impl GhosttyPane {
     fn install_resize(&self) {
         let state = self.state.clone();
         let area = self.area.clone();
+        let adj = self.adj.clone();
+        let scrollbar = self.scrollbar.clone();
+        let syncing = self.syncing.clone();
         self.area.connect_resize(move |_area, w, h| {
             let mut s = state.borrow_mut();
             if s.cell_w <= 0.0 || s.cell_h <= 0.0 {
@@ -212,6 +236,7 @@ impl GhosttyPane {
                 let _ = s.pty.resize(cols, rows, cw, chh);
                 drop(s);
                 area.queue_draw();
+                sync_scrollbar_adj(&state, &adj, &scrollbar, &syncing);
             }
         });
     }
@@ -222,6 +247,9 @@ impl GhosttyPane {
         let pid = self.pid.clone();
         let id = self.id;
         let surface = self.surface;
+        let adj = self.adj.clone();
+        let scrollbar = self.scrollbar.clone();
+        let syncing = self.syncing.clone();
         let fd = self.state.borrow().pty.master_fd();
         glib::source::unix_fd_add_local(fd, glib::IOCondition::IN, move |_fd, _cond| {
             let mut buf = [0u8; 16384];
@@ -254,6 +282,7 @@ impl GhosttyPane {
                 (callbacks.on_terminal_title_changed.borrow_mut())(id, surface, title);
             }
             area.queue_draw();
+            sync_scrollbar_adj(&state, &adj, &scrollbar, &syncing);
             glib::ControlFlow::Continue
         });
     }
@@ -455,6 +484,9 @@ impl GhosttyPane {
         {
             let state = self.state.clone();
             let area = self.area.clone();
+            let adj = self.adj.clone();
+            let scrollbar = self.scrollbar.clone();
+            let syncing = self.syncing.clone();
             scroll.connect_scroll(move |_c, _dx, dy| {
                 let mut s = state.borrow_mut();
                 if s.vt.mouse_enabled() {
@@ -473,6 +505,7 @@ impl GhosttyPane {
                 }
                 drop(s);
                 area.queue_draw();
+                sync_scrollbar_adj(&state, &adj, &scrollbar, &syncing);
                 glib::Propagation::Stop
             });
         }
@@ -631,6 +664,61 @@ impl GhosttyPane {
 
     pub fn add_controller(&self, controller: impl IsA<gtk::EventController>) {
         self.container.add_controller(controller);
+    }
+
+    /// Drive the overlaid scrollbar from the terminal's own scroll position.
+    fn install_scrollbar(&self) {
+        let state = self.state.clone();
+        let area = self.area.clone();
+        let scrollbar = self.scrollbar.clone();
+        let syncing = self.syncing.clone();
+        self.adj.connect_value_changed(move |adj| {
+            if syncing.get() {
+                return; // programmatic update from sync_scrollbar_adj
+            }
+            let target = adj.value().round() as i64;
+            {
+                let mut s = state.borrow_mut();
+                if let Some((_total, offset, _len)) = s.vt.scrollbar() {
+                    let delta = target - offset as i64;
+                    if delta != 0 {
+                        s.vt.scroll(delta as isize);
+                    }
+                }
+            }
+            area.queue_draw();
+            sync_scrollbar_adj(&state, &adj, &scrollbar, &syncing);
+        });
+    }
+}
+
+/// Push the terminal's scroll geometry into the overlaid scrollbar's
+/// adjustment, showing it only when there is scrollback. `syncing` guards the
+/// value-changed handler from treating this programmatic update as user input.
+fn sync_scrollbar_adj(
+    state: &Rc<RefCell<State>>,
+    adj: &gtk::Adjustment,
+    scrollbar: &gtk::Scrollbar,
+    syncing: &Rc<Cell<bool>>,
+) {
+    let geom = state.borrow().vt.scrollbar();
+    let Some((total, offset, len)) = geom else {
+        return;
+    };
+    if total > len && len > 0 {
+        syncing.set(true);
+        adj.set_lower(0.0);
+        adj.set_upper(total as f64);
+        adj.set_page_size(len as f64);
+        adj.set_step_increment(1.0);
+        adj.set_page_increment(len as f64);
+        adj.set_value(offset.min(total - len) as f64);
+        syncing.set(false);
+        if !scrollbar.is_visible() {
+            scrollbar.set_visible(true);
+        }
+    } else if scrollbar.is_visible() {
+        scrollbar.set_visible(false);
     }
 }
 
