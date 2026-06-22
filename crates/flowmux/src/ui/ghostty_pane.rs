@@ -787,34 +787,54 @@ fn draw(state: &mut State, cr: &cairo::Context, w: i32, h: i32) {
 
     for row in 0..rows {
         let y = row as f64 * ch;
-        for col in 0..cols {
-            let Some(cell) = state.vt.cell(row, col) else {
-                continue;
-            };
+        // Read the row's cells once, then render in two passes. Backgrounds
+        // must all be painted before any glyph, otherwise a wide glyph's right
+        // half (which spills into the next cell) is erased by that spacer
+        // cell's background fill — the cause of "left-half-only" Hangul on a
+        // colored background.
+        let cells: Vec<Option<flowmux_terminal::vt::Cell>> =
+            (0..cols).map(|col| state.vt.cell(row, col)).collect();
+
+        // Pass 1: backgrounds + selection wash.
+        for (col, cell) in cells.iter().enumerate() {
+            let Some(cell) = cell else { continue };
             let x = col as f64 * cw;
             let cell_px_w = if cell.wide { cw * 2.0 } else { cw };
-
-            let (mut fg, bg) = if cell.style.inverse {
-                (cell.bg.unwrap_or(colors.bg), Some(cell.fg))
-            } else {
-                (cell.fg, cell.bg)
-            };
-
             if cell.selected {
                 let (r, g, bl) = rgb(sel_bg);
                 cr.set_source_rgb(r, g, bl);
                 cr.rectangle(x, y, cell_px_w, ch);
                 let _ = cr.fill();
+            } else {
+                let bg = if cell.style.inverse {
+                    Some(cell.fg)
+                } else {
+                    cell.bg
+                };
+                if let Some(b) = bg {
+                    let (r, g, bl) = rgb(b);
+                    cr.set_source_rgb(r, g, bl);
+                    cr.rectangle(x, y, cell_px_w, ch);
+                    let _ = cr.fill();
+                }
+            }
+        }
+
+        // Pass 2: glyphs + underline/strikethrough, on top of all backgrounds.
+        for (col, cell) in cells.iter().enumerate() {
+            let Some(cell) = cell else { continue };
+            let x = col as f64 * cw;
+            let cell_px_w = if cell.wide { cw * 2.0 } else { cw };
+            let mut fg = if cell.style.inverse {
+                cell.bg.unwrap_or(colors.bg)
+            } else {
+                cell.fg
+            };
+            if cell.selected {
                 if let Some(sfg) = sel_fg {
                     fg = sfg;
                 }
-            } else if let Some(b) = bg {
-                let (r, g, bl) = rgb(b);
-                cr.set_source_rgb(r, g, bl);
-                cr.rectangle(x, y, cell_px_w, ch);
-                let _ = cr.fill();
             }
-
             let (fr, fgc, fb) = rgb(fg);
             if !cell.text.is_empty() {
                 layout.set_text(&cell.text);

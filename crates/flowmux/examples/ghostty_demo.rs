@@ -159,48 +159,55 @@ fn draw(term: &mut Term, cr: &cairo::Context, w: i32, h: i32) {
 
     for row in 0..rows {
         let y = row as f64 * ch;
-        for col in 0..cols {
-            let Some(cell) = term.vt.cell(row, col) else {
-                continue;
-            };
+        // Read the row once, render in two passes (all backgrounds, then all
+        // glyphs) so a wide glyph's right half is not erased by the next
+        // spacer cell's background.
+        let cells: Vec<Option<flowmux_terminal::vt::Cell>> =
+            (0..cols).map(|col| term.vt.cell(row, col)).collect();
+
+        for (col, cell) in cells.iter().enumerate() {
+            let Some(cell) = cell else { continue };
             let x = col as f64 * cw;
             let cell_px_w = if cell.wide { cw * 2.0 } else { cw };
-
-            // Inverse swaps fg/bg; resolve effective colors up front.
-            let (fg, bg) = if cell.style.inverse {
-                (cell.bg.unwrap_or(colors.bg), Some(cell.fg))
-            } else {
-                (cell.fg, cell.bg)
-            };
-
-            // Background / selection.
             if cell.selected {
-                // A neutral selection wash (blue-grey) regardless of cell bg.
                 cr.set_source_rgb(0.20, 0.34, 0.55);
                 cr.rectangle(x, y, cell_px_w, ch);
                 let _ = cr.fill();
-            } else if let Some(b) = bg {
-                let (r, g, bl) = rgb(b);
-                cr.set_source_rgb(r, g, bl);
-                cr.rectangle(x, y, cell_px_w, ch);
-                let _ = cr.fill();
+            } else {
+                let bg = if cell.style.inverse {
+                    Some(cell.fg)
+                } else {
+                    cell.bg
+                };
+                if let Some(b) = bg {
+                    let (r, g, bl) = rgb(b);
+                    cr.set_source_rgb(r, g, bl);
+                    cr.rectangle(x, y, cell_px_w, ch);
+                    let _ = cr.fill();
+                }
             }
+        }
 
+        for (col, cell) in cells.iter().enumerate() {
+            let Some(cell) = cell else { continue };
+            let x = col as f64 * cw;
+            let cell_px_w = if cell.wide { cw * 2.0 } else { cw };
+            let fg = if cell.style.inverse {
+                cell.bg.unwrap_or(colors.bg)
+            } else {
+                cell.fg
+            };
             let (fr, fgc, fb) = rgb(fg);
             if !cell.text.is_empty() {
                 layout.set_text(&cell.text);
-                // Align to a common baseline so CJK fallback glyphs match ASCII.
                 let baseline = layout.baseline() as f64 / pango::SCALE as f64;
                 cr.set_source_rgb(fr, fgc, fb);
                 cr.move_to(x, y + ascent - baseline);
                 pangocairo::functions::show_layout(cr, &layout);
             }
-
-            // Underline / strikethrough drawn as rules so they don't depend on
-            // the font carrying the attribute.
             if cell.style.underline {
                 cr.set_source_rgb(fr, fgc, fb);
-                cr.rectangle(x, y + term.ascent + 2.0, cell_px_w, 1.0);
+                cr.rectangle(x, y + ascent + 2.0, cell_px_w, 1.0);
                 let _ = cr.fill();
             }
             if cell.style.strikethrough {

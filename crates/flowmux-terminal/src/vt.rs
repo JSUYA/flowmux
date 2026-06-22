@@ -509,12 +509,25 @@ impl Vt {
         for row in 0..rows {
             let mut line = String::new();
             let mut row_has = false;
+            let mut prev_wide = false;
             for col in 0..cols {
                 if let Some(cell) = self.cell(row, col) {
                     if cell.selected {
                         row_has = true;
-                        line.push_str(&cell.text);
+                        if cell.text.is_empty() {
+                            // Blank cell inside the selection → a space, so words
+                            // separated by cleared cells don't run together on
+                            // copy. Skip the spacer that trails a wide glyph.
+                            if !prev_wide {
+                                line.push(' ');
+                            }
+                        } else {
+                            line.push_str(&cell.text);
+                        }
                     }
+                    prev_wide = cell.wide;
+                } else {
+                    prev_wide = false;
                 }
             }
             if row_has {
