@@ -166,6 +166,47 @@ int fxvt_colors(FxvtCtx *ctx, uint8_t out_fg[3], uint8_t out_bg[3],
     return 0;
 }
 
+int fxvt_set_default_colors(FxvtCtx *ctx, const uint8_t fg[3],
+                            const uint8_t bg[3], const uint8_t cursor[3]) {
+    if (ctx == NULL) {
+        return -1;
+    }
+    GhosttyColorRgb f = {fg[0], fg[1], fg[2]};
+    GhosttyColorRgb b = {bg[0], bg[1], bg[2]};
+    GhosttyColorRgb c = {cursor[0], cursor[1], cursor[2]};
+    int ok = 0;
+    ok |= ghostty_terminal_set(ctx->terminal, GHOSTTY_TERMINAL_OPT_COLOR_FOREGROUND, &f)
+          != GHOSTTY_SUCCESS;
+    ok |= ghostty_terminal_set(ctx->terminal, GHOSTTY_TERMINAL_OPT_COLOR_BACKGROUND, &b)
+          != GHOSTTY_SUCCESS;
+    ok |= ghostty_terminal_set(ctx->terminal, GHOSTTY_TERMINAL_OPT_COLOR_CURSOR, &c)
+          != GHOSTTY_SUCCESS;
+    return ok ? -1 : 0;
+}
+
+int fxvt_set_palette(FxvtCtx *ctx, const uint8_t *rgb, int count) {
+    if (ctx == NULL || rgb == NULL || count < 0 || count > 256) {
+        return -1;
+    }
+    /* Start from libghostty's standard default palette so untouched entries
+     * (the 16-231 cube + 232-255 grayscale) stay xterm-standard, matching how
+     * VTE fills a <=16 color theme out to 256. */
+    GhosttyColorRgb pal[256];
+    if (ghostty_terminal_get(ctx->terminal, GHOSTTY_TERMINAL_DATA_COLOR_PALETTE_DEFAULT, pal)
+        != GHOSTTY_SUCCESS) {
+        return -1;
+    }
+    for (int i = 0; i < count; i++) {
+        pal[i].r = rgb[i * 3 + 0];
+        pal[i].g = rgb[i * 3 + 1];
+        pal[i].b = rgb[i * 3 + 2];
+    }
+    return ghostty_terminal_set(ctx->terminal, GHOSTTY_TERMINAL_OPT_COLOR_PALETTE, pal)
+                   == GHOSTTY_SUCCESS
+               ? 0
+               : -1;
+}
+
 /* Bind ctx->row_iter to the snapshot and advance it to `row`, then bind
  * ctx->cells to that row. Returns 1 on success, 0 if the row is out of range. */
 static int fxvt_seek_row(FxvtCtx *ctx, uint16_t row) {

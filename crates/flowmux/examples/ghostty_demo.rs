@@ -244,6 +244,21 @@ fn capture(cmd: Option<&str>, path: &str) {
     let rows: u16 = 30;
 
     let mut vt = Vt::new(cols, rows, SCROLLBACK).expect("vt new");
+    // Optional theme colors for verifying the libghostty color path:
+    // FLOWMUX_DEMO_COLORS="fgR,fgG,fgB,bgR,bgG,bgB[,curR,curG,curB]".
+    if let Ok(spec) = std::env::var("FLOWMUX_DEMO_COLORS") {
+        let n: Vec<u8> = spec.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+        if n.len() >= 6 {
+            let fg = Rgb { r: n[0], g: n[1], b: n[2] };
+            let bg = Rgb { r: n[3], g: n[4], b: n[5] };
+            let cur = if n.len() >= 9 {
+                Rgb { r: n[6], g: n[7], b: n[8] }
+            } else {
+                fg
+            };
+            vt.set_default_colors(fg, bg, cur);
+        }
+    }
     let env = vec![
         ("TERM".to_string(), "xterm-256color".to_string()),
         ("COLORTERM".to_string(), "truecolor".to_string()),

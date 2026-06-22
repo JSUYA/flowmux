@@ -1526,11 +1526,14 @@ fn build_panel(
                         extra_env,
                         callbacks.clone(),
                     );
+                    // Match the VTE path's visuals: theme font + fg/bg/palette/
+                    // cursor/selection, then the per-tab font override + zoom.
+                    theme.apply_to_ghostty(&pane);
                     pane.set_font(&font);
                     pane.set_font_scale(opts.zoom_factor());
-                    // Theme application + OSC title/cwd notify wiring for the
-                    // libghostty backend land in the input-parity milestone; the
-                    // once-per-second cwd poller still tracks `cd`.
+                    // OSC title/cwd notify wiring for the libghostty backend
+                    // lands in the input-parity milestone; the once-per-second
+                    // cwd poller still tracks `cd`.
                     PaneTerminal::Ghostty(pane)
                 }
                 #[cfg(not(feature = "libghostty"))]

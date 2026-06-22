@@ -60,6 +60,13 @@ extern "C" {
     ) -> c_int;
     fn fxvt_cell(ctx: *mut FxvtCtx, row: u16, col: u16, out: *mut FxvtCell) -> c_int;
     fn fxvt_row_text(ctx: *mut FxvtCtx, row: u16, buf: *mut c_char, cap: usize) -> usize;
+    fn fxvt_set_default_colors(
+        ctx: *mut FxvtCtx,
+        fg: *const u8,
+        bg: *const u8,
+        cursor: *const u8,
+    ) -> c_int;
+    fn fxvt_set_palette(ctx: *mut FxvtCtx, rgb: *const u8, count: c_int) -> c_int;
 }
 
 /// A 24-bit RGB color resolved by libghostty (palette + style flattened).
@@ -172,6 +179,32 @@ impl Vt {
             y,
             visible: vis != 0,
         })
+    }
+
+    /// Set the terminal's default foreground/background/cursor colors so the
+    /// rendered palette matches the host theme (the libghostty equivalent of
+    /// VTE's `set_colors`/`set_color_cursor`).
+    pub fn set_default_colors(&mut self, fg: Rgb, bg: Rgb, cursor: Rgb) -> bool {
+        let f = [fg.r, fg.g, fg.b];
+        let b = [bg.r, bg.g, bg.b];
+        let c = [cursor.r, cursor.g, cursor.b];
+        unsafe {
+            fxvt_set_default_colors(self.ctx, f.as_ptr(), b.as_ptr(), c.as_ptr()) == 0
+        }
+    }
+
+    /// Override the low palette entries (typically the 16 themeable ANSI
+    /// colors) while keeping libghostty's standard xterm 16..256 fill, matching
+    /// how VTE expands a small theme palette.
+    pub fn set_palette(&mut self, palette: &[Rgb]) -> bool {
+        let count = palette.len().min(256);
+        let mut flat = Vec::with_capacity(count * 3);
+        for c in &palette[..count] {
+            flat.push(c.r);
+            flat.push(c.g);
+            flat.push(c.b);
+        }
+        unsafe { fxvt_set_palette(self.ctx, flat.as_ptr(), count as c_int) == 0 }
     }
 
     /// Default fg/bg/cursor colors from the latest snapshot. The renderer
@@ -354,6 +387,35 @@ mod tests {
         // Column 5 was never written.
         let cell = vt.cell(0, 5).expect("cell 0,5 in range");
         assert_eq!(cell.text, "");
+    }
+
+    #[test]
+    fn set_default_colors_overrides_theme_fg_bg() {
+        let mut vt = updated(20, 3);
+        let fg = Rgb { r: 0xab, g: 0xcd, b: 0xef };
+        let bg = Rgb { r: 0x10, g: 0x20, b: 0x30 };
+        let cursor = Rgb { r: 0xff, g: 0x88, b: 0x00 };
+        assert!(vt.set_default_colors(fg, bg, cursor));
+        vt.write(b"z");
+        assert!(vt.update());
+        let colors = vt.colors().expect("colors");
+        assert_eq!(colors.fg, fg, "default fg should match the set value");
+        assert_eq!(colors.bg, bg, "default bg should match the set value");
+        // A default-colored cell now resolves to the themed fg.
+        assert_eq!(vt.cell(0, 0).unwrap().fg, fg);
+    }
+
+    #[test]
+    fn set_palette_recolors_indexed_ansi() {
+        let mut vt = updated(20, 3);
+        // Make ANSI red (index 1) a recognizable custom value.
+        let mut palette = vec![Rgb { r: 0, g: 0, b: 0 }; 16];
+        palette[1] = Rgb { r: 0x12, g: 0x34, b: 0x56 };
+        assert!(vt.set_palette(&palette));
+        // SGR 31 selects palette index 1 for the foreground.
+        vt.write(b"\x1b[31mR\x1b[0m");
+        assert!(vt.update());
+        assert_eq!(vt.cell(0, 0).unwrap().fg, palette[1]);
     }
 
     #[test]

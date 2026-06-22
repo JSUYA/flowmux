@@ -44,6 +44,12 @@ struct State {
     ascent: f64,
     cols: u16,
     rows: u16,
+    /// Theme cursor/selection colors for host-side drawing (libghostty owns the
+    /// fg/bg/palette via `Vt::set_default_colors`/`set_palette`; selection and
+    /// cursor are painted by us to match VTE).
+    cursor_color: Option<Rgb>,
+    selection_bg: Option<Rgb>,
+    selection_fg: Option<Rgb>,
 }
 
 impl State {
@@ -126,6 +132,9 @@ impl GhosttyPane {
             ascent,
             cols,
             rows,
+            cursor_color: None,
+            selection_bg: None,
+            selection_fg: None,
         }));
 
         let area = gtk::DrawingArea::new();
@@ -313,6 +322,30 @@ impl GhosttyPane {
         self.set_font_scale(scale);
     }
 
+    /// Apply the host theme colors. Default fg/bg/palette are pushed into
+    /// libghostty so resolved cell colors match VTE; cursor and selection
+    /// colors are kept for host-side drawing. Mirrors
+    /// `theme.apply_to_terminal` for the VTE path.
+    pub fn apply_colors(
+        &self,
+        fg: Rgb,
+        bg: Rgb,
+        cursor: Rgb,
+        palette: &[Rgb],
+        selection_bg: Option<Rgb>,
+        selection_fg: Option<Rgb>,
+    ) {
+        {
+            let mut s = self.state.borrow_mut();
+            s.vt.set_default_colors(fg, bg, cursor);
+            s.vt.set_palette(palette);
+            s.cursor_color = Some(cursor);
+            s.selection_bg = selection_bg;
+            s.selection_fg = selection_fg;
+        }
+        self.area.queue_draw();
+    }
+
     pub fn has_selection(&self) -> bool {
         // Selection lands in M3 (libghostty selection API + drag handling).
         false
@@ -373,18 +406,24 @@ fn rgb(c: Rgb) -> (f64, f64, f64) {
     (c.r as f64 / 255.0, c.g as f64 / 255.0, c.b as f64 / 255.0)
 }
 
-/// Measure monospace cell metrics (width, height, ascent) for `font`.
+/// Measure monospace cell metrics (width, height, ascent) for `font`, derived
+/// the same way VTE sizes a cell: `ceil(approximate_char_width)` for the column
+/// width and `ceil(ascent + descent)` for the row height, so the grid layout,
+/// line spacing, and top/bottom placement match the VTE path.
 fn measure_cell(font: &pango::FontDescription) -> (f64, f64, f64) {
     let surf = cairo::ImageSurface::create(cairo::Format::ARgb32, 8, 8).unwrap();
     let cr = cairo::Context::new(&surf).unwrap();
     let layout = pangocairo::functions::create_layout(&cr);
     layout.set_font_description(Some(font));
-    layout.set_text("M");
-    let (w_px, h_px) = layout.pixel_size();
     let ctx = layout.context();
     let metrics = ctx.metrics(Some(font), None);
-    let ascent = metrics.ascent() as f64 / pango::SCALE as f64;
-    (w_px.max(1) as f64, h_px.max(1) as f64, ascent)
+    let scale = pango::SCALE as f64;
+    let ascent = metrics.ascent() as f64 / scale;
+    let descent = metrics.descent() as f64 / scale;
+    let char_w = metrics.approximate_char_width() as f64 / scale;
+    let cell_w = char_w.ceil().max(1.0);
+    let cell_h = (ascent + descent).ceil().max(1.0);
+    (cell_w, cell_h, ascent)
 }
 
 fn draw(state: &mut State, cr: &cairo::Context, w: i32, h: i32) {
@@ -408,6 +447,15 @@ fn draw(state: &mut State, cr: &cairo::Context, w: i32, h: i32) {
     let cw = state.cell_w;
     let ch = state.cell_h;
     let ascent = state.ascent;
+    // Selection wash + cursor color come from the theme (host-drawn to match
+    // VTE); fall back to a neutral blue-grey / the default fg when unset.
+    let sel_bg = state.selection_bg.unwrap_or(Rgb { r: 51, g: 87, b: 140 });
+    let sel_fg = state.selection_fg;
+    let cursor_rgb = state.cursor_color.unwrap_or(if colors.cursor_has_value {
+        colors.cursor
+    } else {
+        colors.fg
+    });
 
     for row in 0..rows {
         let y = row as f64 * ch;
@@ -418,16 +466,20 @@ fn draw(state: &mut State, cr: &cairo::Context, w: i32, h: i32) {
             let x = col as f64 * cw;
             let cell_px_w = if cell.wide { cw * 2.0 } else { cw };
 
-            let (fg, bg) = if cell.style.inverse {
+            let (mut fg, bg) = if cell.style.inverse {
                 (cell.bg.unwrap_or(colors.bg), Some(cell.fg))
             } else {
                 (cell.fg, cell.bg)
             };
 
             if cell.selected {
-                cr.set_source_rgb(0.20, 0.34, 0.55);
+                let (r, g, bl) = rgb(sel_bg);
+                cr.set_source_rgb(r, g, bl);
                 cr.rectangle(x, y, cell_px_w, ch);
                 let _ = cr.fill();
+                if let Some(sfg) = sel_fg {
+                    fg = sfg;
+                }
             } else if let Some(b) = bg {
                 let (r, g, bl) = rgb(b);
                 cr.set_source_rgb(r, g, bl);
@@ -457,11 +509,7 @@ fn draw(state: &mut State, cr: &cairo::Context, w: i32, h: i32) {
 
     if let Some(cursor) = state.vt.cursor() {
         if cursor.visible && cursor.x < cols && cursor.y < rows {
-            let (r, g, b) = if colors.cursor_has_value {
-                rgb(colors.cursor)
-            } else {
-                rgb(colors.fg)
-            };
+            let (r, g, b) = rgb(cursor_rgb);
             cr.set_source_rgba(r, g, b, 0.6);
             cr.rectangle(cursor.x as f64 * cw, cursor.y as f64 * ch, cw, ch);
             let _ = cr.fill();

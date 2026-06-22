@@ -83,6 +83,17 @@ int fxvt_cursor(FxvtCtx *ctx, uint16_t *out_x, uint16_t *out_y, int *out_visible
 int fxvt_colors(FxvtCtx *ctx, uint8_t out_fg[3], uint8_t out_bg[3],
                 uint8_t out_cursor[3], int *out_cursor_has);
 
+/* Set the terminal default foreground/background/cursor colors so the
+ * libghostty palette matches the host theme. Each is a 3-byte RGB. Returns 0
+ * on success. */
+int fxvt_set_default_colors(FxvtCtx *ctx, const uint8_t fg[3],
+                            const uint8_t bg[3], const uint8_t cursor[3]);
+
+/* Override the first `count` (<=256) entries of the 256-color palette with
+ * `rgb` (count*3 bytes), keeping libghostty's standard xterm defaults for the
+ * rest — matching how VTE fills 16->256. Returns 0 on success. */
+int fxvt_set_palette(FxvtCtx *ctx, const uint8_t *rgb, int count);
+
 /* Read one cell at (row, col) in the viewport into *out.
  * Returns 1 if the cell exists and was written, 0 otherwise. */
 int fxvt_cell(FxvtCtx *ctx, uint16_t row, uint16_t col, FxvtCell *out);
