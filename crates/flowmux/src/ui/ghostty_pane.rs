@@ -7,11 +7,12 @@
 //! [`crate::ui::pane_terminal::PaneTerminal`] when the libghostty backend is
 //! toggled on; the VTE path stays the default so nothing regresses.
 //!
-//! Parity status (this is the integration milestone): rendering, PTY I/O,
-//! keyboard (incl. IME commit), focus, font, resize, cwd, and screen-text
-//! extraction work. Mouse reporting, drag selection, the scrollbar, OSC title
-//! tracking, and inline IME preedit are deferred to the input-parity milestone;
-//! the methods are present but degrade gracefully (no-op / best-effort).
+//! Parity status: rendering (theme font/colors/metrics), PTY I/O, keyboard +
+//! inline IME preedit (Hangul/CJK), focus, font, resize, drag selection +
+//! clipboard copy/paste, mouse reporting (modes 1000/1002/1003), wheel
+//! scrollback, Ctrl-click URLs, OSC 0/2 title tracking, and OSC 7 / `/proc`
+//! cwd all work. Not yet matched: a visible scrollbar widget (libghostty
+//! exposes no viewport-offset query) — wheel scrolling works regardless.
 
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
@@ -59,6 +60,8 @@ struct State {
     /// Whether a left-button drag selection is in progress, and its anchor cell.
     selecting: bool,
     anchor: (u16, u16),
+    /// Last OSC title seen, to fire the title-changed callback only on change.
+    last_title: String,
 }
 
 impl State {
@@ -87,6 +90,7 @@ impl State {
 #[derive(Clone)]
 pub struct GhosttyPane {
     pub id: PaneId,
+    surface: SurfaceId,
     pub container: gtk::Overlay,
     area: gtk::DrawingArea,
     state: Rc<RefCell<State>>,
@@ -99,7 +103,7 @@ impl GhosttyPane {
     /// interchangeable at the call site.
     pub fn spawn(
         id: PaneId,
-        _surface: SurfaceId,
+        surface: SurfaceId,
         argv: Vec<String>,
         cwd: Option<PathBuf>,
         extra_env: Vec<(String, String)>,
@@ -129,7 +133,7 @@ impl GhosttyPane {
         )
         .expect("libghostty pty spawn");
 
-        let pid = Rc::new(Cell::new(None));
+        let pid = Rc::new(Cell::new(Some(pty.child_pid())));
 
         let state = Rc::new(RefCell::new(State {
             vt,
@@ -149,6 +153,7 @@ impl GhosttyPane {
             pointer: (0.0, 0.0),
             selecting: false,
             anchor: (0, 0),
+            last_title: String::new(),
         }));
 
         let area = gtk::DrawingArea::new();
@@ -164,6 +169,7 @@ impl GhosttyPane {
 
         let pane = GhosttyPane {
             id,
+            surface,
             container,
             area: area.clone(),
             state: state.clone(),
@@ -215,10 +221,14 @@ impl GhosttyPane {
         let area = self.area.clone();
         let pid = self.pid.clone();
         let id = self.id;
+        let surface = self.surface;
         let fd = self.state.borrow().pty.master_fd();
         glib::source::unix_fd_add_local(fd, glib::IOCondition::IN, move |_fd, _cond| {
             let mut buf = [0u8; 16384];
             let mut s = state.borrow_mut();
+            // OSC title change to forward after we drop the borrow (the VTE path
+            // tracks this via connect_title_notify; libghostty has no poller).
+            let mut title_change: Option<String> = None;
             match s.pty.read(&mut buf) {
                 Ok(0) => {
                     // Child exited: reap to learn the status and notify.
@@ -228,10 +238,21 @@ impl GhosttyPane {
                     (callbacks.on_child_exited.borrow_mut())(id, status);
                     return glib::ControlFlow::Break;
                 }
-                Ok(n) => s.vt.write(&buf[..n]),
+                Ok(n) => {
+                    s.vt.write(&buf[..n]);
+                    if let Some(title) = s.vt.title() {
+                        if !title.is_empty() && title != s.last_title {
+                            s.last_title = title.clone();
+                            title_change = Some(title);
+                        }
+                    }
+                }
                 Err(_) => return glib::ControlFlow::Break,
             }
             drop(s);
+            if let Some(title) = title_change {
+                (callbacks.on_terminal_title_changed.borrow_mut())(id, surface, title);
+            }
             area.queue_draw();
             glib::ControlFlow::Continue
         });
@@ -459,8 +480,14 @@ impl GhosttyPane {
         self.area.grab_focus();
     }
 
-    /// Best-effort cwd via `/proc/<pid>/cwd` (OSC 7 tracking lands in M3).
+    /// Current working directory: prefer the shell's OSC 7 announcement (exact),
+    /// falling back to the `/proc/<pid>/cwd` symlink.
     pub fn current_dir(&self) -> Option<PathBuf> {
+        if let Some(pwd) = self.state.borrow().vt.pwd() {
+            if let Some(p) = pwd_to_path(&pwd) {
+                return Some(p);
+            }
+        }
         let pid = self.pid.get()?;
         std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
     }
@@ -601,6 +628,23 @@ fn px_to_cell(x: f64, y: f64, cell_w: f64, cell_h: f64, cols: u16, rows: u16) ->
         col.min(cols.saturating_sub(1) as u32) as u16,
         row.min(rows.saturating_sub(1) as u32) as u16,
     )
+}
+
+/// Convert an OSC 7 working-directory value to a path. Accepts either a bare
+/// path or a `file://host/path` URI (the host segment is dropped — flowmux is
+/// local).
+fn pwd_to_path(pwd: &str) -> Option<PathBuf> {
+    if pwd.is_empty() {
+        return None;
+    }
+    if let Some(rest) = pwd.strip_prefix("file://") {
+        let path = match rest.find('/') {
+            Some(idx) => &rest[idx..],
+            None => rest,
+        };
+        return Some(PathBuf::from(path));
+    }
+    Some(PathBuf::from(pwd))
 }
 
 /// GTK modifier state → shim mouse-modifier bits.

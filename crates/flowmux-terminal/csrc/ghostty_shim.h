@@ -107,6 +107,12 @@ void fxvt_clear_selection(FxvtCtx *ctx);
 /* Scroll the viewport by `delta` rows through scrollback (up = negative). */
 void fxvt_scroll(FxvtCtx *ctx, long delta);
 
+/* Copy the terminal's current OSC title / working directory (as set by escape
+ * sequences) into `buf` (NUL-terminated when cap > 0). Returns the byte length
+ * written excluding the NUL (0 if unset). */
+size_t fxvt_title(FxvtCtx *ctx, char *buf, size_t cap);
+size_t fxvt_pwd(FxvtCtx *ctx, char *buf, size_t cap);
+
 /* 1 if the foreground app has enabled any mouse-tracking mode (1000/1002/1003),
  * so pointer events should be reported to it rather than driving selection. */
 int fxvt_mouse_enabled(FxvtCtx *ctx);

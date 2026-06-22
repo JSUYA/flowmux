@@ -77,6 +77,8 @@ extern "C" {
     ) -> c_int;
     fn fxvt_clear_selection(ctx: *mut FxvtCtx);
     fn fxvt_scroll(ctx: *mut FxvtCtx, delta: c_long);
+    fn fxvt_title(ctx: *mut FxvtCtx, buf: *mut c_char, cap: usize) -> usize;
+    fn fxvt_pwd(ctx: *mut FxvtCtx, buf: *mut c_char, cap: usize) -> usize;
     fn fxvt_mouse_enabled(ctx: *mut FxvtCtx) -> c_int;
     fn fxvt_encode_mouse(
         ctx: *mut FxvtCtx,
@@ -114,6 +116,17 @@ pub enum MouseButton {
 pub const MOD_SHIFT: u8 = 1;
 pub const MOD_CTRL: u8 = 2;
 pub const MOD_ALT: u8 = 4;
+
+/// Read a NUL-terminated string the shim writes into a caller buffer.
+fn read_c_string(f: impl Fn(*mut c_char, usize) -> usize) -> Option<String> {
+    let mut buf = vec![0i8; 4096];
+    let n = f(buf.as_mut_ptr(), buf.len());
+    if n == 0 {
+        return None;
+    }
+    let bytes: Vec<u8> = buf[..n].iter().map(|&b| b as u8).collect();
+    Some(String::from_utf8_lossy(&bytes).into_owned())
+}
 
 /// A 24-bit RGB color resolved by libghostty (palette + style flattened).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -369,6 +382,16 @@ impl Vt {
         unsafe { fxvt_scroll(self.ctx, delta as c_long) };
     }
 
+    /// The terminal's OSC 0/2 title, if one has been set.
+    pub fn title(&self) -> Option<String> {
+        read_c_string(|buf, cap| unsafe { fxvt_title(self.ctx, buf, cap) })
+    }
+
+    /// The terminal's working directory from OSC 7, if announced by the shell.
+    pub fn pwd(&self) -> Option<String> {
+        read_c_string(|buf, cap| unsafe { fxvt_pwd(self.ctx, buf, cap) })
+    }
+
     /// Whether the foreground app has enabled mouse tracking (modes
     /// 1000/1002/1003). When true, pointer events should be reported to it via
     /// [`Vt::encode_mouse`] rather than driving local selection.
@@ -586,6 +609,19 @@ mod tests {
         assert!(cell.bg.is_some(), "explicit bg should set has_bg");
         // No explicit fg => seeded with the terminal default foreground.
         assert_eq!(cell.fg, colors.fg);
+    }
+
+    #[test]
+    fn osc_title_is_reported() {
+        // The GhosttyPane has no title poller, so OSC 0/2 title tracking must
+        // come through this query for tab titles to update.
+        let mut vt = updated(40, 3);
+        assert_eq!(vt.title(), None, "no title before any OSC");
+        vt.write(b"\x1b]2;my-title\x07");
+        assert_eq!(vt.title().as_deref(), Some("my-title"));
+        // pwd() is best-effort (OSC 7); current_dir falls back to /proc, so we
+        // only assert it does not error here.
+        let _ = vt.pwd();
     }
 
     #[test]

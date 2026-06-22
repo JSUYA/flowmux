@@ -274,6 +274,31 @@ void fxvt_clear_selection(FxvtCtx *ctx) {
     }
 }
 
+static size_t fxvt_copy_string(FxvtCtx *ctx, GhosttyTerminalData kind, char *buf, size_t cap) {
+    if (ctx == NULL || buf == NULL || cap == 0) {
+        return 0;
+    }
+    buf[0] = '\0';
+    GhosttyString s;
+    s.ptr = NULL;
+    s.len = 0;
+    if (ghostty_terminal_get(ctx->terminal, kind, &s) != GHOSTTY_SUCCESS || s.ptr == NULL) {
+        return 0;
+    }
+    size_t n = s.len < cap - 1 ? s.len : cap - 1;
+    memcpy(buf, s.ptr, n);
+    buf[n] = '\0';
+    return n;
+}
+
+size_t fxvt_title(FxvtCtx *ctx, char *buf, size_t cap) {
+    return fxvt_copy_string(ctx, GHOSTTY_TERMINAL_DATA_TITLE, buf, cap);
+}
+
+size_t fxvt_pwd(FxvtCtx *ctx, char *buf, size_t cap) {
+    return fxvt_copy_string(ctx, GHOSTTY_TERMINAL_DATA_PWD, buf, cap);
+}
+
 void fxvt_scroll(FxvtCtx *ctx, long delta) {
     if (ctx == NULL) {
         return;

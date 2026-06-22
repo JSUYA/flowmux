@@ -111,6 +111,11 @@ impl Pty {
         self.master
     }
 
+    /// PID of the spawned child (for `/proc/<pid>/cwd` lookups).
+    pub fn child_pid(&self) -> i32 {
+        self.child
+    }
+
     /// Read available output bytes into `buf`. Returns 0 at EOF (child exited
     /// and closed the slave).
     pub fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {

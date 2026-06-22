@@ -12,14 +12,18 @@ use crate::ui::ghostty_pane::GhosttyPane;
 use crate::ui::pane_terminal::PaneTerminal;
 use crate::ui::terminal_pane::{PaneCallbacks, TerminalPane};
 
-/// Whether new terminal surfaces should use the libghostty-vt backend instead
-/// of VTE. Opt-in via `FLOWMUX_TERMINAL_BACKEND=libghostty` (or `ghostty`);
-/// anything else (including unset) keeps the VTE default.
+/// Whether new terminal surfaces should use the libghostty-vt backend.
+///
+/// When the `libghostty` feature is compiled in, it is the default backend;
+/// `FLOWMUX_TERMINAL_BACKEND=vte` opts back into the legacy VTE widget. (The
+/// feature is still opt-in at compile time, so default/CI builds without Zig
+/// remain VTE-only and unaffected.)
 #[cfg(feature = "libghostty")]
 fn ghostty_backend_enabled() -> bool {
-    std::env::var("FLOWMUX_TERMINAL_BACKEND")
-        .map(|v| v.eq_ignore_ascii_case("libghostty") || v.eq_ignore_ascii_case("ghostty"))
-        .unwrap_or(false)
+    !matches!(
+        std::env::var("FLOWMUX_TERMINAL_BACKEND"),
+        Ok(v) if v.eq_ignore_ascii_case("vte")
+    )
 }
 use flowmux_core::{
     terminal_tab_title_for_cwd, Pane, PaneContent, PaneId, PaneSurface, SplitDirection, Surface,
@@ -1518,6 +1522,7 @@ fn build_panel(
             let pane_terminal: PaneTerminal = if want_ghostty {
                 #[cfg(feature = "libghostty")]
                 {
+                    tracing::info!(%pane_id, surface = %surface.id, "spawning libghostty-vt terminal backend");
                     let pane = GhosttyPane::spawn(
                         pane_id,
                         surface.id,
