@@ -162,16 +162,16 @@ fn draw(term: &mut Term, cr: &cairo::Context, w: i32, h: i32) {
     let ch = term.cell_h;
     let ascent = term.ascent;
 
+    let grid = term.vt.read_grid(cols, rows);
+
     for row in 0..rows {
         let y = row as f64 * ch;
-        // Read the row once, render in two passes (all backgrounds, then all
-        // glyphs) so a wide glyph's right half is not erased by the next
-        // spacer cell's background.
-        let cells: Vec<Option<flowmux_terminal::vt::Cell>> =
-            (0..cols).map(|col| term.vt.cell(row, col)).collect();
+        // Two passes (all backgrounds, then all glyphs) so a wide glyph's right
+        // half is not erased by the next spacer cell's background.
+        let row_start = row as usize * cols as usize;
+        let cells = &grid[row_start..row_start + cols as usize];
 
         for (col, cell) in cells.iter().enumerate() {
-            let Some(cell) = cell else { continue };
             let x = col as f64 * cw;
             let cell_px_w = if cell.wide { cw * 2.0 } else { cw };
             if cell.selected {
@@ -194,7 +194,6 @@ fn draw(term: &mut Term, cr: &cairo::Context, w: i32, h: i32) {
         }
 
         for (col, cell) in cells.iter().enumerate() {
-            let Some(cell) = cell else { continue };
             let x = col as f64 * cw;
             let cell_px_w = if cell.wide { cw * 2.0 } else { cw };
             let fg = if cell.style.inverse {
@@ -320,6 +319,14 @@ fn capture(cmd: Option<&str>, path: &str) {
             } {
                 eprintln!("selection_text = {text:?}");
             }
+        }
+    }
+
+    // Optional: scroll up N lines before rendering (tests scrollback rendering).
+    if let Ok(n) = std::env::var("FLOWMUX_DEMO_SCROLL") {
+        if let Ok(n) = n.trim().parse::<isize>() {
+            vt.scroll(-n);
+            vt.update();
         }
     }
 

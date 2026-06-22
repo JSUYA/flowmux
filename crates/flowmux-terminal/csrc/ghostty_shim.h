@@ -183,6 +183,13 @@ size_t fxvt_encode_mouse(FxvtCtx *ctx, int action, int button, double px,
  * Returns 1 if the cell exists and was written, 0 otherwise. */
 int fxvt_cell(FxvtCtx *ctx, uint16_t row, uint16_t col, FxvtCell *out);
 
+/* Read the whole viewport grid into `out` (a caller-provided array of at least
+ * cols*rows FxvtCell, row-major) in a single render-state pass — O(cols*rows)
+ * rather than the O(rows^2*cols) of calling fxvt_cell per cell. Cells past the
+ * available content are left as the caller initialized them. Returns the number
+ * of rows written. This is the renderer's hot path. */
+int fxvt_read_grid(FxvtCtx *ctx, FxvtCell *out, uint16_t cols, uint16_t rows);
+
 /* Write the UTF-8 text of a whole viewport row into buf (capacity cap,
  * always NUL-terminated when cap > 0). Trailing blank cells are trimmed.
  * Returns the number of bytes written excluding the NUL. */

@@ -947,19 +947,22 @@ fn draw(state: &mut State, cr: &cairo::Context, w: i32, h: i32) {
         colors.fg
     });
 
+    // One render pass for the whole grid (O(cols*rows)); far cheaper than a
+    // per-cell read, which re-seeks the row iterator every call (was
+    // O(rows^2*cols) and made tall terminals jank under streaming output).
+    let grid = state.vt.read_grid(cols, rows);
+
     for row in 0..rows {
         let y = row as f64 * ch;
-        // Read the row's cells once, then render in two passes. Backgrounds
-        // must all be painted before any glyph, otherwise a wide glyph's right
-        // half (which spills into the next cell) is erased by that spacer
-        // cell's background fill — the cause of "left-half-only" Hangul on a
-        // colored background.
-        let cells: Vec<Option<flowmux_terminal::vt::Cell>> =
-            (0..cols).map(|col| state.vt.cell(row, col)).collect();
+        // Render each row in two passes (all backgrounds, then all glyphs) so a
+        // wide glyph's right half is not erased by the next spacer cell's
+        // background fill — the cause of "left-half-only" Hangul on a colored
+        // background.
+        let row_start = row as usize * cols as usize;
+        let cells = &grid[row_start..row_start + cols as usize];
 
         // Pass 1: backgrounds + selection wash.
         for (col, cell) in cells.iter().enumerate() {
-            let Some(cell) = cell else { continue };
             let x = col as f64 * cw;
             let cell_px_w = if cell.wide { cw * 2.0 } else { cw };
             if cell.selected {
@@ -984,7 +987,6 @@ fn draw(state: &mut State, cr: &cairo::Context, w: i32, h: i32) {
 
         // Pass 2: glyphs + underline/strikethrough, on top of all backgrounds.
         for (col, cell) in cells.iter().enumerate() {
-            let Some(cell) = cell else { continue };
             let x = col as f64 * cw;
             let cell_px_w = if cell.wide { cw * 2.0 } else { cw };
             let mut fg = if cell.style.inverse {

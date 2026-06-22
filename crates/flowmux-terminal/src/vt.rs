@@ -43,6 +43,58 @@ const FXVT_FLAG_STRIKETHROUGH: u8 = 1 << 4;
 const FXVT_FLAG_FAINT: u8 = 1 << 5;
 const FXVT_FLAG_BLINK: u8 = 1 << 6;
 
+impl FxvtCell {
+    fn zeroed() -> Self {
+        FxvtCell {
+            codepoints: [0; 8],
+            cp_len: 0,
+            fg: [0; 3],
+            bg: [0; 3],
+            has_bg: 0,
+            flags: 0,
+            selected: 0,
+            wide: 0,
+            _pad: [0; 2],
+        }
+    }
+}
+
+/// Decode a raw shim cell (as produced by `fxvt_cell`/`fxvt_read_grid`) into the
+/// safe [`Cell`] view.
+fn cell_from_raw(raw: &FxvtCell) -> Cell {
+    let mut text = String::new();
+    for &cp in raw.codepoints.iter().take(raw.cp_len as usize) {
+        if let Some(c) = char::from_u32(cp) {
+            text.push(c);
+        }
+    }
+    let style = CellStyle {
+        bold: raw.flags & FXVT_FLAG_BOLD != 0,
+        italic: raw.flags & FXVT_FLAG_ITALIC != 0,
+        underline: raw.flags & FXVT_FLAG_UNDERLINE != 0,
+        inverse: raw.flags & FXVT_FLAG_INVERSE != 0,
+        strikethrough: raw.flags & FXVT_FLAG_STRIKETHROUGH != 0,
+        faint: raw.flags & FXVT_FLAG_FAINT != 0,
+        blink: raw.flags & FXVT_FLAG_BLINK != 0,
+    };
+    Cell {
+        text,
+        fg: Rgb {
+            r: raw.fg[0],
+            g: raw.fg[1],
+            b: raw.fg[2],
+        },
+        bg: (raw.has_bg != 0).then_some(Rgb {
+            r: raw.bg[0],
+            g: raw.bg[1],
+            b: raw.bg[2],
+        }),
+        style,
+        selected: raw.selected != 0,
+        wide: raw.wide != 0,
+    }
+}
+
 extern "C" {
     fn fxvt_new(cols: u16, rows: u16, scrollback: usize) -> *mut FxvtCtx;
     fn fxvt_free(ctx: *mut FxvtCtx);
@@ -59,6 +111,7 @@ extern "C" {
         cursor_has: *mut c_int,
     ) -> c_int;
     fn fxvt_cell(ctx: *mut FxvtCtx, row: u16, col: u16, out: *mut FxvtCell) -> c_int;
+    fn fxvt_read_grid(ctx: *mut FxvtCtx, out: *mut FxvtCell, cols: u16, rows: u16) -> c_int;
     fn fxvt_row_text(ctx: *mut FxvtCtx, row: u16, buf: *mut c_char, cap: usize) -> usize;
     fn fxvt_set_default_colors(
         ctx: *mut FxvtCtx,
@@ -348,55 +401,20 @@ impl Vt {
 
     /// Read one cell at `(row, col)`. Returns `None` for out-of-range coords.
     pub fn cell(&self, row: u16, col: u16) -> Option<Cell> {
-        let mut raw = FxvtCell {
-            codepoints: [0; 8],
-            cp_len: 0,
-            fg: [0; 3],
-            bg: [0; 3],
-            has_bg: 0,
-            flags: 0,
-            selected: 0,
-            wide: 0,
-            _pad: [0; 2],
-        };
+        let mut raw = FxvtCell::zeroed();
         let found = unsafe { fxvt_cell(self.ctx, row, col, &mut raw) == 1 };
-        if !found {
-            return None;
-        }
+        found.then(|| cell_from_raw(&raw))
+    }
 
-        let mut text = String::new();
-        for &cp in raw.codepoints.iter().take(raw.cp_len as usize) {
-            if let Some(c) = char::from_u32(cp) {
-                text.push(c);
-            }
-        }
-
-        let style = CellStyle {
-            bold: raw.flags & FXVT_FLAG_BOLD != 0,
-            italic: raw.flags & FXVT_FLAG_ITALIC != 0,
-            underline: raw.flags & FXVT_FLAG_UNDERLINE != 0,
-            inverse: raw.flags & FXVT_FLAG_INVERSE != 0,
-            strikethrough: raw.flags & FXVT_FLAG_STRIKETHROUGH != 0,
-            faint: raw.flags & FXVT_FLAG_FAINT != 0,
-            blink: raw.flags & FXVT_FLAG_BLINK != 0,
-        };
-
-        Some(Cell {
-            text,
-            fg: Rgb {
-                r: raw.fg[0],
-                g: raw.fg[1],
-                b: raw.fg[2],
-            },
-            bg: (raw.has_bg != 0).then_some(Rgb {
-                r: raw.bg[0],
-                g: raw.bg[1],
-                b: raw.bg[2],
-            }),
-            style,
-            selected: raw.selected != 0,
-            wide: raw.wide != 0,
-        })
+    /// Read the entire viewport grid in a single render pass (O(cols*rows)),
+    /// returning a row-major `Vec` of `cols*rows` cells (blank where there is no
+    /// content). This is the renderer's hot path — far cheaper than calling
+    /// [`Vt::cell`] per cell, which re-seeks the row iterator every time.
+    pub fn read_grid(&self, cols: u16, rows: u16) -> Vec<Cell> {
+        let n = cols as usize * rows as usize;
+        let mut raw = vec![FxvtCell::zeroed(); n];
+        unsafe { fxvt_read_grid(self.ctx, raw.as_mut_ptr(), cols, rows) };
+        raw.iter().map(cell_from_raw).collect()
     }
 
     /// Set the active selection to the inclusive viewport range
@@ -595,6 +613,31 @@ mod tests {
 
     fn updated(cols: u16, rows: u16) -> Vt {
         Vt::new(cols, rows, 100).expect("vt new")
+    }
+
+    #[test]
+    fn read_grid_matches_per_cell_reads() {
+        let mut vt = updated(20, 4);
+        vt.write(b"hi \x1b[1;31mX\x1b[0m\r\n2nd ");
+        vt.write("한글".as_bytes());
+        assert!(vt.update());
+        let (cols, rows) = vt.dims().unwrap();
+        let grid = vt.read_grid(cols, rows);
+        assert_eq!(grid.len(), cols as usize * rows as usize);
+        // Spot-check a few cells against the per-cell path.
+        for &(r, c) in &[(0u16, 0u16), (0, 3), (1, 0), (1, 4)] {
+            let g = &grid[r as usize * cols as usize + c as usize];
+            let single = vt.cell(r, c).unwrap();
+            assert_eq!(g.text, single.text, "text mismatch at {r},{c}");
+            assert_eq!(g.fg, single.fg, "fg mismatch at {r},{c}");
+            assert_eq!(g.wide, single.wide, "wide mismatch at {r},{c}");
+            assert_eq!(g.style.bold, single.style.bold, "bold mismatch at {r},{c}");
+        }
+        // Row 0 reconstructed from the grid reads "hi X".
+        let row0: String = (0..cols)
+            .map(|c| grid[c as usize].text.clone())
+            .collect::<String>();
+        assert!(row0.starts_with("hi X"), "row0 was {row0:?}");
     }
 
     #[test]

@@ -533,28 +533,15 @@ static int fxvt_seek_row(FxvtCtx *ctx, uint16_t row) {
     return 0;
 }
 
-int fxvt_cell(FxvtCtx *ctx, uint16_t row, uint16_t col, FxvtCell *out) {
-    if (ctx == NULL || out == NULL) {
-        return -1;
-    }
-    if (!fxvt_seek_row(ctx, row)) {
-        return 0;
-    }
-    if (ghostty_render_state_row_cells_select(ctx->cells, col) != GHOSTTY_SUCCESS) {
-        return 0;
-    }
-
+/* Decode the cell the row-cells cursor is currently positioned on (via
+ * `_select` or `_next`) into *out. `defaults` supplies the terminal default
+ * foreground for cells without an explicit color. */
+static void fxvt_decode_current_cell(FxvtCtx *ctx, FxvtCell *out,
+                                     const GhosttyRenderStateColors *defaults) {
     memset(out, 0, sizeof(*out));
-
-    /* Seed foreground with the terminal default so cells without an explicit
-     * color render correctly; the FG_COLOR query below overwrites it only when
-     * the cell carries one (matching Ghostty's own renderer). */
-    GhosttyRenderStateColors defaults = GHOSTTY_INIT_SIZED(GhosttyRenderStateColors);
-    if (ghostty_render_state_colors_get(ctx->render, &defaults) == GHOSTTY_SUCCESS) {
-        out->fg[0] = defaults.foreground.r;
-        out->fg[1] = defaults.foreground.g;
-        out->fg[2] = defaults.foreground.b;
-    }
+    out->fg[0] = defaults->foreground.r;
+    out->fg[1] = defaults->foreground.g;
+    out->fg[2] = defaults->foreground.b;
 
     uint32_t glen = 0;
     ghostty_render_state_row_cells_get(
@@ -572,7 +559,6 @@ int fxvt_cell(FxvtCtx *ctx, uint16_t row, uint16_t col, FxvtCell *out) {
     }
     out->cp_len = (uint8_t)glen;
 
-    /* Foreground: defaults are applied by the renderer when no explicit color. */
     GhosttyColorRgb fg = {0, 0, 0};
     if (ghostty_render_state_row_cells_get(
             ctx->cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_FG_COLOR, &fg)
@@ -614,9 +600,6 @@ int fxvt_cell(FxvtCtx *ctx, uint16_t row, uint16_t col, FxvtCell *out) {
         out->selected = selected ? 1 : 0;
     }
 
-    /* Wide-glyph state lives on the low-level GhosttyCell (a packed handle),
-     * reachable via the RAW cell value. The renderer advances two columns for
-     * a WIDE lead cell and skips its SPACER_TAIL. */
     GhosttyCell raw_cell = 0;
     if (ghostty_render_state_row_cells_get(
             ctx->cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_RAW, &raw_cell)
@@ -626,9 +609,53 @@ int fxvt_cell(FxvtCtx *ctx, uint16_t row, uint16_t col, FxvtCell *out) {
             out->wide = (wide == GHOSTTY_CELL_WIDE_WIDE) ? 1 : 0;
         }
     }
+}
 
+int fxvt_read_grid(FxvtCtx *ctx, FxvtCell *out, uint16_t cols, uint16_t rows) {
+    if (ctx == NULL || out == NULL || cols == 0 || rows == 0) {
+        return 0;
+    }
+    GhosttyRenderStateColors defaults = GHOSTTY_INIT_SIZED(GhosttyRenderStateColors);
+    ghostty_render_state_colors_get(ctx->render, &defaults);
+
+    GhosttyRenderStateRowIterator it = ctx->row_iter;
+    if (ghostty_render_state_get(ctx->render, GHOSTTY_RENDER_STATE_DATA_ROW_ITERATOR, &it)
+        != GHOSTTY_SUCCESS) {
+        return 0;
+    }
+    uint16_t r = 0;
+    while (r < rows && ghostty_render_state_row_iterator_next(it)) {
+        if (ghostty_render_state_row_get(it, GHOSTTY_RENDER_STATE_ROW_DATA_CELLS, &ctx->cells)
+            == GHOSTTY_SUCCESS) {
+            uint16_t c = 0;
+            /* Walk the row's cells sequentially (one per column, including wide
+             * spacer cells) — no per-cell seek/select. */
+            while (c < cols && ghostty_render_state_row_cells_next(ctx->cells)) {
+                fxvt_decode_current_cell(ctx, &out[(size_t)r * cols + c], &defaults);
+                c++;
+            }
+        }
+        r++;
+    }
+    return r;
+}
+
+int fxvt_cell(FxvtCtx *ctx, uint16_t row, uint16_t col, FxvtCell *out) {
+    if (ctx == NULL || out == NULL) {
+        return -1;
+    }
+    if (!fxvt_seek_row(ctx, row)) {
+        return 0;
+    }
+    if (ghostty_render_state_row_cells_select(ctx->cells, col) != GHOSTTY_SUCCESS) {
+        return 0;
+    }
+    GhosttyRenderStateColors defaults = GHOSTTY_INIT_SIZED(GhosttyRenderStateColors);
+    ghostty_render_state_colors_get(ctx->render, &defaults);
+    fxvt_decode_current_cell(ctx, out, &defaults);
     return 1;
 }
+
 
 /* Minimal UTF-8 encoder for a single scalar value. Returns bytes written. */
 static size_t fxvt_utf8_encode(uint32_t cp, char *buf) {
