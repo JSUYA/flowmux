@@ -113,6 +113,37 @@ void fxvt_scroll(FxvtCtx *ctx, long delta);
 size_t fxvt_title(FxvtCtx *ctx, char *buf, size_t cap);
 size_t fxvt_pwd(FxvtCtx *ctx, char *buf, size_t cap);
 
+/* Named (non-text) keys for fxvt_encode_key. 0 = none/unidentified, used for
+ * plain character keys where the codepoint carries the identity. */
+#define FXVT_KEY_NONE        0
+#define FXVT_KEY_ENTER       1
+#define FXVT_KEY_TAB         2
+#define FXVT_KEY_BACKSPACE   3
+#define FXVT_KEY_ESCAPE      4
+#define FXVT_KEY_SPACE       5
+#define FXVT_KEY_UP          6
+#define FXVT_KEY_DOWN        7
+#define FXVT_KEY_LEFT        8
+#define FXVT_KEY_RIGHT       9
+#define FXVT_KEY_HOME        10
+#define FXVT_KEY_END         11
+#define FXVT_KEY_PAGE_UP     12
+#define FXVT_KEY_PAGE_DOWN   13
+#define FXVT_KEY_DELETE      14
+#define FXVT_KEY_INSERT      15
+#define FXVT_KEY_KP_ENTER    16
+/* Function keys F1..F12 are 101..112. */
+#define FXVT_KEY_F1          101
+
+/* Encode a key press into the bytes the terminal expects, honoring the
+ * terminal's current modes (application cursor keys, keypad, Kitty keyboard,
+ * Alt-as-ESC, …) via the libghostty key encoder. `named_key` is an FXVT_KEY_*
+ * code (0 for plain character keys), `unshifted_cp` the base Unicode scalar (0
+ * if none), `mods` the FXVT_MOD_* bitset, `composing` non-zero while an IME
+ * preedit is active. Returns the encoded byte count (0 if nothing to send). */
+size_t fxvt_encode_key(FxvtCtx *ctx, int named_key, uint32_t unshifted_cp,
+                       int mods, int composing, char *buf, size_t cap);
+
 /* 1 if the foreground app has enabled any mouse-tracking mode (1000/1002/1003),
  * so pointer events should be reported to it rather than driving selection. */
 int fxvt_mouse_enabled(FxvtCtx *ctx);

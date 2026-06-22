@@ -155,6 +155,7 @@ fn draw(term: &mut Term, cr: &cairo::Context, w: i32, h: i32) {
     let (cols, rows) = term.vt.dims().unwrap_or((term.cols, term.rows));
     let cw = term.cell_w;
     let ch = term.cell_h;
+    let ascent = term.ascent;
 
     for row in 0..rows {
         let y = row as f64 * ch;
@@ -188,8 +189,10 @@ fn draw(term: &mut Term, cr: &cairo::Context, w: i32, h: i32) {
             let (fr, fgc, fb) = rgb(fg);
             if !cell.text.is_empty() {
                 layout.set_text(&cell.text);
+                // Align to a common baseline so CJK fallback glyphs match ASCII.
+                let baseline = layout.baseline() as f64 / pango::SCALE as f64;
                 cr.set_source_rgb(fr, fgc, fb);
-                cr.move_to(x, y);
+                cr.move_to(x, y + ascent - baseline);
                 pangocairo::functions::show_layout(cr, &layout);
             }
 

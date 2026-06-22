@@ -20,6 +20,8 @@ struct FxvtCtx {
     GhosttyRenderStateRowCells cells;
     GhosttyMouseEncoder mouse_enc;
     GhosttyMouseEvent mouse_ev;
+    GhosttyKeyEncoder key_enc;
+    GhosttyKeyEvent key_ev;
     /* Geometry the mouse encoder needs to map pixels -> cells. */
     uint16_t cols;
     uint16_t rows;
@@ -72,6 +74,12 @@ FxvtCtx *fxvt_new(uint16_t cols, uint16_t rows, size_t scrollback) {
     if (ghostty_mouse_event_new(NULL, &ctx->mouse_ev) != GHOSTTY_SUCCESS) {
         ctx->mouse_ev = NULL;
     }
+    if (ghostty_key_encoder_new(NULL, &ctx->key_enc) != GHOSTTY_SUCCESS) {
+        ctx->key_enc = NULL;
+    }
+    if (ghostty_key_event_new(NULL, &ctx->key_ev) != GHOSTTY_SUCCESS) {
+        ctx->key_ev = NULL;
+    }
     ctx->cols = cols;
     ctx->rows = rows;
     ctx->cell_w_px = 1;
@@ -83,6 +91,8 @@ void fxvt_free(FxvtCtx *ctx) {
     if (ctx == NULL) {
         return;
     }
+    if (ctx->key_ev) ghostty_key_event_free(ctx->key_ev);
+    if (ctx->key_enc) ghostty_key_encoder_free(ctx->key_enc);
     if (ctx->mouse_ev) ghostty_mouse_event_free(ctx->mouse_ev);
     if (ctx->mouse_enc) ghostty_mouse_encoder_free(ctx->mouse_enc);
     if (ctx->cells) ghostty_render_state_row_cells_free(ctx->cells);
@@ -297,6 +307,82 @@ size_t fxvt_title(FxvtCtx *ctx, char *buf, size_t cap) {
 
 size_t fxvt_pwd(FxvtCtx *ctx, char *buf, size_t cap) {
     return fxvt_copy_string(ctx, GHOSTTY_TERMINAL_DATA_PWD, buf, cap);
+}
+
+/* Defined later (shared with fxvt_row_text). */
+static size_t fxvt_utf8_encode(uint32_t cp, char *buf);
+
+static GhosttyKey fxvt_map_key(int named_key) {
+    switch (named_key) {
+        case FXVT_KEY_ENTER: return GHOSTTY_KEY_ENTER;
+        case FXVT_KEY_TAB: return GHOSTTY_KEY_TAB;
+        case FXVT_KEY_BACKSPACE: return GHOSTTY_KEY_BACKSPACE;
+        case FXVT_KEY_ESCAPE: return GHOSTTY_KEY_ESCAPE;
+        case FXVT_KEY_SPACE: return GHOSTTY_KEY_SPACE;
+        case FXVT_KEY_UP: return GHOSTTY_KEY_ARROW_UP;
+        case FXVT_KEY_DOWN: return GHOSTTY_KEY_ARROW_DOWN;
+        case FXVT_KEY_LEFT: return GHOSTTY_KEY_ARROW_LEFT;
+        case FXVT_KEY_RIGHT: return GHOSTTY_KEY_ARROW_RIGHT;
+        case FXVT_KEY_HOME: return GHOSTTY_KEY_HOME;
+        case FXVT_KEY_END: return GHOSTTY_KEY_END;
+        case FXVT_KEY_PAGE_UP: return GHOSTTY_KEY_PAGE_UP;
+        case FXVT_KEY_PAGE_DOWN: return GHOSTTY_KEY_PAGE_DOWN;
+        case FXVT_KEY_DELETE: return GHOSTTY_KEY_DELETE;
+        case FXVT_KEY_INSERT: return GHOSTTY_KEY_INSERT;
+        case FXVT_KEY_KP_ENTER: return GHOSTTY_KEY_NUMPAD_ENTER;
+        case FXVT_KEY_F1 + 0: return GHOSTTY_KEY_F1;
+        case FXVT_KEY_F1 + 1: return GHOSTTY_KEY_F2;
+        case FXVT_KEY_F1 + 2: return GHOSTTY_KEY_F3;
+        case FXVT_KEY_F1 + 3: return GHOSTTY_KEY_F4;
+        case FXVT_KEY_F1 + 4: return GHOSTTY_KEY_F5;
+        case FXVT_KEY_F1 + 5: return GHOSTTY_KEY_F6;
+        case FXVT_KEY_F1 + 6: return GHOSTTY_KEY_F7;
+        case FXVT_KEY_F1 + 7: return GHOSTTY_KEY_F8;
+        case FXVT_KEY_F1 + 8: return GHOSTTY_KEY_F9;
+        case FXVT_KEY_F1 + 9: return GHOSTTY_KEY_F10;
+        case FXVT_KEY_F1 + 10: return GHOSTTY_KEY_F11;
+        case FXVT_KEY_F1 + 11: return GHOSTTY_KEY_F12;
+        default: return GHOSTTY_KEY_UNIDENTIFIED;
+    }
+}
+
+size_t fxvt_encode_key(FxvtCtx *ctx, int named_key, uint32_t unshifted_cp,
+                       int mods, int composing, char *buf, size_t cap) {
+    if (ctx == NULL || ctx->key_enc == NULL || ctx->key_ev == NULL || buf == NULL || cap == 0) {
+        return 0;
+    }
+    /* Pull the terminal's current modes (DECCKM app cursor keys, keypad,
+     * Kitty keyboard flags, Alt-as-ESC, …) so the encoding matches what the
+     * foreground app (vim/claude/codex) negotiated. */
+    ghostty_key_encoder_setopt_from_terminal(ctx->key_enc, ctx->terminal);
+
+    ghostty_key_event_set_action(ctx->key_ev, GHOSTTY_KEY_ACTION_PRESS);
+    ghostty_key_event_set_key(ctx->key_ev, fxvt_map_key(named_key));
+
+    GhosttyMods m = 0;
+    if (mods & FXVT_MOD_SHIFT) m |= GHOSTTY_MODS_SHIFT;
+    if (mods & FXVT_MOD_CTRL) m |= GHOSTTY_MODS_CTRL;
+    if (mods & FXVT_MOD_ALT) m |= GHOSTTY_MODS_ALT;
+    ghostty_key_event_set_mods(ctx->key_ev, m);
+    ghostty_key_event_set_consumed_mods(ctx->key_ev, 0);
+    ghostty_key_event_set_composing(ctx->key_ev, composing ? true : false);
+
+    if (unshifted_cp != 0) {
+        ghostty_key_event_set_unshifted_codepoint(ctx->key_ev, unshifted_cp);
+        char u8[8];
+        size_t n = fxvt_utf8_encode(unshifted_cp, u8);
+        ghostty_key_event_set_utf8(ctx->key_ev, u8, n);
+    } else {
+        ghostty_key_event_set_unshifted_codepoint(ctx->key_ev, 0);
+        ghostty_key_event_set_utf8(ctx->key_ev, "", 0);
+    }
+
+    size_t out_len = 0;
+    if (ghostty_key_encoder_encode(ctx->key_enc, ctx->key_ev, buf, cap, &out_len)
+        != GHOSTTY_SUCCESS) {
+        return 0;
+    }
+    return out_len;
 }
 
 void fxvt_scroll(FxvtCtx *ctx, long delta) {

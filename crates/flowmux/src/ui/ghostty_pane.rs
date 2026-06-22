@@ -259,28 +259,46 @@ impl GhosttyPane {
     }
 
     fn install_input(&self) {
-        // Direct key handling (control/navigation/printable fast path).
         let key = gtk::EventControllerKey::new();
+
+        // IME: route committed text (e.g. composed Hangul syllables) to the PTY
+        // and show the in-progress preedit inline at the cursor. Setting the IM
+        // context makes the controller filter text keys through the IME first,
+        // so key-pressed below only fires for keys the IME did not consume.
+        let im = gtk::IMMulticontext::new();
+        key.set_im_context(Some(&im));
+
+        // Non-text keys (control combos, navigation, function, Enter/Tab/…) are
+        // encoded by libghostty honoring the terminal's modes (application
+        // cursor keys, keypad, Kitty keyboard, Alt-as-ESC) — what vim/claude/
+        // codex rely on. Plain text arrives via the IM commit above instead.
         {
             let state = self.state.clone();
             let area = self.area.clone();
-            key.connect_key_pressed(move |_kc, keyval, _code, mods| {
-                if let Some(bytes) = encode_key(keyval, mods) {
-                    let mut s = state.borrow_mut();
-                    let _ = s.pty.write(&bytes);
-                    drop(s);
-                    area.queue_draw();
-                    glib::Propagation::Stop
-                } else {
-                    glib::Propagation::Proceed
+            let im_for_key = im.clone();
+            key.connect_key_pressed(move |_kc, keyval, _code, gtk_mods| {
+                // Commit any in-progress IME text before this (non-consumed)
+                // key acts, so e.g. Shift+Enter newlines AFTER the composing
+                // syllable instead of stranding it after the newline. Scope the
+                // borrow so the synchronous commit signal can borrow_mut.
+                let composing = !state.borrow().preedit.is_empty();
+                if composing {
+                    im_for_key.reset();
+                }
+                let mods = mods_from_state(gtk_mods);
+                let (named, cp) = map_keyval(keyval);
+                let mut s = state.borrow_mut();
+                match s.vt.encode_key(named, cp, mods, false) {
+                    Some(bytes) => {
+                        let _ = s.pty.write(&bytes);
+                        drop(s);
+                        area.queue_draw();
+                        glib::Propagation::Stop
+                    }
+                    None => glib::Propagation::Proceed,
                 }
             });
         }
-
-        // IME: route committed text (e.g. composed Hangul syllables) to the PTY
-        // and show the in-progress preedit inline at the cursor.
-        let im = gtk::IMMulticontext::new();
-        key.set_im_context(Some(&im));
         {
             let state = self.state.clone();
             let area = self.area.clone();
@@ -800,8 +818,13 @@ fn draw(state: &mut State, cr: &cairo::Context, w: i32, h: i32) {
             let (fr, fgc, fb) = rgb(fg);
             if !cell.text.is_empty() {
                 layout.set_text(&cell.text);
+                // Align every glyph to a common baseline at `y + ascent`,
+                // regardless of the (possibly fallback, e.g. CJK) font Pango
+                // shaped it with — otherwise Hangul/CJK runs ride higher or
+                // lower than ASCII. Offset by this layout's own baseline.
+                let baseline = layout.baseline() as f64 / pango::SCALE as f64;
                 cr.set_source_rgb(fr, fgc, fb);
-                cr.move_to(x, y);
+                cr.move_to(x, y + ascent - baseline);
                 pangocairo::functions::show_layout(cr, &layout);
             }
             if cell.style.underline {
@@ -826,13 +849,14 @@ fn draw(state: &mut State, cr: &cairo::Context, w: i32, h: i32) {
             // after it — matching the VTE path's inline preedit.
             layout.set_text(&state.preedit);
             let pw = layout.pixel_size().0 as f64;
+            let baseline = layout.baseline() as f64 / pango::SCALE as f64;
             let (br2, bg2, bb2) = rgb(colors.bg);
             cr.set_source_rgb(br2, bg2, bb2);
             cr.rectangle(cx, cy, pw, ch);
             let _ = cr.fill();
             let (fr, fgc, fb) = rgb(colors.fg);
             cr.set_source_rgb(fr, fgc, fb);
-            cr.move_to(cx, cy);
+            cr.move_to(cx, cy + ascent - baseline);
             pangocairo::functions::show_layout(cr, &layout);
             cr.rectangle(cx, cy + ascent + 2.0, pw, 1.0);
             let _ = cr.fill();
@@ -851,66 +875,47 @@ fn draw(state: &mut State, cr: &cairo::Context, w: i32, h: i32) {
     }
 }
 
-/// Encode a GTK key press into terminal bytes. Returns None for keys handled by
-/// the IM context (plain printable text) or not translated.
-fn encode_key(keyval: gdk::Key, state: gdk::ModifierType) -> Option<Vec<u8>> {
+/// Map a GTK keyval to a libghostty named-key code + unshifted codepoint.
+/// Named (non-text) keys get an `nk::*` code; everything else carries its
+/// Unicode scalar so the encoder can apply modifiers (Ctrl/Alt) correctly.
+fn map_keyval(keyval: gdk::Key) -> (i32, u32) {
+    use flowmux_terminal::vt::named_key as nk;
     use gdk::Key;
-    let ctrl = state.contains(gdk::ModifierType::CONTROL_MASK);
-    let alt = state.contains(gdk::ModifierType::ALT_MASK);
-
-    let named: Option<&[u8]> = match keyval {
-        Key::Return | Key::KP_Enter => Some(b"\r"),
-        Key::BackSpace => Some(b"\x7f"),
-        Key::Tab => Some(b"\t"),
-        Key::Escape => Some(b"\x1b"),
-        Key::Up => Some(b"\x1b[A"),
-        Key::Down => Some(b"\x1b[B"),
-        Key::Right => Some(b"\x1b[C"),
-        Key::Left => Some(b"\x1b[D"),
-        Key::Home => Some(b"\x1b[H"),
-        Key::End => Some(b"\x1b[F"),
-        Key::Page_Up => Some(b"\x1b[5~"),
-        Key::Page_Down => Some(b"\x1b[6~"),
-        Key::Delete => Some(b"\x1b[3~"),
-        Key::Insert => Some(b"\x1b[2~"),
-        _ => None,
+    let named = match keyval {
+        Key::Return => nk::ENTER,
+        Key::KP_Enter => nk::KP_ENTER,
+        Key::Tab | Key::ISO_Left_Tab => nk::TAB,
+        Key::BackSpace => nk::BACKSPACE,
+        Key::Escape => nk::ESCAPE,
+        Key::Up | Key::KP_Up => nk::UP,
+        Key::Down | Key::KP_Down => nk::DOWN,
+        Key::Left | Key::KP_Left => nk::LEFT,
+        Key::Right | Key::KP_Right => nk::RIGHT,
+        Key::Home | Key::KP_Home => nk::HOME,
+        Key::End | Key::KP_End => nk::END,
+        Key::Page_Up | Key::KP_Page_Up => nk::PAGE_UP,
+        Key::Page_Down | Key::KP_Page_Down => nk::PAGE_DOWN,
+        Key::Delete | Key::KP_Delete => nk::DELETE,
+        Key::Insert | Key::KP_Insert => nk::INSERT,
+        Key::F1 => nk::f(1),
+        Key::F2 => nk::f(2),
+        Key::F3 => nk::f(3),
+        Key::F4 => nk::f(4),
+        Key::F5 => nk::f(5),
+        Key::F6 => nk::f(6),
+        Key::F7 => nk::f(7),
+        Key::F8 => nk::f(8),
+        Key::F9 => nk::f(9),
+        Key::F10 => nk::f(10),
+        Key::F11 => nk::f(11),
+        Key::F12 => nk::f(12),
+        _ => nk::NONE,
     };
-    if let Some(bytes) = named {
-        return Some(bytes.to_vec());
+    if named != nk::NONE {
+        (named, 0)
+    } else {
+        (nk::NONE, keyval.to_unicode().map(|c| c as u32).unwrap_or(0))
     }
-
-    let ch = keyval.to_unicode()?;
-    if ctrl {
-        let b = ch.to_ascii_uppercase() as u32;
-        if (b'A' as u32..=b'Z' as u32).contains(&b) {
-            return Some(vec![(b - b'A' as u32 + 1) as u8]);
-        }
-        match ch {
-            ' ' => return Some(vec![0]),
-            '[' => return Some(vec![0x1b]),
-            '\\' => return Some(vec![0x1c]),
-            ']' => return Some(vec![0x1d]),
-            _ => {}
-        }
-    }
-
-    // Plain printable text is left to the IM context (so dead keys / CJK
-    // composition work); only emit here when Alt is held (ESC-prefixed).
-    if alt {
-        let mut buf = [0u8; 4];
-        let s = ch.encode_utf8(&mut buf);
-        let mut out = vec![0x1b];
-        out.extend_from_slice(s.as_bytes());
-        return Some(out);
-    }
-
-    // ASCII control range typed without modifiers (rare) still goes through.
-    if (ch as u32) < 0x20 {
-        let mut buf = [0u8; 4];
-        return Some(ch.encode_utf8(&mut buf).as_bytes().to_vec());
-    }
-
-    None
 }
 
 #[cfg(test)]

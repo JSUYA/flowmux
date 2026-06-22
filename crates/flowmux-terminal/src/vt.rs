@@ -79,6 +79,15 @@ extern "C" {
     fn fxvt_scroll(ctx: *mut FxvtCtx, delta: c_long);
     fn fxvt_title(ctx: *mut FxvtCtx, buf: *mut c_char, cap: usize) -> usize;
     fn fxvt_pwd(ctx: *mut FxvtCtx, buf: *mut c_char, cap: usize) -> usize;
+    fn fxvt_encode_key(
+        ctx: *mut FxvtCtx,
+        named_key: c_int,
+        unshifted_cp: u32,
+        mods: c_int,
+        composing: c_int,
+        buf: *mut c_char,
+        cap: usize,
+    ) -> usize;
     fn fxvt_mouse_enabled(ctx: *mut FxvtCtx) -> c_int;
     fn fxvt_encode_mouse(
         ctx: *mut FxvtCtx,
@@ -112,10 +121,37 @@ pub enum MouseButton {
     WheelDown = 5,
 }
 
-/// Modifier bits for [`Vt::encode_mouse`] (shim `FXVT_MOD_*`).
+/// Modifier bits for [`Vt::encode_mouse`]/[`Vt::encode_key`] (shim `FXVT_MOD_*`).
 pub const MOD_SHIFT: u8 = 1;
 pub const MOD_CTRL: u8 = 2;
 pub const MOD_ALT: u8 = 4;
+
+/// Named (non-text) key codes for [`Vt::encode_key`]. Plain character keys use
+/// [`NONE`] and carry their identity in the unshifted codepoint. Values mirror
+/// the shim's `FXVT_KEY_*`.
+pub mod named_key {
+    pub const NONE: i32 = 0;
+    pub const ENTER: i32 = 1;
+    pub const TAB: i32 = 2;
+    pub const BACKSPACE: i32 = 3;
+    pub const ESCAPE: i32 = 4;
+    pub const SPACE: i32 = 5;
+    pub const UP: i32 = 6;
+    pub const DOWN: i32 = 7;
+    pub const LEFT: i32 = 8;
+    pub const RIGHT: i32 = 9;
+    pub const HOME: i32 = 10;
+    pub const END: i32 = 11;
+    pub const PAGE_UP: i32 = 12;
+    pub const PAGE_DOWN: i32 = 13;
+    pub const DELETE: i32 = 14;
+    pub const INSERT: i32 = 15;
+    pub const KP_ENTER: i32 = 16;
+    /// Function key Fn (1-12) → 101..112.
+    pub const fn f(n: u32) -> i32 {
+        101 + n as i32 - 1
+    }
+}
 
 /// Read a NUL-terminated string the shim writes into a caller buffer.
 fn read_c_string(f: impl Fn(*mut c_char, usize) -> usize) -> Option<String> {
@@ -382,6 +418,38 @@ impl Vt {
         unsafe { fxvt_scroll(self.ctx, delta as c_long) };
     }
 
+    /// Encode a key press into terminal bytes via libghostty's key encoder,
+    /// which honors the terminal's current modes (application cursor keys,
+    /// keypad, Kitty keyboard protocol, Alt-as-ESC). `named_key` is a
+    /// [`named_key`] code (0 for plain character keys); `unshifted_cp` is the
+    /// base Unicode scalar (0 if none); `composing` is true while an IME
+    /// preedit is active. Returns `None` when nothing should be sent.
+    pub fn encode_key(
+        &mut self,
+        named_key: i32,
+        unshifted_cp: u32,
+        mods: u8,
+        composing: bool,
+    ) -> Option<Vec<u8>> {
+        let mut buf = [0i8; 64];
+        let n = unsafe {
+            fxvt_encode_key(
+                self.ctx,
+                named_key as c_int,
+                unshifted_cp,
+                mods as c_int,
+                composing as c_int,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        if n == 0 {
+            None
+        } else {
+            Some(buf[..n].iter().map(|&b| b as u8).collect())
+        }
+    }
+
     /// The terminal's OSC 0/2 title, if one has been set.
     pub fn title(&self) -> Option<String> {
         read_c_string(|buf, cap| unsafe { fxvt_title(self.ctx, buf, cap) })
@@ -609,6 +677,43 @@ mod tests {
         assert!(cell.bg.is_some(), "explicit bg should set has_bg");
         // No explicit fg => seeded with the terminal default foreground.
         assert_eq!(cell.fg, colors.fg);
+    }
+
+    #[test]
+    fn encode_key_respects_application_cursor_mode() {
+        let mut vt = updated(40, 5);
+        // Normal mode: Up arrow → CSI A.
+        assert_eq!(
+            vt.encode_key(named_key::UP, 0, 0, false).as_deref(),
+            Some(&b"\x1b[A"[..])
+        );
+        // Enable DECCKM (application cursor keys) as full-screen apps
+        // (vim/claude/codex) do; Up arrow now → SS3 A.
+        vt.write(b"\x1b[?1h");
+        assert_eq!(
+            vt.encode_key(named_key::UP, 0, 0, false).as_deref(),
+            Some(&b"\x1bOA"[..]),
+            "application cursor mode must switch arrows to SS3"
+        );
+    }
+
+    #[test]
+    fn encode_key_control_and_named_keys() {
+        let mut vt = updated(40, 5);
+        // Ctrl+C → 0x03.
+        assert_eq!(
+            vt.encode_key(named_key::NONE, 'c' as u32, MOD_CTRL, false).as_deref(),
+            Some(&b"\x03"[..])
+        );
+        // Enter → CR; Tab → HT; Backspace → DEL.
+        assert_eq!(vt.encode_key(named_key::ENTER, 0, 0, false).as_deref(), Some(&b"\r"[..]));
+        assert_eq!(vt.encode_key(named_key::TAB, 0, 0, false).as_deref(), Some(&b"\t"[..]));
+        assert_eq!(
+            vt.encode_key(named_key::BACKSPACE, 0, 0, false).as_deref(),
+            Some(&b"\x7f"[..])
+        );
+        // A composing key produces nothing (IME owns it).
+        assert_eq!(vt.encode_key(named_key::NONE, 'k' as u32, 0, true), None);
     }
 
     #[test]
