@@ -32,6 +32,22 @@ use crate::ui::terminal_pane::PaneCallbacks;
 
 const DEFAULT_FONT: &str = "Monospace 12";
 const SCROLLBACK: usize = 10_000;
+/// Right-edge gutter reserved for the overlaid scrollbar (its 12px width plus a
+/// little slack). Terminal columns are computed against the width minus this so
+/// content never renders under the scrollbar — which made a long line at the
+/// right edge look unwrapped and corrupted.
+const SCROLLBAR_GUTTER: f64 = 14.0;
+
+/// Columns that fit in a pane `w` pixels wide for a `cell_w`-wide cell,
+/// reserving the scrollbar gutter. Reserved unconditionally so the column count
+/// stays stable whether or not the scrollbar is currently shown.
+fn cols_for_width(w: i32, cell_w: f64) -> u16 {
+    if cell_w <= 0.0 {
+        return 1;
+    }
+    let usable = (w as f64 - SCROLLBAR_GUTTER).max(cell_w);
+    ((usable / cell_w).floor() as i64).clamp(1, u16::MAX as i64) as u16
+}
 
 /// Shared, mutable terminal state behind an `Rc<RefCell<…>>` so the draw,
 /// resize, key, and PTY-pump closures can all reach it on the GTK thread.
@@ -225,7 +241,7 @@ impl GhosttyPane {
             if s.cell_w <= 0.0 || s.cell_h <= 0.0 {
                 return;
             }
-            let cols = ((w as f64 / s.cell_w).floor() as i64).clamp(1, u16::MAX as i64) as u16;
+            let cols = cols_for_width(w, s.cell_w);
             let rows = ((h as f64 / s.cell_h).floor() as i64).clamp(1, u16::MAX as i64) as u16;
             if (cols, rows) != (s.cols, s.rows) {
                 s.cols = cols;
@@ -587,7 +603,7 @@ impl GhosttyPane {
         // Re-fit the grid to the new cell size on the next allocation.
         let (w, h) = (self.area.width(), self.area.height());
         if w > 0 && h > 0 && s.cell_w > 0.0 && s.cell_h > 0.0 {
-            let cols = ((w as f64 / s.cell_w).floor() as i64).clamp(1, u16::MAX as i64) as u16;
+            let cols = cols_for_width(w, s.cell_w);
             let rows = ((h as f64 / s.cell_h).floor() as i64).clamp(1, u16::MAX as i64) as u16;
             s.cols = cols;
             s.rows = rows;
