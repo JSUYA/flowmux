@@ -146,6 +146,18 @@ impl GhosttyPane {
             argv
         };
         let argv_ref: Vec<&str> = argv_owned.iter().map(|s| s.as_str()).collect();
+
+        // Ensure the child has a valid terminal identity. The VTE widget sets
+        // TERM for its child automatically; the libghostty path must do it
+        // itself. Without TERM, readline can't load terminfo and falls back to
+        // horizontal-scroll line editing — a long line stops wrapping and shows
+        // "<"/">" scroll markers instead. libghostty emulates an xterm-class
+        // terminal, so xterm-256color (universally installed) is the right id.
+        let mut extra_env = extra_env;
+        if !extra_env.iter().any(|(k, _)| k == "TERM") {
+            extra_env.push(("TERM".to_string(), "xterm-256color".to_string()));
+        }
+
         let pty = Pty::spawn(
             &argv_ref,
             cwd.as_deref(),
