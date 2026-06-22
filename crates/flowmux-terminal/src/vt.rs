@@ -51,6 +51,13 @@ extern "C" {
     fn fxvt_update(ctx: *mut FxvtCtx) -> c_int;
     fn fxvt_dims(ctx: *mut FxvtCtx, cols: *mut u16, rows: *mut u16) -> c_int;
     fn fxvt_cursor(ctx: *mut FxvtCtx, x: *mut u16, y: *mut u16, vis: *mut c_int) -> c_int;
+    fn fxvt_colors(
+        ctx: *mut FxvtCtx,
+        fg: *mut u8,
+        bg: *mut u8,
+        cursor: *mut u8,
+        cursor_has: *mut c_int,
+    ) -> c_int;
     fn fxvt_cell(ctx: *mut FxvtCtx, row: u16, col: u16, out: *mut FxvtCell) -> c_int;
     fn fxvt_row_text(ctx: *mut FxvtCtx, row: u16, buf: *mut c_char, cap: usize) -> usize;
 }
@@ -98,6 +105,17 @@ pub struct Cursor {
     pub x: u16,
     pub y: u16,
     pub visible: bool,
+}
+
+/// Default palette colors from the latest snapshot: the terminal default
+/// foreground/background and the cursor color.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Colors {
+    pub fg: Rgb,
+    pub bg: Rgb,
+    pub cursor: Rgb,
+    /// When false the cursor has no explicit color; invert the cell instead.
+    pub cursor_has_value: bool,
 }
 
 /// A libghostty-vt terminal instance. `!Send`/`!Sync` (raw pointer): drive it
@@ -153,6 +171,43 @@ impl Vt {
             x,
             y,
             visible: vis != 0,
+        })
+    }
+
+    /// Default fg/bg/cursor colors from the latest snapshot. The renderer
+    /// clears with `bg`, uses `fg` for default-colored text, and `cursor` for
+    /// the cursor block.
+    pub fn colors(&self) -> Option<Colors> {
+        let mut fg = [0u8; 3];
+        let mut bg = [0u8; 3];
+        let mut cur = [0u8; 3];
+        let mut has: c_int = 0;
+        let ok = unsafe {
+            fxvt_colors(
+                self.ctx,
+                fg.as_mut_ptr(),
+                bg.as_mut_ptr(),
+                cur.as_mut_ptr(),
+                &mut has,
+            ) == 0
+        };
+        ok.then_some(Colors {
+            fg: Rgb {
+                r: fg[0],
+                g: fg[1],
+                b: fg[2],
+            },
+            bg: Rgb {
+                r: bg[0],
+                g: bg[1],
+                b: bg[2],
+            },
+            cursor: Rgb {
+                r: cur[0],
+                g: cur[1],
+                b: cur[2],
+            },
+            cursor_has_value: has != 0,
         })
     }
 
@@ -299,6 +354,30 @@ mod tests {
         // Column 5 was never written.
         let cell = vt.cell(0, 5).expect("cell 0,5 in range");
         assert_eq!(cell.text, "");
+    }
+
+    #[test]
+    fn default_colors_are_available_after_update() {
+        let mut vt = updated(20, 3);
+        vt.write(b"x");
+        assert!(vt.update());
+        let colors = vt.colors().expect("default colors");
+        // A default terminal palette has a non-equal fg/bg (text is visible).
+        assert_ne!(colors.fg, colors.bg, "fg and bg should differ");
+    }
+
+    #[test]
+    fn explicit_bg_sets_has_bg_and_default_fg_is_seeded() {
+        let mut vt = updated(20, 3);
+        // Blue background (SGR 44), then 'Y'.
+        vt.write(b"\x1b[44mY\x1b[0m");
+        assert!(vt.update());
+        let colors = vt.colors().expect("colors");
+        let cell = vt.cell(0, 0).expect("cell 0,0");
+        assert_eq!(cell.text, "Y");
+        assert!(cell.bg.is_some(), "explicit bg should set has_bg");
+        // No explicit fg => seeded with the terminal default foreground.
+        assert_eq!(cell.fg, colors.fg);
     }
 
     #[test]

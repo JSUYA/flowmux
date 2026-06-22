@@ -77,6 +77,12 @@ int fxvt_dims(FxvtCtx *ctx, uint16_t *out_cols, uint16_t *out_rows);
  * Returns 0 on success. */
 int fxvt_cursor(FxvtCtx *ctx, uint16_t *out_x, uint16_t *out_y, int *out_visible);
 
+/* Read the snapshot's default colors: terminal default foreground/background
+ * and the cursor color. *out_cursor_has is 0/1; when 0 the renderer should
+ * fall back to inverting the cell under the cursor. Returns 0 on success. */
+int fxvt_colors(FxvtCtx *ctx, uint8_t out_fg[3], uint8_t out_bg[3],
+                uint8_t out_cursor[3], int *out_cursor_has);
+
 /* Read one cell at (row, col) in the viewport into *out.
  * Returns 1 if the cell exists and was written, 0 otherwise. */
 int fxvt_cell(FxvtCtx *ctx, uint16_t row, uint16_t col, FxvtCell *out);

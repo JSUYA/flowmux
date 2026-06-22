@@ -143,6 +143,29 @@ int fxvt_cursor(FxvtCtx *ctx, uint16_t *out_x, uint16_t *out_y, int *out_visible
     return 0;
 }
 
+int fxvt_colors(FxvtCtx *ctx, uint8_t out_fg[3], uint8_t out_bg[3],
+                uint8_t out_cursor[3], int *out_cursor_has) {
+    if (ctx == NULL || out_fg == NULL || out_bg == NULL || out_cursor == NULL
+        || out_cursor_has == NULL) {
+        return -1;
+    }
+    GhosttyRenderStateColors colors = GHOSTTY_INIT_SIZED(GhosttyRenderStateColors);
+    if (ghostty_render_state_colors_get(ctx->render, &colors) != GHOSTTY_SUCCESS) {
+        return -1;
+    }
+    out_fg[0] = colors.foreground.r;
+    out_fg[1] = colors.foreground.g;
+    out_fg[2] = colors.foreground.b;
+    out_bg[0] = colors.background.r;
+    out_bg[1] = colors.background.g;
+    out_bg[2] = colors.background.b;
+    out_cursor[0] = colors.cursor.r;
+    out_cursor[1] = colors.cursor.g;
+    out_cursor[2] = colors.cursor.b;
+    *out_cursor_has = colors.cursor_has_value ? 1 : 0;
+    return 0;
+}
+
 /* Bind ctx->row_iter to the snapshot and advance it to `row`, then bind
  * ctx->cells to that row. Returns 1 on success, 0 if the row is out of range. */
 static int fxvt_seek_row(FxvtCtx *ctx, uint16_t row) {
@@ -179,6 +202,16 @@ int fxvt_cell(FxvtCtx *ctx, uint16_t row, uint16_t col, FxvtCell *out) {
     }
 
     memset(out, 0, sizeof(*out));
+
+    /* Seed foreground with the terminal default so cells without an explicit
+     * color render correctly; the FG_COLOR query below overwrites it only when
+     * the cell carries one (matching Ghostty's own renderer). */
+    GhosttyRenderStateColors defaults = GHOSTTY_INIT_SIZED(GhosttyRenderStateColors);
+    if (ghostty_render_state_colors_get(ctx->render, &defaults) == GHOSTTY_SUCCESS) {
+        out->fg[0] = defaults.foreground.r;
+        out->fg[1] = defaults.foreground.g;
+        out->fg[2] = defaults.foreground.b;
+    }
 
     uint32_t glen = 0;
     ghostty_render_state_row_cells_get(
