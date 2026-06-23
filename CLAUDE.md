@@ -11,13 +11,15 @@ MSRV 1.93). All crates live under `crates/`. Most day-to-day commands run
 from the repo root.
 
 ```bash
-# Type-check everything (uses the workspace `default-members`, which
-# excludes the GTK GUI crate so this works on a fresh checkout before
-# `libgtk-4-dev` is installed).
-cargo check --workspace
+# Type-check the headless crates (bare `cargo check` uses the workspace
+# `default-members`, which excludes the GTK GUI crate so this works before
+# `libgtk-4-dev` is installed). NOTE: `default-members` includes
+# `flowmux-terminal`, which builds libghostty-vt, so **Zig 0.15.x must be on
+# `PATH`** even for this — see "Terminal backend" below.
+cargo check
 
 # Type-check the GUI crate too (requires GTK4 + libadwaita + WebKitGTK
-# 6.0 dev packages — see README "Build prerequisites").
+# 6.0 dev packages — see README "Build prerequisites" — plus Zig on PATH).
 cargo check -p flowmux
 
 # Release build of all binaries (`flowmux`, `flowmuxctl`).
@@ -41,23 +43,19 @@ cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-### Terminal backend: libghostty-vt (default) vs VTE (fallback)
+### Terminal backend: libghostty-vt
 
-flowmux has two terminal backends. The **default** is a libghostty-vt core
-that flowmux renders itself (Cairo/Pango) — `flowmux-terminal`'s `libghostty`
-cargo feature. It links a static `libghostty-vt.a` built from a pinned Ghostty
-revision by `scripts/build-ghostty-vt.sh` (`zig build -Demit-lib-vt`), so
-**Zig 0.15.x must be on `PATH`** for any build with that feature. The feature
-is *opt-in at compile time* (off by default) so `cargo check`/CI without Zig
-stay green; `scripts/install-host.sh` turns it on, so the installed app uses
-libghostty by default. `FLOWMUX_TERMINAL_BACKEND=vte` selects the legacy VTE
-widget at runtime instead (still linked for the fallback path).
-
-The patched **VTE** (the older backend, `scripts/build-vte.sh`) is kept as the
-env-selectable fallback and for `flowmux read-screen`. The `flowmux` crate's
-`vte-text` feature backs `read-screen` (needs VTE ≥ 0.76, above the default
-`v0_70` floor kept for Ubuntu 22.04); off by default, enabled by
-`scripts/install-host.sh` + Flatpak which link the patched VTE 0.78.4.
+flowmux has a single terminal backend: a libghostty-vt core that flowmux
+renders itself (Cairo/Pango). It links a static `libghostty-vt.a` built from a
+pinned Ghostty revision by `scripts/build-ghostty-vt.sh` (`zig build
+-Demit-lib-vt`), invoked automatically by `flowmux-terminal`'s `build.rs` on the
+first build, so **Zig 0.15.x must be on `PATH`** for any build that includes
+`flowmux-terminal`. There is no compile-time feature gate and no VTE path any
+more, and `flowmux-terminal` is in `default-members`, so even a bare
+`cargo check` / `cargo check --workspace` builds the native shim and needs Zig
+(the `default-members` GTK exclusion only spares the GUI's system headers, not
+the Zig requirement). `read-screen` reads the viewport straight from the
+libghostty grid, so it needs no extra feature.
 
 CJK note: the libghostty renderer substitutes a CJK monospace face
 ("Noto Sans Mono CJK KR") when the configured font is the generic `monospace`,
@@ -108,13 +106,13 @@ handle it in the dispatch loop.
 A `Workspace` (`flowmux-core`) owns a tree of `Pane`s; each `Pane`
 holds one or more `PaneSurface`s of kind `Terminal` or `Browser`.
 Terminal surfaces are stored as `PaneTerminal`
-(`crates/flowmux/src/ui/pane_terminal.rs`), an enum over the libghostty
-backend (`ui::ghostty_pane::GhosttyPane`, default — PTY +
-`flowmux-terminal::vt::Vt` + a Cairo/Pango `DrawingArea` renderer) and the
-legacy VTE backend (`ui::terminal_pane::TerminalPane`). Browser surfaces are
-backed by `flowmux-browser` (WebKitGTK 6.0 WebView with a scriptable
-controller). The IPC protocol and the GUI both refer to these by
-`WorkspaceId` / `PaneId` / `SurfaceId` (UUID newtypes in `flowmux-core`).
+(`crates/flowmux/src/ui/pane_terminal.rs`), which is a type alias for the sole
+backend `ui::ghostty_pane::GhosttyPane` (PTY + `flowmux-terminal::vt::Vt` + a
+Cairo/Pango `DrawingArea` renderer); `pane_terminal.rs` also holds the shared
+`PaneCallbacks` bundle. Browser surfaces are backed by `flowmux-browser`
+(WebKitGTK 6.0 WebView with a scriptable controller). The IPC protocol and the
+GUI both refer to these by `WorkspaceId` / `PaneId` / `SurfaceId` (UUID newtypes
+in `flowmux-core`).
 
 The libghostty backend lives across two crates: `flowmux-terminal`
 (headless — `vt::Vt` over a C shim `csrc/ghostty_shim.*` to libghostty-vt,
@@ -138,10 +136,11 @@ points worth knowing when navigating:
 - `flowmux-state` — persistent workspace/session JSON store. Reopened
   on app start so resumed workspaces land on the right pane.
 - `flowmux-terminal` / `flowmux-browser` — surface backends. They do
-  not depend on GTK widgets directly; the GUI crate adapts them. Under the
-  `libghostty` feature, `flowmux-terminal` exposes `vt::Vt` (libghostty-vt via
-  the C shim) and `pty::Pty`; the headless tests there cover the VT/PTY
-  contract (`cargo test -p flowmux-terminal --features libghostty`).
+  not depend on GTK widgets directly; the GUI crate adapts them.
+  `flowmux-terminal` exposes `vt::Vt` (libghostty-vt via the C shim) and
+  `pty::Pty`; its headless tests cover the VT/PTY contract
+  (`cargo test -p flowmux-terminal` — always builds libghostty-vt, so Zig is
+  required).
 - `flowmux-ipc` — wire protocol (Unix socket, newline-delimited JSON).
   `protocol::Request`/`Response` are the source of truth for verb
   shape. The verb set mirrors cmux's socket API; unimplemented verbs

@@ -23,7 +23,6 @@
 
 use gtk::gdk;
 use gtk::pango;
-use vte::prelude::*;
 
 pub struct ResolvedTheme {
     pub font: pango::FontDescription,
@@ -152,38 +151,10 @@ impl ResolvedTheme {
         desc
     }
 
-    pub fn apply_to_terminal(&self, term: &crate::ui::terminal_pane::TerminalPane) {
-        let vte: &vte::Terminal = &term.widget;
-        vte.set_font(Some(&self.font));
-        let refs: Vec<&gdk::RGBA> = self.palette.iter().collect();
-        vte.set_colors(Some(&self.fg), Some(&self.bg), &refs);
-        vte.set_color_cursor(Some(&self.cursor));
-        if let Some(sbg) = &self.selection_bg {
-            vte.set_color_highlight(Some(sbg));
-        }
-        if let Some(sfg) = &self.selection_fg {
-            vte.set_color_highlight_foreground(Some(sfg));
-        }
-        // Block-blink cursor, no audible bell, generous scrollback —
-        // matches the look the pre-libghostty build shipped with.
-        vte.set_cursor_blink_mode(vte::CursorBlinkMode::On);
-        vte.set_cursor_shape(vte::CursorShape::Block);
-        vte.set_audible_bell(false);
-        vte.set_scrollback_lines(20_000);
-        // Snap the viewport back to the cursor when the user presses
-        // any key, so a scrolled-up history view doesn't silently swallow
-        // input. Output does NOT snap, so a live `tig` / `vim` redraw
-        // can paint without yanking a user-scrolled view.
-        vte.set_scroll_on_keystroke(true);
-        vte.set_scroll_on_output(false);
-    }
-
-    /// libghostty-backend equivalent of [`Self::apply_to_terminal`]: push the
-    /// theme font + default fg/bg, the 16 ANSI palette colors, the cursor
-    /// color, and selection colors so the libghostty pane renders identically
-    /// to the VTE path. Indices 16..256 keep libghostty's standard xterm fill,
-    /// matching VTE's behavior for a 16-color theme.
-    #[cfg(feature = "libghostty")]
+    /// Push the theme font + default fg/bg, the 16 ANSI palette colors, the
+    /// cursor color, and selection colors into the libghostty terminal pane.
+    /// Indices 16..256 keep libghostty's standard xterm fill (so a 16-color
+    /// theme expands the same way a traditional terminal would).
     pub fn apply_to_ghostty(&self, pane: &crate::ui::ghostty_pane::GhosttyPane) {
         use flowmux_terminal::vt::Rgb;
         fn to_rgb(c: &gdk::RGBA) -> Rgb {

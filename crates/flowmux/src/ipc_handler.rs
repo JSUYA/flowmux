@@ -225,11 +225,11 @@ impl Handler for GuiHandler {
                         .await;
                     match rx.await {
                         Ok(Ok(Some(text))) => Response::ScreenContents { text },
-                        // `None` = built without the `vte-text` feature, so the
-                        // VTE text API is unavailable. Report it explicitly
-                        // rather than returning empty output.
+                        // `None` = the pane has no readable terminal surface
+                        // (e.g. a browser tab). The libghostty backend always
+                        // exposes screen text, so this is not feature-gated.
                         Ok(Ok(None)) => Response::Error(RpcError::Unimplemented(
-                            "read-screen requires building flowmux with --features vte-text".into(),
+                            "read-screen: this pane has no readable terminal surface".into(),
                         )),
                         Ok(Err(e)) => Response::Error(RpcError::NotFound(e)),
                         Err(_) => Response::Error(RpcError::Internal("bridge closed".into())),

@@ -56,8 +56,8 @@ while that surface is focused, and isolated per window.
   is-visible / count / …), `flowmux identify` and `capabilities` for context
   discovery, `flowmux tree` to inspect the workspace → pane → tab structure,
   `workspace current|focus`, `focus-pane|close-pane`, `focus-tab|close-tab`,
-  `send-keys`, and `read-screen` (terminal buffer dump; needs the `vte-text`
-  build, see Build). Pane args accept `pane:<uuid>` or fall back to
+  `send-keys`, and `read-screen` (terminal buffer dump). Pane args accept
+  `pane:<uuid>` or fall back to
   `$FLOWMUX_PANE_ID`; `--json` everywhere. Full contract in
   [`AGENTS.md`](AGENTS.md).
 - **Customizable keybindings** — Options → **Keybindings** rebinds any shortcut
@@ -99,14 +99,11 @@ sudo apt install \
     libgtk-4-dev libadwaita-1-dev \
     libwebkitgtk-6.0-dev libssl-dev \
     libssh2-1-dev libdbus-1-dev
-# For the patched VTE build (see "Patched VTE" below) — meson/ninja plus the
-# VTE source-build dependencies not already pulled in by libgtk-4-dev:
-sudo apt install \
-    meson ninja-build \
-    liblz4-dev libpcre2-dev libfribidi-dev libicu-dev libgnutls28-dev
 # rustup (Rust 1.93+) and Zig 0.15.x required; Zig builds the vendored
-# libghostty-vt used by the terminal pane.
+# libghostty-vt that backs the terminal pane (the only terminal backend, so
+# Zig is needed for any build that includes flowmux-terminal).
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+# Zig 0.15.x — install from https://ziglang.org/download/ and put `zig` on PATH.
 ```
 
 ### Optional — full media playback in tab browser
@@ -133,44 +130,28 @@ Produces two binaries under `target/release/`:
 - `flowmux` — GTK4 GUI; also forwards CLI subcommands to `flowmuxctl`.
 - `flowmuxctl` — CLI helper invoked by the GUI and by agent hooks.
 
-`flowmux read-screen` (terminal buffer dump) needs VTE ≥ 0.76, above the
-default `v0_70` floor kept for Ubuntu 22.04, so it sits behind the opt-in
-`vte-text` cargo feature. The patched-VTE install path
-(`scripts/install-host.sh`) and the Flatpak build enable it automatically;
-to enable it in a manual build that links a VTE ≥ 0.76, add
-`--features flowmux/vte-text`. Without it, `read-screen` returns an explicit
-"not supported" error.
+`flowmux read-screen` (terminal buffer dump) reads the viewport straight from
+the libghostty-vt grid, so it works in every build — no extra feature flag.
 
 For development:
 
 ```bash
 cargo run -p flowmux           # debug GUI
-cargo check --workspace        # type-check everything
+cargo check --workspace        # type-check everything (needs Zig on PATH)
 ```
 
-### Patched VTE (drag-selection in agent TUIs)
-
-Upstream VTE drops a text selection the instant the foreground application
-rewrites the cells under it. TUIs such as Codex and Claude Code repaint their
-UI continuously, so a drag-selection in their pane vanishes on the next frame —
-and VTE exposes no public API to disable that behaviour. flowmux therefore
-links a small patched copy of VTE (`packaging/vte-patches/`) that keeps the
-selection anchored across output. The system libvte other apps use is left
-untouched.
-
-For a native install, build the patched VTE and link flowmux against it in one
-step (needs the `meson`/`ninja`/`liblz4-dev`/… packages listed in the
-prerequisites):
+### Install to the host
 
 ```bash
-scripts/install-host.sh        # builds patched VTE → builds flowmux → installs
+scripts/install-host.sh        # release-builds flowmux → installs the binaries
 ```
 
-This installs the patched VTE to `~/.local/flowmux-vte` and the binaries to
-`~/.local/bin` and `~/.cargo/bin`, baking a RUNPATH so the GUI loads the
-patched library at runtime. The Flatpak build (Ubuntu 22.04) applies the same
-patch automatically. A plain `cargo build --release --workspace` still works
-but links the system VTE, so drag-selection will not survive a repaint.
+This installs the `flowmux` and `flowmuxctl` binaries to `~/.local/bin` and
+`~/.cargo/bin`. It is a plain `cargo build --release` — the terminal backend is
+the static libghostty-vt linked by `flowmux-terminal`'s build script (so Zig
+must be on `PATH`), with no patched VTE and no runtime library to bake a RUNPATH
+for. Drag-selection in agent TUIs survives repaints because libghostty owns the
+selection state directly.
 
 ## Verify & repair
 

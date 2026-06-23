@@ -7,7 +7,7 @@
 //! screenshot-verified independently of flowmux's pane system; M4 promotes the
 //! widget into the real pane tree. Build/run with:
 //!
-//!   cargo run -p flowmux --features libghostty --example ghostty_demo -- [cmd]
+//!   cargo run -p flowmux --example ghostty_demo -- [cmd]
 //!
 //! With no argument it runs `$SHELL` (or bash) interactively. With an argument
 //! it runs `sh -c <cmd>` and keeps the screen up (handy for deterministic
@@ -41,11 +41,7 @@ struct Term {
 }
 
 fn rgb(c: Rgb) -> (f64, f64, f64) {
-    (
-        c.r as f64 / 255.0,
-        c.g as f64 / 255.0,
-        c.b as f64 / 255.0,
-    )
+    (c.r as f64 / 255.0, c.g as f64 / 255.0, c.b as f64 / 255.0)
 }
 
 /// Measure monospace cell metrics (width, height, ascent) for FONT using Pango,
@@ -137,9 +133,17 @@ fn encode_key(keyval: gdk::Key, state: gdk::ModifierType) -> Option<Vec<u8>> {
 fn draw(term: &mut Term, cr: &cairo::Context, w: i32, h: i32) {
     let _ = term.vt.update();
     let colors = term.vt.colors().unwrap_or(flowmux_terminal::vt::Colors {
-        fg: Rgb { r: 220, g: 220, b: 220 },
+        fg: Rgb {
+            r: 220,
+            g: 220,
+            b: 220,
+        },
         bg: Rgb { r: 0, g: 0, b: 0 },
-        cursor: Rgb { r: 220, g: 220, b: 220 },
+        cursor: Rgb {
+            r: 220,
+            g: 220,
+            b: 220,
+        },
         cursor_has_value: false,
     });
 
@@ -263,12 +267,27 @@ fn capture(cmd: Option<&str>, path: &str) {
     // Optional theme colors for verifying the libghostty color path:
     // FLOWMUX_DEMO_COLORS="fgR,fgG,fgB,bgR,bgG,bgB[,curR,curG,curB]".
     if let Ok(spec) = std::env::var("FLOWMUX_DEMO_COLORS") {
-        let n: Vec<u8> = spec.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+        let n: Vec<u8> = spec
+            .split(',')
+            .filter_map(|s| s.trim().parse().ok())
+            .collect();
         if n.len() >= 6 {
-            let fg = Rgb { r: n[0], g: n[1], b: n[2] };
-            let bg = Rgb { r: n[3], g: n[4], b: n[5] };
+            let fg = Rgb {
+                r: n[0],
+                g: n[1],
+                b: n[2],
+            };
+            let bg = Rgb {
+                r: n[3],
+                g: n[4],
+                b: n[5],
+            };
             let cur = if n.len() >= 9 {
-                Rgb { r: n[6], g: n[7], b: n[8] }
+                Rgb {
+                    r: n[6],
+                    g: n[7],
+                    b: n[8],
+                }
             } else {
                 fg
             };
@@ -310,7 +329,10 @@ fn capture(cmd: Option<&str>, path: &str) {
     // Optional selection for verifying the selection path:
     // FLOWMUX_DEMO_SELECT="sx,sy,ex,ey".
     if let Ok(spec) = std::env::var("FLOWMUX_DEMO_SELECT") {
-        let n: Vec<u16> = spec.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+        let n: Vec<u16> = spec
+            .split(',')
+            .filter_map(|s| s.trim().parse().ok())
+            .collect();
         if n.len() == 4 {
             vt.set_selection((n[0], n[1]), (n[2], n[3]), false);
             if let Some(text) = {

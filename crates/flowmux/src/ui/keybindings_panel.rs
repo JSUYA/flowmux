@@ -163,9 +163,7 @@ fn present_edit_dialog(
     state: SharedOverrides,
     accel_label: gtk::Label,
 ) {
-    let parent = anchor
-        .root()
-        .and_then(|r| r.downcast::<gtk::Window>().ok());
+    let parent = anchor.root().and_then(|r| r.downcast::<gtk::Window>().ok());
 
     let dialog = gtk::Window::builder()
         .modal(true)
@@ -283,9 +281,7 @@ fn present_edit_dialog(
 /// [`gtk::accelerator_name`], writes the result into `entry`, then
 /// closes itself. Esc cancels without writing.
 fn present_capture_overlay(anchor: &gtk::Button, entry: gtk::Entry) {
-    let parent = anchor
-        .root()
-        .and_then(|r| r.downcast::<gtk::Window>().ok());
+    let parent = anchor.root().and_then(|r| r.downcast::<gtk::Window>().ok());
 
     let dialog = gtk::Window::builder()
         .modal(true)

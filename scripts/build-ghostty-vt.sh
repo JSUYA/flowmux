@@ -5,13 +5,11 @@
 # from a pinned source revision and install it to a prefix as a static
 # library + C headers.
 #
-# Why: flowmux's terminal surfaces are migrating off the VTE GTK widget onto
-# a libghostty-vt core that flowmux renders itself (see crate
-# `flowmux-terminal`, cargo feature `libghostty`). libghostty-vt owns VT
-# parsing, terminal state, scrollback and reflow; the GTK layer owns the
-# PTY and the renderer. Unlike the patched VTE path (scripts/build-vte.sh),
-# this links a *static* `libghostty-vt.a` with no extra runtime deps, so no
-# rpath is required.
+# Why: flowmux's terminal surfaces render on a libghostty-vt core that flowmux
+# draws itself (see crate `flowmux-terminal`). libghostty-vt owns VT parsing,
+# terminal state, scrollback and reflow; the GTK layer owns the PTY and the
+# renderer. It is linked as a *static* `libghostty-vt.a` with no extra runtime
+# deps, so no rpath is required.
 #
 # Ghostty is MIT licensed (see the upstream LICENSE); flowmux is
 # GPL-3.0-or-later, which MIT is compatible with. Attribution is recorded in

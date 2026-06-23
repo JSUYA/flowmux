@@ -24,10 +24,9 @@ P0 ("contract and agent usability") is implemented:
   dialog. Top-level `workspace close` is intentionally omitted (destructive;
   the GUI confirm dialog guards it).
 - P0-6 — `send-keys` (literal/raw input), `send-key` (named-key,
-  tmux-style), and `read-screen` (terminal buffer dump). `read-screen` is
-  behind the opt-in `vte-text` feature, kept off by default to preserve the
-  Ubuntu 22.04 VTE `v0_70` floor and enabled in the patched-VTE install and
-  Flatpak builds.
+  tmux-style), and `read-screen` (terminal buffer dump). `read-screen` reads
+  the viewport directly from the libghostty-vt grid, so it works in every
+  build with no feature flag.
 
 P1 ("daily usability") is implemented:
 

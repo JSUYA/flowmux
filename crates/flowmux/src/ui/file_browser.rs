@@ -2244,20 +2244,16 @@ mod tests {
         );
         assert_eq!(panel_selected_names(&panel), vec!["a.txt", "b.txt"]);
         assert_eq!(panel_focused_path(&panel), Some(tmp.path.join("b.txt")));
-        assert!(
-            panel
-                .list
-                .row_at_index(0)
-                .unwrap()
-                .has_css_class("selected")
-        );
-        assert!(
-            panel
-                .list
-                .row_at_index(1)
-                .unwrap()
-                .has_css_class("selected")
-        );
+        assert!(panel
+            .list
+            .row_at_index(0)
+            .unwrap()
+            .has_css_class("selected"));
+        assert!(panel
+            .list
+            .row_at_index(1)
+            .unwrap()
+            .has_css_class("selected"));
 
         assert_eq!(
             panel.handle_key(gdk::Key::Down, gdk::ModifierType::SHIFT_MASK),
@@ -2310,13 +2306,11 @@ mod tests {
 
         panel.toggle_path_selection(b.clone());
         assert_eq!(panel_selected_names(&panel), vec!["a.txt", "b.txt"]);
-        assert!(
-            panel
-                .list
-                .row_at_index(1)
-                .unwrap()
-                .has_css_class("selected")
-        );
+        assert!(panel
+            .list
+            .row_at_index(1)
+            .unwrap()
+            .has_css_class("selected"));
 
         panel.toggle_path_selection(a);
         assert_eq!(panel_selected_names(&panel), vec!["b.txt"]);

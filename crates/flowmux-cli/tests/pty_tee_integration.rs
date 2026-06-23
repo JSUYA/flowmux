@@ -59,10 +59,10 @@ fn spawn_fake_daemon(socket: PathBuf) -> mpsc::Receiver<String> {
                         // successful and stays connected for the next
                         // OSC.
                         let env = serde_json::json!({
-                            "id": next_id,
-                            "kind": "response",
-                "notified": { "desktop_id": "desktop-1" }
-                        });
+                                    "id": next_id,
+                                    "kind": "response",
+                        "notified": { "desktop_id": "desktop-1" }
+                                });
                         next_id += 1;
                         // Best-effort write; the tee may have closed
                         // the connection if its child exited fast.
@@ -264,9 +264,7 @@ fn osc_9_round_trips_to_daemon_notify_request() {
 
 #[test]
 fn osc_99_promotes_to_attention_needed_when_body_says_waiting() {
-    let envelopes = run_tee_with_osc(&[
-        "99;urgency=critical;Claude is waiting for your input",
-    ]);
+    let envelopes = run_tee_with_osc(&["99;urgency=critical;Claude is waiting for your input"]);
     assert!(
         !envelopes.is_empty(),
         "fake daemon received nothing for OSC 99"

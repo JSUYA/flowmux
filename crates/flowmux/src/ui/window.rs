@@ -12,8 +12,8 @@ use crate::notifications::{
 };
 use crate::theme::ResolvedTheme;
 use crate::ui::file_browser::{FileBrowserPaneState, FileBrowserPanel};
+use crate::ui::pane_terminal::PaneCallbacks;
 use crate::ui::sidebar::Sidebar;
-use crate::ui::terminal_pane::PaneCallbacks;
 use crate::ui::workspace_view::{
     attach_surface_to_pane, build_surface, solo_workspace_pane, split_pane_incremental,
     IncrementalSplitOutcome, PaneRegistry, TornOffSurface,
@@ -1452,10 +1452,7 @@ impl WindowController {
 
     fn focus_direction_or_file_browser(&self, from: PaneId, dir: FocusDir) {
         let moved = self.focus_in_direction(from, dir).is_some();
-        if dir == FocusDir::Right
-            && self.file_browser.widget().is_visible()
-            && !moved
-        {
+        if dir == FocusDir::Right && self.file_browser.widget().is_visible() && !moved {
             self.file_browser_source_pane.set(Some(from));
             self.focus_file_browser();
         }
@@ -3830,27 +3827,9 @@ fn make_callbacks(
     use std::cell::RefCell;
     use std::rc::Rc;
     PaneCallbacks {
-        on_notification: Rc::new(RefCell::new(|pane, title, body| {
-            tracing::info!(%pane, %title, %body, "OSC 99 from pane");
-        })),
-        on_bell: Rc::new(RefCell::new(|pane| {
-            tracing::debug!(%pane, "BEL");
-        })),
         on_child_exited: Rc::new(RefCell::new(|pane, status| {
             tracing::info!(%pane, status, "child exited");
         })),
-        on_focus: {
-            let bridge = bridge.clone();
-            Rc::new(RefCell::new(move |pane| {
-                tracing::debug!(%pane, "pane focused");
-                focused.set(Some(pane));
-                let bridge = bridge.clone();
-                glib::MainContext::default().spawn_local(async move {
-                    let _ = bridge.tx.send(GtkCommand::PaneFocused { pane }).await;
-                    let _ = bridge.tx.send(GtkCommand::RefreshWindowTitle).await;
-                });
-            }))
-        },
         on_close_pane: {
             let bridge = bridge.clone();
             Rc::new(RefCell::new(move |pane| {
@@ -3861,6 +3840,18 @@ fn make_callbacks(
                         .tx
                         .send(GtkCommand::CloseFocused { pane, ack: tx })
                         .await;
+                });
+            }))
+        },
+        on_focus: {
+            let bridge = bridge.clone();
+            Rc::new(RefCell::new(move |pane| {
+                tracing::debug!(%pane, "pane focused");
+                focused.set(Some(pane));
+                let bridge = bridge.clone();
+                glib::MainContext::default().spawn_local(async move {
+                    let _ = bridge.tx.send(GtkCommand::PaneFocused { pane }).await;
+                    let _ = bridge.tx.send(GtkCommand::RefreshWindowTitle).await;
                 });
             }))
         },
@@ -5468,12 +5459,25 @@ mod tests {
             Some("flowmux - bravo-poll-cwd")
         );
 
-        // Direct poll body call. Calling again with the same cwd is a no-op
-        // because the store reports no change. Label/window title stay unchanged.
+        // poll_terminal_cwds is the OSC-7-less safety net: it reads each pane's
+        // real cwd (the shell spawned in `initial` and emitted no OSC 7, so
+        // /proc/<pid>/cwd reports `initial`). Polling reconciles the label from
+        // the simulated event back to the shell's actual directory.
+        controller.poll_terminal_cwds().await;
+        let polled = store.surface_title(pane, surface).await;
+        assert_eq!(
+            polled.as_deref(),
+            Some("alpha-poll-cwd"),
+            "poll reflects the shell's real cwd via /proc when no OSC 7 was emitted"
+        );
+
+        // A second poll with no real cwd change is a no-op (store reports no
+        // change, so the label and window title stay put).
         controller.poll_terminal_cwds().await;
         assert_eq!(
-            store.surface_title(pane, surface).await.as_deref(),
-            Some("bravo-poll-cwd")
+            store.surface_title(pane, surface).await,
+            polled,
+            "a second poll with no real change leaves the label unchanged"
         );
     }
 
@@ -6669,7 +6673,7 @@ mod tests {
             let r = controller.pane_registry.borrow();
             r.active_terminal(original)
                 .expect("rendered workspace should expose a terminal for the only pane")
-                .vte_widget()
+                .render_area()
                 .clone()
         };
         let original_frame_pre_split = controller
@@ -6695,7 +6699,7 @@ mod tests {
             .borrow()
             .active_terminal(original)
             .expect("original pane must still have an active terminal after split")
-            .vte_widget()
+            .render_area()
             .clone();
         let original_frame_after_split = controller
             .pane_registry
@@ -6732,7 +6736,7 @@ mod tests {
                 "regression: closing the split sibling dropped the surviving pane's terminal entry — \
                  a fresh terminal means the running shell / agent was killed",
             )
-            .vte_widget()
+            .render_area()
             .clone();
         let original_frame_after_close = controller
             .pane_registry
@@ -6778,7 +6782,7 @@ mod tests {
             registry
                 .active_terminal(pane)
                 .expect("source pane should have an active terminal")
-                .vte_widget()
+                .render_area()
                 .clone()
         };
 
@@ -6806,7 +6810,7 @@ mod tests {
             .active_terminal(pane)
             .expect("source pane terminal should survive the split");
         assert!(
-            current_terminal.vte_widget().clone() == original_terminal,
+            current_terminal.render_area().clone() == original_terminal,
             "CLI-applied split must reuse the existing terminal widget"
         );
         assert!(
@@ -6825,7 +6829,7 @@ mod tests {
             registry
                 .active_terminal(pane)
                 .expect("source pane should have an active terminal")
-                .vte_widget()
+                .render_area()
                 .clone()
         };
 
@@ -6848,7 +6852,7 @@ mod tests {
             .active_terminal(pane)
             .expect("source pane terminal should survive browser split");
         assert!(
-            current_terminal.vte_widget().clone() == original_terminal,
+            current_terminal.render_area().clone() == original_terminal,
             "CLI browser open split must reuse the source terminal widget"
         );
         assert!(
@@ -6896,7 +6900,7 @@ mod tests {
             .borrow()
             .active_terminal(pane_a)
             .expect("pane A terminal must be registered")
-            .vte_widget()
+            .render_area()
             .clone();
         let a_frame_initial = controller
             .pane_registry
@@ -6918,7 +6922,7 @@ mod tests {
             .borrow()
             .active_terminal(pane_b)
             .expect("pane B terminal must be registered after first split")
-            .vte_widget()
+            .render_area()
             .clone();
 
         // Second split: split B horizontally → B (top) over C (bottom).
@@ -6936,14 +6940,14 @@ mod tests {
             .borrow()
             .active_terminal(pane_a)
             .expect("pane A terminal must survive both splits")
-            .vte_widget()
+            .render_area()
             .clone();
         let b_terminal_after_splits = controller
             .pane_registry
             .borrow()
             .active_terminal(pane_b)
             .expect("pane B terminal must survive its own split")
-            .vte_widget()
+            .render_area()
             .clone();
         assert!(
             a_terminal_initial == a_terminal_after_splits,
@@ -6972,14 +6976,14 @@ mod tests {
                 "regression: pane A vanished from registry — the close fell back to a full \
                  rerender and any agent running in A is now dead",
             )
-            .vte_widget()
+            .render_area()
             .clone();
         let b_terminal_after_close = controller
             .pane_registry
             .borrow()
             .active_terminal(pane_b)
             .expect("regression: pane B vanished from registry after closing inner sibling C")
-            .vte_widget()
+            .render_area()
             .clone();
         let a_frame_after_close = controller
             .pane_registry

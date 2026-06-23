@@ -1,11 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! libghostty-vt-backed terminal pane (task C).
+//! libghostty-vt-backed terminal pane — flowmux's only terminal backend.
 //!
-//! A drop-in alternative to [`crate::ui::terminal_pane::TerminalPane`] that
-//! renders the grid itself from `flowmux_terminal`'s libghostty-vt core instead
-//! of embedding a VTE widget. Selected at pane-creation time by
-//! [`crate::ui::pane_terminal::PaneTerminal`] when the libghostty backend is
-//! toggled on; the VTE path stays the default so nothing regresses.
+//! Renders the grid itself from `flowmux_terminal`'s libghostty-vt core (PTY +
+//! `vt::Vt` + a Cairo/Pango `DrawingArea`). Stored as
+//! [`crate::ui::pane_terminal::PaneTerminal`] (an alias for this type).
 //!
 //! Parity status: rendering (theme font/colors/metrics), PTY I/O, keyboard +
 //! inline IME preedit (Hangul/CJK), focus, font, resize, drag selection +
@@ -28,7 +26,7 @@ use flowmux_core::{PaneId, SurfaceId};
 use flowmux_terminal::pty::Pty;
 use flowmux_terminal::vt::{Colors, MouseAction, MouseButton, Rgb, Vt};
 
-use crate::ui::terminal_pane::PaneCallbacks;
+use crate::ui::pane_terminal::PaneCallbacks;
 
 const DEFAULT_FONT: &str = "Monospace 12";
 const SCROLLBACK: usize = 10_000;
@@ -78,6 +76,11 @@ struct State {
     anchor: (u16, u16),
     /// Last OSC title seen, to fire the title-changed callback only on change.
     last_title: String,
+    /// Last working directory forwarded, to fire the cwd-changed callback only
+    /// on change. Tracks the shell's OSC 7 announcement (the VTE path used
+    /// VTE's `current-directory-uri`; libghostty has no signal so we poll the
+    /// vt's pwd after each read).
+    last_cwd: Option<PathBuf>,
 }
 
 impl State {
@@ -158,14 +161,8 @@ impl GhosttyPane {
             extra_env.push(("TERM".to_string(), "xterm-256color".to_string()));
         }
 
-        let pty = Pty::spawn(
-            &argv_ref,
-            cwd.as_deref(),
-            &extra_env,
-            cols,
-            rows,
-        )
-        .expect("libghostty pty spawn");
+        let pty = Pty::spawn(&argv_ref, cwd.as_deref(), &extra_env, cols, rows)
+            .expect("libghostty pty spawn");
 
         let pid = Rc::new(Cell::new(Some(pty.child_pid())));
 
@@ -188,6 +185,7 @@ impl GhosttyPane {
             selecting: false,
             anchor: (0, 0),
             last_title: String::new(),
+            last_cwd: None,
         }));
 
         let area = gtk::DrawingArea::new();
@@ -282,9 +280,12 @@ impl GhosttyPane {
         glib::source::unix_fd_add_local(fd, glib::IOCondition::IN, move |_fd, _cond| {
             let mut buf = [0u8; 16384];
             let mut s = state.borrow_mut();
-            // OSC title change to forward after we drop the borrow (the VTE path
-            // tracks this via connect_title_notify; libghostty has no poller).
+            // OSC title / cwd changes to forward after we drop the borrow (the
+            // VTE path tracked these via connect_title_notify /
+            // current-directory-uri; libghostty has no signal so we poll the vt
+            // after each read).
             let mut title_change: Option<String> = None;
+            let mut cwd_change: Option<PathBuf> = None;
             match s.pty.read(&mut buf) {
                 Ok(0) => {
                     // Child exited: reap to learn the status and notify.
@@ -302,12 +303,24 @@ impl GhosttyPane {
                             title_change = Some(title);
                         }
                     }
+                    // OSC 7 working-directory announcement. Only forward on a
+                    // real change so the controller's title/VCS refresh runs
+                    // once per `cd`, matching the VTE path.
+                    if let Some(cwd) = s.vt.pwd().as_deref().and_then(pwd_to_path) {
+                        if s.last_cwd.as_deref() != Some(cwd.as_path()) {
+                            s.last_cwd = Some(cwd.clone());
+                            cwd_change = Some(cwd);
+                        }
+                    }
                 }
                 Err(_) => return glib::ControlFlow::Break,
             }
             drop(s);
             if let Some(title) = title_change {
                 (callbacks.on_terminal_title_changed.borrow_mut())(id, surface, title);
+            }
+            if let Some(cwd) = cwd_change {
+                (callbacks.on_terminal_cwd_changed.borrow_mut())(id, surface, cwd);
             }
             area.queue_draw();
             sync_scrollbar_adj(&state, &adj, &scrollbar, &syncing);
@@ -483,6 +496,9 @@ impl GhosttyPane {
             let area = self.area.clone();
             let on_open_url = callbacks.on_open_url.clone();
             let id = self.id;
+            // Clones for the right-click context menu (cheap: refcounted handles).
+            let pane_for_menu = self.clone();
+            let cb_for_menu = callbacks.clone();
             click.connect_pressed(move |g, _n, x, y| {
                 let button = g.current_button();
                 let mods = mods_from_state(g.current_event_state());
@@ -502,8 +518,17 @@ impl GhosttyPane {
                     return;
                 }
 
-                // App mouse reporting (unless Shift forces local selection).
+                // Secondary (right) click with no app mouse reporting (or with
+                // Shift forcing local handling) → terminal-body context menu.
                 let shift = (mods & flowmux_terminal::vt::MOD_SHIFT) != 0;
+                if button == gdk::BUTTON_SECONDARY && (!s.vt.mouse_enabled() || shift) {
+                    drop(s);
+                    pane_for_menu.show_context_menu(x, y, &cb_for_menu);
+                    g.set_state(gtk::EventSequenceState::Claimed);
+                    return;
+                }
+
+                // App mouse reporting (unless Shift forces local selection).
                 if s.vt.mouse_enabled() && !shift {
                     let gb = ghostty_button(button);
                     if let Some(bytes) = s.vt.encode_mouse(MouseAction::Press, gb, x, y, mods) {
@@ -586,7 +611,13 @@ impl GhosttyPane {
         self.area.add_controller(focus);
     }
 
-    // ---- TerminalPane-compatible method surface (see pane_terminal.rs) ----
+    // ---- Method surface used by the pane registry (see pane_terminal.rs) ----
+
+    /// The owning leaf pane id (also available as the `id` field; this method
+    /// mirrors the call sites that used the former PaneTerminal enum).
+    pub fn id(&self) -> PaneId {
+        self.id
+    }
 
     pub fn root_widget(&self) -> gtk::Widget {
         self.container.clone().upcast::<gtk::Widget>()
@@ -706,6 +737,101 @@ impl GhosttyPane {
         }
     }
 
+    /// Terminal-body right-click context menu: Copy / Paste / Split Right /
+    /// Split Down / Copy path / Close Pane. Ports the popover the VTE pane used
+    /// (a plain `Popover` of flat `Button`s, not PopoverMenu + `win.*` actions,
+    /// whose action lookup chain dropped through in some GTK versions). Copy is
+    /// a no-op without a selection so it never clobbers the clipboard.
+    fn show_context_menu(&self, x: f64, y: f64, cb: &PaneCallbacks) {
+        let id = self.id;
+        let surface = self.surface;
+        // Focus the pane first, mirroring the VTE menu, so the action targets it.
+        (cb.on_focus.borrow_mut())(id);
+
+        let popover = gtk::Popover::new();
+        let v = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        v.set_margin_top(4);
+        v.set_margin_bottom(4);
+
+        let mk = |label: &str| -> gtk::Button {
+            let b = gtk::Button::with_label(label);
+            b.add_css_class("flat");
+            b.set_halign(gtk::Align::Fill);
+            b.set_hexpand(true);
+            if let Some(label) = b.child().and_downcast::<gtk::Label>() {
+                label.set_xalign(0.0);
+            }
+            b
+        };
+
+        let copy = mk("Copy");
+        let pop = popover.clone();
+        let pane = self.clone();
+        copy.connect_clicked(move |_| {
+            pop.popdown();
+            pane.copy_selection_to_clipboard();
+        });
+        v.append(&copy);
+
+        let paste = mk("Paste");
+        let pop = popover.clone();
+        let pane = self.clone();
+        paste.connect_clicked(move |_| {
+            pop.popdown();
+            pane.paste_clipboard();
+        });
+        v.append(&paste);
+
+        v.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+
+        let split_r = mk("Split Right");
+        let pop = popover.clone();
+        let h = cb.on_split_right.clone();
+        split_r.connect_clicked(move |_| {
+            pop.popdown();
+            (h.borrow_mut())(id);
+        });
+        v.append(&split_r);
+
+        let split_d = mk("Split Down");
+        let pop = popover.clone();
+        let h = cb.on_split_down.clone();
+        split_d.connect_clicked(move |_| {
+            pop.popdown();
+            (h.borrow_mut())(id);
+        });
+        v.append(&split_d);
+
+        v.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+
+        let copy_path = mk("Copy path");
+        let pop = popover.clone();
+        let h = cb.on_copy_surface_text.clone();
+        copy_path.connect_clicked(move |_| {
+            pop.popdown();
+            (h.borrow_mut())(id, surface);
+        });
+        v.append(&copy_path);
+
+        v.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+
+        let close_p = mk("Close Pane");
+        let pop = popover.clone();
+        let h = cb.on_close_pane.clone();
+        close_p.connect_clicked(move |_| {
+            pop.popdown();
+            (h.borrow_mut())(id);
+        });
+        v.append(&close_p);
+
+        popover.set_child(Some(&v));
+        popover.set_parent(&self.area);
+        popover.set_has_arrow(false);
+        crate::ui::popover_pos::anchor_at_click(&popover, &self.area, x, y);
+        popover.connect_closed(|p| p.unparent());
+        popover.popup();
+    }
+
     /// Inject bytes into the terminal display (not the child). Mirrors
     /// `TerminalPane::feed` (used to surface inline messages).
     pub fn feed(&self, bytes: &[u8]) {
@@ -737,6 +863,14 @@ impl GhosttyPane {
 
     pub fn add_controller(&self, controller: impl IsA<gtk::EventController>) {
         self.container.add_controller(controller);
+    }
+
+    /// Test-only access to the render widget, for the split-tree identity
+    /// assertions in `window.rs` (a pane must keep the same widget across
+    /// rebuilds so its PTY child survives).
+    #[cfg(test)]
+    pub fn render_area(&self) -> gtk::DrawingArea {
+        self.area.clone()
     }
 
     /// Drive the overlaid scrollbar from the terminal's own scroll position.
@@ -805,10 +939,7 @@ fn rgb(c: Rgb) -> (f64, f64, f64) {
 /// loosely spaced; a real CJK monospace face fills two cells naturally. A user
 /// who set an explicit font family is respected as-is.
 fn cjk_friendly_font(desc: &pango::FontDescription) -> pango::FontDescription {
-    let family = desc
-        .family()
-        .map(|s| s.to_string())
-        .unwrap_or_default();
+    let family = desc.family().map(|s| s.to_string()).unwrap_or_default();
     let is_generic = family.is_empty()
         || family.eq_ignore_ascii_case("monospace")
         || family.eq_ignore_ascii_case("mono");
@@ -824,8 +955,16 @@ fn cjk_friendly_font(desc: &pango::FontDescription) -> pango::FontDescription {
 
 /// Map a surface pixel position to a viewport cell, clamped to the grid.
 fn px_to_cell(x: f64, y: f64, cell_w: f64, cell_h: f64, cols: u16, rows: u16) -> (u16, u16) {
-    let col = if cell_w > 0.0 { (x / cell_w).floor().max(0.0) } else { 0.0 } as u32;
-    let row = if cell_h > 0.0 { (y / cell_h).floor().max(0.0) } else { 0.0 } as u32;
+    let col = if cell_w > 0.0 {
+        (x / cell_w).floor().max(0.0)
+    } else {
+        0.0
+    } as u32;
+    let row = if cell_h > 0.0 {
+        (y / cell_h).floor().max(0.0)
+    } else {
+        0.0
+    } as u32;
     (
         col.min(cols.saturating_sub(1) as u32) as u16,
         row.min(rows.saturating_sub(1) as u32) as u16,
@@ -947,9 +1086,17 @@ fn measure_cell(font: &pango::FontDescription) -> (f64, f64, f64) {
 fn draw(state: &mut State, cr: &cairo::Context, w: i32, h: i32) {
     let _ = state.vt.update();
     let colors = state.vt.colors().unwrap_or(Colors {
-        fg: Rgb { r: 220, g: 220, b: 220 },
+        fg: Rgb {
+            r: 220,
+            g: 220,
+            b: 220,
+        },
         bg: Rgb { r: 0, g: 0, b: 0 },
-        cursor: Rgb { r: 220, g: 220, b: 220 },
+        cursor: Rgb {
+            r: 220,
+            g: 220,
+            b: 220,
+        },
         cursor_has_value: false,
     });
 
@@ -967,7 +1114,11 @@ fn draw(state: &mut State, cr: &cairo::Context, w: i32, h: i32) {
     let ascent = state.ascent;
     // Selection wash + cursor color come from the theme (host-drawn to match
     // VTE); fall back to a neutral blue-grey / the default fg when unset.
-    let sel_bg = state.selection_bg.unwrap_or(Rgb { r: 51, g: 87, b: 140 });
+    let sel_bg = state.selection_bg.unwrap_or(Rgb {
+        r: 51,
+        g: 87,
+        b: 140,
+    });
     let sel_fg = state.selection_fg;
     let cursor_rgb = state.cursor_color.unwrap_or(if colors.cursor_has_value {
         colors.cursor

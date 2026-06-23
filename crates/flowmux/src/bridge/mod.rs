@@ -176,8 +176,8 @@ pub enum GtkCommand {
         ack: oneshot::Sender<Result<(), String>>,
     },
     /// Read the terminal buffer text of a pane (`flowmux read-screen`).
-    /// `Ok(None)` means the build lacks the `vte-text` feature; `Err`
-    /// means the pane id did not resolve to a terminal.
+    /// `Ok(None)` means the pane has no readable terminal surface (e.g. a
+    /// browser tab); `Err` means the pane id did not resolve to a pane.
     PaneReadScreen {
         pane: PaneId,
         ack: oneshot::Sender<Result<Option<String>, String>>,

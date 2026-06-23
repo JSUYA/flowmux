@@ -21,7 +21,7 @@
 
 use crate::bridge::{Bridge, FocusDir, GtkCommand, WsNav};
 use crate::ui::pane_terminal::PaneTerminal;
-use crate::ui::terminal_pane::ALT_ENTER_BYTES;
+use crate::ui::pane_terminal::ALT_ENTER_BYTES;
 use crate::ui::window::ClipboardToast;
 use adw::prelude::*;
 use flowmux_config::keybindings::{ActionId, KeybindingOverrides};

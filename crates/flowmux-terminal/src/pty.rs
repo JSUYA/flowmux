@@ -45,8 +45,7 @@ impl Pty {
             .map(|a| CString::new(*a))
             .collect::<Result<_, _>>()
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "argv has NUL"))?;
-        let mut argv_ptrs: Vec<*const libc::c_char> =
-            c_argv.iter().map(|s| s.as_ptr()).collect();
+        let mut argv_ptrs: Vec<*const libc::c_char> = c_argv.iter().map(|s| s.as_ptr()).collect();
         argv_ptrs.push(std::ptr::null());
 
         let c_env = build_envp(extra_env)?;
@@ -71,14 +70,8 @@ impl Pty {
         let mut master: RawFd = -1;
         // SAFETY: forkpty allocates a PTY pair and forks. We pass a valid
         // master-out pointer and winsize; name/termios default to NULL.
-        let pid = unsafe {
-            libc::forkpty(
-                &mut master,
-                std::ptr::null_mut(),
-                std::ptr::null(),
-                &mut ws,
-            )
-        };
+        let pid =
+            unsafe { libc::forkpty(&mut master, std::ptr::null_mut(), std::ptr::null(), &mut ws) };
 
         if pid < 0 {
             return Err(io::Error::last_os_error());
@@ -157,7 +150,13 @@ impl Pty {
 
     /// Resize the kernel PTY window. `cell_w_px`/`cell_h_px` populate the pixel
     /// fields some apps read; pass 0 when unknown.
-    pub fn resize(&mut self, cols: u16, rows: u16, cell_w_px: u16, cell_h_px: u16) -> io::Result<()> {
+    pub fn resize(
+        &mut self,
+        cols: u16,
+        rows: u16,
+        cell_w_px: u16,
+        cell_h_px: u16,
+    ) -> io::Result<()> {
         let ws = libc::winsize {
             ws_row: rows,
             ws_col: cols,
@@ -244,14 +243,8 @@ mod tests {
     #[test]
     fn shell_output_flows_through_pty_into_vt_grid() {
         let mut vt = Vt::new(40, 8, 200).expect("vt");
-        let mut pty = Pty::spawn(
-            &["sh", "-c", "printf 'hello world'"],
-            None,
-            &[],
-            40,
-            8,
-        )
-        .expect("spawn sh");
+        let mut pty =
+            Pty::spawn(&["sh", "-c", "printf 'hello world'"], None, &[], 40, 8).expect("spawn sh");
 
         let mut buf = [0u8; 4096];
         let deadline = Instant::now() + Duration::from_secs(5);

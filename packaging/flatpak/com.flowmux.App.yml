@@ -27,52 +27,24 @@ finish-args:
   - --talk-name=org.freedesktop.Flatpak
 
 modules:
-  # Build VTE 0.78 from source. VTE 0.80 added a hard dependency on
-  # the `fast_float` C++ library, which the GNOME 48 SDK does not
-  # ship as a system package; meson's fallback path then tries to
-  # `git clone` it from github inside the build sandbox where DNS is
-  # unavailable, and configuration aborts. 0.78 still exposes every
-  # symbol the rust binding's `v0_70` feature set needs (hyperlink
-  # match, regex match, scroll-on-keystroke, …) so we pin there.
-  - name: vte
-    buildsystem: meson
-    config-opts:
-      # Force libdir=lib (meson defaults to lib64 on x86_64) so the
-      # generated vte-2.91-gtk4.pc lands in /app/lib/pkgconfig, which is
-      # what flatpak adds to PKG_CONFIG_PATH and where the runtime
-      # linker looks for /app libraries.
-      - -Dlibdir=lib
-      - -Dgtk3=false
-      - -Dgtk4=true
-      - -Dvapi=false
-      - -Dgir=false
-      - -Ddocs=false
-      - -D_systemd=false
-    cleanup:
-      - /bin
-      - /libexec
-      - /share/vala
-    sources:
-      - type: git
-        url: https://gitlab.gnome.org/GNOME/vte.git
-        tag: '0.78.4'
-      # Keep text selections alive while a TUI repaints. Upstream VTE
-      # deselects whenever the application rewrites the cells under the
-      # selection, so a drag-selection in a Codex / Claude Code pane
-      # vanishes on the next frame. See packaging/vte-patches.
-      - type: patch
-        path: ../vte-patches/0001-keep-selection-on-output.patch
-
+  # flowmux renders terminals with the libghostty-vt backend, a static
+  # `libghostty-vt.a` that flowmux-terminal's build.rs builds from a pinned
+  # Ghostty revision with Zig (scripts/build-ghostty-vt.sh). The GNOME 48 SDK
+  # ships no Zig, so we drop the official Zig 0.15.x toolchain into the build
+  # tree and put it on PATH for the cargo build. There is no VTE module any
+  # more — the static lib is self-contained (no extra runtime deps, no rpath).
   - name: flowmux
     buildsystem: simple
     build-options:
       append-path: /usr/lib/sdk/rust-stable/bin
       build-args:
+        # build.rs runs `zig build` / git fetch for libghostty-vt on the first
+        # build, so the build sandbox needs the network.
         - --share=network
     build-commands:
-      # vte-text enables `flowmux read-screen`; the bundled VTE is 0.78.4
-      # (built above), which supports the required text-extraction API.
-      - cargo build --release --manifest-path Cargo.toml -p flowmux -p flowmux-cli --features flowmux/vte-text
+      # Put the bundled Zig (extracted to ./zig by the archive source below) on
+      # PATH so flowmux-terminal's build.rs can compile libghostty-vt.
+      - PATH="$PWD/zig:$PATH" cargo build --release --manifest-path Cargo.toml -p flowmux -p flowmux-cli
       - install -Dm755 target/release/flowmux    /app/bin/flowmux
       - install -Dm755 target/release/flowmuxctl /app/lib/flowmux/flowmuxctl
       # Expose flowmuxctl on /app/bin so `flatpak run --command=flowmuxctl
@@ -91,3 +63,9 @@ modules:
     sources:
       - type: dir
         path: ../..
+      # Zig toolchain for building libghostty-vt (see build-commands). Extracted
+      # to ./zig in the build tree; the flowmux runtime does not ship it.
+      - type: archive
+        url: https://ziglang.org/download/0.15.2/zig-x86_64-linux-0.15.2.tar.xz
+        sha256: 02aa270f183da276e5b5920b1dac44a63f1a49e55050ebde3aecc9eb82f93239
+        dest: zig

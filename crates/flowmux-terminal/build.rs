@@ -2,24 +2,19 @@
 //
 // Build script for flowmux-terminal.
 //
-// When the `libghostty` cargo feature is enabled, this compiles the C shim
-// (csrc/ghostty_shim.c) and links it against a static libghostty-vt built by
-// scripts/build-ghostty-vt.sh. The feature is OFF by default, so a plain
-// `cargo check`/`cargo build` does no native work and needs neither Zig nor
-// the Ghostty source — the VTE-backed GUI remains the shipping default while
-// this backend is developed (see crate docs).
+// flowmux's only terminal backend is libghostty-vt, so this always compiles the
+// C shim (csrc/ghostty_shim.c) and links it against a static libghostty-vt
+// built by scripts/build-ghostty-vt.sh. That means `cargo build`/`cargo check`
+// needs Zig 0.15.x on PATH (to build libghostty-vt on the first run) — there is
+// no VTE path and no opt-in feature gate any more.
 
 use std::env;
 use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
-    // Only do native work for the opt-in backend. Cargo exposes enabled
-    // features to build scripts as CARGO_FEATURE_<NAME>.
-    if env::var_os("CARGO_FEATURE_LIBGHOSTTY").is_none() {
-        return;
-    }
-
+    // The libghostty-vt core is always built: compile the C shim and link a
+    // static libghostty-vt produced by scripts/build-ghostty-vt.sh (needs Zig).
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     // crates/flowmux-terminal -> workspace root.
     let workspace_root = manifest_dir

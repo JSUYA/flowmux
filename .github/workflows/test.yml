@@ -30,10 +30,18 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential pkg-config \
-            libgtk-4-dev libadwaita-1-dev libvte-2.91-gtk4-dev \
+            libgtk-4-dev libadwaita-1-dev \
             libwebkitgtk-6.0-dev libssl-dev \
             libssh2-1-dev libdbus-1-dev \
             dbus-x11 xvfb
+
+      - name: Install Zig (builds the vendored libghostty-vt terminal backend)
+        run: |
+          ZIG_VERSION=0.15.2
+          curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" -o /tmp/zig.tar.xz
+          mkdir -p "$HOME/zig"
+          tar -xJf /tmp/zig.tar.xz -C "$HOME/zig" --strip-components=1
+          echo "$HOME/zig" >> "$GITHUB_PATH"
 
       - name: Run tests
         run: xvfb-run -a dbus-run-session -- cargo test --workspace --locked -- --nocapture

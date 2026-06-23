@@ -135,9 +135,9 @@ or feed a command in another pane, then read its output to decide what
 to do next. `close-*` verbs refuse the case that would destroy a
 workspace, so they never pop a confirmation dialog or block your call.
 
-*`read-screen` needs a flowmux built with the `vte-text` feature (the
-shipped install/Flatpak builds enable it); otherwise it returns an
-explicit not-supported error.
+*`read-screen` reads the viewport directly from the libghostty-vt grid, so
+it works in every build (no feature flag); it only returns not-supported for
+a pane that has no terminal surface (e.g. a browser tab).
 
 ## DO NOT
 

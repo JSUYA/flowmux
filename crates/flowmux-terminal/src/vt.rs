@@ -6,9 +6,8 @@
 //! is the boundary: feed bytes with [`Vt::write`], snapshot with
 //! [`Vt::update`], then read the grid with [`Vt::cell`] / [`Vt::row_text`].
 //!
-//! Compiled only under the `libghostty` cargo feature. libghostty-vt is
-//! extracted from Ghostty (MIT, © Mitchell Hashimoto and Ghostty
-//! contributors); see the crate `NOTICE` for attribution.
+//! libghostty-vt is extracted from Ghostty (MIT, © Mitchell Hashimoto and
+//! Ghostty contributors); see the crate `NOTICE` for attribution.
 
 use std::os::raw::{c_char, c_int, c_long};
 
@@ -131,12 +130,8 @@ extern "C" {
     fn fxvt_clear_selection(ctx: *mut FxvtCtx);
     fn fxvt_scroll(ctx: *mut FxvtCtx, delta: c_long);
     fn fxvt_scroll_bottom(ctx: *mut FxvtCtx);
-    fn fxvt_scrollbar(
-        ctx: *mut FxvtCtx,
-        total: *mut u64,
-        offset: *mut u64,
-        len: *mut u64,
-    ) -> c_int;
+    fn fxvt_scrollbar(ctx: *mut FxvtCtx, total: *mut u64, offset: *mut u64, len: *mut u64)
+        -> c_int;
     fn fxvt_title(ctx: *mut FxvtCtx, buf: *mut c_char, cap: usize) -> usize;
     fn fxvt_pwd(ctx: *mut FxvtCtx, buf: *mut c_char, cap: usize) -> usize;
     fn fxvt_encode_key(
@@ -343,9 +338,7 @@ impl Vt {
         let f = [fg.r, fg.g, fg.b];
         let b = [bg.r, bg.g, bg.b];
         let c = [cursor.r, cursor.g, cursor.b];
-        unsafe {
-            fxvt_set_default_colors(self.ctx, f.as_ptr(), b.as_ptr(), c.as_ptr()) == 0
-        }
+        unsafe { fxvt_set_default_colors(self.ctx, f.as_ptr(), b.as_ptr(), c.as_ptr()) == 0 }
     }
 
     /// Override the low palette entries (typically the 16 themeable ANSI
@@ -710,9 +703,21 @@ mod tests {
     #[test]
     fn set_default_colors_overrides_theme_fg_bg() {
         let mut vt = updated(20, 3);
-        let fg = Rgb { r: 0xab, g: 0xcd, b: 0xef };
-        let bg = Rgb { r: 0x10, g: 0x20, b: 0x30 };
-        let cursor = Rgb { r: 0xff, g: 0x88, b: 0x00 };
+        let fg = Rgb {
+            r: 0xab,
+            g: 0xcd,
+            b: 0xef,
+        };
+        let bg = Rgb {
+            r: 0x10,
+            g: 0x20,
+            b: 0x30,
+        };
+        let cursor = Rgb {
+            r: 0xff,
+            g: 0x88,
+            b: 0x00,
+        };
         assert!(vt.set_default_colors(fg, bg, cursor));
         vt.write(b"z");
         assert!(vt.update());
@@ -728,7 +733,11 @@ mod tests {
         let mut vt = updated(20, 3);
         // Make ANSI red (index 1) a recognizable custom value.
         let mut palette = vec![Rgb { r: 0, g: 0, b: 0 }; 16];
-        palette[1] = Rgb { r: 0x12, g: 0x34, b: 0x56 };
+        palette[1] = Rgb {
+            r: 0x12,
+            g: 0x34,
+            b: 0x56,
+        };
         assert!(vt.set_palette(&palette));
         // SGR 31 selects palette index 1 for the foreground.
         vt.write(b"\x1b[31mR\x1b[0m");
@@ -783,12 +792,19 @@ mod tests {
         let mut vt = updated(40, 5);
         // Ctrl+C → 0x03.
         assert_eq!(
-            vt.encode_key(named_key::NONE, 'c' as u32, MOD_CTRL, false).as_deref(),
+            vt.encode_key(named_key::NONE, 'c' as u32, MOD_CTRL, false)
+                .as_deref(),
             Some(&b"\x03"[..])
         );
         // Enter → CR; Tab → HT; Backspace → DEL.
-        assert_eq!(vt.encode_key(named_key::ENTER, 0, 0, false).as_deref(), Some(&b"\r"[..]));
-        assert_eq!(vt.encode_key(named_key::TAB, 0, 0, false).as_deref(), Some(&b"\t"[..]));
+        assert_eq!(
+            vt.encode_key(named_key::ENTER, 0, 0, false).as_deref(),
+            Some(&b"\r"[..])
+        );
+        assert_eq!(
+            vt.encode_key(named_key::TAB, 0, 0, false).as_deref(),
+            Some(&b"\t"[..])
+        );
         assert_eq!(
             vt.encode_key(named_key::BACKSPACE, 0, 0, false).as_deref(),
             Some(&b"\x7f"[..])
@@ -866,7 +882,10 @@ mod tests {
         vt.write(b"\x1b[?1000h"); // enable normal mouse tracking
         assert!(vt.mouse_enabled(), "mode 1000 should enable tracking");
         vt.write(b"\x1b[?1000l"); // disable
-        assert!(!vt.mouse_enabled(), "mode 1000 reset should disable tracking");
+        assert!(
+            !vt.mouse_enabled(),
+            "mode 1000 reset should disable tracking"
+        );
     }
 
     #[test]
@@ -894,9 +913,15 @@ mod tests {
         // Select "hello" (cols 0..=4 on row 0).
         assert!(vt.set_selection((0, 0), (4, 0), false));
         assert!(vt.update());
-        assert!(vt.cell(0, 0).unwrap().selected, "first cell should be selected");
+        assert!(
+            vt.cell(0, 0).unwrap().selected,
+            "first cell should be selected"
+        );
         assert!(vt.cell(0, 4).unwrap().selected, "last selected cell");
-        assert!(!vt.cell(0, 6).unwrap().selected, "cell past selection is unselected");
+        assert!(
+            !vt.cell(0, 6).unwrap().selected,
+            "cell past selection is unselected"
+        );
         assert_eq!(vt.selection_text().as_deref(), Some("hello"));
 
         vt.clear_selection();
