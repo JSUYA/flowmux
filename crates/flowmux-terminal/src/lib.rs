@@ -146,6 +146,13 @@ pub trait TerminalBackend {
 pub mod ghostty_backend;
 pub mod key_modes;
 
+/// libghostty-vt core (feed bytes, snapshot, read grid) over the C shim, which
+/// links a static libghostty-vt. Always built — see build.rs.
+pub mod vt;
+
+/// PTY layer for the terminal backend (spawn child, read/write master, resize).
+pub mod pty;
+
 pub use key_modes::TerminalInputModes;
 
 #[cfg(test)]

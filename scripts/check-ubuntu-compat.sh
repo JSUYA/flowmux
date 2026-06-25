@@ -59,18 +59,25 @@ apt-get update >/dev/null
 apt-get install -y --no-install-recommends \
     ca-certificates curl git build-essential pkg-config \
     meson ninja-build python3 xvfb xauth \
-    libgtk-4-dev libadwaita-1-dev libvte-2.91-gtk4-dev \
+    libgtk-4-dev libadwaita-1-dev \
     libwebkitgtk-6.0-dev libssl-dev libssh2-1-dev \
-    libdbus-1-dev libsecret-1-dev \
-    liblz4-dev libpcre2-dev libfribidi-dev libicu-dev libgnutls28-dev >/dev/null
+    libdbus-1-dev libsecret-1-dev >/dev/null
 curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
     | sh -s -- -y --profile minimal >/dev/null
 . "$HOME/.cargo/env"
 echo "rustc $(rustc --version)"
+# The terminal backend (libghostty-vt) is built by Zig, so the GUI build needs
+# Zig 0.15.x on PATH. No VTE is required any more.
+ZIG_VERSION=0.15.2
+curl --proto "=https" --tlsv1.2 -fsSL \
+    "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" \
+    | tar -xJ -C /opt
+export PATH="/opt/zig-x86_64-linux-${ZIG_VERSION}:$PATH"
+echo "zig $(zig version)"
 /workspace/scripts/install-host.sh --check
 CARGO_HOME=/tmp/cargo CARGO_TARGET_DIR=/tmp/flowmux-target \
     cargo build --manifest-path /workspace/Cargo.toml \
-    -p flowmux -p flowmux-cli --features flowmux/vte-text --locked
+    -p flowmux -p flowmux-cli --locked
 export XDG_RUNTIME_DIR=/tmp/flowmux-runtime
 export XDG_STATE_HOME=/tmp/flowmux-state
 export XDG_DATA_HOME=/tmp/flowmux-data

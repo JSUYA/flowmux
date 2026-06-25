@@ -7,7 +7,8 @@
 
 use crate::theme::ResolvedTheme;
 use crate::ui::browser_pane::BrowserPane;
-use crate::ui::terminal_pane::{PaneCallbacks, TerminalPane};
+use crate::ui::ghostty_pane::GhosttyPane;
+use crate::ui::pane_terminal::{PaneCallbacks, PaneTerminal};
 use flowmux_core::{
     terminal_tab_title_for_cwd, Pane, PaneContent, PaneId, PaneSurface, SplitDirection, Surface,
     SurfaceId, SurfaceKind, Workspace, WorkspaceId,
@@ -36,7 +37,7 @@ pub fn solo_workspace_pane(ws: &Workspace) -> Option<PaneId> {
 
 #[derive(Default)]
 pub struct PaneRegistry {
-    pub terminals: HashMap<SurfaceId, TerminalPane>,
+    pub terminals: HashMap<SurfaceId, PaneTerminal>,
     pub browsers: HashMap<SurfaceId, BrowserPane>,
     active_terminal_by_pane: HashMap<PaneId, SurfaceId>,
     active_browser_by_pane: HashMap<PaneId, SurfaceId>,
@@ -66,7 +67,7 @@ pub struct TornOffSurface {
 }
 
 impl PaneRegistry {
-    pub fn active_terminal(&self, pane: PaneId) -> Option<&TerminalPane> {
+    pub fn active_terminal(&self, pane: PaneId) -> Option<&PaneTerminal> {
         self.active_terminal_by_pane
             .get(&pane)
             .and_then(|surface| self.terminals.get(surface))
@@ -156,7 +157,7 @@ impl PaneRegistry {
             .filter_map(|(surface, terminal)| {
                 terminal
                     .current_dir()
-                    .map(|cwd| (terminal.id, *surface, cwd))
+                    .map(|cwd| (terminal.id(), *surface, cwd))
             })
             .collect()
     }
@@ -946,7 +947,7 @@ fn build_surface_tab_widget(
 }
 
 /// Build the secondary-click popover used by surface tabs. Mirrors the
-/// pattern used by `terminal_pane.rs` and `sidebar.rs`: plain `Popover`
+/// pattern used by `ghostty_pane.rs` and `sidebar.rs`: plain `Popover`
 /// + `Button` rows whose `connect_clicked` closures route directly to
 /// the per-pane callbacks. PopoverMenu + `win.*` actions have been
 /// observed to drop in some GTK versions.
@@ -1489,7 +1490,14 @@ fn build_panel(
                 &socket,
                 bundled_cli.as_deref(),
             );
-            let pane = TerminalPane::spawn(
+            // Start the new terminal widget with the current font + zoom
+            // options so a freshly spawned tab matches the live ones.
+            let opts = (callbacks.read_options)();
+            let font = theme.font_with_overrides(opts.font_family.as_deref(), opts.font_size);
+
+            // libghostty-vt is the only terminal backend. GhosttyPane owns the
+            // PTY + render; title/cwd changes are forwarded from inside it.
+            let pane: PaneTerminal = GhosttyPane::spawn(
                 pane_id,
                 surface.id,
                 argv,
@@ -1497,39 +1505,10 @@ fn build_panel(
                 extra_env,
                 callbacks.clone(),
             );
-            theme.apply_to_terminal(&pane);
-            // Start the new terminal widget with the current font + zoom
-            // options so a freshly spawned tab matches the live ones.
-            let opts = (callbacks.read_options)();
-            pane.set_font(&theme.font_with_overrides(opts.font_family.as_deref(), opts.font_size));
+            theme.apply_to_ghostty(&pane);
+            pane.set_font(&font);
             pane.set_font_scale(opts.zoom_factor());
-
-            {
-                let cb = callbacks.on_terminal_cwd_changed.clone();
-                let surface_id = surface.id;
-                pane.connect_current_dir_notify(move |pane| {
-                    if let Some(cwd) = pane.current_dir() {
-                        (cb.borrow_mut())(pane_id, surface_id, cwd);
-                    }
-                });
-            }
-
-            // Apply OSC 0/2 window titles emitted by vi/claude/codex/tmux and
-            // similar programs to the tab label and window title. terminal may send
-            // empty resets, so the dispatcher ignores trim-empty values.
-            {
-                let cb = callbacks.on_terminal_title_changed.clone();
-                let surface_id = surface.id;
-                pane.connect_title_notify(move |_pane, title| {
-                    tracing::debug!(
-                        %pane_id,
-                        %surface_id,
-                        title = %title,
-                        "terminal title notify"
-                    );
-                    (cb.borrow_mut())(pane_id, surface_id, title);
-                });
-            }
+            let pane_terminal: PaneTerminal = pane;
 
             // Toggle the .focused class on frame focus enter/leave. theme.rs
             // CSS draws a 1px border for the focused pane using the focus
@@ -1545,14 +1524,14 @@ fn build_panel(
             focus.connect_leave(move |_| {
                 frame_out.remove_css_class("focused");
             });
-            pane.add_controller(focus);
+            pane_terminal.add_controller(focus);
 
             // The terminal widget is the pane's root; keeping the same root
             // instance alive preserves the running PTY child across split
             // tree changes.
-            let widget = pane.root_widget();
+            let widget = pane_terminal.root_widget();
             let mut r = registry.borrow_mut();
-            r.terminals.insert(surface.id, pane);
+            r.terminals.insert(surface.id, pane_terminal);
             r.surface_workspace.insert(surface.id, workspace);
             widget
         }

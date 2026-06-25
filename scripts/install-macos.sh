@@ -66,7 +66,7 @@ EOF
     fi
 
     local missing_commands=()
-    for command in cargo pkg-config codesign iconutil install open plutil xattr xcrun; do
+    for command in cargo zig pkg-config codesign iconutil install open plutil xattr xcrun; do
         if ! command -v "$command" >/dev/null 2>&1; then
             missing_commands+=("$command")
         fi
@@ -83,7 +83,7 @@ EOF
 
     local missing_modules=()
     if command -v pkg-config >/dev/null 2>&1; then
-        for module in gtk4 libadwaita-1 vte-2.91-gtk4; do
+        for module in gtk4 libadwaita-1; do
             if ! pkg-config --exists "$module"; then
                 missing_modules+=("$module")
             fi
@@ -102,10 +102,12 @@ EOF
         fi
         cat >&2 <<'EOF'
 Install the macOS native prerequisites:
-  brew install pkg-config gtk4 libadwaita vte3
+  brew install pkg-config gtk4 libadwaita
+  # plus Zig 0.15.x (https://ziglang.org/download/) to build libghostty-vt
 
-FlowMux uses the Apple WebKit.framework on macOS; do not install Homebrew
-webkitgtk for browser support.
+FlowMux renders terminals with the libghostty-vt backend (no VTE) and uses the
+Apple WebKit.framework for the browser pane; do not install Homebrew vte3 or
+webkitgtk.
 
 Install Rust with rustup if `cargo` is missing:
   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
@@ -196,9 +198,9 @@ fi
 cd "$REPO_ROOT"
 echo "==> building flowmux ($PROFILE)"
 if [ "${#build_args[@]}" -gt 0 ]; then
-    cargo build "${build_args[@]}" -p flowmux -p flowmux-cli --features flowmux/vte-text
+    cargo build "${build_args[@]}" -p flowmux -p flowmux-cli
 else
-    cargo build -p flowmux -p flowmux-cli --features flowmux/vte-text
+    cargo build -p flowmux -p flowmux-cli
 fi
 
 version="$(workspace_version)"

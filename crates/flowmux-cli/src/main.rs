@@ -185,8 +185,7 @@ enum Cmd {
     },
 
     /// Print a terminal pane's buffer text (`pane:<uuid>` or bare uuid;
-    /// falls back to `$FLOWMUX_PANE_ID`). Requires a flowmux built with
-    /// the `vte-text` feature.
+    /// falls back to `$FLOWMUX_PANE_ID`).
     ReadScreen { pane: Option<PaneId> },
     /// tmux-compatible alias for `read-screen`.
     CapturePane { pane: Option<PaneId> },

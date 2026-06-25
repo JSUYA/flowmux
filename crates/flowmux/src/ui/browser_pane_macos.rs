@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! macOS in-app browser pane backed by the system WebKit `WKWebView`.
 
-use crate::ui::terminal_pane::PaneCallbacks;
+use crate::ui::pane_terminal::PaneCallbacks;
 use flowmux_browser::{BrowserProfile, RefScope, RefStore};
 use flowmux_config::options::BrowserEngine;
 use flowmux_core::{PaneId, SurfaceId};

@@ -23,7 +23,6 @@
 
 use gtk::gdk;
 use gtk::pango;
-use vte::prelude::*;
 
 pub struct ResolvedTheme {
     pub font: pango::FontDescription,
@@ -152,30 +151,29 @@ impl ResolvedTheme {
         desc
     }
 
-    pub fn apply_to_terminal(&self, term: &crate::ui::terminal_pane::TerminalPane) {
-        let vte: &vte::Terminal = &term.widget;
-        vte.set_font(Some(&self.font));
-        let refs: Vec<&gdk::RGBA> = self.palette.iter().collect();
-        vte.set_colors(Some(&self.fg), Some(&self.bg), &refs);
-        vte.set_color_cursor(Some(&self.cursor));
-        if let Some(sbg) = &self.selection_bg {
-            vte.set_color_highlight(Some(sbg));
+    /// Push the theme font + default fg/bg, the 16 ANSI palette colors, the
+    /// cursor color, and selection colors into the libghostty terminal pane.
+    /// Indices 16..256 keep libghostty's standard xterm fill (so a 16-color
+    /// theme expands the same way a traditional terminal would).
+    pub fn apply_to_ghostty(&self, pane: &crate::ui::ghostty_pane::GhosttyPane) {
+        use flowmux_terminal::vt::Rgb;
+        fn to_rgb(c: &gdk::RGBA) -> Rgb {
+            Rgb {
+                r: (c.red() * 255.0).round().clamp(0.0, 255.0) as u8,
+                g: (c.green() * 255.0).round().clamp(0.0, 255.0) as u8,
+                b: (c.blue() * 255.0).round().clamp(0.0, 255.0) as u8,
+            }
         }
-        if let Some(sfg) = &self.selection_fg {
-            vte.set_color_highlight_foreground(Some(sfg));
-        }
-        // Block-blink cursor, no audible bell, generous scrollback —
-        // matches the look the pre-libghostty build shipped with.
-        vte.set_cursor_blink_mode(vte::CursorBlinkMode::On);
-        vte.set_cursor_shape(vte::CursorShape::Block);
-        vte.set_audible_bell(false);
-        vte.set_scrollback_lines(20_000);
-        // Snap the viewport back to the cursor when the user presses
-        // any key, so a scrolled-up history view doesn't silently swallow
-        // input. Output does NOT snap, so a live `tig` / `vim` redraw
-        // can paint without yanking a user-scrolled view.
-        vte.set_scroll_on_keystroke(true);
-        vte.set_scroll_on_output(false);
+        pane.set_font(&self.font);
+        let palette: Vec<Rgb> = self.palette.iter().map(to_rgb).collect();
+        pane.apply_colors(
+            to_rgb(&self.fg),
+            to_rgb(&self.bg),
+            to_rgb(&self.cursor),
+            &palette,
+            self.selection_bg.as_ref().map(to_rgb),
+            self.selection_fg.as_ref().map(to_rgb),
+        );
     }
 
     pub fn is_dark(&self) -> bool {
