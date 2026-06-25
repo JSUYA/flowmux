@@ -88,11 +88,14 @@ flowmux browser title pane:$PANE
 | is-visible / is-enabled / is-checked / count | yes | return strings or ints |
 | text / value / attr | yes | read by ref |
 | eval (low-level JS) | yes | escape hatch only |
-| screenshot / wait / viewport / network mocking / screencast | not yet | Phase 5 deferred; CDP-only items will stay `not_supported` |
+| screenshot | yes | visible-viewport PNG written to a path |
+| wait | yes | polls for selector / text / url / ready-state / JS predicate (timeout + poll interval) |
+| viewport / network mocking / screencast | no | CDP-only; WebKitGTK 6 / WKWebView do not expose CDP |
 
 ## When the task really needs Playwright / Puppeteer
 
-`flowmux-browser` runs on WebKitGTK 6, which does not expose the Chrome
+The in-app browser runs on WebKitGTK 6 (Linux) or WKWebView (macOS),
+neither of which exposes the Chrome
 DevTools Protocol. If a task strictly requires CDP-only features
 (network request mocking, full-page tracing, accurate device viewport
 emulation, etc.), say so explicitly and run an external Playwright

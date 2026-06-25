@@ -109,8 +109,10 @@ Terminal surfaces are stored as `PaneTerminal`
 (`crates/flowmux/src/ui/pane_terminal.rs`), which is a type alias for the sole
 backend `ui::ghostty_pane::GhosttyPane` (PTY + `flowmux-terminal::vt::Vt` + a
 Cairo/Pango `DrawingArea` renderer); `pane_terminal.rs` also holds the shared
-`PaneCallbacks` bundle. Browser surfaces are backed by `flowmux-browser`
-(WebKitGTK 6.0 WebView with a scriptable controller). The IPC protocol and the
+`PaneCallbacks` bundle. Browser surfaces are backed by a scriptable WebView —
+WebKitGTK 6.0 on Linux, WKWebView on macOS (the platform split lives in
+`flowmux/src/ui/browser_pane_{webkit,macos,stub}.rs`; `flowmux-browser` holds the
+shared controller trait + snapshot types). The IPC protocol and the
 GUI both refer to these by `WorkspaceId` / `PaneId` / `SurfaceId` (UUID newtypes
 in `flowmux-core`).
 
@@ -178,9 +180,10 @@ agent code:
   in a flowmux pane (over Playwright / Puppeteer / system Chromium).
   Snapshots return Markdown + an `eN` ref-token map; refs are
   invalidated by the next snapshot or any navigation.
-- WebKitGTK 6.0 does **not** expose CDP, so CDP-only verbs
-  (`wait`, network mocking, viewport, screencast) are intentionally
-  `not_supported`; do not stub them as no-ops.
+- WebKitGTK 6.0 / WKWebView do **not** expose CDP, so CDP-only verbs
+  (network mocking, viewport, screencast) are intentionally `not_supported`; do
+  not stub them as no-ops. `wait` (DOM polling) and `screenshot` (native
+  snapshot) do not need CDP and are supported.
 - Agent hooks (Claude Code, Codex, OpenCode) are installed by
   `flowmux fix` and audited by `flowmux doctor`. Hook payloads ship
   *inside* the binary, so any change to the on-disk hook format must

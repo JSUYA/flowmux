@@ -212,7 +212,7 @@ install the build prerequisites, run `scripts/install-host.sh`, then start
 `flowmux` from the Linux side so GTK connects to WSLg's Wayland display. The
 runtime detects WSL and enables the terminal key/resize workarounds that differ
 from a regular GNOME session. Ubuntu 22.04 on WSL should use the Flatpak path
-from the Jammy section because the native GTK/libadwaita/VTE floor is too old.
+from the Jammy section because the native GTK/libadwaita floor is too old.
 
 To verify a real WSLg session end to end on 24.04 or 26.04:
 

@@ -3,11 +3,12 @@
 #
 # Docker-backed compatibility smoke check for the Ubuntu support matrix.
 #
-# Ubuntu 24.04 and 26.04 have native GTK4/libadwaita/VTE/WebKitGTK 6 packages,
+# Ubuntu 24.04 and 26.04 have native GTK4 / libadwaita / WebKitGTK 6 packages,
 # so this script builds the GUI and runs it under Xvfb, then verifies CLI and
 # terminal I/O against the live daemon. Ubuntu 22.04 remains the Flatpak target
-# because its native GTK/libadwaita/VTE floor is too low for the GUI crate; the
-# script verifies that expected package gap.
+# because its native GTK4 / libadwaita floor is too low for the GUI crate (the
+# terminal backend is libghostty-vt, built by Zig — VTE is no longer involved);
+# the script verifies that expected version gap.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -28,22 +29,15 @@ set -euo pipefail
 apt-get update >/dev/null
 gtk="$(apt-cache policy libgtk-4-dev | awk "/Candidate:/ {print \$2}")"
 adw="$(apt-cache policy libadwaita-1-dev | awk "/Candidate:/ {print \$2}")"
-if apt-cache show libvte-2.91-gtk4-dev >/dev/null 2>&1; then
-    echo "error: unexpected native GTK4 VTE package on ubuntu:22.04" >&2
+# flowmux needs gtk4 >= 4.12 (v4_12) and libadwaita >= 1.5 (v1_5); Ubuntu 22.04
+# ships ~4.6 / ~1.1, below the floor, so the native build is impossible and
+# 22.04 must use the Flatpak GNOME runtime. VTE is no longer a factor — there is
+# no VTE dependency any more (the terminal backend is libghostty-vt via Zig).
+if dpkg --compare-versions "$gtk" ge 4.12 && dpkg --compare-versions "$adw" ge 1.5; then
+    echo "error: ubuntu:22.04 unexpectedly meets the GTK/libadwaita floor (gtk=$gtk adw=$adw)" >&2
     exit 1
 fi
-echo "gtk=$gtk libadwaita=$adw vte4=missing; use Flatpak GNOME runtime for 22.04"
-'
-    "$DOCKER" run --rm \
-        --mount "type=bind,source=$REPO_ROOT,target=/workspace,readonly" \
-        ubuntu:22.04 bash -lc '
-set -euo pipefail
-if /workspace/scripts/install-host.sh --check 2>/tmp/flowmux-install-host.err; then
-    echo "error: install-host native preflight unexpectedly passed on ubuntu:22.04" >&2
-    exit 1
-fi
-cat /tmp/flowmux-install-host.err
-grep -q "Ubuntu 22.04" /tmp/flowmux-install-host.err
+echo "gtk=$gtk libadwaita=$adw below the v4_12/v1_5 floor; use Flatpak GNOME runtime for 22.04"
 '
 }
 
@@ -74,7 +68,6 @@ curl --proto "=https" --tlsv1.2 -fsSL \
     | tar -xJ -C /opt
 export PATH="/opt/zig-x86_64-linux-${ZIG_VERSION}:$PATH"
 echo "zig $(zig version)"
-/workspace/scripts/install-host.sh --check
 CARGO_HOME=/tmp/cargo CARGO_TARGET_DIR=/tmp/flowmux-target \
     cargo build --manifest-path /workspace/Cargo.toml \
     -p flowmux -p flowmux-cli --locked
