@@ -79,6 +79,13 @@ struct State {
     /// Whether a left-button drag selection is in progress, and its anchor cell.
     selecting: bool,
     anchor: (u16, u16),
+    /// A primary press deferred while app mouse reporting is on: we don't yet
+    /// know if it's a click (report to the app) or the start of a drag (local
+    /// text selection). Holds the press `(x, y, mods)`. Resolved on the first
+    /// motion that leaves the anchor cell (→ selection) or on release without
+    /// movement (→ click is sent to the app). See the press/motion/release
+    /// handlers in `install_input`.
+    pending_app_press: Option<(f64, f64, u8)>,
     /// Last OSC title seen, to fire the title-changed callback only on change.
     last_title: String,
     /// Last working directory forwarded, to fire the cwd-changed callback only
@@ -86,6 +93,14 @@ struct State {
     /// VTE's `current-directory-uri`; libghostty has no signal so we poll the
     /// vt's pwd after each read).
     last_cwd: Option<PathBuf>,
+    /// Cursor blink: whether blinking is enabled, the current on/off phase, and
+    /// whether this pane is focused. The cursor is only hidden mid-blink while
+    /// `blink_enabled && focused && !blink_phase_on`; an unfocused or
+    /// blink-disabled pane always shows a steady cursor. The timer driving
+    /// `blink_phase_on` lives on `GhosttyPane` (see `restart_cursor_blink`).
+    blink_enabled: bool,
+    blink_phase_on: bool,
+    focused: bool,
 }
 
 type PendingInput = Rc<RefCell<Option<Vec<u8>>>>;
@@ -129,6 +144,11 @@ pub struct GhosttyPane {
     scrollbar: gtk::Scrollbar,
     adj: gtk::Adjustment,
     syncing: Rc<Cell<bool>>,
+    /// Cursor blink timer (a `glib` timeout) and its half-period. Shared so the
+    /// cheap `Clone` keeps one timer per pane. `restart_cursor_blink` tears down
+    /// the old source and installs a new one whenever the setting changes.
+    blink_source: Rc<RefCell<Option<glib::SourceId>>>,
+    blink_interval_ms: Rc<Cell<u32>>,
 }
 
 impl GhosttyPane {
@@ -192,6 +212,10 @@ impl GhosttyPane {
             preedit: String::new(),
             pointer: (0.0, 0.0),
             selecting: false,
+            pending_app_press: None,
+            blink_enabled: true,
+            blink_phase_on: true,
+            focused: false,
             anchor: (0, 0),
             last_title: String::new(),
             last_cwd: None,
@@ -234,6 +258,10 @@ impl GhosttyPane {
             scrollbar,
             adj,
             syncing: Rc::new(Cell::new(false)),
+            blink_source: Rc::new(RefCell::new(None)),
+            blink_interval_ms: Rc::new(Cell::new(
+                flowmux_config::options::CURSOR_BLINK_INTERVAL_DEFAULT,
+            )),
         };
 
         pane.install_draw();
@@ -243,6 +271,7 @@ impl GhosttyPane {
         pane.install_mouse(callbacks.clone());
         pane.install_focus(callbacks);
         pane.install_scrollbar();
+        pane.restart_cursor_blink();
 
         pane
     }
@@ -509,15 +538,36 @@ impl GhosttyPane {
             motion.connect_motion(move |_c, x, y| {
                 let mut s = state.borrow_mut();
                 s.pointer = (x, y);
+                let (cols, rows) = s.vt.dims().unwrap_or((s.cols, s.rows));
+                let end = px_to_cell(x, y, s.cell_w, s.cell_h, cols, rows);
                 if s.selecting {
-                    let (cols, rows) = s.vt.dims().unwrap_or((s.cols, s.rows));
                     let anchor = s.anchor;
-                    let end = px_to_cell(x, y, s.cell_w, s.cell_h, cols, rows);
-                    if s.vt.set_selection(anchor, end, false) {
-                        s.has_sel = anchor != end;
+                    if anchor == end {
+                        // Still on the anchor cell — a click/jitter, not a drag.
+                        // Don't paint a stray one-cell block; clear instead.
+                        s.vt.clear_selection();
+                        s.has_sel = false;
+                    } else if s.vt.set_selection(anchor, end, false) {
+                        s.has_sel = true;
                     }
                     drop(s);
                     area.queue_draw();
+                } else if s.pending_app_press.is_some() {
+                    // A deferred primary press (app mouse reporting on) that has
+                    // now moved off its anchor cell → treat as a drag and start
+                    // a local text selection instead of forwarding to the app.
+                    if end != s.anchor {
+                        s.pending_app_press = None;
+                        s.vt.clear_selection();
+                        s.has_sel = false;
+                        let anchor = s.anchor;
+                        if s.vt.set_selection(anchor, end, false) {
+                            s.selecting = true;
+                            s.has_sel = anchor != end;
+                        }
+                        drop(s);
+                        area.queue_draw();
+                    }
                 } else if s.vt.mouse_enabled() {
                     if let Some(bytes) =
                         s.vt.encode_mouse(MouseAction::Motion, MouseButton::None, x, y, 0)
@@ -550,6 +600,7 @@ impl GhosttyPane {
                 let mods = mods_from_state(g.current_event_state());
                 let mut s = state.borrow_mut();
                 s.pointer = (x, y);
+                s.pending_app_press = None;
 
                 // Ctrl + left click → open the URL under the pointer.
                 if button == gdk::BUTTON_PRIMARY && (mods & flowmux_terminal::vt::MOD_CTRL) != 0 {
@@ -564,18 +615,38 @@ impl GhosttyPane {
                     return;
                 }
 
-                // Secondary (right) click with no app mouse reporting (or with
-                // Shift forcing local handling) → terminal-body context menu.
+                // Right click always opens the terminal-body context menu,
+                // even when the app has mouse reporting on — the menu (Copy /
+                // Paste / …) is more useful there than forwarding the click.
                 let shift = (mods & flowmux_terminal::vt::MOD_SHIFT) != 0;
-                if button == gdk::BUTTON_SECONDARY && (!s.vt.mouse_enabled() || shift) {
+                if button == gdk::BUTTON_SECONDARY {
                     drop(s);
                     pane_for_menu.show_context_menu(x, y, &cb_for_menu);
                     g.set_state(gtk::EventSequenceState::Claimed);
                     return;
                 }
 
-                // App mouse reporting (unless Shift forces local selection).
                 if s.vt.mouse_enabled() && !shift {
+                    // App mouse reporting is on. A primary press is ambiguous:
+                    // a click should reach the app, but a drag should select
+                    // text locally. Defer it — motion resolves to a selection,
+                    // release-without-motion forwards the click (see those
+                    // handlers). Non-primary buttons report immediately.
+                    if button == gdk::BUTTON_PRIMARY {
+                        // Clear any existing selection now: a press that turns
+                        // into a click should deselect (and a drag will set a
+                        // fresh selection from this anchor in motion).
+                        if s.has_sel {
+                            s.vt.clear_selection();
+                            s.has_sel = false;
+                        }
+                        let (cols, rows) = s.vt.dims().unwrap_or((s.cols, s.rows));
+                        s.anchor = px_to_cell(x, y, s.cell_w, s.cell_h, cols, rows);
+                        s.pending_app_press = Some((x, y, mods));
+                        drop(s);
+                        area.queue_draw();
+                        return;
+                    }
                     let gb = ghostty_button(button);
                     if let Some(bytes) = s.vt.encode_mouse(MouseAction::Press, gb, x, y, mods) {
                         let _ = s.pty.write(&bytes);
@@ -583,7 +654,8 @@ impl GhosttyPane {
                     return;
                 }
 
-                // Otherwise begin a selection on the primary button.
+                // Mouse reporting off (or Shift held): begin a selection on the
+                // primary button immediately.
                 if button == gdk::BUTTON_PRIMARY {
                     s.vt.clear_selection();
                     s.has_sel = false;
@@ -604,6 +676,17 @@ impl GhosttyPane {
                 let shift = (mods & flowmux_terminal::vt::MOD_SHIFT) != 0;
                 if s.selecting {
                     s.selecting = false;
+                } else if let Some((px, py, pmods)) = s.pending_app_press.take() {
+                    // Deferred primary press never moved off its anchor cell →
+                    // it was a click, not a drag. Forward press+release to the
+                    // app now so single clicks still reach it.
+                    let gb = ghostty_button(gdk::BUTTON_PRIMARY);
+                    if let Some(bytes) = s.vt.encode_mouse(MouseAction::Press, gb, px, py, pmods) {
+                        let _ = s.pty.write(&bytes);
+                    }
+                    if let Some(bytes) = s.vt.encode_mouse(MouseAction::Release, gb, x, y, mods) {
+                        let _ = s.pty.write(&bytes);
+                    }
                 } else if s.vt.mouse_enabled() && !shift {
                     let gb = ghostty_button(button);
                     if let Some(bytes) = s.vt.encode_mouse(MouseAction::Release, gb, x, y, mods) {
@@ -651,10 +734,64 @@ impl GhosttyPane {
     fn install_focus(&self, callbacks: PaneCallbacks) {
         let focus = gtk::EventControllerFocus::new();
         let id = self.id;
+        // Blinking only runs on the focused pane: enter starts the timer (phase
+        // reset to visible), leave stops it and leaves a steady cursor.
+        let pane_enter = self.clone();
         focus.connect_enter(move |_| {
             (callbacks.on_focus.borrow_mut())(id);
+            pane_enter.state.borrow_mut().focused = true;
+            pane_enter.restart_cursor_blink();
+        });
+        let pane_leave = self.clone();
+        focus.connect_leave(move |_| {
+            pane_leave.state.borrow_mut().focused = false;
+            pane_leave.restart_cursor_blink();
         });
         self.area.add_controller(focus);
+    }
+
+    /// Tear down any running blink timer and, if blinking is enabled and this
+    /// pane is focused, install a fresh `glib` timeout at the current interval.
+    /// The phase is reset to visible so the cursor never disappears at the
+    /// moment the setting or focus changes.
+    fn restart_cursor_blink(&self) {
+        if let Some(src) = self.blink_source.borrow_mut().take() {
+            src.remove();
+        }
+        {
+            let mut s = self.state.borrow_mut();
+            s.blink_phase_on = true;
+        }
+        self.area.queue_draw();
+
+        let (enabled, focused) = {
+            let s = self.state.borrow();
+            (s.blink_enabled, s.focused)
+        };
+        if !enabled || !focused {
+            return;
+        }
+        let interval = self.blink_interval_ms.get().max(1) as u64;
+        let state = self.state.clone();
+        let area = self.area.clone();
+        let src = glib::timeout_add_local(std::time::Duration::from_millis(interval), move || {
+            {
+                let mut s = state.borrow_mut();
+                s.blink_phase_on = !s.blink_phase_on;
+            }
+            area.queue_draw();
+            glib::ControlFlow::Continue
+        });
+        *self.blink_source.borrow_mut() = Some(src);
+    }
+
+    /// Apply the cursor-blink option (enabled + half-period in ms). Clamps the
+    /// interval and restarts the timer so the change takes effect live.
+    pub fn set_cursor_blink(&self, enabled: bool, interval_ms: u32) {
+        self.state.borrow_mut().blink_enabled = enabled;
+        self.blink_interval_ms
+            .set(flowmux_config::options::Options::clamp_cursor_blink_interval(interval_ms));
+        self.restart_cursor_blink();
     }
 
     // ---- Method surface used by the pane registry (see pane_terminal.rs) ----
@@ -1321,6 +1458,11 @@ fn draw(state: &mut State, cr: &cairo::Context, w: i32, h: i32) {
         }
     }
 
+    // Hide the cursor on the "off" half of a blink, but only while this pane is
+    // focused and blinking is enabled — an unfocused or steady cursor always
+    // draws. Applies to the IME-preedit cursor too, so composing Hangul/CJK
+    // still blinks.
+    let blink_hidden = state.blink_enabled && state.focused && !state.blink_phase_on;
     if let Some(cursor) = state.vt.cursor() {
         let cx = cursor.x as f64 * cw;
         let cy = cursor.y as f64 * ch;
@@ -1341,13 +1483,13 @@ fn draw(state: &mut State, cr: &cairo::Context, w: i32, h: i32) {
             pangocairo::functions::show_layout(cr, &layout);
             cr.rectangle(cx, cy + ascent + 2.0, pw, 1.0);
             let _ = cr.fill();
-            if cursor.visible {
+            if cursor.visible && !blink_hidden {
                 let (r, g, b) = rgb(cursor_rgb);
                 cr.set_source_rgba(r, g, b, 0.6);
                 cr.rectangle(cx + pw, cy, cw, ch);
                 let _ = cr.fill();
             }
-        } else if cursor.visible && cursor.x < cols && cursor.y < rows {
+        } else if cursor.visible && !blink_hidden && cursor.x < cols && cursor.y < rows {
             let (r, g, b) = rgb(cursor_rgb);
             cr.set_source_rgba(r, g, b, 0.6);
             cr.rectangle(cx, cy, cw, ch);

@@ -23,7 +23,8 @@
 use adw::prelude::*;
 use flowmux_config::keybindings::KeybindingOverrides;
 use flowmux_config::options::{
-    BrowserEngine, Options, FOCUS_BORDER_OPACITY_MAX, FOCUS_BORDER_OPACITY_MIN, ZOOM_MAX, ZOOM_MIN,
+    BrowserEngine, Options, CURSOR_BLINK_INTERVAL_MAX, CURSOR_BLINK_INTERVAL_MIN,
+    FOCUS_BORDER_OPACITY_MAX, FOCUS_BORDER_OPACITY_MIN, ZOOM_MAX, ZOOM_MIN,
 };
 
 /// Present the modal options dialog. If the user clicks OK, `on_apply` is
@@ -87,6 +88,8 @@ fn build_dialog(
     let opacity_widgets = build_focus_opacity_row(current.focus_border_opacity);
     let persist_check = build_persist_check(current.persist_browser_session);
     let system_notify_switch = build_system_notify_switch(current.system_notifications_enabled);
+    let cursor_blink_switch = build_cursor_blink_switch(current.cursor_blink);
+    let blink_interval_spin = build_blink_interval_spin(current.cursor_blink_interval_ms);
 
     // General tab body — the original options dialog contents.
     let general = gtk::Box::new(gtk::Orientation::Vertical, 12);
@@ -102,6 +105,8 @@ fn build_dialog(
     general.append(&row("Focus border opacity (%)", &opacity_widgets.row));
     general.append(&row("Keep browser session data", &persist_check));
     general.append(&row("System notifications", &system_notify_switch));
+    general.append(&row("Cursor blink", &cursor_blink_switch));
+    general.append(&row("Cursor blink interval (ms)", &blink_interval_spin));
 
     let hint = gtk::Label::new(Some(
         "The selected label isolates the cookie/session directory for new \
@@ -184,6 +189,8 @@ fn build_dialog(
         let opacity_spin = opacity_widgets.spin.clone();
         let persist_check = persist_check.clone();
         let system_notify_switch = system_notify_switch.clone();
+        let cursor_blink_switch = cursor_blink_switch.clone();
+        let blink_interval_spin = blink_interval_spin.clone();
         let family_drop = font_widgets.family_drop.clone();
         let font_size_spin = font_widgets.size_spin.clone();
         let families = font_widgets.families.clone();
@@ -205,6 +212,8 @@ fn build_dialog(
                 &opacity_spin,
                 &persist_check,
                 &system_notify_switch,
+                &cursor_blink_switch,
+                &blink_interval_spin,
                 &family_drop,
                 &font_size_spin,
                 &families,
@@ -350,6 +359,8 @@ fn collect_options(
     opacity_spin: &gtk::SpinButton,
     persist_check: &gtk::CheckButton,
     system_notify_switch: &gtk::Switch,
+    cursor_blink_switch: &gtk::Switch,
+    blink_interval_spin: &gtk::SpinButton,
     family_drop: &gtk::DropDown,
     font_size_spin: &gtk::SpinButton,
     families: &[Option<String>],
@@ -385,6 +396,10 @@ fn collect_options(
         focus_border_opacity: opacity,
         persist_browser_session: persist_check.is_active(),
         system_notifications_enabled: system_notify_switch.is_active(),
+        cursor_blink: cursor_blink_switch.is_active(),
+        cursor_blink_interval_ms: Options::clamp_cursor_blink_interval(
+            blink_interval_spin.value() as u32,
+        ),
         font_family,
         font_size,
         keybindings: keybindings.clone(),
@@ -626,6 +641,32 @@ fn build_system_notify_switch(initial: bool) -> gtk::Switch {
     toggle
 }
 
+fn build_cursor_blink_switch(initial: bool) -> gtk::Switch {
+    let toggle = gtk::Switch::new();
+    toggle.set_active(initial);
+    toggle.set_halign(gtk::Align::End);
+    toggle.set_valign(gtk::Align::Center);
+    toggle
+}
+
+/// SpinButton for the cursor blink half-period in milliseconds, clamped to
+/// `[CURSOR_BLINK_INTERVAL_MIN, CURSOR_BLINK_INTERVAL_MAX]`.
+fn build_blink_interval_spin(initial: u32) -> gtk::SpinButton {
+    let initial = Options::clamp_cursor_blink_interval(initial);
+    let adj = gtk::Adjustment::new(
+        initial as f64,
+        CURSOR_BLINK_INTERVAL_MIN as f64,
+        CURSOR_BLINK_INTERVAL_MAX as f64,
+        10.0,
+        50.0,
+        0.0,
+    );
+    let spin = gtk::SpinButton::new(Some(&adj), 1.0, 0);
+    spin.set_numeric(true);
+    spin.set_halign(gtk::Align::End);
+    spin
+}
+
 /// Parse `#rrggbb` or another hex form as GdkRGBA and seed the
 /// ColorDialogButton. Fall back to the default pale yellow on parse failure.
 fn build_focus_color_button(initial_hex: &str) -> gtk::ColorDialogButton {
@@ -754,6 +795,8 @@ mod tests {
         );
         let kb = KeybindingOverrides::default();
         let notify_on = build_system_notify_switch(true);
+        let blink_on = build_cursor_blink_switch(true);
+        let blink_interval = build_blink_interval_spin(300);
         let opts = collect_options(
             &zoom,
             &engine,
@@ -761,12 +804,16 @@ mod tests {
             &opacity.spin,
             &persist_off,
             &notify_on,
+            &blink_on,
+            &blink_interval,
             &family_drop,
             &size_spin,
             &families,
             12.0,
             &kb,
         );
+        assert!(opts.cursor_blink);
+        assert_eq!(opts.cursor_blink_interval_ms, 300);
         assert_eq!(opts.zoom_percent, 120);
         assert_eq!(opts.default_browser_engine, BrowserEngine::Firefox);
         assert_eq!(opts.focus_border_opacity, 40);
@@ -780,6 +827,8 @@ mod tests {
         size_spin.set_value(15.0);
         let persist_on = build_persist_check(true);
         let notify_off = build_system_notify_switch(false);
+        let blink_off = build_cursor_blink_switch(false);
+        let blink_interval = build_blink_interval_spin(800);
         let opts = collect_options(
             &zoom,
             &engine,
@@ -787,12 +836,16 @@ mod tests {
             &opacity.spin,
             &persist_on,
             &notify_off,
+            &blink_off,
+            &blink_interval,
             &family_drop,
             &size_spin,
             &families,
             12.0,
             &kb,
         );
+        assert!(!opts.cursor_blink);
+        assert_eq!(opts.cursor_blink_interval_ms, 800);
         assert!(opts.persist_browser_session);
         assert!(!opts.system_notifications_enabled);
         assert_eq!(opts.font_family, Some("Fira Code".to_string()));

@@ -1970,6 +1970,7 @@ impl WindowController {
                         for terminal in registry.terminals.values() {
                             terminal.set_font(&font);
                             terminal.set_font_scale(opts.zoom_factor());
+                            terminal.set_cursor_blink(opts.cursor_blink, opts.cursor_blink_interval_ms);
                         }
                         for browser in registry.browsers.values() {
                             browser.set_zoom_level(opts.zoom_factor());
@@ -3623,6 +3624,7 @@ impl WindowController {
         for terminal in registry.terminals.values() {
             terminal.set_font(&font);
             terminal.set_font_scale(opts.zoom_factor());
+            terminal.set_cursor_blink(opts.cursor_blink, opts.cursor_blink_interval_ms);
         }
         for browser in registry.browsers.values() {
             browser.set_zoom_level(opts.zoom_factor());

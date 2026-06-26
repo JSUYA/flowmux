@@ -1503,6 +1503,7 @@ fn build_panel(
             theme.apply_to_ghostty(&pane);
             pane.set_font(&font);
             pane.set_font_scale(opts.zoom_factor());
+            pane.set_cursor_blink(opts.cursor_blink, opts.cursor_blink_interval_ms);
             let pane_terminal: PaneTerminal = pane;
 
             // Toggle the .focused class on frame focus enter/leave. theme.rs

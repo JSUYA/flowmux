@@ -44,6 +44,18 @@ pub const PERSIST_BROWSER_SESSION_DEFAULT: bool = true;
 /// the user can opt out to keep only the in-app bell list.
 pub const SYSTEM_NOTIFICATIONS_ENABLED_DEFAULT: bool = true;
 
+/// Default for [`Options::cursor_blink`]. The terminal cursor blinks on first
+/// launch, matching VTE / most terminals.
+pub const CURSOR_BLINK_DEFAULT: bool = true;
+
+/// Cursor blink half-period in milliseconds: the time the cursor stays shown
+/// before toggling to hidden (and vice versa). Range clamps to
+/// `[CURSOR_BLINK_INTERVAL_MIN, CURSOR_BLINK_INTERVAL_MAX]`. The default 530ms
+/// matches GTK's historical `gtk-cursor-blink-time` (1060ms full period).
+pub const CURSOR_BLINK_INTERVAL_MIN: u32 = 100;
+pub const CURSOR_BLINK_INTERVAL_MAX: u32 = 2000;
+pub const CURSOR_BLINK_INTERVAL_DEFAULT: u32 = 530;
+
 /// Web view engine to use for new browser tabs. At this stage every variant
 /// falls back to WebKitGTK; external engine spawning is a later step. The
 /// selected value is still persisted so the future wiring can use it.
@@ -118,6 +130,16 @@ pub struct Options {
     /// is sent. Default: [`SYSTEM_NOTIFICATIONS_ENABLED_DEFAULT`] (`true`).
     #[serde(default = "default_system_notifications_enabled")]
     pub system_notifications_enabled: bool,
+    /// When true, the terminal cursor blinks. Default:
+    /// [`CURSOR_BLINK_DEFAULT`] (`true`).
+    #[serde(default = "default_cursor_blink")]
+    pub cursor_blink: bool,
+    /// Cursor blink half-period in milliseconds (time shown before toggling).
+    /// Clamped to `[CURSOR_BLINK_INTERVAL_MIN, CURSOR_BLINK_INTERVAL_MAX]` by
+    /// [`Options::clamp_cursor_blink_interval`]. Default:
+    /// [`CURSOR_BLINK_INTERVAL_DEFAULT`].
+    #[serde(default = "default_cursor_blink_interval")]
+    pub cursor_blink_interval_ms: u32,
     /// Terminal font family selected in the options dialog. `None` means
     /// "inherit the resolved theme font" (the `font-family` from the theme
     /// file, or the built-in `monospace` fallback). A `Some` value overrides
@@ -159,6 +181,14 @@ fn default_system_notifications_enabled() -> bool {
     SYSTEM_NOTIFICATIONS_ENABLED_DEFAULT
 }
 
+fn default_cursor_blink() -> bool {
+    CURSOR_BLINK_DEFAULT
+}
+
+fn default_cursor_blink_interval() -> u32 {
+    CURSOR_BLINK_INTERVAL_DEFAULT
+}
+
 impl Default for Options {
     fn default() -> Self {
         Self {
@@ -168,6 +198,8 @@ impl Default for Options {
             focus_border_opacity: default_focus_border_opacity(),
             persist_browser_session: default_persist_browser_session(),
             system_notifications_enabled: default_system_notifications_enabled(),
+            cursor_blink: default_cursor_blink(),
+            cursor_blink_interval_ms: default_cursor_blink_interval(),
             font_family: None,
             font_size: None,
             keybindings: KeybindingOverrides::default(),
@@ -179,6 +211,12 @@ impl Options {
     /// Percentage clamped to `[ZOOM_MIN, ZOOM_MAX]`.
     pub fn clamp_zoom(p: u16) -> u16 {
         p.clamp(ZOOM_MIN, ZOOM_MAX)
+    }
+
+    /// Blink interval clamped to
+    /// `[CURSOR_BLINK_INTERVAL_MIN, CURSOR_BLINK_INTERVAL_MAX]` ms.
+    pub fn clamp_cursor_blink_interval(ms: u32) -> u32 {
+        ms.clamp(CURSOR_BLINK_INTERVAL_MIN, CURSOR_BLINK_INTERVAL_MAX)
     }
 
     /// Scale in 0.1..=2.0 form for terminal `set_font_scale` and WebView
