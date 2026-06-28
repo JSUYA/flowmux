@@ -1258,7 +1258,11 @@ mod tests {
         ws.name = "projA".into();
         sidebar.upsert(&ws);
         assert_eq!(
-            titles.borrow().iter().find(|(id, _)| *id == ws.id).map(|(_, n)| n.clone()),
+            titles
+                .borrow()
+                .iter()
+                .find(|(id, _)| *id == ws.id)
+                .map(|(_, n)| n.clone()),
             Some("projA".to_string()),
             "auto name shows when no custom title",
         );
@@ -1267,7 +1271,11 @@ mod tests {
         ws.custom_title = Some("MyName".into());
         sidebar.upsert(&ws);
         assert_eq!(
-            titles.borrow().iter().find(|(id, _)| *id == ws.id).map(|(_, n)| n.clone()),
+            titles
+                .borrow()
+                .iter()
+                .find(|(id, _)| *id == ws.id)
+                .map(|(_, n)| n.clone()),
             Some("MyName".to_string()),
             "custom title is reflected after rename",
         );

@@ -11,7 +11,7 @@ use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
 
-use flowmux_core::{PaneId, SurfaceId, WorkspaceId};
+use flowmux_core::{PaneId, SplitDirection, SurfaceId, WorkspaceId};
 
 use crate::ui::ghostty_pane::GhosttyPane;
 
@@ -68,6 +68,11 @@ pub struct PaneCallbacks {
     /// Move a tab to the last position of the first pane of `dst_workspace`.
     /// Backs the right-click "Move" menu and drops onto a side-panel workspace.
     pub on_move_surface_to_workspace: Rc<RefCell<dyn FnMut(PaneId, SurfaceId, WorkspaceId)>>,
+    /// Split `dst_pane` in the given direction and move the dragged tab into the
+    /// new sibling, preserving its live state. Backs dropping on the right /
+    /// bottom region of a pane body.
+    pub on_split_surface_into_pane:
+        Rc<RefCell<dyn FnMut(PaneId, SurfaceId, PaneId, SplitDirection)>>,
     /// Snapshot of the current workspaces (id + display name) at call time, used
     /// to populate the right-click "Move" submenu so it reflects live state.
     pub list_workspaces: Rc<dyn Fn() -> Vec<(WorkspaceId, String)>>,

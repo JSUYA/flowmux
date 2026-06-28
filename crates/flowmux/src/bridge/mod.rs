@@ -283,6 +283,16 @@ pub enum GtkCommand {
         dst_workspace: WorkspaceId,
         ack: oneshot::Sender<Result<(), String>>,
     },
+    /// Split `dst_pane` in `direction` and move the dragged tab (with its live
+    /// state) into the freshly created sibling pane. Backs dropping a tab on the
+    /// right / bottom region of a pane body.
+    SplitSurfaceIntoPane {
+        src_pane: PaneId,
+        surface: SurfaceId,
+        dst_pane: PaneId,
+        direction: SplitDirection,
+        ack: oneshot::Sender<Result<(), String>>,
+    },
     /// terminal pane reported a cwd change for a terminal surface.
     TerminalCwdChanged {
         pane: PaneId,

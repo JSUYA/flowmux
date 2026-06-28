@@ -966,6 +966,7 @@ impl WindowController {
             &self.callbacks,
             self.pane_registry.clone(),
             self.theme.clone(),
+            false,
         );
 
         match outcome {
@@ -1482,6 +1483,117 @@ impl WindowController {
         let _ = self
             .mount_moved_surface(src_pane, ws_id, surface, moving, usize::MAX)
             .await;
+    }
+
+    /// Split `dst_pane` and move the dragged tab (with its live state) into the
+    /// new sibling. Backs dropping a tab on the right / bottom region of a pane.
+    async fn split_surface_into_pane(
+        &self,
+        src_pane: PaneId,
+        surface: SurfaceId,
+        dst_pane: PaneId,
+        direction: SplitDirection,
+    ) -> Result<(), String> {
+        if !self.pane_registry.borrow().has_pane(dst_pane) {
+            return Err("destination pane is not rendered".to_string());
+        }
+
+        let moving = self
+            .pane_registry
+            .borrow_mut()
+            .detach_surface_for_move(src_pane, surface);
+        let Some(moving) = moving else {
+            return Err("source surface is not rendered".to_string());
+        };
+
+        let outcome = match self
+            .store
+            .split_surface_into_pane(src_pane, surface, dst_pane, direction)
+            .await
+        {
+            Some(outcome) => outcome,
+            None => {
+                self.reattach_surface(src_pane, surface, moving).await;
+                return Err("destination pane no longer exists".to_string());
+            }
+        };
+        let dst_ws = outcome.dst_workspace;
+        let new_pane = outcome.new_pane;
+
+        // Build the new sibling pane empty, then mount the live tab into it.
+        let Some(ws) = self.store.get_workspace(dst_ws).await else {
+            return Err("destination workspace vanished".to_string());
+        };
+        let new_split_id = ws
+            .surfaces
+            .iter()
+            .find_map(|s| s.root_pane.parent_split_id(new_pane));
+        let Some(new_split_id) = new_split_id else {
+            // Could not locate the split node; fall back to a plain tab move so
+            // the live widget is not lost.
+            self.mount_moved_surface(dst_pane, dst_ws, surface, moving, usize::MAX)
+                .await;
+            return Err("could not locate the new split node".to_string());
+        };
+
+        let empty = flowmux_core::PaneContent::Tabs {
+            active: surface,
+            surfaces: Vec::new(),
+        };
+        let stack_name = ws.id.to_string();
+        let split_outcome = split_pane_incremental(
+            ws.id,
+            dst_pane,
+            new_pane,
+            new_split_id,
+            direction,
+            0.5,
+            empty,
+            Some(ws.root_dir.clone()),
+            &stack_name,
+            &self.callbacks,
+            self.pane_registry.clone(),
+            self.theme.clone(),
+            true,
+        );
+        match split_outcome {
+            IncrementalSplitOutcome::SucceededRoot { new_root } => {
+                self.surfaces.borrow_mut().insert(ws.id, new_root);
+            }
+            IncrementalSplitOutcome::SucceededNested => {}
+            IncrementalSplitOutcome::Failed => {
+                // Sibling not built; keep the tab by re-homing it into dst.
+                self.mount_moved_surface(dst_pane, dst_ws, surface, moving, usize::MAX)
+                    .await;
+                return Err("incremental split failed".to_string());
+            }
+        }
+
+        let mounted = self
+            .mount_moved_surface(new_pane, dst_ws, surface, moving, 0)
+            .await;
+        if !mounted {
+            return Err("failed to mount moved surface".to_string());
+        }
+
+        if outcome.src_workspace_removed {
+            self.drop_workspace(outcome.src_workspace);
+            self.activate_active_or_show_empty().await;
+        } else if outcome.src_pane_removed {
+            self.apply_close_pane_incremental_or_rerender(outcome.src_workspace, src_pane)
+                .await;
+        }
+
+        if let Some(ws) = self.store.get_workspace(dst_ws).await {
+            self.refresh_workspace_solo(&ws);
+        }
+        self.sync_workspace_label(dst_ws).await;
+        if outcome.src_workspace != dst_ws && !outcome.src_workspace_removed {
+            self.sync_workspace_label(outcome.src_workspace).await;
+        }
+        self.refresh_window_title().await;
+        self.focus_pane(new_pane);
+        Ok(())
     }
 
     /// Shared pane registry — exposed so the keybindings module can
@@ -2555,6 +2667,18 @@ impl WindowController {
             } => {
                 let res = self
                     .move_surface_to_workspace(src_pane, surface, dst_workspace)
+                    .await;
+                let _ = ack.send(res);
+            }
+            GtkCommand::SplitSurfaceIntoPane {
+                src_pane,
+                surface,
+                dst_pane,
+                direction,
+                ack,
+            } => {
+                let res = self
+                    .split_surface_into_pane(src_pane, surface, dst_pane, direction)
                     .await;
                 let _ = ack.send(res);
             }
@@ -4418,6 +4542,28 @@ fn make_callbacks(
         workspace_of_pane: {
             let pane_registry = pane_registry.clone();
             Rc::new(move |pane| pane_registry.borrow().workspace_of_pane(pane))
+        },
+        on_split_surface_into_pane: {
+            let bridge = bridge.clone();
+            Rc::new(RefCell::new(
+                move |src_pane, surface, dst_pane, direction| {
+                    let bridge = bridge.clone();
+                    glib::MainContext::default().spawn_local(async move {
+                        let (ack_tx, ack_rx) = oneshot::channel();
+                        let _ = bridge
+                            .tx
+                            .send(GtkCommand::SplitSurfaceIntoPane {
+                                src_pane,
+                                surface,
+                                dst_pane,
+                                direction,
+                                ack: ack_tx,
+                            })
+                            .await;
+                        let _ = ack_rx.await;
+                    });
+                },
+            ))
         },
         tab_drag_drop_seen: Rc::new(Cell::new(false)),
         on_terminal_cwd_changed: {
@@ -9334,5 +9480,97 @@ mod tests {
             .borrow()
             .terminals
             .contains_key(&moved));
+    }
+
+    fn pane_of_surface(ws: &Workspace, surface: SurfaceId) -> Option<PaneId> {
+        let mut found = None;
+        for s in &ws.surfaces {
+            s.root_pane.for_each_leaf(|pane| {
+                if let Some(flowmux_core::PaneContent::Tabs { surfaces, .. }) =
+                    s.root_pane.find_leaf_content(pane)
+                {
+                    if surfaces.iter().any(|x| x.id == surface) {
+                        found = Some(pane);
+                    }
+                }
+            });
+        }
+        found
+    }
+
+    /// Dropping a tab on the split region creates a sibling pane holding the
+    /// same live terminal widget.
+    #[gtk::test]
+    async fn split_surface_into_pane_preserves_live_widget() {
+        adw::init().expect("libadwaita should initialize in GTK test");
+        let root = std::env::temp_dir().join("flowmux-ui-split-move");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = StateStore::new_lazy(State::default());
+        let ws_id = store
+            .create_workspace(Some("ui".into()), root.clone())
+            .await;
+        let dst = store.get_workspace(ws_id).await.unwrap().surfaces[0]
+            .root_pane
+            .first_leaf_id()
+            .unwrap();
+        let (_, src) = store
+            .split_pane(dst, flowmux_core::SplitDirection::Vertical)
+            .await
+            .unwrap();
+        let (_, moved) = store.add_terminal_surface_to_pane(src, None).await.unwrap();
+        let ws = store.get_workspace(ws_id).await.unwrap();
+
+        let (bridge, _rx) = Bridge::new();
+        let app = adw::Application::builder()
+            .application_id("com.flowmux.App.UiTest.SplitMove")
+            .build();
+        app.register(None::<&gtk::gio::Cancellable>).unwrap();
+        let controller = WindowController::new(
+            &app,
+            store.clone(),
+            Arc::new(ResolvedTheme::load()),
+            bridge,
+            gtk::CssProvider::new(),
+            None,
+        );
+        controller.render_workspace(&ws);
+
+        let before = controller
+            .pane_registry
+            .borrow()
+            .terminals
+            .get(&moved)
+            .map(|t| t.root_widget());
+        assert!(before.is_some());
+
+        let (ack_tx, ack_rx) = oneshot::channel();
+        controller
+            .dispatch(GtkCommand::SplitSurfaceIntoPane {
+                src_pane: src,
+                surface: moved,
+                dst_pane: dst,
+                direction: flowmux_core::SplitDirection::Horizontal,
+                ack: ack_tx,
+            })
+            .await;
+        ack_rx.await.unwrap().expect("split-move should succeed");
+
+        let ws2 = store.get_workspace(ws_id).await.unwrap();
+        let new_pane = pane_of_surface(&ws2, moved).expect("moved surface has a pane");
+        assert_ne!(new_pane, src);
+        assert_ne!(new_pane, dst);
+        assert_eq!(leaf_surface_ids(&ws2, new_pane), vec![moved]);
+
+        let after = controller
+            .pane_registry
+            .borrow()
+            .terminals
+            .get(&moved)
+            .map(|t| t.root_widget());
+        assert_eq!(
+            before, after,
+            "split-moved terminal must be the same widget"
+        );
+        assert!(controller.pane_registry.borrow().has_pane(new_pane));
     }
 }

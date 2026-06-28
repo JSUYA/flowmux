@@ -683,6 +683,7 @@ pub enum IncrementalSplitOutcome {
 ///
 /// `parent_stack_name` is supplied by the caller so a target frame that was a
 /// direct stack child can be re-added with the same name, the workspace id.
+#[allow(clippy::too_many_arguments)]
 pub fn split_pane_incremental(
     workspace: WorkspaceId,
     target_pane: PaneId,
@@ -696,6 +697,9 @@ pub fn split_pane_incremental(
     callbacks: &PaneCallbacks,
     registry: Rc<RefCell<PaneRegistry>>,
     theme: Arc<ResolvedTheme>,
+    // Build the new sibling empty (no tab / terminal) so a dragged live tab can
+    // be mounted into it afterwards.
+    empty_sibling: bool,
 ) -> IncrementalSplitOutcome {
     let Some(target_frame) = registry.borrow().pane_frame(target_pane) else {
         return IncrementalSplitOutcome::Failed;
@@ -743,6 +747,7 @@ pub fn split_pane_incremental(
         callbacks,
         registry.clone(),
         theme.clone(),
+        empty_sibling,
     );
 
     let orient = match direction {
@@ -825,7 +830,7 @@ fn build_pane(
 ) -> gtk::Widget {
     match pane {
         Pane::Leaf { id, content } => build_leaf_pane(
-            workspace, *id, content, argv, cwd, callbacks, registry, theme,
+            workspace, *id, content, argv, cwd, callbacks, registry, theme, false,
         ),
         Pane::Split {
             id: split_id,
@@ -878,6 +883,7 @@ fn build_pane(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_leaf_pane(
     workspace: WorkspaceId,
     pane_id: PaneId,
@@ -887,15 +893,30 @@ fn build_leaf_pane(
     callbacks: &PaneCallbacks,
     registry: Rc<RefCell<PaneRegistry>>,
     theme: Arc<ResolvedTheme>,
+    // Build a tab-less, terminal-less shell pane. Used as the sibling of a
+    // drag-split: the moved live tab is mounted into it right afterwards via
+    // `attach_moved_surface`, so spawning a throwaway terminal here would be
+    // wasteful and would briefly flash an extra shell.
+    empty: bool,
 ) -> gtk::Widget {
-    let surfaces = materialize_surfaces(content, cwd);
+    let surfaces = if empty {
+        Vec::new()
+    } else {
+        materialize_surfaces(content, cwd)
+    };
+    // `active` is unused when `surfaces` is empty (a pane built empty for a
+    // drag-split, whose live tab is mounted right after via
+    // `attach_moved_surface`); fall back to a throwaway id instead of indexing.
     let active = match content {
         PaneContent::Tabs { active, .. }
             if surfaces.iter().any(|surface| surface.id == *active) =>
         {
             *active
         }
-        _ => surfaces[0].id,
+        _ => surfaces
+            .first()
+            .map(|s| s.id)
+            .unwrap_or_else(SurfaceId::new),
     };
 
     let frame = gtk::Frame::new(None);
@@ -990,10 +1011,39 @@ fn build_leaf_pane(
     tabbar.append(&tools);
     root.append(&tabbar);
     root.append(&stack);
-    frame.set_child(Some(&root));
-    // Dropping a tab on the pane body (anywhere but a specific tab) appends it
-    // to the end of this pane.
-    attach_pane_body_dnd(&frame, pane_id, callbacks);
+
+    // Overlay a translucent preview on top of the pane body so a drag can show
+    // whether dropping will split (right / bottom half highlighted) or add a tab
+    // (no highlight). The drawing area is click-through.
+    let overlay = gtk::Overlay::new();
+    overlay.set_child(Some(&root));
+    let drop_zone = Rc::new(Cell::new(PaneDropZone::None));
+    let preview = gtk::DrawingArea::new();
+    preview.set_can_target(false);
+    {
+        let drop_zone = drop_zone.clone();
+        preview.set_draw_func(move |_, cr, w, h| {
+            let (w, h) = (w as f64, h as f64);
+            cr.set_source_rgba(1.0, 1.0, 1.0, 0.10);
+            match drop_zone.get() {
+                PaneDropZone::SplitRight => {
+                    cr.rectangle(w / 2.0, 0.0, w / 2.0, h);
+                    let _ = cr.fill();
+                }
+                PaneDropZone::SplitDown => {
+                    cr.rectangle(0.0, h / 2.0, w, h / 2.0);
+                    let _ = cr.fill();
+                }
+                PaneDropZone::Tab | PaneDropZone::None => {}
+            }
+        });
+    }
+    overlay.add_overlay(&preview);
+    frame.set_child(Some(&overlay));
+
+    // Dropping a tab on the pane body splits or appends depending on the region;
+    // see `attach_pane_body_dnd`.
+    attach_pane_body_dnd(&frame, pane_id, drop_zone, preview, callbacks);
 
     {
         let frame_widget = frame.clone().upcast::<gtk::Widget>();
@@ -1245,6 +1295,19 @@ mod tab_dnd_tests {
     #[test]
     fn parse_tab_dnd_payload_rejects_plain_text() {
         assert!(parse_tab_dnd_payload("not a tab drag").is_err());
+    }
+
+    #[test]
+    fn drop_zone_partitions_pane_into_tab_right_and_down() {
+        // top-left → tab
+        assert!(matches!(drop_zone(0.2, 0.2), PaneDropZone::Tab));
+        // top-right → split right
+        assert!(matches!(drop_zone(0.8, 0.2), PaneDropZone::SplitRight));
+        // bottom (either side) → split down
+        assert!(matches!(drop_zone(0.2, 0.8), PaneDropZone::SplitDown));
+        assert!(matches!(drop_zone(0.8, 0.8), PaneDropZone::SplitDown));
+        // exact center counts as the lower half (split down)
+        assert!(matches!(drop_zone(0.5, 0.5), PaneDropZone::SplitDown));
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -1549,15 +1612,75 @@ fn attach_tab_dnd_handlers(
     tab.add_controller(drop_target);
 }
 
-/// Make the body of a pane a drop target for tab drags: dropping a tab anywhere
-/// on the pane (outside of an individual tab, which has its own finer-grained
-/// target) appends it to the **end** of this pane. Same-pane drops fall through
-/// to a reorder-to-end on the controller side.
+/// Which pane-body region a tab drag is over, deciding the drop outcome and the
+/// translucent preview shown on the pane.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PaneDropZone {
+    /// Not hovering / no preview.
+    None,
+    /// Add as a tab at the end (top-left region).
+    Tab,
+    /// Split side-by-side, new pane on the right (right region).
+    SplitRight,
+    /// Split stacked, new pane below (bottom region).
+    SplitDown,
+}
+
+/// Map normalized pointer coordinates inside a pane to a drop zone: the bottom
+/// half splits down, the upper-right splits right, the upper-left adds a tab.
+fn drop_zone(fx: f64, fy: f64) -> PaneDropZone {
+    if fy >= 0.5 {
+        PaneDropZone::SplitDown
+    } else if fx >= 0.5 {
+        PaneDropZone::SplitRight
+    } else {
+        PaneDropZone::Tab
+    }
+}
+
+/// Make the body of a pane a drop target for tab drags. The region decides the
+/// outcome: right → split side-by-side, bottom → split stacked, top-left → add a
+/// tab at the end. A translucent overlay previews the split while dragging.
 fn attach_pane_body_dnd(
     widget: &impl IsA<gtk::Widget>,
     pane_id: PaneId,
+    zone: Rc<Cell<PaneDropZone>>,
+    preview: gtk::DrawingArea,
     callbacks: &PaneCallbacks,
 ) {
+    let frame: gtk::Widget = widget.clone().upcast();
+
+    // Preview: track the pointer during the drag and repaint the overlay.
+    let motion = gtk::DropControllerMotion::new();
+    {
+        let frame = frame.clone();
+        let zone = zone.clone();
+        let preview = preview.clone();
+        motion.connect_motion(move |_, x, y| {
+            let (w, h) = (frame.width() as f64, frame.height() as f64);
+            let new = if w > 0.0 && h > 0.0 {
+                drop_zone(x / w, y / h)
+            } else {
+                PaneDropZone::None
+            };
+            if zone.get() != new {
+                zone.set(new);
+                preview.queue_draw();
+            }
+        });
+    }
+    {
+        let zone = zone.clone();
+        let preview = preview.clone();
+        motion.connect_leave(move |_| {
+            if zone.get() != PaneDropZone::None {
+                zone.set(PaneDropZone::None);
+                preview.queue_draw();
+            }
+        });
+    }
+    widget.add_controller(motion);
+
     let drop_target = gtk::DropTargetAsync::new(
         Some(gtk::gdk::ContentFormats::new(&[TAB_DND_MIME])),
         gtk::gdk::DragAction::MOVE,
@@ -1571,10 +1694,22 @@ fn attach_pane_body_dnd(
         }
     });
     let move_to_pane_cb = callbacks.on_move_surface_to_pane.clone();
+    let split_cb = callbacks.on_split_surface_into_pane.clone();
     let target_pane = pane_id;
-    drop_target.connect_drop(move |_, drop, _x, _y| {
+    drop_target.connect_drop(move |_, drop, x, y| {
+        let (w, h) = (frame.width() as f64, frame.height() as f64);
+        let landed = if w > 0.0 && h > 0.0 {
+            drop_zone(x / w, y / h)
+        } else {
+            PaneDropZone::Tab
+        };
+        // Clear the preview now that the drop is committing.
+        zone.set(PaneDropZone::None);
+        preview.queue_draw();
+
         let drop = drop.clone();
         let move_to_pane_cb = move_to_pane_cb.clone();
+        let split_cb = split_cb.clone();
         gtk::glib::MainContext::default().spawn_local(async move {
             let (stream, mime_type) = match drop
                 .read_future(&[TAB_DND_MIME], gtk::glib::Priority::default())
@@ -1608,7 +1743,27 @@ fn attach_pane_body_dnd(
                 drop.finish(gtk::gdk::DragAction::empty());
                 return;
             };
-            (move_to_pane_cb.borrow_mut())(src_pane, src_surface, target_pane, usize::MAX);
+            match landed {
+                PaneDropZone::SplitRight => {
+                    (split_cb.borrow_mut())(
+                        src_pane,
+                        src_surface,
+                        target_pane,
+                        SplitDirection::Vertical,
+                    );
+                }
+                PaneDropZone::SplitDown => {
+                    (split_cb.borrow_mut())(
+                        src_pane,
+                        src_surface,
+                        target_pane,
+                        SplitDirection::Horizontal,
+                    );
+                }
+                PaneDropZone::Tab | PaneDropZone::None => {
+                    (move_to_pane_cb.borrow_mut())(src_pane, src_surface, target_pane, usize::MAX);
+                }
+            }
             drop.finish(gtk::gdk::DragAction::MOVE);
         });
         true
