@@ -95,7 +95,7 @@ flowmux/
 ```bash
 sudo apt install \
     build-essential pkg-config git \
-    libgtk-4-dev libadwaita-1-dev \
+    libgtk-4-dev libadwaita-1-dev libvte-2.91-gtk4-dev \
     libwebkitgtk-6.0-dev libssl-dev \
     libssh2-1-dev libdbus-1-dev libsecret-1-dev
 # rustup (Rust 1.93+) required.

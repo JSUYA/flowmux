@@ -52,7 +52,7 @@ apt-get update >/dev/null
 apt-get install -y --no-install-recommends \
     ca-certificates curl git build-essential pkg-config \
     meson ninja-build python3 xvfb xauth \
-    libgtk-4-dev libadwaita-1-dev \
+    libgtk-4-dev libadwaita-1-dev libvte-2.91-gtk4-dev \
     libwebkitgtk-6.0-dev libssl-dev libssh2-1-dev \
     libdbus-1-dev libsecret-1-dev >/dev/null
 curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
