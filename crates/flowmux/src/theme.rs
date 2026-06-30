@@ -152,11 +152,11 @@ impl ResolvedTheme {
     }
 
     /// Push the theme font + default fg/bg, the 16 ANSI palette colors, the
-    /// cursor color, and selection colors into the libghostty terminal pane.
-    /// Indices 16..256 keep libghostty's standard xterm fill (so a 16-color
+    /// cursor color, and selection colors into the VTE terminal pane.
+    /// Indices 16..256 keep VTE's standard xterm fill (so a 16-color
     /// theme expands the same way a traditional terminal would).
     pub fn apply_to_ghostty(&self, pane: &crate::ui::ghostty_pane::GhosttyPane) {
-        use flowmux_terminal::vt::Rgb;
+        use flowmux_terminal::Rgb;
         fn to_rgb(c: &gdk::RGBA) -> Rgb {
             Rgb {
                 r: (c.red() * 255.0).round().clamp(0.0, 255.0) as u8,

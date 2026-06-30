@@ -1,27 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Libghostty-oriented terminal backend abstraction.
-//!
-//! flowmux keeps process/PTY state behind a [`TerminalBackend`] so the
-//! GTK layer uses libghostty-backed rendering without changing IPC,
-//! workspace, or agent-environment plumbing.
+//! Headless terminal support for flowmux: the PTY layer, agent env
+//! injection, terminal input-mode parsing, and a shared color type. The GTK
+//! layer renders with VTE, so this crate no longer carries a VT core.
 
 use flowmux_core::{PaneId, SurfaceId, WorkspaceId};
 use std::path::{Path, PathBuf};
-
-#[derive(Debug, thiserror::Error)]
-pub enum TerminalError {
-    #[error("spawn failed: {0}")]
-    Spawn(String),
-    #[error("pane not found: {0}")]
-    NotFound(PaneId),
-}
-
-#[derive(Debug, Clone)]
-pub struct SpawnSpec<'a> {
-    pub argv: &'a [&'a str],
-    pub cwd: Option<&'a Path>,
-    pub env: &'a [(&'a str, &'a str)],
-}
 
 /// Env vars flowmux injects into every PTY spawn so terminal-side agents
 /// (claude, codex, opencode, …) can discover their own pane and the
@@ -132,27 +115,13 @@ pub fn find_flowmuxctl() -> Option<PathBuf> {
     None
 }
 
-pub trait TerminalBackend {
-    /// Spawn a process in a fresh pane and return its id.
-    fn spawn(&mut self, spec: SpawnSpec<'_>) -> Result<PaneId, TerminalError>;
-    /// Send keystrokes to a pane (raw bytes; caller handles escape).
-    fn send(&mut self, pane: PaneId, bytes: &[u8]) -> Result<(), TerminalError>;
-    /// Resize to (rows, cols).
-    fn resize(&mut self, pane: PaneId, rows: u16, cols: u16) -> Result<(), TerminalError>;
-    /// Close pane and reap child.
-    fn close(&mut self, pane: PaneId) -> Result<(), TerminalError>;
-}
-
-pub mod ghostty_backend;
+pub mod color;
 pub mod key_modes;
-
-/// libghostty-vt core (feed bytes, snapshot, read grid) over the C shim, which
-/// links a static libghostty-vt. Always built — see build.rs.
-pub mod vt;
 
 /// PTY layer for the terminal backend (spawn child, read/write master, resize).
 pub mod pty;
 
+pub use color::Rgb;
 pub use key_modes::TerminalInputModes;
 
 #[cfg(test)]

@@ -1767,14 +1767,14 @@ impl WindowController {
             .or_else(|| std::env::current_dir().ok());
 
         if let Some(root) = root {
-            if self.file_browser.widget().is_visible()
+            if self.file_browser.is_open()
                 && self.file_browser_source_pane.get() == Some(pane)
                 && self.file_browser.is_showing_root(&root)
             {
                 // Opening / refreshing the panel does not move keyboard focus into
                 // it — file_browser_active is driven by connect_focus_changed.
                 //
-                // The is_visible() guard matters: close_file_browser_and_restore_focus
+                // The is_open() guard matters: close_file_browser_and_restore_focus
                 // hides the panel but leaves file_browser_source_pane and the model
                 // root intact, so without it a reopen for the same pane would match
                 // this short-circuit and never call set_visible(true) — leaving the
@@ -1957,7 +1957,7 @@ impl WindowController {
         }
     }
 
-    /// Relying only on libghostty OSC 7 (`current-directory-uri::notify`) misses shells
+    /// Relying only on VTE OSC 7 (`current-directory-uri::notify`) misses shells
     /// without OSC 7 integration, such as Ubuntu's default bash spawned by
     /// flowmux; after `cd`, no notify ever arrives and the tab name stays stale.
     /// Poll once per second to reuse TerminalPane::current_dir()'s
@@ -2717,7 +2717,7 @@ impl WindowController {
                 surface,
                 title,
             } => {
-                // libghostty parsed an OSC 0/2 window title. Prompt-shaped shell
+                // VTE parsed an OSC 0/2 window title. Prompt-shaped shell
                 // titles such as "user@host:~/path" duplicate cwd-driven labels,
                 // and trim-empty or whitespace-only values are ignored. Everything
                 // else follows BrowserTitleChanged semantics, respecting title_locked.

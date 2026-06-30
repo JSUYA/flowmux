@@ -7,7 +7,7 @@
 # so this script builds the GUI and runs it under Xvfb, then verifies CLI and
 # terminal I/O against the live daemon. Ubuntu 22.04 remains the Flatpak target
 # because its native GTK4 / libadwaita floor is too low for the GUI crate (the
-# terminal backend is libghostty-vt, built by Zig — VTE is no longer involved);
+# because its native GTK4 / libadwaita / VTE floor is too low for the GUI crate).
 # the script verifies that expected version gap.
 set -euo pipefail
 
@@ -31,8 +31,7 @@ gtk="$(apt-cache policy libgtk-4-dev | awk "/Candidate:/ {print \$2}")"
 adw="$(apt-cache policy libadwaita-1-dev | awk "/Candidate:/ {print \$2}")"
 # flowmux needs gtk4 >= 4.12 (v4_12) and libadwaita >= 1.5 (v1_5); Ubuntu 22.04
 # ships ~4.6 / ~1.1, below the floor, so the native build is impossible and
-# 22.04 must use the Flatpak GNOME runtime. VTE is no longer a factor — there is
-# no VTE dependency any more (the terminal backend is libghostty-vt via Zig).
+# 22.04 must use the Flatpak GNOME runtime. VTE >= 0.76 is provided there.
 if dpkg --compare-versions "$gtk" ge 4.12 && dpkg --compare-versions "$adw" ge 1.5; then
     echo "error: ubuntu:22.04 unexpectedly meets the GTK/libadwaita floor (gtk=$gtk adw=$adw)" >&2
     exit 1
@@ -60,14 +59,7 @@ curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
     | sh -s -- -y --profile minimal >/dev/null
 . "$HOME/.cargo/env"
 echo "rustc $(rustc --version)"
-# The terminal backend (libghostty-vt) is built by Zig, so the GUI build needs
-# Zig 0.15.x on PATH. No VTE is required any more.
-ZIG_VERSION=0.15.2
-curl --proto "=https" --tlsv1.2 -fsSL \
-    "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" \
-    | tar -xJ -C /opt
-export PATH="/opt/zig-x86_64-linux-${ZIG_VERSION}:$PATH"
-echo "zig $(zig version)"
+# The GUI build uses the distro VTE package; no Zig toolchain is required.
 CARGO_HOME=/tmp/cargo CARGO_TARGET_DIR=/tmp/flowmux-target \
     cargo build --manifest-path /workspace/Cargo.toml \
     -p flowmux -p flowmux-cli --locked

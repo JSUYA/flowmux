@@ -66,7 +66,7 @@ EOF
     fi
 
     local missing_commands=()
-    for command in cargo zig pkg-config codesign iconutil install open plutil xattr xcrun; do
+    for command in cargo pkg-config codesign iconutil install open plutil xattr xcrun; do
         if ! command -v "$command" >/dev/null 2>&1; then
             missing_commands+=("$command")
         fi
@@ -103,11 +103,9 @@ EOF
         cat >&2 <<'EOF'
 Install the macOS native prerequisites:
   brew install pkg-config gtk4 libadwaita
-  # plus Zig 0.15.x (https://ziglang.org/download/) to build libghostty-vt
 
-FlowMux renders terminals with the libghostty-vt backend (no VTE) and uses the
-Apple WebKit.framework for the browser pane; do not install Homebrew vte3 or
-webkitgtk.
+FlowMux uses Homebrew GTK/libadwaita and Apple WebKit.framework for the
+browser pane; do not install WebKitGTK.
 
 Install Rust with rustup if `cargo` is missing:
   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh

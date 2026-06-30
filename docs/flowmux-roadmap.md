@@ -25,7 +25,7 @@ P0 ("contract and agent usability") is implemented:
   the GUI confirm dialog guards it).
 - P0-6 — `send-keys` (literal/raw input), `send-key` (named-key,
   tmux-style), and `read-screen` (terminal buffer dump). `read-screen` reads
-  the viewport directly from the libghostty-vt grid, so it works in every
+  the viewport directly from the VTE terminal buffer, so it works in every
   build with no feature flag.
 
 P1 ("daily usability") is implemented:

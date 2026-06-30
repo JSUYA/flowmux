@@ -1,13 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! A pseudo-terminal for the libghostty-vt backend.
+//! PTY helpers shared by the terminal pane.
 //!
-//! The VTE GUI path lets the VTE widget own its PTY. The libghostty path owns
-//! the PTY itself: this module spawns a child under a fresh PTY via
-//! `forkpty(3)`, exposes the master fd for the read/write loop, and resizes the
-//! kernel window via `TIOCSWINSZ`. The bytes read here are fed to
-//! [`crate::vt::Vt::write`]; keystrokes encoded by the GUI are written back.
-//!
-//! Compiled only under the `libghostty` cargo feature.
+//! Spawns a child under a fresh PTY via `forkpty(3)`, exposes the master fd for
+//! read/write plumbing, and resizes the kernel window via `TIOCSWINSZ`.
 
 use std::ffi::CString;
 use std::io;
@@ -248,23 +243,23 @@ fn build_envp(extra_env: &[(String, String)]) -> io::Result<Vec<CString>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vt::Vt;
     use std::time::{Duration, Instant};
 
-    /// End-to-end headless pipeline: a real child process under a PTY, its
-    /// output fed through libghostty-vt, read back from the grid.
+    /// A real child under a PTY: its stdout reaches the master fd. The GTK layer
+    /// hands this same master to VTE for rendering; here we only check the raw
+    /// plumbing.
     #[test]
-    fn shell_output_flows_through_pty_into_vt_grid() {
-        let mut vt = Vt::new(40, 8, 200).expect("vt");
+    fn shell_output_reaches_the_pty_master() {
         let mut pty =
             Pty::spawn(&["sh", "-c", "printf 'hello world'"], None, &[], 40, 8).expect("spawn sh");
 
+        let mut out = String::new();
         let mut buf = [0u8; 4096];
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             match pty.read(&mut buf) {
                 Ok(0) => break, // EOF: child exited
-                Ok(n) => vt.write(&buf[..n]),
+                Ok(n) => out.push_str(&String::from_utf8_lossy(&buf[..n])),
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(e) => panic!("pty read failed: {e}"),
             }
@@ -273,13 +268,11 @@ mod tests {
             }
         }
 
-        assert!(vt.update());
-        assert_eq!(vt.row_text(0), "hello world");
+        assert!(out.contains("hello world"), "got: {out:?}");
     }
 
     #[test]
     fn extra_env_reaches_the_child() {
-        let mut vt = Vt::new(40, 4, 100).expect("vt");
         let mut pty = Pty::spawn(
             &["sh", "-c", "printf \"%s\" \"$FLOWMUX_TEST_VAR\""],
             None,
@@ -289,43 +282,42 @@ mod tests {
         )
         .expect("spawn sh");
 
+        let mut out = String::new();
         let mut buf = [0u8; 1024];
         loop {
             match pty.read(&mut buf) {
                 Ok(0) => break,
-                Ok(n) => vt.write(&buf[..n]),
+                Ok(n) => out.push_str(&String::from_utf8_lossy(&buf[..n])),
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(e) => panic!("read: {e}"),
             }
         }
-        assert!(vt.update());
-        assert_eq!(vt.row_text(0), "pane42");
+        assert!(out.contains("pane42"), "got: {out:?}");
     }
 
     #[test]
     fn resize_updates_winsize_seen_by_child() {
         // `stty size` prints "rows cols" from the kernel winsize we set.
-        let mut vt = Vt::new(120, 40, 100).expect("vt");
         let mut pty = Pty::spawn(&["sh", "-c", "stty size"], None, &[], 100, 30).expect("spawn");
         // Resize before the child reads its winsize.
         pty.resize(100, 30, 8, 16).expect("resize");
 
+        let mut out = String::new();
         let mut buf = [0u8; 1024];
         loop {
             match pty.read(&mut buf) {
                 Ok(0) => break,
-                Ok(n) => vt.write(&buf[..n]),
+                Ok(n) => out.push_str(&String::from_utf8_lossy(&buf[..n])),
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(_) => break,
             }
         }
-        assert!(vt.update());
         // Some shells emit "30 100"; tolerate either field order issues by
         // checking both numbers are present on the first row.
-        let row = vt.row_text(0);
+        let row = out;
         assert!(
             row.contains("30") && row.contains("100"),
-            "stty size row was {row:?}"
+            "stty size output was {row:?}"
         );
     }
 }

@@ -27,24 +27,17 @@ finish-args:
   - --talk-name=org.freedesktop.Flatpak
 
 modules:
-  # flowmux renders terminals with the libghostty-vt backend, a static
-  # `libghostty-vt.a` that flowmux-terminal's build.rs builds from a pinned
-  # Ghostty revision with Zig (scripts/build-ghostty-vt.sh). The GNOME 48 SDK
-  # ships no Zig, so we drop the official Zig 0.15.x toolchain into the build
-  # tree and put it on PATH for the cargo build. There is no VTE module any
-  # more — the static lib is self-contained (no extra runtime deps, no rpath).
+  # flowmux builds against the GNOME runtime GTK/WebKit/VTE stack; no vendored
+  # terminal backend or extra compiler toolchain is built here.
   - name: flowmux
     buildsystem: simple
     build-options:
       append-path: /usr/lib/sdk/rust-stable/bin
       build-args:
-        # build.rs runs `zig build` / git fetch for libghostty-vt on the first
-        # build, so the build sandbox needs the network.
+        # Cargo may need network access to fetch dependencies during the build.
         - --share=network
     build-commands:
-      # Put the bundled Zig (extracted to ./zig by the archive source below) on
-      # PATH so flowmux-terminal's build.rs can compile libghostty-vt.
-      - PATH="$PWD/zig:$PATH" cargo build --release --manifest-path Cargo.toml -p flowmux -p flowmux-cli
+      - cargo build --release --manifest-path Cargo.toml -p flowmux -p flowmux-cli
       - install -Dm755 target/release/flowmux    /app/bin/flowmux
       - install -Dm755 target/release/flowmuxctl /app/lib/flowmux/flowmuxctl
       # Expose flowmuxctl on /app/bin so `flatpak run --command=flowmuxctl
@@ -63,9 +56,3 @@ modules:
     sources:
       - type: dir
         path: ../..
-      # Zig toolchain for building libghostty-vt (see build-commands). Extracted
-      # to ./zig in the build tree; the flowmux runtime does not ship it.
-      - type: archive
-        url: https://ziglang.org/download/0.15.2/zig-x86_64-linux-0.15.2.tar.xz
-        sha256: 02aa270f183da276e5b5920b1dac44a63f1a49e55050ebde3aecc9eb82f93239
-        dest: zig

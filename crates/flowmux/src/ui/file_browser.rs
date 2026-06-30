@@ -7,7 +7,7 @@ use crate::ui::popover_pos;
 use crate::ui::show_in_folder;
 use gtk::prelude::*;
 use gtk::{gdk, gio, glib};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::fs;
@@ -29,8 +29,9 @@ pub struct FileBrowserPanel {
     on_focus_out: Rc<RefCell<Option<Box<dyn Fn(FocusDir)>>>>,
     on_escape: Rc<RefCell<Option<Box<dyn Fn()>>>>,
     on_focus_changed: Rc<RefCell<Option<Box<dyn Fn(bool)>>>>,
+    open: Rc<Cell<bool>>,
     #[cfg(all(test, not(target_os = "macos")))]
-    rebuild_count: Rc<std::cell::Cell<usize>>,
+    rebuild_count: Rc<Cell<usize>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -175,8 +176,9 @@ impl FileBrowserPanel {
             on_focus_out: Rc::new(RefCell::new(None)),
             on_escape: Rc::new(RefCell::new(None)),
             on_focus_changed: Rc::new(RefCell::new(None)),
+            open: Rc::new(Cell::new(false)),
             #[cfg(all(test, not(target_os = "macos")))]
-            rebuild_count: Rc::new(std::cell::Cell::new(0)),
+            rebuild_count: Rc::new(Cell::new(0)),
         };
 
         panel.install_focus_style();
@@ -222,6 +224,7 @@ impl FileBrowserPanel {
     #[cfg(all(test, not(target_os = "macos")))]
     fn show_for_root(&self, root: PathBuf) {
         self.model.borrow_mut().set_root(root.clone());
+        self.open.set(true);
         self.root.set_visible(true);
         self.refresh_reset_scroll();
     }
@@ -232,9 +235,14 @@ impl FileBrowserPanel {
         state: Option<FileBrowserPaneState>,
     ) {
         let scroll_value = self.model.borrow_mut().set_root_with_state(root, state);
+        self.open.set(true);
         self.root.set_visible(true);
         self.rebuild_rows();
         self.restore_scroll_value(scroll_value);
+    }
+
+    pub(crate) fn is_open(&self) -> bool {
+        self.open.get()
     }
 
     pub(crate) fn is_showing_root(&self, root: &Path) -> bool {
@@ -260,6 +268,7 @@ impl FileBrowserPanel {
     }
 
     pub fn hide(&self) {
+        self.open.set(false);
         self.root.set_visible(false);
     }
 

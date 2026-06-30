@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Terminal pane type + the shared per-pane callback bundle.
 //!
-//! flowmux renders terminals with the libghostty-vt backend
-//! ([`crate::ui::ghostty_pane::GhosttyPane`]), so `PaneTerminal` is an alias for
-//! it. (Historically this was an enum over a VTE backend and the libghostty
-//! backend; VTE has since been removed.) The pane registry stores
+//! flowmux renders terminals with the VTE-backed
+//! [`crate::ui::ghostty_pane::GhosttyPane`], so `PaneTerminal` is an alias for
+//! it. (Historically this was an enum over multiple backends.) The pane registry stores
 //! `PaneTerminal`; spawn-time wiring lives in `workspace_view.rs`.
 
 use std::cell::{Cell, RefCell};

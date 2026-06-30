@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Terminal input mode tracking shared by terminal compatibility glue and
-//! the libghostty-oriented backend contract.
+//! the terminal backend compatibility layer.
 
 use std::borrow::Cow;
 

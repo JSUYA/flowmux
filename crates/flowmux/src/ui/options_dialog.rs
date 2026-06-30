@@ -398,7 +398,7 @@ fn collect_options(
         system_notifications_enabled: system_notify_switch.is_active(),
         cursor_blink: cursor_blink_switch.is_active(),
         cursor_blink_interval_ms: Options::clamp_cursor_blink_interval(
-            blink_interval_spin.value() as u32,
+            blink_interval_spin.value() as u32
         ),
         font_family,
         font_size,

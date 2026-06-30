@@ -226,8 +226,8 @@ impl Handler for GuiHandler {
                     match rx.await {
                         Ok(Ok(Some(text))) => Response::ScreenContents { text },
                         // `None` = the pane has no readable terminal surface
-                        // (e.g. a browser tab). The libghostty backend always
-                        // exposes screen text, so this is not feature-gated.
+                        // (e.g. a browser tab). Terminal panes expose screen text through VTE,
+                        // so this is not feature-gated.
                         Ok(Ok(None)) => Response::Error(RpcError::Unimplemented(
                             "read-screen: this pane has no readable terminal surface".into(),
                         )),

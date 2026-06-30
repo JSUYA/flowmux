@@ -1913,7 +1913,7 @@ fn build_panel(
             let opts = (callbacks.read_options)();
             let font = theme.font_with_overrides(opts.font_family.as_deref(), opts.font_size);
 
-            // libghostty-vt is the only terminal backend. GhosttyPane owns the
+            // VTE is the only terminal backend. GhosttyPane owns the
             // PTY + render; title/cwd changes are forwarded from inside it.
             let pane: PaneTerminal = GhosttyPane::spawn(
                 pane_id,

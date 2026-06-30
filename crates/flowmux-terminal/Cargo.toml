@@ -5,15 +5,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish = false
-description = "Libghostty-oriented terminal backend contract for flowmux."
+description = "Terminal PTY and compatibility helpers for flowmux."
 
 [dependencies]
 flowmux-core = { workspace = true }
 thiserror = { workspace = true }
 libc = { workspace = true }
-
-# The libghostty-vt core (src/vt.rs, src/pty.rs) is always built: build.rs
-# compiles the C shim and links a static libghostty-vt produced by
-# scripts/build-ghostty-vt.sh, so Zig 0.15.x must be on PATH to build this crate.
-[build-dependencies]
-cc = "1"

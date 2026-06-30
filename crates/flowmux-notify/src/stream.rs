@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Byte-stream OSC extractor.
 //!
-//! Some terminal backends (libghostty, raw PTY readers) hand flowmux raw
+//! Some terminal backends (raw PTY readers) hand flowmux raw
 //! bytes from the child process. This module is a tiny state machine
 //! that watches that byte stream, finds OSC sequences (`ESC ] ... ST`
 //! or `ESC ] ... BEL`), and emits the payload to a callback. Other

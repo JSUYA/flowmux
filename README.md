@@ -13,8 +13,7 @@
 ### A terminal for AI agent workflows, browser control, and task signals.
 
 flowmux is a Linux/GTK4 terminal for AI coding agents. The terminal pane uses
-`libghostty-vt` for VT state, flowmux-owned PTYs, and an application-owned GTK
-renderer.
+the system VTE widget for terminal emulation, flowmux-owned PTYs, and GTK integration.
 
 > Unofficial GPL-3.0-or-later reimplementation inspired by [cmux](https://cmux.com/ko), a macOS/AppKit app. Not affiliated with cmux.
   
@@ -73,7 +72,7 @@ flowmux/
 │   ├── flowmux-core/       Domain types: Workspace, Surface, Pane, Notification
 │   ├── flowmux-config/     cmux.json + ~/.config/ghostty/config readers
 │   ├── flowmux-state/      Persistent workspace/session state on disk
-│   ├── flowmux-terminal/   libghostty-oriented terminal backend + PTY env helpers
+│   ├── flowmux-terminal/   VTE terminal integration + PTY env helpers
 │   ├── flowmux-browser/    WebKitGTK 6.0 browser surface + scriptable refs
 │   ├── flowmux-cookies/    Browser cookie/session import (libsecret + sqlite)
 │   ├── flowmux-notify/     OSC 9/99/777 parser + libnotify D-Bus sender
@@ -99,11 +98,8 @@ sudo apt install \
     libgtk-4-dev libadwaita-1-dev \
     libwebkitgtk-6.0-dev libssl-dev \
     libssh2-1-dev libdbus-1-dev libsecret-1-dev
-# rustup (Rust 1.93+) and Zig 0.15.x required; Zig builds the vendored
-# libghostty-vt that backs the terminal pane (the only terminal backend, so
-# Zig is needed for any build that includes flowmux-terminal).
+# rustup (Rust 1.93+) required.
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-# Zig 0.15.x — install from https://ziglang.org/download/ and put `zig` on PATH.
 ```
 
 ### Optional — full media playback in tab browser
@@ -131,20 +127,20 @@ Produces two binaries under `target/release/`:
 - `flowmuxctl` — CLI helper invoked by the GUI and by agent hooks.
 
 `flowmux read-screen` (terminal buffer dump) reads the viewport straight from
-the libghostty-vt grid, so it works in every build — no extra feature flag.
+the VTE terminal buffer, so it works in every build.
 
 For development:
 
 ```bash
 cargo run -p flowmux           # debug GUI
-cargo check --workspace        # type-check everything (needs Zig on PATH)
+cargo check --workspace        # type-check everything
 scripts/check-ubuntu-compat.sh # Docker smoke check for 22.04/24.04/26.04
 ```
 
 ## macOS local install
 
 The macOS build uses Homebrew GTK / libadwaita and the system
-WebKit.framework for the browser pane — no VTE, no WebKitGTK. It installs a
+WebKit.framework for the browser pane. It installs a
 regular app bundle plus CLI binaries:
 
 ```bash
@@ -155,8 +151,7 @@ open "$HOME/Applications/FlowMux.app"
 ```
 
 The script installs `FlowMux.app` under `~/Applications` and copies `flowmux`
-and `flowmuxctl` to `~/.local/bin`. Zig 0.15.x must be on PATH — it builds the
-libghostty-vt terminal backend.
+and `flowmuxctl` to `~/.local/bin`.
 
 ### Install to the host
 
@@ -164,12 +159,9 @@ libghostty-vt terminal backend.
 scripts/install-host.sh        # release-builds flowmux → installs the binaries
 ```
 
-This installs the `flowmux` and `flowmuxctl` binaries to `~/.local/bin` and
-`~/.cargo/bin`. It is a plain `cargo build --release` — the terminal backend is
-the static libghostty-vt linked by `flowmux-terminal`'s build script (so Zig
-must be on `PATH`), with no patched VTE and no runtime library to bake a RUNPATH
-for. Drag-selection in agent TUIs survives repaints because libghostty owns the
-selection state directly.
+This installs `flowmux` and `flowmuxctl` binaries to `~/.local/bin` and
+`~/.cargo/bin`. It is a plain `cargo build --release` using the system VTE
+library; no Zig toolchain or vendored terminal backend is required.
 
 ## Verify & repair
 
