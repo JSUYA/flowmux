@@ -294,6 +294,8 @@ impl GhosttyPane {
         // even when the foreground app has hidden the terminal cursor.
         install_preedit_redraw_on_keystroke(&container, &term);
 
+        let pid: Rc<Cell<Option<i32>>> = Rc::new(Cell::new(None));
+
         if crate::platform::running_under_wsl() {
             install_wsl_ctrl_c_interrupt_passthrough(&container, &term);
         }
@@ -381,7 +383,13 @@ impl GhosttyPane {
         // via Ctrl+click. A PCRE2 regex match changes hover to the pointer
         // cursor; Ctrl+left-click opens the URL in a new browser tab in the
         // same pane. Plain clicks continue into VTE text selection.
-        install_url_link_handling(&term, id, callbacks.on_open_url.clone());
+        install_url_link_handling(
+            &term,
+            id,
+            pid.clone(),
+            callbacks.on_open_url.clone(),
+            callbacks.on_open_image.clone(),
+        );
         install_ibus_nav_workaround(&term, smart_page_enabled);
 
         // Process exit.
@@ -569,7 +577,7 @@ impl GhosttyPane {
             init_rows,
         )
         .expect("forkpty spawn");
-        let pid: Rc<Cell<Option<i32>>> = Rc::new(Cell::new(Some(pty.child_pid())));
+        pid.set(Some(pty.child_pid()));
         let child_pid = pty.child_pid();
         let dup_fd = unsafe { libc::dup(pty.master_fd()) };
         let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(dup_fd) };
@@ -694,6 +702,7 @@ fn wrap_argv_with_pty_tee(argv: Vec<String>, pane: PaneId, surface: SurfaceId) -
 /// A match may include trailing sentence punctuation, so trim it immediately
 /// before dispatch.
 const URL_REGEX_PATTERN: &str = r#"(?i)(?:https?|ftp|file)://[^\s<>"'`]+"#;
+const IMAGE_PATH_REGEX_PATTERN: &str = r#"(?i)(?<![^\s<>"'`])(?:/|~/|\.{1,2}/)?(?:[^\s<>"'`:]+/)*[^\s<>"'`:]+\.(?:svg|png|jpe?g|webp?|lottie|json)"#;
 
 /// PCRE2 compile flags.
 ///   * PCRE2_MULTILINE (0x400): keep matches working across wrapped terminal output.
@@ -717,10 +726,65 @@ fn trim_url_trailing(s: &str) -> String {
     .to_string()
 }
 
+enum TerminalClickTarget {
+    Url(String),
+    Image(PathBuf),
+}
+
+fn terminal_image_path(raw: &str, cwd: Option<&std::path::Path>) -> Option<PathBuf> {
+    let trimmed = raw.trim_end_matches(|c: char| {
+        matches!(
+            c,
+            '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}' | '\'' | '"' | '`'
+        )
+    });
+    let path = PathBuf::from(trimmed);
+    if !is_supported_image_path(&path) {
+        return None;
+    }
+
+    if path.is_absolute() {
+        return Some(path);
+    }
+
+    if let Some(rest) = trimmed.strip_prefix("~/") {
+        return std::env::var_os("HOME").map(|home| PathBuf::from(home).join(rest));
+    }
+
+    cwd.map(|cwd| cwd.join(path))
+}
+
+fn is_supported_image_path(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| {
+            matches!(
+                ext.to_ascii_lowercase().as_str(),
+                "svg" | "png" | "jpg" | "jpeg" | "web" | "webp" | "lottie" | "json"
+            )
+        })
+}
+
+fn terminal_current_dir(term: &vte::Terminal, pid: &Rc<Cell<Option<i32>>>) -> Option<PathBuf> {
+    if let Some(uri) = term.current_directory_uri() {
+        let s: String = uri.into();
+        if !s.is_empty() {
+            if let Some(path) = uri_to_path(&s) {
+                return Some(path);
+            }
+        }
+    }
+
+    pid.get()
+        .and_then(|pid| std::fs::read_link(format!("/proc/{pid}/cwd")).ok())
+}
+
 fn install_url_link_handling(
     term: &vte::Terminal,
     pane_id: PaneId,
+    pid: Rc<Cell<Option<i32>>>,
     on_open_url: Rc<RefCell<dyn FnMut(PaneId, String)>>,
+    on_open_image: Rc<RefCell<dyn FnMut(PaneId, PathBuf)>>,
 ) {
     // 1) Compile and register the regex. If this fails, usually due to a PCRE2
     //    build issue, link recognition is disabled while the terminal itself
@@ -732,12 +796,24 @@ fn install_url_link_handling(
             return;
         }
     };
-    let tag = term.match_add_regex(&regex, 0);
+    let url_tag = term.match_add_regex(&regex, 0);
     // Show a pointer cursor on hover. The pointer appears even without Ctrl,
     // but activation requires Ctrl, matching the gnome-terminal UX pattern:
     // always show the hint, gate the action behind the modifier.
-    term.match_set_cursor_name(tag, "pointer");
-    tracing::debug!(%pane_id, tag, "URL match registered on terminal");
+    term.match_set_cursor_name(url_tag, "pointer");
+    tracing::debug!(%pane_id, tag = url_tag, "URL match registered on terminal");
+
+    let image_regex = match vte::Regex::for_match(IMAGE_PATH_REGEX_PATTERN, URL_REGEX_COMPILE_FLAGS)
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to compile image path regex; image clicking disabled");
+            return;
+        }
+    };
+    let image_tag = term.match_add_regex(&image_regex, 0);
+    term.match_set_cursor_name(image_tag, "pointer");
+    tracing::debug!(%pane_id, tag = image_tag, "image path match registered on terminal");
 
     // 2) Left-click gesture. Keep it out of capture phase so VTE's keyboard
     //    IMContext stays on the same path as a plain terminal widget.
@@ -770,44 +846,60 @@ fn install_url_link_handling(
         // Prefer OSC 8 hyperlinks, where the URL is attached by escape
         // sequence, then fall back to regex matches. Links produced by ls,
         // git, or build tools that support OSC 8 should win.
-        let url_raw: Option<String> = term_widget
+        let link = term_widget
             .check_hyperlink_at(x, y)
-            .map(|g| g.to_string())
+            .map(|g| TerminalClickTarget::Url(g.to_string()))
             .or_else(|| {
-                let (m, _tag) = term_widget.check_match_at(x, y);
-                m.map(|g| g.to_string())
+                let (m, tag) = term_widget.check_match_at(x, y);
+                let raw = m.map(|g| g.to_string())?;
+                if tag == image_tag {
+                    let cwd = terminal_current_dir(&term_widget, &pid);
+                    terminal_image_path(&raw, cwd.as_deref()).map(TerminalClickTarget::Image)
+                } else if tag == url_tag {
+                    Some(TerminalClickTarget::Url(raw))
+                } else {
+                    None
+                }
             });
 
-        let Some(raw) = url_raw else {
+        let Some(link) = link else {
             // Ctrl was held, but the click was not on a URL. Treat it as a
             // selection attempt and release the sequence so VTE features such
             // as Ctrl+drag block selection still work.
             gesture.set_state(gtk::EventSequenceState::Denied);
             return;
         };
-        let url = trim_url_trailing(&raw);
-        if url.is_empty() {
-            gesture.set_state(gtk::EventSequenceState::Denied);
-            return;
-        }
-        if modifiers.contains(gtk::gdk::ModifierType::SHIFT_MASK) {
-            // Ctrl+Shift+click → open in the system default browser instead of
-            // an in-app browser tab.
-            tracing::info!(%pane_id, %url, "Ctrl+Shift+click on terminal URL → open in system browser");
-            let parent = term_widget.root().and_downcast::<gtk::Window>();
-            let launcher = gtk::UriLauncher::new(&url);
-            launcher.launch(
-                parent.as_ref(),
-                gtk::gio::Cancellable::NONE,
-                |res| {
-                    if let Err(e) = res {
-                        tracing::warn!(error = %e, "failed to open URL in system browser");
-                    }
-                },
-            );
-        } else {
-            tracing::info!(%pane_id, %url, "Ctrl+click on terminal URL → open in browser tab");
-            (on_open_url.borrow_mut())(pane_id, url);
+        match link {
+            TerminalClickTarget::Image(path) => {
+                tracing::info!(%pane_id, path = %path.display(), "Ctrl+click on terminal image path");
+                (on_open_image.borrow_mut())(pane_id, path);
+            }
+            TerminalClickTarget::Url(raw) => {
+                let url = trim_url_trailing(&raw);
+                if url.is_empty() {
+                    gesture.set_state(gtk::EventSequenceState::Denied);
+                    return;
+                }
+                if modifiers.contains(gtk::gdk::ModifierType::SHIFT_MASK) {
+                    // Ctrl+Shift+click → open in the system default browser instead of
+                    // an in-app browser tab.
+                    tracing::info!(%pane_id, %url, "Ctrl+Shift+click on terminal URL → open in system browser");
+                    let parent = term_widget.root().and_downcast::<gtk::Window>();
+                    let launcher = gtk::UriLauncher::new(&url);
+                    launcher.launch(
+                        parent.as_ref(),
+                        gtk::gio::Cancellable::NONE,
+                        |res| {
+                            if let Err(e) = res {
+                                tracing::warn!(error = %e, "failed to open URL in system browser");
+                            }
+                        },
+                    );
+                } else {
+                    tracing::info!(%pane_id, %url, "Ctrl+click on terminal URL → open in browser tab");
+                    (on_open_url.borrow_mut())(pane_id, url);
+                }
+            }
         }
         // We handled the URL, so claim the sequence to prevent VTE selection.
         gesture.set_state(gtk::EventSequenceState::Claimed);
@@ -1772,6 +1864,12 @@ mod tests {
     use super::*;
 
     #[test]
+    fn image_path_regex_compiles() {
+        vte::Regex::for_match(IMAGE_PATH_REGEX_PATTERN, URL_REGEX_COMPILE_FLAGS)
+            .expect("image path regex compiles");
+    }
+
+    #[test]
     fn trim_url_trailing_strips_common_sentence_punctuation() {
         assert_eq!(
             trim_url_trailing("https://example.com/page."),
@@ -1816,6 +1914,50 @@ mod tests {
     fn trim_url_trailing_handles_empty() {
         assert_eq!(trim_url_trailing(""), "");
         assert_eq!(trim_url_trailing("...,,;"), "");
+    }
+
+    #[test]
+    fn terminal_image_path_accepts_absolute_supported_paths() {
+        assert_eq!(
+            terminal_image_path("/tmp/render.PNG,", None),
+            Some(PathBuf::from("/tmp/render.PNG"))
+        );
+        assert_eq!(
+            terminal_image_path("/tmp/render.web", None),
+            Some(PathBuf::from("/tmp/render.web"))
+        );
+        assert_eq!(
+            terminal_image_path("/tmp/vector.svg", None),
+            Some(PathBuf::from("/tmp/vector.svg"))
+        );
+        assert_eq!(
+            terminal_image_path("/home/user/anim.lottie)", None),
+            Some(PathBuf::from("/home/user/anim.lottie"))
+        );
+        assert_eq!(
+            terminal_image_path("/home/user/bodymovin.json", None),
+            Some(PathBuf::from("/home/user/bodymovin.json"))
+        );
+    }
+
+    #[test]
+    fn terminal_image_path_rejects_relative_or_unsupported_paths() {
+        assert_eq!(terminal_image_path("render.png", None), None);
+        assert_eq!(terminal_image_path("/tmp/readme.txt", None), None);
+    }
+
+    #[test]
+    fn terminal_image_path_resolves_ls_relative_paths_against_cwd() {
+        let cwd = PathBuf::from("/home/user/images");
+
+        assert_eq!(
+            terminal_image_path("render.png", Some(&cwd)),
+            Some(PathBuf::from("/home/user/images/render.png"))
+        );
+        assert_eq!(
+            terminal_image_path("icons/vector.svg", Some(&cwd)),
+            Some(PathBuf::from("/home/user/images/icons/vector.svg"))
+        );
     }
 
     #[test]

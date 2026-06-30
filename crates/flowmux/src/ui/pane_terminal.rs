@@ -108,4 +108,7 @@ pub struct PaneCallbacks {
     /// (GtkCommand::OpenUrlInBrowserTab). The URL arrives with trailing
     /// punctuation already trimmed.
     pub on_open_url: Rc<RefCell<dyn FnMut(PaneId, String)>>,
+    /// Called when Ctrl+click selects an absolute image path inside the
+    /// terminal. The caller opens it in a dedicated image viewer window.
+    pub on_open_image: Rc<RefCell<dyn FnMut(PaneId, PathBuf)>>,
 }

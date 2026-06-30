@@ -2,6 +2,7 @@
 pub mod browser_pane;
 pub mod file_browser;
 pub mod ghostty_pane;
+pub mod image_viewer;
 pub mod keybindings_panel;
 pub mod options_dialog;
 pub mod overlay_menu;

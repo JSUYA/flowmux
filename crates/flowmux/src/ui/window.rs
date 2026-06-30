@@ -2487,6 +2487,10 @@ impl WindowController {
                         .await;
                 }
             }
+            GtkCommand::OpenImageViewer { pane, path } => {
+                tracing::info!(%pane, path = %path.display(), "opening terminal image path");
+                crate::ui::image_viewer::open_image_viewer(&self.window, path);
+            }
             GtkCommand::ActivateSurface { pane, surface } => {
                 let ws_id = self.store.set_active_surface(pane, surface).await;
                 self.pane_registry
@@ -4644,6 +4648,18 @@ fn make_callbacks(
                     let _ = bridge
                         .tx
                         .send(GtkCommand::OpenUrlInBrowserTab { pane, url })
+                        .await;
+                });
+            }))
+        },
+        on_open_image: {
+            let bridge = bridge.clone();
+            Rc::new(RefCell::new(move |pane, path| {
+                let bridge = bridge.clone();
+                glib::MainContext::default().spawn_local(async move {
+                    let _ = bridge
+                        .tx
+                        .send(GtkCommand::OpenImageViewer { pane, path })
                         .await;
                 });
             }))

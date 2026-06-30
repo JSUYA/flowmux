@@ -233,6 +233,8 @@ pub enum GtkCommand {
     /// pane. `pane` is the source terminal pane and `url` has already had
     /// trailing punctuation trimmed.
     OpenUrlInBrowserTab { pane: PaneId, url: String },
+    /// Open a Ctrl-clicked terminal image path in a dedicated viewer window.
+    OpenImageViewer { pane: PaneId, path: PathBuf },
     /// Switch the active pane-local surface tab.
     ActivateSurface { pane: PaneId, surface: SurfaceId },
     /// Close a pane-local surface tab.
