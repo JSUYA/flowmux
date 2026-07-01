@@ -442,6 +442,68 @@ impl StateStore {
         })
     }
 
+    /// Insert a surface imported from another window/process into `dst_pane`.
+    /// The surface gets a fresh id in this store; terminal/browser live widget
+    /// state is rebuilt by the GUI from the model.
+    pub async fn import_surface_to_pane(
+        &self,
+        dst_pane: PaneId,
+        mut surface: PaneSurface,
+        target_index: usize,
+    ) -> Option<(WorkspaceId, SurfaceId)> {
+        surface.id = SurfaceId::new();
+        surface.agent = None;
+        let surface_id = surface.id;
+
+        let mut s = self.inner.lock().await;
+        for ws in s.workspaces.iter_mut() {
+            for sf in ws.surfaces.iter_mut() {
+                if sf.root_pane.find_leaf_content(dst_pane).is_some() {
+                    sf.root_pane
+                        .insert_surface_into_leaf(dst_pane, surface, target_index)?;
+                    let ws_id = ws.id;
+                    drop(s);
+                    self.mark_dirty();
+                    return Some((ws_id, surface_id));
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Split `dst_pane` and place a surface imported from another
+    /// window/process into the new sibling pane.
+    pub async fn split_imported_surface_into_pane(
+        &self,
+        dst_pane: PaneId,
+        mut surface: PaneSurface,
+        direction: SplitDirection,
+    ) -> Option<(WorkspaceId, PaneId, SurfaceId)> {
+        surface.id = SurfaceId::new();
+        surface.agent = None;
+        let surface_id = surface.id;
+        let content = PaneContent::Tabs {
+            active: surface_id,
+            surfaces: vec![surface],
+        };
+
+        let mut s = self.inner.lock().await;
+        for ws in s.workspaces.iter_mut() {
+            for sf in ws.surfaces.iter_mut() {
+                if sf.root_pane.find_leaf_content(dst_pane).is_some() {
+                    let new_pane = sf.root_pane.split_leaf(dst_pane, direction, 0.5, content)?;
+                    let ws_id = ws.id;
+                    drop(s);
+                    self.mark_dirty();
+                    return Some((ws_id, new_pane, surface_id));
+                }
+            }
+        }
+
+        None
+    }
+
     /// Return the workspace that owns leaf pane `target`, if any.
     pub async fn workspace_of_pane(&self, target: PaneId) -> Option<WorkspaceId> {
         let s = self.inner.lock().await;
@@ -3689,6 +3751,55 @@ mod tests {
             .root_pane
             .parent_split_id(out.new_pane)
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn import_surface_to_pane_assigns_new_id_and_activates() {
+        let store = StateStore::new_lazy(State::default());
+        let ws = store
+            .create_workspace(Some("ws".into()), std::path::PathBuf::from("/tmp/ws"))
+            .await;
+        let pane = first_pane(&store.get_workspace(ws).await.unwrap());
+        let imported = PaneSurface::browser("Remote", "https://remote.test".into());
+        let old_id = imported.id;
+
+        let (dst_ws, new_id) = store
+            .import_surface_to_pane(pane, imported, usize::MAX)
+            .await
+            .unwrap();
+
+        assert_eq!(dst_ws, ws);
+        assert_ne!(new_id, old_id);
+        assert_eq!(
+            store.get_workspace(ws).await.unwrap().surfaces[0]
+                .root_pane
+                .active_surface_id(pane),
+            Some(new_id)
+        );
+        assert_eq!(
+            store.surface_title(pane, new_id).await.as_deref(),
+            Some("Remote")
+        );
+    }
+
+    #[tokio::test]
+    async fn split_imported_surface_into_pane_creates_sibling() {
+        let store = StateStore::new_lazy(State::default());
+        let ws = store
+            .create_workspace(Some("ws".into()), std::path::PathBuf::from("/tmp/ws"))
+            .await;
+        let dst = first_pane(&store.get_workspace(ws).await.unwrap());
+        let imported = PaneSurface::terminal("Remote shell", Some("/tmp/remote".into()));
+
+        let (dst_ws, new_pane, new_surface) = store
+            .split_imported_surface_into_pane(dst, imported, SplitDirection::Horizontal)
+            .await
+            .unwrap();
+
+        assert_eq!(dst_ws, ws);
+        assert_eq!(pane_tab_ids(&store, ws, new_pane).await, vec![new_surface]);
+        let w = store.get_workspace(ws).await.unwrap();
+        assert!(w.surfaces[0].root_pane.parent_split_id(new_pane).is_some());
     }
 
     #[tokio::test]

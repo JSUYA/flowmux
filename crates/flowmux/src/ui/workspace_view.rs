@@ -21,7 +21,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub(crate) const TAB_DND_MIME: &str = "application/x-flowmux-tab";
-pub(crate) const TAB_DND_PAYLOAD_MAX: usize = 128;
+pub(crate) const TAB_DND_PAYLOAD_MAX: usize = 64 * 1024;
+
+#[derive(Debug, Clone)]
+pub(crate) struct TabDndPayload {
+    pub src_pane: PaneId,
+    pub src_surface: SurfaceId,
+    pub surface: Option<PaneSurface>,
+}
 
 /// Return the leaf pane id when the workspace is "solo" — the first
 /// (rendered) surface's root is a single leaf holding a single tab.
@@ -81,6 +88,21 @@ impl PaneRegistry {
 
     pub fn pane_frame(&self, pane: PaneId) -> Option<gtk::Widget> {
         self.pane_frames.get(&pane).cloned()
+    }
+
+    pub fn mark_focused_pane(&self, focused: PaneId) {
+        if !self.pane_frames.contains_key(&focused) {
+            return;
+        }
+        for (pane, frame) in &self.pane_frames {
+            if *pane == focused {
+                if !frame.has_css_class("focused") {
+                    frame.add_css_class("focused");
+                }
+            } else {
+                frame.remove_css_class("focused");
+            }
+        }
     }
 
     /// Workspace id containing each `pane`. Used by focus_in_direction to keep
@@ -594,9 +616,11 @@ impl PaneRegistry {
         tabs_box.append(&tab);
         match moving.handle {
             MovingHandle::Terminal(terminal) => {
+                terminal.set_pane_id(dst_pane);
                 self.terminals.insert(surface, terminal);
             }
             MovingHandle::Browser(browser) => {
+                browser.set_pane_id(dst_pane);
                 self.browsers.insert(surface, browser);
             }
         }
@@ -1126,7 +1150,7 @@ pub(crate) fn build_surface_tab_widget(
     // "Copy URL". Browser tabs have no cwd so "Show in folder" is
     // intentionally absent rather than disabled.
     attach_tab_context_menu(&tab, pane_id, surface, callbacks);
-    attach_tab_dnd_handlers(&tab, pane_id, surface.id, callbacks);
+    attach_tab_dnd_handlers(&tab, pane_id, surface, callbacks);
     (tab, label)
 }
 
@@ -1266,8 +1290,12 @@ fn attach_tab_context_menu(
     tab.add_controller(click);
 }
 
-pub(crate) fn parse_tab_dnd_payload(payload: &str) -> Result<(PaneId, SurfaceId), &'static str> {
-    let Some((src_pane_str, src_surface_str)) = payload.split_once('|') else {
+pub(crate) fn parse_tab_dnd_payload(payload: &str) -> Result<TabDndPayload, &'static str> {
+    let mut parts = payload.splitn(3, '|');
+    let Some(src_pane_str) = parts.next() else {
+        return Err("missing separator");
+    };
+    let Some(src_surface_str) = parts.next() else {
         return Err("missing separator");
     };
     let src_pane = src_pane_str
@@ -1276,7 +1304,16 @@ pub(crate) fn parse_tab_dnd_payload(payload: &str) -> Result<(PaneId, SurfaceId)
     let src_surface = src_surface_str
         .parse::<SurfaceId>()
         .map_err(|_| "invalid surface id")?;
-    Ok((src_pane, src_surface))
+    let surface = parts
+        .next()
+        .map(serde_json::from_str::<PaneSurface>)
+        .transpose()
+        .map_err(|_| "invalid surface model")?;
+    Ok(TabDndPayload {
+        src_pane,
+        src_surface,
+        surface,
+    })
 }
 
 #[cfg(test)]
@@ -1289,7 +1326,27 @@ mod tab_dnd_tests {
         let surface = SurfaceId::new();
         let payload = format!("{pane}|{surface}");
 
-        assert_eq!(parse_tab_dnd_payload(&payload), Ok((pane, surface)));
+        let parsed = parse_tab_dnd_payload(&payload).expect("payload parses");
+        assert_eq!(parsed.src_pane, pane);
+        assert_eq!(parsed.src_surface, surface);
+        assert!(parsed.surface.is_none());
+    }
+
+    #[test]
+    fn parse_tab_dnd_payload_accepts_surface_model() {
+        let pane = PaneId::new();
+        let surface = PaneSurface::browser("Docs", "https://example.test".into());
+        let payload = format!(
+            "{pane}|{}|{}",
+            surface.id,
+            serde_json::to_string(&surface).unwrap()
+        );
+
+        let parsed = parse_tab_dnd_payload(&payload).expect("payload parses");
+        assert_eq!(parsed.src_pane, pane);
+        assert_eq!(parsed.src_surface, surface.id);
+        let parsed_surface = parsed.surface.expect("surface model");
+        assert_eq!(parsed_surface.title, "Docs");
     }
 
     #[test]
@@ -1308,6 +1365,22 @@ mod tab_dnd_tests {
         assert!(matches!(drop_zone(0.8, 0.8), PaneDropZone::SplitDown));
         // exact center counts as the lower half (split down)
         assert!(matches!(drop_zone(0.5, 0.5), PaneDropZone::SplitDown));
+    }
+
+    #[test]
+    fn landed_drop_zone_prefers_visible_split_preview() {
+        assert!(matches!(
+            landed_drop_zone(PaneDropZone::SplitRight, Some(0.2), Some(0.2)),
+            PaneDropZone::SplitRight
+        ));
+        assert!(matches!(
+            landed_drop_zone(PaneDropZone::SplitDown, None, None),
+            PaneDropZone::SplitDown
+        ));
+        assert!(matches!(
+            landed_drop_zone(PaneDropZone::Tab, Some(0.8), Some(0.2)),
+            PaneDropZone::SplitRight
+        ));
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -1364,43 +1437,99 @@ mod tab_dnd_tests {
 fn attach_tab_dnd_handlers(
     tab: &gtk::Box,
     pane_id: PaneId,
-    surface_id: SurfaceId,
+    surface: &PaneSurface,
     callbacks: &PaneCallbacks,
 ) {
+    let surface_id = surface.id;
     let saw_tab_drop_target = callbacks.tab_drag_drop_seen.clone();
+    let committed_tab_drop = callbacks.tab_drag_drop_committed.clone();
+    let split_candidate = callbacks.tab_drag_split_candidate.clone();
     let opened_new_window = Rc::new(Cell::new(false));
 
     let drag_source = gtk::DragSource::new();
     drag_source.set_actions(gtk::gdk::DragAction::MOVE);
+    let surface_for_payload = surface.clone();
     drag_source.connect_prepare(move |_, _, _| {
         tracing::debug!(%pane_id, %surface_id, "tab drag prepare");
-        let payload = format!("{pane_id}|{surface_id}");
+        let payload = match serde_json::to_string(&surface_for_payload) {
+            Ok(surface_json) => format!("{pane_id}|{surface_id}|{surface_json}"),
+            Err(error) => {
+                tracing::warn!(%surface_id, %error, "tab drag: failed to serialize surface model");
+                format!("{pane_id}|{surface_id}")
+            }
+        };
         let bytes = gtk::glib::Bytes::from_owned(payload.into_bytes());
         Some(gtk::gdk::ContentProvider::for_bytes(TAB_DND_MIME, &bytes))
     });
     let tab_for_begin = tab.clone();
     let saw_target_for_begin = saw_tab_drop_target.clone();
+    let committed_for_begin = committed_tab_drop.clone();
+    let split_candidate_for_begin = split_candidate.clone();
     let opened_for_begin = opened_new_window.clone();
     drag_source.connect_drag_begin(move |_, _| {
         saw_target_for_begin.set(false);
+        committed_for_begin.set(false);
+        split_candidate_for_begin.borrow_mut().take();
         opened_for_begin.set(false);
         tab_for_begin.set_opacity(0.4);
         tab_for_begin.add_css_class("flowmux-pane-tab-dragging");
     });
     let tab_for_end = tab.clone();
     let saw_target_for_end = saw_tab_drop_target.clone();
+    let committed_for_end = committed_tab_drop.clone();
     let opened_for_end = opened_new_window.clone();
     let new_window_cb_for_end = callbacks.on_tab_drag_to_new_window.clone();
+    let close_cb_for_remote_move = callbacks.on_close_surface.clone();
+    let split_candidate_for_end = split_candidate.clone();
+    let split_cb_for_end = callbacks.on_split_surface_into_pane.clone();
+    let surface_for_end = surface.clone();
     drag_source.connect_drag_end(move |_, drag, delete_data| {
+        let selected_action = drag.selected_action();
         tracing::debug!(
             %pane_id,
             %surface_id,
             delete_data,
-            selected_action = ?drag.selected_action(),
+            selected_action = ?selected_action,
             saw_tab_drop_target = saw_target_for_end.get(),
             "tab drag end"
         );
-        if !saw_target_for_end.get() && !opened_for_end.get() {
+        if !committed_for_end.get() && !opened_for_end.get() {
+            if let Some((target_pane, direction)) = split_candidate_for_end.borrow_mut().take() {
+                saw_target_for_end.set(true);
+                committed_for_end.set(true);
+                opened_for_end.set(true);
+                tracing::info!(
+                    %pane_id,
+                    %surface_id,
+                    %target_pane,
+                    ?direction,
+                    "tab drag ended without a drop target; committing previewed split"
+                );
+                (split_cb_for_end.borrow_mut())(
+                    pane_id,
+                    surface_id,
+                    Some(surface_for_end.clone()),
+                    target_pane,
+                    direction,
+                );
+            }
+        }
+        if selected_action.contains(gtk::gdk::DragAction::MOVE)
+            && delete_data
+            && !saw_target_for_end.get()
+            && !committed_for_end.get()
+        {
+            tracing::info!(
+                %pane_id,
+                %surface_id,
+                "tab drag moved to another window; closing source tab"
+            );
+            (close_cb_for_remote_move.borrow_mut())(pane_id, surface_id);
+        } else if selected_action.is_empty()
+            && !delete_data
+            && !saw_target_for_end.get()
+            && !opened_for_end.get()
+        {
             opened_for_end.set(true);
             tracing::info!(
                 %pane_id,
@@ -1409,29 +1538,57 @@ fn attach_tab_dnd_handlers(
             );
             (new_window_cb_for_end.borrow_mut())(pane_id, surface_id);
         }
+        split_candidate_for_end.borrow_mut().take();
         saw_target_for_end.set(false);
         tab_for_end.set_opacity(1.0);
         tab_for_end.remove_css_class("flowmux-pane-tab-dragging");
     });
     let tab_for_cancel = tab.clone();
     let saw_target_for_cancel = saw_tab_drop_target.clone();
+    let committed_for_cancel = committed_tab_drop.clone();
     let new_window_cb = callbacks.on_tab_drag_to_new_window.clone();
     let opened_for_cancel = opened_new_window.clone();
+    let split_candidate_for_cancel = split_candidate.clone();
+    let split_cb_for_cancel = callbacks.on_split_surface_into_pane.clone();
+    let surface_for_cancel = surface.clone();
     drag_source.connect_drag_cancel(move |_, drag, reason| {
+        let selected_action = drag.selected_action();
         tab_for_cancel.set_opacity(1.0);
         tab_for_cancel.remove_css_class("flowmux-pane-tab-dragging");
         tracing::debug!(
             %pane_id,
             %surface_id,
             ?reason,
-            selected_action = ?drag.selected_action(),
+            selected_action = ?selected_action,
             saw_tab_drop_target = saw_target_for_cancel.get(),
             "tab drag cancel"
         );
+        if !committed_for_cancel.get() && !opened_for_cancel.get() {
+            if let Some((target_pane, direction)) = split_candidate_for_cancel.borrow_mut().take() {
+                saw_target_for_cancel.set(true);
+                committed_for_cancel.set(true);
+                opened_for_cancel.set(true);
+                tracing::info!(
+                    %pane_id,
+                    %surface_id,
+                    %target_pane,
+                    ?direction,
+                    "tab drag canceled without a drop target; committing previewed split"
+                );
+                (split_cb_for_cancel.borrow_mut())(
+                    pane_id,
+                    surface_id,
+                    Some(surface_for_cancel.clone()),
+                    target_pane,
+                    direction,
+                );
+            }
+        }
         if matches!(
             reason,
             gtk::gdk::DragCancelReason::NoTarget | gtk::gdk::DragCancelReason::Error
-        ) && !saw_target_for_cancel.get()
+        ) && selected_action.is_empty()
+            && !saw_target_for_cancel.get()
             && !opened_for_cancel.get()
         {
             opened_for_cancel.set(true);
@@ -1442,6 +1599,7 @@ fn attach_tab_dnd_handlers(
             );
             (new_window_cb.borrow_mut())(pane_id, surface_id);
         }
+        split_candidate_for_cancel.borrow_mut().take();
         saw_target_for_cancel.set(false);
         false
     });
@@ -1492,8 +1650,12 @@ fn attach_tab_dnd_handlers(
     let move_to_pane_cb = callbacks.on_move_surface_to_pane.clone();
     let position_of_surface_cb = callbacks.position_of_surface_in_pane.clone();
     let saw_target_for_drop = saw_tab_drop_target.clone();
+    let committed_for_drop = committed_tab_drop.clone();
+    let split_candidate_for_drop = split_candidate.clone();
     drop_target.connect_drop(move |_, drop, x, _y| {
         saw_target_for_drop.set(true);
+        committed_for_drop.set(true);
+        split_candidate_for_drop.borrow_mut().take();
         tracing::debug!(%target_pane, %target_surface, "tab drop fired");
         tab_for_drop.remove_css_class("flowmux-pane-tab-drop-before");
         tab_for_drop.remove_css_class("flowmux-pane-tab-drop-after");
@@ -1538,11 +1700,14 @@ fn attach_tab_dnd_handlers(
                     return;
                 }
             };
-            let Ok((src_pane, src_surface)) = parse_tab_dnd_payload(payload) else {
+            let Ok(payload) = parse_tab_dnd_payload(payload) else {
                 tracing::warn!(payload = %payload, "tab drop: payload invalid");
                 drop.finish(gtk::gdk::DragAction::empty());
                 return;
             };
+            let src_pane = payload.src_pane;
+            let src_surface = payload.src_surface;
+            let src_surface_model = payload.surface;
             // Dropping a tab onto itself within the same pane is a no-op.
             if src_pane == target_pane && src_surface == target_surface {
                 tracing::debug!(%src_surface, "tab drop: dropped onto self, ignoring");
@@ -1603,7 +1768,13 @@ fn attach_tab_dnd_handlers(
             if src_pane == target_pane {
                 (reorder_cb.borrow_mut())(target_pane, src_surface, final_index);
             } else {
-                (move_to_pane_cb.borrow_mut())(src_pane, src_surface, target_pane, final_index);
+                (move_to_pane_cb.borrow_mut())(
+                    src_pane,
+                    src_surface,
+                    src_surface_model,
+                    target_pane,
+                    final_index,
+                );
             }
             drop.finish(gtk::gdk::DragAction::MOVE);
         });
@@ -1626,6 +1797,16 @@ enum PaneDropZone {
     SplitDown,
 }
 
+impl PaneDropZone {
+    fn split_direction(self) -> Option<SplitDirection> {
+        match self {
+            PaneDropZone::SplitRight => Some(SplitDirection::Vertical),
+            PaneDropZone::SplitDown => Some(SplitDirection::Horizontal),
+            PaneDropZone::None | PaneDropZone::Tab => None,
+        }
+    }
+}
+
 /// Map normalized pointer coordinates inside a pane to a drop zone: the bottom
 /// half splits down, the upper-right splits right, the upper-left adds a tab.
 fn drop_zone(fx: f64, fy: f64) -> PaneDropZone {
@@ -1635,6 +1816,17 @@ fn drop_zone(fx: f64, fy: f64) -> PaneDropZone {
         PaneDropZone::SplitRight
     } else {
         PaneDropZone::Tab
+    }
+}
+
+fn landed_drop_zone(previewed: PaneDropZone, fx: Option<f64>, fy: Option<f64>) -> PaneDropZone {
+    if previewed.split_direction().is_some() {
+        return previewed;
+    }
+
+    match (fx, fy) {
+        (Some(fx), Some(fy)) => drop_zone(fx, fy),
+        _ => PaneDropZone::Tab,
     }
 }
 
@@ -1652,17 +1844,31 @@ fn attach_pane_body_dnd(
 
     // Preview: track the pointer during the drag and repaint the overlay.
     let motion = gtk::DropControllerMotion::new();
+    motion.set_propagation_phase(gtk::PropagationPhase::Capture);
     {
         let frame = frame.clone();
         let zone = zone.clone();
         let preview = preview.clone();
-        motion.connect_motion(move |_, x, y| {
+        let saw_drop_target = callbacks.tab_drag_drop_seen.clone();
+        let split_candidate = callbacks.tab_drag_split_candidate.clone();
+        motion.connect_motion(move |motion, x, y| {
+            if motion
+                .drop()
+                .is_some_and(|drop| drop.formats().contain_mime_type(TAB_DND_MIME))
+            {
+                saw_drop_target.set(true);
+            }
             let (w, h) = (frame.width() as f64, frame.height() as f64);
             let new = if w > 0.0 && h > 0.0 {
                 drop_zone(x / w, y / h)
             } else {
                 PaneDropZone::None
             };
+            if let Some(direction) = new.split_direction() {
+                *split_candidate.borrow_mut() = Some((pane_id, direction));
+            } else {
+                split_candidate.borrow_mut().take();
+            }
             if zone.get() != new {
                 zone.set(new);
                 preview.queue_draw();
@@ -1672,7 +1878,18 @@ fn attach_pane_body_dnd(
     {
         let zone = zone.clone();
         let preview = preview.clone();
+        let saw_drop_target = callbacks.tab_drag_drop_seen.clone();
+        let committed_drop = callbacks.tab_drag_drop_committed.clone();
+        let split_candidate = callbacks.tab_drag_split_candidate.clone();
         motion.connect_leave(move |_| {
+            if !committed_drop.get() {
+                if zone.get().split_direction().is_some() {
+                    saw_drop_target.set(true);
+                } else {
+                    saw_drop_target.set(false);
+                    split_candidate.borrow_mut().take();
+                }
+            }
             if zone.get() != PaneDropZone::None {
                 zone.set(PaneDropZone::None);
                 preview.queue_draw();
@@ -1685,6 +1902,7 @@ fn attach_pane_body_dnd(
         Some(gtk::gdk::ContentFormats::new(&[TAB_DND_MIME])),
         gtk::gdk::DragAction::MOVE,
     );
+    drop_target.set_propagation_phase(gtk::PropagationPhase::Capture);
     drop_target.connect_accept(|target, drop| {
         if drop.formats().contain_mime_type(TAB_DND_MIME) {
             true
@@ -1696,13 +1914,19 @@ fn attach_pane_body_dnd(
     let move_to_pane_cb = callbacks.on_move_surface_to_pane.clone();
     let split_cb = callbacks.on_split_surface_into_pane.clone();
     let target_pane = pane_id;
+    let saw_drop_target = callbacks.tab_drag_drop_seen.clone();
+    let committed_drop = callbacks.tab_drag_drop_committed.clone();
+    let split_candidate = callbacks.tab_drag_split_candidate.clone();
     drop_target.connect_drop(move |_, drop, x, y| {
+        saw_drop_target.set(true);
+        committed_drop.set(true);
+        split_candidate.borrow_mut().take();
         let (w, h) = (frame.width() as f64, frame.height() as f64);
-        let landed = if w > 0.0 && h > 0.0 {
-            drop_zone(x / w, y / h)
-        } else {
-            PaneDropZone::Tab
-        };
+        let landed = landed_drop_zone(
+            zone.get(),
+            (w > 0.0).then_some(x / w),
+            (h > 0.0).then_some(y / h),
+        );
         // Clear the preview now that the drop is committing.
         zone.set(PaneDropZone::None);
         preview.queue_draw();
@@ -1739,15 +1963,19 @@ fn attach_pane_body_dnd(
                 drop.finish(gtk::gdk::DragAction::empty());
                 return;
             };
-            let Ok((src_pane, src_surface)) = parse_tab_dnd_payload(payload) else {
+            let Ok(payload) = parse_tab_dnd_payload(payload) else {
                 drop.finish(gtk::gdk::DragAction::empty());
                 return;
             };
+            let src_pane = payload.src_pane;
+            let src_surface = payload.src_surface;
+            let src_surface_model = payload.surface;
             match landed {
                 PaneDropZone::SplitRight => {
                     (split_cb.borrow_mut())(
                         src_pane,
                         src_surface,
+                        src_surface_model,
                         target_pane,
                         SplitDirection::Vertical,
                     );
@@ -1756,12 +1984,19 @@ fn attach_pane_body_dnd(
                     (split_cb.borrow_mut())(
                         src_pane,
                         src_surface,
+                        src_surface_model,
                         target_pane,
                         SplitDirection::Horizontal,
                     );
                 }
                 PaneDropZone::Tab | PaneDropZone::None => {
-                    (move_to_pane_cb.borrow_mut())(src_pane, src_surface, target_pane, usize::MAX);
+                    (move_to_pane_cb.borrow_mut())(
+                        src_pane,
+                        src_surface,
+                        src_surface_model,
+                        target_pane,
+                        usize::MAX,
+                    );
                 }
             }
             drop.finish(gtk::gdk::DragAction::MOVE);
@@ -1967,6 +2202,7 @@ fn build_panel(
             // Apply the zoom option to the new browser tab immediately so
             // widgets created before apply_zoom still start in sync.
             pane.set_zoom_level(opts.zoom_factor());
+            let browser_pane_id = pane.pane_id_handle();
 
             // Browser tabs use the same focus marker and on_focus callback.
             // on_focus updates WindowController.focused_pane, then
@@ -1985,6 +2221,7 @@ fn build_panel(
             let on_focus = callbacks.on_focus.clone();
             let focus = gtk::EventControllerFocus::new();
             focus.connect_enter(move |_| {
+                let pane_id = browser_pane_id.get();
                 tracing::debug!(%pane_id, "browser pane focus enter");
                 if !frame_in.has_css_class("focused") {
                     frame_in.add_css_class("focused");

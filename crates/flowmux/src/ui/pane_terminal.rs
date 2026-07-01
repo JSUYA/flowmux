@@ -10,7 +10,7 @@ use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
 
-use flowmux_core::{PaneId, SplitDirection, SurfaceId, WorkspaceId};
+use flowmux_core::{PaneId, PaneSurface, SplitDirection, SurfaceId, WorkspaceId};
 
 use crate::ui::ghostty_pane::GhosttyPane;
 
@@ -63,7 +63,8 @@ pub struct PaneCallbacks {
     /// Move a tab into another pane (possibly in another workspace) by drag and
     /// drop, preserving its live state. Args: source pane, surface, destination
     /// pane, final 0-based index in the destination (clamped to the end).
-    pub on_move_surface_to_pane: Rc<RefCell<dyn FnMut(PaneId, SurfaceId, PaneId, usize)>>,
+    pub on_move_surface_to_pane:
+        Rc<RefCell<dyn FnMut(PaneId, SurfaceId, Option<PaneSurface>, PaneId, usize)>>,
     /// Move a tab to the last position of the first pane of `dst_workspace`.
     /// Backs the right-click "Move" menu and drops onto a side-panel workspace.
     pub on_move_surface_to_workspace: Rc<RefCell<dyn FnMut(PaneId, SurfaceId, WorkspaceId)>>,
@@ -71,7 +72,7 @@ pub struct PaneCallbacks {
     /// new sibling, preserving its live state. Backs dropping on the right /
     /// bottom region of a pane body.
     pub on_split_surface_into_pane:
-        Rc<RefCell<dyn FnMut(PaneId, SurfaceId, PaneId, SplitDirection)>>,
+        Rc<RefCell<dyn FnMut(PaneId, SurfaceId, Option<PaneSurface>, PaneId, SplitDirection)>>,
     /// Snapshot of the current workspaces (id + display name) at call time, used
     /// to populate the right-click "Move" submenu so it reflects live state.
     pub list_workspaces: Rc<dyn Fn() -> Vec<(WorkspaceId, String)>>,
@@ -82,6 +83,13 @@ pub struct PaneCallbacks {
     /// The source tab uses this to distinguish a true no-target drag from a
     /// rejected drop on a known tab (self/cross-pane/invalid payload).
     pub tab_drag_drop_seen: Rc<Cell<bool>>,
+    /// Set once a same-window tab drop callback has started. This keeps a
+    /// post-drop leave event from making the source treat the move as remote.
+    pub tab_drag_drop_committed: Rc<Cell<bool>>,
+    /// Last split preview shown while dragging a tab over a pane body. GTK can
+    /// report the final drop as having no target near zone edges; in that case
+    /// drag end commits the previewed split instead of tearing off.
+    pub tab_drag_split_candidate: Rc<RefCell<Option<(PaneId, SplitDirection)>>>,
     /// The terminal reported that a surface changed its cwd (OSC 7). The
     /// controller refreshes the window title / VCS sidebar and records the
     /// cwd so a new tab in the pane inherits it.

@@ -9,8 +9,8 @@
 //! window controller.
 
 use flowmux_core::{
-    AgentActivity, NotificationId, NotificationLevel, PaneId, PlacementStrategy, SplitDirection,
-    SurfaceId, WorkspaceId,
+    AgentActivity, NotificationId, NotificationLevel, PaneId, PaneSurface, PlacementStrategy,
+    SplitDirection, SurfaceId, WorkspaceId,
 };
 use flowmux_ipc::protocol::{BrowserWaitCondition, NotificationSummary};
 use std::path::PathBuf;
@@ -274,6 +274,7 @@ pub enum GtkCommand {
     MoveSurfaceToPane {
         src_pane: PaneId,
         surface: SurfaceId,
+        surface_model: Option<PaneSurface>,
         dst_pane: PaneId,
         target_index: usize,
         ack: oneshot::Sender<Result<(), String>>,
@@ -293,6 +294,7 @@ pub enum GtkCommand {
     SplitSurfaceIntoPane {
         src_pane: PaneId,
         surface: SurfaceId,
+        surface_model: Option<PaneSurface>,
         dst_pane: PaneId,
         direction: SplitDirection,
         ack: oneshot::Sender<Result<(), String>>,

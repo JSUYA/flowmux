@@ -870,10 +870,12 @@ fn attach_tab_drop_to_row(row: &gtk::ListBoxRow, ws_id: WorkspaceId, bridge: Bri
                 drop.finish(gtk::gdk::DragAction::empty());
                 return;
             };
-            let Ok((src_pane, surface)) = parse_tab_dnd_payload(payload) else {
+            let Ok(payload) = parse_tab_dnd_payload(payload) else {
                 drop.finish(gtk::gdk::DragAction::empty());
                 return;
             };
+            let src_pane = payload.src_pane;
+            let surface = payload.src_surface;
             let (ack_tx, _ack_rx) = oneshot::channel();
             let _ = bridge
                 .tx

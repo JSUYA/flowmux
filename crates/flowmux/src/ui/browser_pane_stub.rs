@@ -6,7 +6,7 @@ use flowmux_browser::{RefScope, RefStore};
 use flowmux_config::options::BrowserEngine;
 use flowmux_core::{PaneId, SurfaceId};
 use gtk::prelude::*;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 const UNSUPPORTED: &str =
@@ -14,6 +14,7 @@ const UNSUPPORTED: &str =
 
 #[derive(Clone)]
 pub struct BrowserPane {
+    pane_id: Rc<Cell<PaneId>>,
     pub root: gtk::Box,
     pub web_view: gtk::Widget,
     pub refs: Rc<RefCell<RefStore>>,
@@ -32,13 +33,14 @@ pub fn suspend_native_browser_views_for_window(_window: &gtk::Window) -> NativeB
 
 impl BrowserPane {
     pub fn new(
-        _id: PaneId,
+        id: PaneId,
         surface_id: SurfaceId,
         initial_url: Option<&str>,
         callbacks: PaneCallbacks,
         _engine: BrowserEngine,
         _persist_session: bool,
     ) -> Self {
+        let pane_id = Rc::new(Cell::new(id));
         let _ = callbacks.on_browser_uri_changed.clone();
         let _ = callbacks.on_browser_title_changed.clone();
 
@@ -70,6 +72,7 @@ impl BrowserPane {
         root.append(&message);
 
         Self {
+            pane_id,
             root,
             web_view: message.upcast::<gtk::Widget>(),
             refs: Rc::new(RefCell::new(RefStore::new())),
@@ -101,6 +104,14 @@ impl BrowserPane {
 
     pub fn grab_focus(&self) {
         self.web_view.grab_focus();
+    }
+
+    pub fn pane_id_handle(&self) -> Rc<Cell<PaneId>> {
+        self.pane_id.clone()
+    }
+
+    pub fn set_pane_id(&self, id: PaneId) {
+        self.pane_id.set(id);
     }
 
     pub fn focus_widget(&self) -> gtk::Widget {

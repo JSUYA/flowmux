@@ -25,7 +25,7 @@ use vte::prelude::*;
 
 #[derive(Clone)]
 pub struct GhosttyPane {
-    pub id: PaneId,
+    id: Rc<Cell<PaneId>>,
     /// The VTE widget itself. Sits inside `container` and owns every
     /// event controller, IM context, focus, and PTY child. Theme and
     /// font calls target this widget directly.
@@ -55,7 +55,11 @@ pub const INSERT_NEWLINE_BYTES: &[u8] = b"\x1b\r";
 
 impl GhosttyPane {
     pub fn id(&self) -> PaneId {
-        self.id
+        self.id.get()
+    }
+
+    pub fn set_pane_id(&self, id: PaneId) {
+        self.id.set(id);
     }
 
     /// Enable/disable the VTE cursor blink. VTE drives the blink interval from
@@ -242,6 +246,7 @@ impl GhosttyPane {
         extra_env: Vec<(String, String)>,
         callbacks: PaneCallbacks,
     ) -> Self {
+        let pane_id = Rc::new(Cell::new(id));
         let term = vte::Terminal::new();
         term.set_hexpand(true);
         term.set_vexpand(true);
@@ -346,7 +351,7 @@ impl GhosttyPane {
         // sync, and a new tab inherits the surface's directory.
         {
             let cb = callbacks.on_terminal_cwd_changed.clone();
-            let id = id;
+            let pane_id = pane_id.clone();
             let surface = surface;
             // Forward OSC 7 cwd only on a real change, matching the controller's
             // expectation that the title / VCS / file-browser refresh runs once
@@ -359,7 +364,7 @@ impl GhosttyPane {
                         if last.as_deref() != Some(path.as_path()) {
                             *last = Some(path.clone());
                             drop(last);
-                            (cb.borrow_mut())(id, surface, path);
+                            (cb.borrow_mut())(pane_id.get(), surface, path);
                         }
                     }
                 }
@@ -367,14 +372,14 @@ impl GhosttyPane {
         }
         {
             let cb = callbacks.on_terminal_title_changed.clone();
-            let id = id;
+            let pane_id = pane_id.clone();
             let surface = surface;
             let last_title: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
             term.connect_window_title_notify(move |t| {
                 let title = t.window_title().map(|g| g.to_string()).unwrap_or_default();
                 if !title.is_empty() && *last_title.borrow() != title {
                     *last_title.borrow_mut() = title.clone();
-                    (cb.borrow_mut())(id, surface, title);
+                    (cb.borrow_mut())(pane_id.get(), surface, title);
                 }
             });
         }
@@ -396,9 +401,9 @@ impl GhosttyPane {
         // Process exit.
         {
             let cb = callbacks.on_child_exited.clone();
-            let id = id;
+            let pane_id = pane_id.clone();
             term.connect_child_exited(move |_term, status| {
-                (cb.borrow_mut())(id, status);
+                (cb.borrow_mut())(pane_id.get(), status);
             });
         }
 
@@ -406,9 +411,9 @@ impl GhosttyPane {
         // need to know which pane is currently focused.
         {
             let cb = callbacks.on_focus.clone();
-            let id = id;
+            let pane_id = pane_id.clone();
             let focus_ctrl = gtk::EventControllerFocus::new();
-            focus_ctrl.connect_enter(move |_| (cb.borrow_mut())(id));
+            focus_ctrl.connect_enter(move |_| (cb.borrow_mut())(pane_id.get()));
             term.add_controller(focus_ctrl);
         }
 
@@ -425,11 +430,12 @@ impl GhosttyPane {
             let on_close_pane = callbacks.on_close_pane.clone();
             let on_copy_text = callbacks.on_copy_surface_text.clone();
             let surface_for_menu = surface;
-            let id = id;
+            let pane_id = pane_id.clone();
             let term_widget = term.clone();
             let click = gtk::GestureClick::new();
             click.set_button(gtk::gdk::BUTTON_SECONDARY);
             click.connect_pressed(move |gesture, _n_press, x, y| {
+                let id = pane_id.get();
                 (on_focus.borrow_mut())(id);
 
                 let popover = gtk::Popover::new();
@@ -588,7 +594,7 @@ impl GhosttyPane {
         term.watch_child(glib::Pid(child_pid));
 
         Self {
-            id,
+            id: pane_id,
             widget: term,
             container,
             pid,

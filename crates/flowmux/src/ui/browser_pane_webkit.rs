@@ -21,12 +21,13 @@ use flowmux_browser::{BrowserProfile, RefScope, RefStore};
 use flowmux_config::options::BrowserEngine;
 use flowmux_core::{PaneId, SurfaceId};
 use gtk::prelude::*;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use webkit6::prelude::*;
 
 #[derive(Clone)]
 pub struct BrowserPane {
+    pane_id: Rc<Cell<PaneId>>,
     pub root: gtk::Box,
     pub web_view: webkit6::WebView,
     /// cmux-style server-side ref store. Each snapshot clears + repopulates
@@ -59,6 +60,7 @@ impl BrowserPane {
         engine: BrowserEngine,
         persist_session: bool,
     ) -> Self {
+        let pane_id = Rc::new(Cell::new(id));
         // BrowserEngine labels affect only WebsiteDataStore isolation, matching
         // upstream cmux. Every tab renders through the same WebKitGTK engine.
         // Map them 1:1 to flowmux-browser::BrowserProfile to split data dirs.
@@ -239,11 +241,12 @@ impl BrowserPane {
         {
             let a = address.clone();
             let uri_cb = callbacks.on_browser_uri_changed.clone();
+            let pane_id = pane_id.clone();
             web_view.connect_uri_notify(move |w| {
                 if let Some(uri) = w.uri() {
                     let uri_str = uri.to_string();
                     a.set_text(&uri_str);
-                    (uri_cb.borrow_mut())(id, surface_id, uri_str);
+                    (uri_cb.borrow_mut())(pane_id.get(), surface_id, uri_str);
                 }
             });
         }
@@ -252,10 +255,11 @@ impl BrowserPane {
         // The daemon ignores them for title-locked user-renamed surfaces.
         {
             let title_cb = callbacks.on_browser_title_changed.clone();
+            let pane_id = pane_id.clone();
             web_view.connect_title_notify(move |w| {
                 let title = w.title().map(|t| t.to_string()).unwrap_or_default();
                 if !title.trim().is_empty() {
-                    (title_cb.borrow_mut())(id, surface_id, title);
+                    (title_cb.borrow_mut())(pane_id.get(), surface_id, title);
                 }
             });
         }
@@ -269,6 +273,7 @@ impl BrowserPane {
         }
 
         Self {
+            pane_id,
             root,
             web_view,
             refs: Rc::new(RefCell::new(RefStore::new())),
@@ -320,6 +325,14 @@ impl BrowserPane {
 
     pub fn grab_focus(&self) {
         self.web_view.grab_focus();
+    }
+
+    pub fn pane_id_handle(&self) -> Rc<Cell<PaneId>> {
+        self.pane_id.clone()
+    }
+
+    pub fn set_pane_id(&self, id: PaneId) {
+        self.pane_id.set(id);
     }
 
     pub fn focus_widget(&self) -> gtk::Widget {

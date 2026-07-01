@@ -1328,6 +1328,7 @@ impl WindowController {
         &self,
         src_pane: PaneId,
         surface: SurfaceId,
+        surface_model: Option<flowmux_core::PaneSurface>,
         dst_pane: PaneId,
         target_index: usize,
     ) -> Result<(), String> {
@@ -1358,6 +1359,11 @@ impl WindowController {
             .borrow_mut()
             .detach_surface_for_move(src_pane, surface);
         let Some(moving) = moving else {
+            if let Some(surface_model) = surface_model {
+                return self
+                    .import_surface_to_pane(surface_model, dst_pane, target_index)
+                    .await;
+            }
             return Err("source surface is not rendered".to_string());
         };
 
@@ -1393,6 +1399,9 @@ impl WindowController {
         } else if outcome.src_pane_removed {
             self.apply_close_pane_incremental_or_rerender(outcome.src_workspace, src_pane)
                 .await;
+        } else {
+            self.sync_pane_active_from_store(outcome.src_workspace, src_pane)
+                .await;
         }
 
         if let Some(ws) = self.store.get_workspace(outcome.dst_workspace).await {
@@ -1427,7 +1436,7 @@ impl WindowController {
             })
             .ok_or_else(|| "destination workspace has no pane".to_string())?;
         let res = self
-            .move_surface(src_pane, surface, dst_pane, usize::MAX)
+            .move_surface(src_pane, surface, None, dst_pane, usize::MAX)
             .await;
         if res.is_ok() {
             self.activate_workspace(dst_workspace).await;
@@ -1485,12 +1494,121 @@ impl WindowController {
             .await;
     }
 
+    async fn sync_pane_active_from_store(&self, workspace: WorkspaceId, pane: PaneId) {
+        let Some(ws) = self.store.get_workspace(workspace).await else {
+            return;
+        };
+        let Some(active) = active_surface_from_workspace(&ws, pane) else {
+            return;
+        };
+        self.pane_registry
+            .borrow_mut()
+            .activate_surface(pane, active);
+    }
+
+    async fn import_surface_to_pane(
+        &self,
+        surface_model: flowmux_core::PaneSurface,
+        dst_pane: PaneId,
+        target_index: usize,
+    ) -> Result<(), String> {
+        if !self.pane_registry.borrow().has_pane(dst_pane) {
+            return Err("destination pane is not rendered".to_string());
+        }
+
+        let Some((ws_id, surface_id)) = self
+            .store
+            .import_surface_to_pane(dst_pane, surface_model, target_index)
+            .await
+        else {
+            return Err("destination pane no longer exists".to_string());
+        };
+
+        self.attach_or_rerender_surface(ws_id, dst_pane, surface_id)
+            .await;
+        if let Some(ws) = self.store.get_workspace(ws_id).await {
+            self.refresh_workspace_solo(&ws);
+        }
+        self.sync_workspace_label(ws_id).await;
+        self.refresh_window_title().await;
+        self.focus_pane(dst_pane);
+        Ok(())
+    }
+
+    async fn split_imported_surface_into_pane(
+        &self,
+        surface_model: flowmux_core::PaneSurface,
+        dst_pane: PaneId,
+        direction: SplitDirection,
+    ) -> Result<(), String> {
+        if !self.pane_registry.borrow().has_pane(dst_pane) {
+            return Err("destination pane is not rendered".to_string());
+        }
+
+        let Some((ws_id, new_pane, _surface_id)) = self
+            .store
+            .split_imported_surface_into_pane(dst_pane, surface_model, direction)
+            .await
+        else {
+            return Err("destination pane no longer exists".to_string());
+        };
+        let Some(ws) = self.store.get_workspace(ws_id).await else {
+            return Err("destination workspace vanished".to_string());
+        };
+        let Some(new_split_id) = ws
+            .surfaces
+            .iter()
+            .find_map(|s| s.root_pane.parent_split_id(new_pane))
+        else {
+            return Err("could not locate the new split node".to_string());
+        };
+        let Some(content) = ws
+            .surfaces
+            .iter()
+            .find_map(|s| s.root_pane.find_leaf_content(new_pane))
+        else {
+            return Err("could not locate imported surface content".to_string());
+        };
+
+        let stack_name = ws.id.to_string();
+        match split_pane_incremental(
+            ws.id,
+            dst_pane,
+            new_pane,
+            new_split_id,
+            direction,
+            0.5,
+            content,
+            Some(ws.root_dir.clone()),
+            &stack_name,
+            &self.callbacks,
+            self.pane_registry.clone(),
+            self.theme.clone(),
+            false,
+        ) {
+            IncrementalSplitOutcome::SucceededRoot { new_root } => {
+                self.surfaces.borrow_mut().insert(ws.id, new_root);
+            }
+            IncrementalSplitOutcome::SucceededNested => {}
+            IncrementalSplitOutcome::Failed => {
+                return Err("incremental split failed".to_string());
+            }
+        }
+
+        self.refresh_workspace_solo(&ws);
+        self.sync_workspace_label(ws.id).await;
+        self.refresh_window_title().await;
+        self.focus_pane(new_pane);
+        Ok(())
+    }
+
     /// Split `dst_pane` and move the dragged tab (with its live state) into the
     /// new sibling. Backs dropping a tab on the right / bottom region of a pane.
     async fn split_surface_into_pane(
         &self,
         src_pane: PaneId,
         surface: SurfaceId,
+        surface_model: Option<flowmux_core::PaneSurface>,
         dst_pane: PaneId,
         direction: SplitDirection,
     ) -> Result<(), String> {
@@ -1503,6 +1621,11 @@ impl WindowController {
             .borrow_mut()
             .detach_surface_for_move(src_pane, surface);
         let Some(moving) = moving else {
+            if let Some(surface_model) = surface_model {
+                return self
+                    .split_imported_surface_into_pane(surface_model, dst_pane, direction)
+                    .await;
+            }
             return Err("source surface is not rendered".to_string());
         };
 
@@ -1581,6 +1704,9 @@ impl WindowController {
             self.activate_active_or_show_empty().await;
         } else if outcome.src_pane_removed {
             self.apply_close_pane_incremental_or_rerender(outcome.src_workspace, src_pane)
+                .await;
+        } else {
+            self.sync_pane_active_from_store(outcome.src_workspace, src_pane)
                 .await;
         }
 
@@ -1938,6 +2064,8 @@ impl WindowController {
         let Some(ws_id) = self.store.workspace_for_pane(pane).await else {
             return;
         };
+        self.focused_pane.set(Some(pane));
+        self.pane_registry.borrow().mark_focused_pane(pane);
         {
             let mut mru = self.focus_mru.borrow_mut();
             let queue = mru.entry(ws_id).or_default();
@@ -2184,6 +2312,19 @@ impl WindowController {
     /// notification firing and the user clicking it.
     fn focus_pane(&self, pane: PaneId) {
         let registry = self.pane_registry.clone();
+        if registry.borrow().pane_frame(pane).is_none() {
+            tracing::debug!(%pane, "focus_pane: pane is not registered");
+            return;
+        }
+        // Keep pane-local shortcuts and the focus border in sync even if the
+        // backend widget does not emit a focus-enter event after a drag split.
+        self.focused_pane.set(Some(pane));
+        registry.borrow().mark_focused_pane(pane);
+        let bridge = self.bridge.clone();
+        glib::MainContext::default().spawn_local(async move {
+            let _ = bridge.tx.send(GtkCommand::PaneFocused { pane }).await;
+            let _ = bridge.tx.send(GtkCommand::RefreshWindowTitle).await;
+        });
         glib::idle_add_local_once(move || {
             let r = registry.borrow();
             if let Some(term) = r.active_terminal(pane) {
@@ -2660,12 +2801,13 @@ impl WindowController {
             GtkCommand::MoveSurfaceToPane {
                 src_pane,
                 surface,
+                surface_model,
                 dst_pane,
                 target_index,
                 ack,
             } => {
                 let res = self
-                    .move_surface(src_pane, surface, dst_pane, target_index)
+                    .move_surface(src_pane, surface, surface_model, dst_pane, target_index)
                     .await;
                 let _ = ack.send(res);
             }
@@ -2683,12 +2825,13 @@ impl WindowController {
             GtkCommand::SplitSurfaceIntoPane {
                 src_pane,
                 surface,
+                surface_model,
                 dst_pane,
                 direction,
                 ack,
             } => {
                 let res = self
-                    .split_surface_into_pane(src_pane, surface, dst_pane, direction)
+                    .split_surface_into_pane(src_pane, surface, surface_model, dst_pane, direction)
                     .await;
                 let _ = ack.send(res);
             }
@@ -3721,16 +3864,12 @@ impl WindowController {
         }
         let _ = Rect::new(0.0, 0.0, 0.0, 0.0); // ensure import used in non-tests path
         if let Some((id, _)) = best {
-            // If the target pane's active tab is a browser tab, focus web_view.
-            // Previously only active_terminal was tried, so browser panes could
-            // not be reached with Alt+arrow.
-            if let Some(term) = registry.active_terminal(id) {
-                self.focused_pane.set(Some(id));
-                term.grab_focus();
-                Some(id)
-            } else if let Some(browser) = registry.active_browser(id) {
-                self.focused_pane.set(Some(id));
-                browser.grab_focus();
+            let has_active_surface =
+                registry.active_terminal(id).is_some() || registry.active_browser(id).is_some();
+            drop(registry);
+
+            if has_active_surface {
+                self.focus_pane(id);
                 Some(id)
             } else {
                 tracing::debug!(target_pane = %id, "no active surface to focus");
@@ -4346,6 +4485,7 @@ fn make_callbacks(
         },
         on_focus: {
             let bridge = bridge.clone();
+            let focused = focused.clone();
             Rc::new(RefCell::new(move |pane| {
                 tracing::debug!(%pane, "pane focused");
                 focused.set(Some(pane));
@@ -4392,7 +4532,9 @@ fn make_callbacks(
         },
         on_activate_surface: {
             let bridge = bridge.clone();
+            let focused = focused.clone();
             Rc::new(RefCell::new(move |pane, surface| {
+                focused.set(Some(pane));
                 let bridge = bridge.clone();
                 glib::MainContext::default().spawn_local(async move {
                     let _ = bridge
@@ -4507,7 +4649,7 @@ fn make_callbacks(
         on_move_surface_to_pane: {
             let bridge = bridge.clone();
             Rc::new(RefCell::new(
-                move |src_pane, surface, dst_pane, target_index| {
+                move |src_pane, surface, surface_model, dst_pane, target_index| {
                     let bridge = bridge.clone();
                     glib::MainContext::default().spawn_local(async move {
                         let (ack_tx, ack_rx) = oneshot::channel();
@@ -4516,6 +4658,7 @@ fn make_callbacks(
                             .send(GtkCommand::MoveSurfaceToPane {
                                 src_pane,
                                 surface,
+                                surface_model,
                                 dst_pane,
                                 target_index,
                                 ack: ack_tx,
@@ -4556,7 +4699,7 @@ fn make_callbacks(
         on_split_surface_into_pane: {
             let bridge = bridge.clone();
             Rc::new(RefCell::new(
-                move |src_pane, surface, dst_pane, direction| {
+                move |src_pane, surface, surface_model, dst_pane, direction| {
                     let bridge = bridge.clone();
                     glib::MainContext::default().spawn_local(async move {
                         let (ack_tx, ack_rx) = oneshot::channel();
@@ -4565,6 +4708,7 @@ fn make_callbacks(
                             .send(GtkCommand::SplitSurfaceIntoPane {
                                 src_pane,
                                 surface,
+                                surface_model,
                                 dst_pane,
                                 direction,
                                 ack: ack_tx,
@@ -4576,6 +4720,8 @@ fn make_callbacks(
             ))
         },
         tab_drag_drop_seen: Rc::new(Cell::new(false)),
+        tab_drag_drop_committed: Rc::new(Cell::new(false)),
+        tab_drag_split_candidate: Rc::new(RefCell::new(None)),
         on_terminal_cwd_changed: {
             let bridge = bridge.clone();
             Rc::new(RefCell::new(move |pane, surface, cwd| {
@@ -9431,6 +9577,7 @@ mod tests {
             .dispatch(GtkCommand::MoveSurfaceToPane {
                 src_pane: src,
                 surface: moved,
+                surface_model: None,
                 dst_pane: dst,
                 target_index: usize::MAX,
                 ack: ack_tx,
@@ -9497,6 +9644,7 @@ mod tests {
             .dispatch(GtkCommand::MoveSurfaceToPane {
                 src_pane: src,
                 surface: moved,
+                surface_model: None,
                 dst_pane: keep,
                 target_index: usize::MAX,
                 ack: ack_tx,
@@ -9582,6 +9730,7 @@ mod tests {
             .dispatch(GtkCommand::SplitSurfaceIntoPane {
                 src_pane: src,
                 surface: moved,
+                surface_model: None,
                 dst_pane: dst,
                 direction: flowmux_core::SplitDirection::Horizontal,
                 ack: ack_tx,
@@ -9594,6 +9743,17 @@ mod tests {
         assert_ne!(new_pane, src);
         assert_ne!(new_pane, dst);
         assert_eq!(leaf_surface_ids(&ws2, new_pane), vec![moved]);
+        assert_eq!(
+            controller
+                .pane_registry
+                .borrow()
+                .terminals
+                .get(&moved)
+                .expect("moved terminal is still registered")
+                .id(),
+            new_pane,
+            "split-moved terminal must report its destination pane id"
+        );
 
         let after = controller
             .pane_registry

@@ -37,6 +37,7 @@ unsafe extern "C" {
 
 #[derive(Clone)]
 pub struct BrowserPane {
+    pane_id: Rc<Cell<PaneId>>,
     pub root: gtk::Box,
     pub web_view: gtk::Widget,
     native: Rc<NativeBrowserView>,
@@ -160,6 +161,7 @@ impl BrowserPane {
         engine: BrowserEngine,
         persist_session: bool,
     ) -> Self {
+        let pane_id = Rc::new(Cell::new(id));
         let profile = engine_to_profile(&engine);
         tracing::debug!(
             engine = ?engine,
@@ -284,6 +286,7 @@ impl BrowserPane {
             let address = address.downgrade();
             let uri_cb = callbacks.on_browser_uri_changed.clone();
             let title_cb = callbacks.on_browser_title_changed.clone();
+            let pane_id = pane_id.clone();
             gtk::glib::timeout_add_local(Duration::from_millis(250), move || {
                 let Some(native) = native.upgrade() else {
                     return glib::ControlFlow::Break;
@@ -291,7 +294,14 @@ impl BrowserPane {
                 let Some(address) = address.upgrade() else {
                     return glib::ControlFlow::Break;
                 };
-                sync_browser_state(&native, &address, id, surface_id, &uri_cb, &title_cb);
+                sync_browser_state(
+                    &native,
+                    &address,
+                    pane_id.get(),
+                    surface_id,
+                    &uri_cb,
+                    &title_cb,
+                );
                 glib::ControlFlow::Continue
             });
         }
@@ -303,6 +313,7 @@ impl BrowserPane {
         load_uri_native(&native.web_view, &initial);
 
         Self {
+            pane_id,
             root,
             web_view: web_widget,
             native,
@@ -360,6 +371,14 @@ impl BrowserPane {
 
     pub fn grab_focus(&self) {
         focus_native_view(&self.native.web_view);
+    }
+
+    pub fn pane_id_handle(&self) -> Rc<Cell<PaneId>> {
+        self.pane_id.clone()
+    }
+
+    pub fn set_pane_id(&self, id: PaneId) {
+        self.pane_id.set(id);
     }
 
     pub fn focus_widget(&self) -> gtk::Widget {
