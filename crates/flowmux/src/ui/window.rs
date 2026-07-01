@@ -2491,6 +2491,12 @@ impl WindowController {
                 tracing::info!(%pane, path = %path.display(), "opening terminal image path");
                 crate::ui::image_viewer::open_image_viewer(&self.window, path);
             }
+            GtkCommand::OpenMarkdownViewer { pane, path } => {
+                tracing::info!(%pane, path = %path.display(), "opening terminal markdown path");
+                if let Err(err) = crate::ui::file_browser::launch_markdown_viewer(&path) {
+                    tracing::warn!(error = %err, path = %path.display(), "failed to open Markdown viewer from terminal path");
+                }
+            }
             GtkCommand::ActivateSurface { pane, surface } => {
                 let ws_id = self.store.set_active_surface(pane, surface).await;
                 self.pane_registry
@@ -4660,6 +4666,18 @@ fn make_callbacks(
                     let _ = bridge
                         .tx
                         .send(GtkCommand::OpenImageViewer { pane, path })
+                        .await;
+                });
+            }))
+        },
+        on_open_markdown: {
+            let bridge = bridge.clone();
+            Rc::new(RefCell::new(move |pane, path| {
+                let bridge = bridge.clone();
+                glib::MainContext::default().spawn_local(async move {
+                    let _ = bridge
+                        .tx
+                        .send(GtkCommand::OpenMarkdownViewer { pane, path })
                         .await;
                 });
             }))

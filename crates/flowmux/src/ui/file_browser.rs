@@ -13,6 +13,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::rc::Rc;
 
 #[derive(Clone)]
@@ -1472,6 +1473,18 @@ fn show_context_menu(parent: &impl IsA<gtk::Widget>, path: &Path, x: f64, y: f64
     content.set_margin_top(4);
     content.set_margin_bottom(4);
 
+    let open = gtk::Button::with_label("Open");
+    open.add_css_class("flat");
+    open.set_halign(gtk::Align::Fill);
+    open.set_hexpand(true);
+    let target = path.to_path_buf();
+    let pop = popover.clone();
+    open.connect_clicked(move |_| {
+        open_file(&target);
+        pop.popdown();
+    });
+    content.append(&open);
+
     let show = gtk::Button::with_label("Show in folder");
     show.add_css_class("flat");
     show.set_halign(gtk::Align::Fill);
@@ -1517,11 +1530,57 @@ fn show_path_in_folder(path: &Path) {
 }
 
 fn open_file(path: &Path) {
+    if is_markdown_file(path) {
+        match launch_markdown_viewer(path) {
+            Ok(()) => return,
+            Err(err) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %err,
+                    "failed to launch Markdown viewer; falling back to default app"
+                );
+            }
+        }
+    }
+
     let file = gio::File::for_path(path);
     let uri = file.uri();
     if let Err(err) = gio::AppInfo::launch_default_for_uri(&uri, None::<&gio::AppLaunchContext>) {
         tracing::warn!(path = %path.display(), error = %err, "failed to open file");
     }
+}
+
+fn is_markdown_file(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .map(str::to_ascii_lowercase),
+        Some(ext) if matches!(ext.as_str(), "md" | "markdown" | "mdown" | "mkd" | "mkdn")
+    )
+}
+
+pub(crate) fn launch_markdown_viewer(path: &Path) -> io::Result<()> {
+    Command::new(markdown_viewer_binary())
+        .arg(path)
+        .spawn()
+        .map(|_| ())
+}
+
+fn markdown_viewer_binary() -> PathBuf {
+    if let Some(path) = std::env::var_os("FLOWMUX_MD_VIEWER") {
+        return PathBuf::from(path);
+    }
+
+    if let Ok(current_exe) = std::env::current_exe() {
+        if let Some(dir) = current_exe.parent() {
+            let candidate = dir.join("flowmux-md-viewer");
+            if candidate.exists() {
+                return candidate;
+            }
+        }
+    }
+
+    PathBuf::from("flowmux-md-viewer")
 }
 
 fn key_to_focus_dir(key: gdk::Key) -> Option<FocusDir> {
@@ -1654,6 +1713,30 @@ mod tests {
     use super::*;
     use std::cell::Cell;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn markdown_file_extensions_route_to_markdown_viewer() {
+        for name in [
+            "README.md",
+            "notes.markdown",
+            "draft.mdown",
+            "post.mkd",
+            "manual.mkdn",
+            "UPPER.MD",
+        ] {
+            assert!(
+                is_markdown_file(Path::new(name)),
+                "{name} should be Markdown"
+            );
+        }
+
+        for name in ["image.png", "archive.md.bak", "Makefile", "folder"] {
+            assert!(
+                !is_markdown_file(Path::new(name)),
+                "{name} should not be Markdown"
+            );
+        }
+    }
 
     struct TestDir {
         path: PathBuf,

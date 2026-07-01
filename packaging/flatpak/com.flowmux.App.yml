@@ -37,8 +37,9 @@ modules:
         # Cargo may need network access to fetch dependencies during the build.
         - --share=network
     build-commands:
-      - cargo build --release --manifest-path Cargo.toml -p flowmux -p flowmux-cli
+      - cargo build --release --manifest-path Cargo.toml -p flowmux -p flowmux-cli -p flowmux-md-viewer
       - install -Dm755 target/release/flowmux    /app/bin/flowmux
+      - install -Dm755 target/release/flowmux-md-viewer /app/bin/flowmux-md-viewer
       - install -Dm755 target/release/flowmuxctl /app/lib/flowmux/flowmuxctl
       # Expose flowmuxctl on /app/bin so `flatpak run --command=flowmuxctl
       # com.flowmux.App …` resolves without typing the full /app/lib path.

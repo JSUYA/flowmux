@@ -389,6 +389,7 @@ impl GhosttyPane {
             pid.clone(),
             callbacks.on_open_url.clone(),
             callbacks.on_open_image.clone(),
+            callbacks.on_open_markdown.clone(),
         );
         install_ibus_nav_workaround(&term, smart_page_enabled);
 
@@ -702,7 +703,8 @@ fn wrap_argv_with_pty_tee(argv: Vec<String>, pane: PaneId, surface: SurfaceId) -
 /// A match may include trailing sentence punctuation, so trim it immediately
 /// before dispatch.
 const URL_REGEX_PATTERN: &str = r#"(?i)(?:https?|ftp|file)://[^\s<>"'`]+"#;
-const IMAGE_PATH_REGEX_PATTERN: &str = r#"(?i)(?<![^\s<>"'`])(?:/|~/|\.{1,2}/)?(?:[^\s<>"'`:]+/)*[^\s<>"'`:]+\.(?:svg|png|jpe?g|webp?|lottie|json)"#;
+const IMAGE_PATH_REGEX_PATTERN: &str = r#"(?i)(?<![^\s<>"'`])(?:/|~/|\.{1,2}/)?(?:[^\s<>"'`:]+/)*[^\s<>"'`:]+\.(?:gif|svg|png|jpe?g|webp?|lottie|json)"#;
+const MARKDOWN_PATH_REGEX_PATTERN: &str = r#"(?i)(?<![^\s<>"'`])(?:/|~/|\.{1,2}/)?(?:[^\s<>"'`:]+/)*[^\s<>"'`:]+\.(?:md|markdown|mdown|mkd|mkdn)"#;
 
 /// PCRE2 compile flags.
 ///   * PCRE2_MULTILINE (0x400): keep matches working across wrapped terminal output.
@@ -729,6 +731,7 @@ fn trim_url_trailing(s: &str) -> String {
 enum TerminalClickTarget {
     Url(String),
     Image(PathBuf),
+    Markdown(PathBuf),
 }
 
 fn terminal_image_path(raw: &str, cwd: Option<&std::path::Path>) -> Option<PathBuf> {
@@ -754,13 +757,47 @@ fn terminal_image_path(raw: &str, cwd: Option<&std::path::Path>) -> Option<PathB
     cwd.map(|cwd| cwd.join(path))
 }
 
+fn terminal_markdown_path(raw: &str, cwd: Option<&std::path::Path>) -> Option<PathBuf> {
+    let trimmed = raw.trim_end_matches(|c: char| {
+        matches!(
+            c,
+            '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}' | '\'' | '"' | '`'
+        )
+    });
+    let path = PathBuf::from(trimmed);
+    if !is_supported_markdown_path(&path) {
+        return None;
+    }
+
+    if path.is_absolute() {
+        return Some(path);
+    }
+
+    if let Some(rest) = trimmed.strip_prefix("~/") {
+        return std::env::var_os("HOME").map(|home| PathBuf::from(home).join(rest));
+    }
+
+    cwd.map(|cwd| cwd.join(path))
+}
+
 fn is_supported_image_path(path: &std::path::Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
         .is_some_and(|ext| {
             matches!(
                 ext.to_ascii_lowercase().as_str(),
-                "svg" | "png" | "jpg" | "jpeg" | "web" | "webp" | "lottie" | "json"
+                "gif" | "svg" | "png" | "jpg" | "jpeg" | "web" | "webp" | "lottie" | "json"
+            )
+        })
+}
+
+fn is_supported_markdown_path(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| {
+            matches!(
+                ext.to_ascii_lowercase().as_str(),
+                "md" | "markdown" | "mdown" | "mkd" | "mkdn"
             )
         })
 }
@@ -785,6 +822,7 @@ fn install_url_link_handling(
     pid: Rc<Cell<Option<i32>>>,
     on_open_url: Rc<RefCell<dyn FnMut(PaneId, String)>>,
     on_open_image: Rc<RefCell<dyn FnMut(PaneId, PathBuf)>>,
+    on_open_markdown: Rc<RefCell<dyn FnMut(PaneId, PathBuf)>>,
 ) {
     // 1) Compile and register the regex. If this fails, usually due to a PCRE2
     //    build issue, link recognition is disabled while the terminal itself
@@ -814,6 +852,20 @@ fn install_url_link_handling(
     let image_tag = term.match_add_regex(&image_regex, 0);
     term.match_set_cursor_name(image_tag, "pointer");
     tracing::debug!(%pane_id, tag = image_tag, "image path match registered on terminal");
+
+    let markdown_regex = match vte::Regex::for_match(
+        MARKDOWN_PATH_REGEX_PATTERN,
+        URL_REGEX_COMPILE_FLAGS,
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to compile markdown path regex; markdown clicking disabled");
+            return;
+        }
+    };
+    let markdown_tag = term.match_add_regex(&markdown_regex, 0);
+    term.match_set_cursor_name(markdown_tag, "pointer");
+    tracing::debug!(%pane_id, tag = markdown_tag, "markdown path match registered on terminal");
 
     // 2) Left-click gesture. Keep it out of capture phase so VTE's keyboard
     //    IMContext stays on the same path as a plain terminal widget.
@@ -855,6 +907,10 @@ fn install_url_link_handling(
                 if tag == image_tag {
                     let cwd = terminal_current_dir(&term_widget, &pid);
                     terminal_image_path(&raw, cwd.as_deref()).map(TerminalClickTarget::Image)
+                } else if tag == markdown_tag {
+                    let cwd = terminal_current_dir(&term_widget, &pid);
+                    terminal_markdown_path(&raw, cwd.as_deref())
+                        .map(TerminalClickTarget::Markdown)
                 } else if tag == url_tag {
                     Some(TerminalClickTarget::Url(raw))
                 } else {
@@ -873,6 +929,10 @@ fn install_url_link_handling(
             TerminalClickTarget::Image(path) => {
                 tracing::info!(%pane_id, path = %path.display(), "Ctrl+click on terminal image path");
                 (on_open_image.borrow_mut())(pane_id, path);
+            }
+            TerminalClickTarget::Markdown(path) => {
+                tracing::info!(%pane_id, path = %path.display(), "Ctrl+click on terminal markdown path");
+                (on_open_markdown.borrow_mut())(pane_id, path);
             }
             TerminalClickTarget::Url(raw) => {
                 let url = trim_url_trailing(&raw);
@@ -1958,6 +2018,39 @@ mod tests {
             terminal_image_path("icons/vector.svg", Some(&cwd)),
             Some(PathBuf::from("/home/user/images/icons/vector.svg"))
         );
+    }
+
+    #[test]
+    fn markdown_path_regex_compiles() {
+        vte::Regex::for_match(MARKDOWN_PATH_REGEX_PATTERN, URL_REGEX_COMPILE_FLAGS)
+            .expect("markdown path regex compiles");
+    }
+
+    #[test]
+    fn terminal_markdown_path_resolves_ls_relative_paths_against_cwd() {
+        let cwd = PathBuf::from("/home/user/docs");
+
+        assert_eq!(
+            terminal_markdown_path("README.md", Some(&cwd)),
+            Some(PathBuf::from("/home/user/docs/README.md"))
+        );
+        assert_eq!(
+            terminal_markdown_path("guides/install.markdown,", Some(&cwd)),
+            Some(PathBuf::from("/home/user/docs/guides/install.markdown"))
+        );
+        assert_eq!(
+            terminal_markdown_path("./notes.mkd", Some(&cwd)),
+            Some(PathBuf::from("/home/user/docs/./notes.mkd"))
+        );
+    }
+
+    #[test]
+    fn terminal_markdown_path_rejects_non_markdown_paths() {
+        let cwd = PathBuf::from("/home/user/docs");
+
+        assert_eq!(terminal_markdown_path("README.txt", Some(&cwd)), None);
+        assert_eq!(terminal_markdown_path("image.png", Some(&cwd)), None);
+        assert_eq!(terminal_markdown_path("README.md", None), None);
     }
 
     #[test]

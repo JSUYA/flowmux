@@ -111,4 +111,7 @@ pub struct PaneCallbacks {
     /// Called when Ctrl+click selects an absolute image path inside the
     /// terminal. The caller opens it in a dedicated image viewer window.
     pub on_open_image: Rc<RefCell<dyn FnMut(PaneId, PathBuf)>>,
+    /// Called when Ctrl+click selects a Markdown path inside the terminal.
+    /// The caller opens it in the Markdown viewer binary.
+    pub on_open_markdown: Rc<RefCell<dyn FnMut(PaneId, PathBuf)>>,
 }

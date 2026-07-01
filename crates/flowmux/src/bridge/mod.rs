@@ -235,6 +235,8 @@ pub enum GtkCommand {
     OpenUrlInBrowserTab { pane: PaneId, url: String },
     /// Open a Ctrl-clicked terminal image path in a dedicated viewer window.
     OpenImageViewer { pane: PaneId, path: PathBuf },
+    /// Open a Ctrl-clicked terminal Markdown path in the Markdown viewer binary.
+    OpenMarkdownViewer { pane: PaneId, path: PathBuf },
     /// Switch the active pane-local surface tab.
     ActivateSurface { pane: PaneId, surface: SurfaceId },
     /// Close a pane-local surface tab.
