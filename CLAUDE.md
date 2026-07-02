@@ -65,10 +65,11 @@ The inline image viewer (`flowmux/src/ui/image_viewer.rs`) renders through
 `thorvg-sys = { version = "0.2.1", default-features = false }`, which drops the
 crate's bundled `cc` build and links the system ThorVG through `pkg-config`
 (`thorvg-1`). The image viewer needs a ThorVG built with the C API and all
-loaders; `scripts/install-thorvg.sh` builds that from source
+loaders. Where a distro packages a recent ThorVG built that way (Debian's
+`libthorvg-dev`) `sudo apt install libthorvg-dev` is enough; Ubuntu (through
+24.04) does not package it, so `scripts/install-thorvg.sh` builds it from source
 (`meson setup -Dloaders=all -Dbindings=capi`, ThorVG v1.0.6 to match the
-crate's bindings) since Ubuntu does not package it. `install.sh` aborts if
-`pkg-config` can't find ThorVG. PNG / JPEG / WebP / SVG are decoded and
+crate's bindings). `install.sh` aborts if `pkg-config` can't find ThorVG. PNG / JPEG / WebP / SVG are decoded and
 rendered by ThorVG; Lottie plays frame by frame; GIF (no ThorVG loader) is
 decoded with the Rust `image` crate and handed to ThorVG to render. Whether a
 loader is available is a property of the installed ThorVG, not a repo-side

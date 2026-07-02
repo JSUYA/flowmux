@@ -15,8 +15,9 @@ cd "$REPO_ROOT"
 
 if ! pkg-config --exists thorvg-1 && ! pkg-config --exists thorvg; then
     echo "error: system ThorVG not found (pkg-config: thorvg-1)." >&2
-    echo "       The image viewer links ThorVG. Install it first with:" >&2
-    echo "         scripts/install-thorvg.sh" >&2
+    echo "       The image viewer links ThorVG. Install it first:" >&2
+    echo "         sudo apt install libthorvg-dev   # where packaged (e.g. Debian)" >&2
+    echo "         scripts/install-thorvg.sh        # build from source (Ubuntu)" >&2
     echo "       (or set PKG_CONFIG_PATH if ThorVG is in a custom prefix)." >&2
     exit 1
 fi

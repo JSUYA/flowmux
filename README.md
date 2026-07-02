@@ -135,9 +135,20 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ### ThorVG (image viewer)
 
 The image viewer links the system **ThorVG** library through the `thorvg-sys`
-crate (`libclang-dev` above provides the headers for its bindings). Ubuntu does
-not package ThorVG, so build and install it — with every loader enabled and the
-C API exposed — using the helper script (needs `meson` + `ninja-build`):
+crate (`libclang-dev` above provides the headers for its bindings). ThorVG must
+be built with the **C API** (`-Dbindings=capi`) and **all loaders**
+(`-Dloaders=all`) — otherwise JPEG/WebP previews won't work and the build fails
+to link.
+
+If your distribution packages a recent ThorVG (Debian ships `libthorvg-dev`),
+install it directly — as long as it was built with the C API and loaders:
+
+```bash
+sudo apt install libthorvg-dev    # Debian / where packaged
+```
+
+Ubuntu (through 24.04) does **not** package ThorVG, so build and install it with
+the helper script (needs `meson` + `ninja-build`):
 
 ```bash
 scripts/install-thorvg.sh          # builds ThorVG v1.0.6, installs to /usr/local (sudo)
