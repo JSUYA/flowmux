@@ -59,7 +59,11 @@ jobs:
             build-essential pkg-config \
             libgtk-4-dev libadwaita-1-dev libvte-2.91-gtk4-dev \
             libwebkitgtk-6.0-dev libssl-dev \
-            libssh2-1-dev libdbus-1-dev libsecret-1-dev
+            libssh2-1-dev libdbus-1-dev libsecret-1-dev \
+            libclang-dev meson ninja-build
+
+      - name: Install ThorVG (image viewer backend, all loaders + C API)
+        run: sudo ./scripts/install-thorvg.sh
 
       - name: Install Zig (builds the vendored libghostty-vt terminal backend)
         run: |

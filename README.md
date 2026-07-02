@@ -52,7 +52,8 @@ leaving flowmux. Supports **PNG, JPEG, WebP, GIF, SVG, and Lottie**
 [ThorVG](https://www.thorvg.org/): PNG / JPEG / WebP / SVG are decoded and
 rendered by ThorVG's own loaders, Lottie plays back frame by frame, and GIF
 (which ThorVG has no loader for) is decoded with the Rust `image` crate and
-then handed to ThorVG to render.
+then handed to ThorVG to render. ThorVG is a system dependency — see
+[Build prerequisites](#build-prerequisites-ubuntu-2404-native).
 
 ![image viewer](resources/screenshot/image_viewer.gif)
 
@@ -111,7 +112,6 @@ flowmux/
 │   ├── flowmux-vcs/        Git/PR sidebar integration
 │   ├── flowmux-cli/        `flowmuxctl` helper for CLI subcommands
 │   └── flowmux/            GTK4 + libadwaita main app and public `flowmux` binary
-├── third_party/thorvg-sys/  Vendored ThorVG FFI fork (adds jpg/webp loaders)
 ├── packaging/{debian,flatpak}/  Distro packaging metadata
 ├── resources/             .desktop file, icons, screenshots, themes
 ├── LICENSE                GPL-3.0-or-later (verbatim from gnu.org)
@@ -126,14 +126,30 @@ sudo apt install \
     build-essential pkg-config git \
     libgtk-4-dev libadwaita-1-dev libvte-2.91-gtk4-dev \
     libwebkitgtk-6.0-dev libssl-dev \
-    libssh2-1-dev libdbus-1-dev libsecret-1-dev
+    libssh2-1-dev libdbus-1-dev libsecret-1-dev \
+    libclang-dev meson ninja-build
 # rustup (Rust 1.93+) required.
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
 
-The image viewer builds a vendored ThorVG fork (`third_party/thorvg-sys/`) from
-C++ source via `cc`, so a C++ compiler is needed — `build-essential` above
-already provides it. No other extra toolchain is required.
+### ThorVG (image viewer)
+
+The image viewer links the system **ThorVG** library through the `thorvg-sys`
+crate (`libclang-dev` above provides the headers for its bindings). Ubuntu does
+not package ThorVG, so build and install it — with every loader enabled and the
+C API exposed — using the helper script (needs `meson` + `ninja-build`):
+
+```bash
+scripts/install-thorvg.sh          # builds ThorVG v1.0.6, installs to /usr/local (sudo)
+# or, without sudo, into a user prefix:
+PREFIX="$HOME/.local" scripts/install-thorvg.sh
+# then point pkg-config/loader at it before building flowmux:
+export PKG_CONFIG_PATH="$HOME/.local/lib/x86_64-linux-gnu/pkgconfig:$PKG_CONFIG_PATH"
+export LD_LIBRARY_PATH="$HOME/.local/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH"
+```
+
+The script clones ThorVG into a temporary directory (nothing is vendored into
+this repo) and configures it with `meson setup -Dloaders=all -Dbindings=capi`.
 
 ### Optional — full media playback in tab browser
 
@@ -195,8 +211,9 @@ The script installs `FlowMux.app` under `~/Applications` and copies `flowmux`,
 This installs `flowmux`, `flowmuxctl`, and `flowmux-md-viewer` binaries to
 `~/.local/bin` and `~/.cargo/bin`. It is a plain `cargo build --release` using
 the system VTE library; no Zig toolchain or vendored terminal backend is
-required. (The image viewer's vendored ThorVG backend is compiled from C++ via
-`cc`, using the system C++ compiler from `build-essential`.)
+required. It links the system ThorVG for the image viewer (see
+[ThorVG](#thorvg-image-viewer) above), so `install.sh` aborts early if ThorVG
+is not installed.
 
 After installing, fully restart any running flowmux GUI to pick up the new
 binary.

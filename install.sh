@@ -3,10 +3,9 @@
 #
 # Release-build flowmux and install the binaries to the host.
 #
-# flowmux uses the system GTK4/libadwaita/WebKitGTK/VTE libraries. The only
-# vendored C/C++ source built here is the ThorVG image-viewer backend under
-# third_party/, compiled via cc with the system C++ compiler (build-essential);
-# no extra compiler toolchain is required.
+# flowmux uses the system GTK4/libadwaita/WebKitGTK/VTE libraries. The image
+# viewer links the system ThorVG (via the thorvg-sys crate in pkg-config mode),
+# so ThorVG must be installed first — see scripts/install-thorvg.sh.
 #
 # Usage: ./install.sh
 set -euo pipefail
@@ -14,6 +13,13 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$REPO_ROOT"
 
+if ! pkg-config --exists thorvg-1 && ! pkg-config --exists thorvg; then
+    echo "error: system ThorVG not found (pkg-config: thorvg-1)." >&2
+    echo "       The image viewer links ThorVG. Install it first with:" >&2
+    echo "         scripts/install-thorvg.sh" >&2
+    echo "       (or set PKG_CONFIG_PATH if ThorVG is in a custom prefix)." >&2
+    exit 1
+fi
 
 echo "==> building flowmux (release)"
 cargo build --release -p flowmux -p flowmux-cli -p flowmux-md-viewer
