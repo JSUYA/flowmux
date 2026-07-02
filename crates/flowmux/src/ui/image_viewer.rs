@@ -11,8 +11,9 @@ use std::time::Duration;
 use adw::prelude::*;
 use gtk::gdk;
 use gtk::glib;
-use thorvg_sys as tvg;
 use zip::ZipArchive;
+
+use super::thorvg as tvg;
 
 const MAX_VIEW_WIDTH: u32 = 1200;
 const MAX_VIEW_HEIGHT: u32 = 900;
@@ -496,6 +497,14 @@ struct ThorvgEngine;
 
 impl ThorvgEngine {
     fn init() -> Result<Self, String> {
+        if !tvg::available() {
+            return Err(
+                "ThorVG is not installed.\n\nThe image viewer needs the ThorVG \
+                 library. Install it (see the project README, e.g. \
+                 scripts/install-thorvg.sh) and try again."
+                    .to_string(),
+            );
+        }
         check(unsafe { tvg::tvg_engine_init(0) }, "initialize ThorVG")?;
         Ok(Self)
     }
@@ -562,7 +571,7 @@ fn picture_size(picture: tvg::Tvg_Paint) -> Option<(f32, f32)> {
 
 fn animation_float(
     animation: tvg::Tvg_Animation,
-    getter: unsafe extern "C" fn(tvg::Tvg_Animation, *mut f32) -> tvg::Tvg_Result,
+    getter: unsafe fn(tvg::Tvg_Animation, *mut f32) -> tvg::Tvg_Result,
 ) -> Option<f32> {
     let mut value = 0.0f32;
     let result = unsafe { getter(animation, &mut value) };

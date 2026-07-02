@@ -57,23 +57,27 @@ flowmux targets Ubuntu 24.04 and later (native GTK4/libadwaita/WebKitGTK).
 `flowmux doctor` / `flowmux fix` audit and repair the on-host pieces (agent
 hooks, SKILL files, socket, browser data dir).
 
-### Image viewer: system ThorVG
+### Image viewer: optional runtime ThorVG
 
 The inline image viewer (`flowmux/src/ui/image_viewer.rs`) renders through
-[ThorVG](https://www.thorvg.org/) via the `thorvg-sys` FFI crate. ThorVG is
-**not** vendored: `crates/flowmux/Cargo.toml` pins
-`thorvg-sys = { version = "0.2.1", default-features = false }`, which drops the
-crate's bundled `cc` build and links the system ThorVG through `pkg-config`
-(`thorvg-1`). The image viewer needs a ThorVG built with the C API and all
-loaders. Where a distro packages a recent ThorVG built that way (Debian's
-`libthorvg-dev`) `sudo apt install libthorvg-dev` is enough; Ubuntu (through
-24.04) does not package it, so `scripts/install-thorvg.sh` builds it from source
-(`meson setup -Dloaders=all -Dbindings=capi`, ThorVG v1.0.6 to match the
-crate's bindings). `install.sh` aborts if `pkg-config` can't find ThorVG. PNG / JPEG / WebP / SVG are decoded and
-rendered by ThorVG; Lottie plays frame by frame; GIF (no ThorVG loader) is
-decoded with the Rust `image` crate and handed to ThorVG to render. Whether a
-loader is available is a property of the installed ThorVG, not a repo-side
-patch.
+[ThorVG](https://www.thorvg.org/). ThorVG is neither vendored nor link-time
+linked: `crates/flowmux/src/ui/thorvg.rs` is a hand-written `dlopen` shim (via
+`libloading`) binding the subset of the ThorVG C API the viewer uses. The
+library loads lazily on first use; `thorvg::available()` reports whether it was
+found, and `ThorvgEngine::init()` gates every render path — if ThorVG is absent
+it returns a "ThorVG is not installed" error the viewer displays. So flowmux
+builds and runs without ThorVG; only the image viewer is affected. There is no
+thorvg-sys / build-time dependency; to bind another C function add a field +
+`forward!` entry in `thorvg.rs`.
+
+The viewer needs a ThorVG built with the C API (`-Dbindings=capi`) and all
+loaders (`-Dloaders=all`). Distro packages (Debian `libthorvg-dev`, Fedora
+`thorvg`, Homebrew, …) work if built that way; Ubuntu (through 24.04) does not
+package it, so `scripts/install-thorvg.sh` builds v1.0.6 from source. PNG / JPEG
+/ WebP / SVG are decoded and rendered by ThorVG; Lottie plays frame by frame;
+GIF (no ThorVG loader) is decoded with the Rust `image` crate and handed to
+ThorVG to render. Whether a loader is available is a property of the installed
+ThorVG.
 
 ## Architecture
 

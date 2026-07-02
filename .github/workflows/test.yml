@@ -33,7 +33,7 @@ jobs:
             libgtk-4-dev libadwaita-1-dev libvte-2.91-gtk4-dev \
             libwebkitgtk-6.0-dev libssl-dev \
             libssh2-1-dev libdbus-1-dev \
-            libclang-dev meson ninja-build \
+            meson ninja-build \
             dbus-x11 xvfb
 
       - name: Install ThorVG (image viewer backend, all loaders + C API)

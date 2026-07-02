@@ -10,6 +10,7 @@ pub mod pane_terminal;
 pub mod popover_pos;
 pub mod show_in_folder;
 pub mod sidebar;
+pub mod thorvg;
 pub mod window;
 pub mod workspace_view;
 

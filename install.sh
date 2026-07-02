@@ -13,13 +13,15 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$REPO_ROOT"
 
-if ! pkg-config --exists thorvg-1 && ! pkg-config --exists thorvg; then
-    echo "error: system ThorVG not found (pkg-config: thorvg-1)." >&2
-    echo "       The image viewer links ThorVG. Install it first:" >&2
-    echo "         sudo apt install libthorvg-dev   # where packaged (e.g. Debian)" >&2
-    echo "         scripts/install-thorvg.sh        # build from source (Ubuntu)" >&2
-    echo "       (or set PKG_CONFIG_PATH if ThorVG is in a custom prefix)." >&2
-    exit 1
+# ThorVG is an optional runtime dependency: flowmux builds and installs without
+# it. If it is missing, everything works except the inline image viewer, which
+# shows a "ThorVG is not installed" message until the library is present.
+if ! ldconfig -p 2>/dev/null | grep -q 'libthorvg-1\.so' \
+    && ! pkg-config --exists thorvg-1 2>/dev/null; then
+    echo "note: ThorVG not detected — the image viewer will be disabled until" >&2
+    echo "      you install it:" >&2
+    echo "        sudo apt install libthorvg-dev   # where packaged (e.g. Debian)" >&2
+    echo "        scripts/install-thorvg.sh        # build from source (Ubuntu)" >&2
 fi
 
 echo "==> building flowmux (release)"
