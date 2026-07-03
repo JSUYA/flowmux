@@ -65,8 +65,14 @@ impl Pty {
         let mut master: RawFd = -1;
         // SAFETY: forkpty allocates a PTY pair and forks. We pass a valid
         // master-out pointer and winsize; name/termios default to NULL.
-        let pid =
-            unsafe { libc::forkpty(&mut master, std::ptr::null_mut(), std::ptr::null(), &mut ws) };
+        let pid = unsafe {
+            libc::forkpty(
+                &mut master,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut ws,
+            )
+        };
 
         if pid < 0 {
             return Err(io::Error::last_os_error());
@@ -227,8 +233,21 @@ impl Drop for Pty {
 /// Merge `extra_env` onto the inherited environment into a `KEY=VALUE` CString
 /// list. Later duplicate keys win.
 fn build_envp(extra_env: &[(String, String)]) -> io::Result<Vec<CString>> {
+    build_envp_from(std::env::vars(), extra_env)
+}
+
+fn build_envp_from<I>(inherited: I, extra_env: &[(String, String)]) -> io::Result<Vec<CString>>
+where
+    I: IntoIterator<Item = (String, String)>,
+{
     use std::collections::BTreeMap;
-    let mut map: BTreeMap<String, String> = std::env::vars().collect();
+    // Terminal panes should advertise their own color capability instead of
+    // inheriting NO_COLOR from the GUI launcher (for example Codex runs with
+    // NO_COLOR=1). Callers can still pass NO_COLOR explicitly via extra_env.
+    let mut map: BTreeMap<String, String> = inherited
+        .into_iter()
+        .filter(|(k, _)| k != "NO_COLOR")
+        .collect();
     for (k, v) in extra_env {
         map.insert(k.clone(), v.clone());
     }
@@ -244,6 +263,40 @@ fn build_envp(extra_env: &[(String, String)]) -> io::Result<Vec<CString>> {
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    fn envp_strings(envp: Vec<CString>) -> Vec<String> {
+        envp.into_iter()
+            .map(|s| s.into_string().expect("test env should be utf8"))
+            .collect()
+    }
+
+    #[test]
+    fn inherited_no_color_is_not_forwarded_to_terminal_children() {
+        let envp = build_envp_from(
+            [
+                ("NO_COLOR".to_string(), "1".to_string()),
+                ("TERM".to_string(), "dumb".to_string()),
+            ],
+            &[("TERM".to_string(), "xterm-256color".to_string())],
+        )
+        .expect("envp");
+        let entries = envp_strings(envp);
+
+        assert!(!entries.iter().any(|e| e.starts_with("NO_COLOR=")));
+        assert!(entries.iter().any(|e| e == "TERM=xterm-256color"));
+    }
+
+    #[test]
+    fn explicit_no_color_extra_env_is_preserved() {
+        let envp = build_envp_from(
+            [("NO_COLOR".to_string(), "1".to_string())],
+            &[("NO_COLOR".to_string(), "1".to_string())],
+        )
+        .expect("envp");
+        let entries = envp_strings(envp);
+
+        assert!(entries.iter().any(|e| e == "NO_COLOR=1"));
+    }
 
     /// A real child under a PTY: its stdout reaches the master fd. The GTK layer
     /// hands this same master to VTE for rendering; here we only check the raw
