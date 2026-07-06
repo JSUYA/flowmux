@@ -102,6 +102,85 @@ pub fn comm_of(pid: u32) -> Option<String> {
     })
 }
 
+/// Canonical CLI names of AI coding agents flowmux recognizes by process
+/// `comm`. Kept ≤15 chars so a match survives the kernel's `comm`
+/// truncation (`TASK_COMM_LEN` = 16 including NUL). These are the identity
+/// strings the Agent Bar renders and that hook/screen sources also use.
+pub const KNOWN_AGENT_COMMS: &[&str] = &[
+    "codex", "claude", "opencode", "cline", "gemini", "aider", "goose",
+];
+
+/// Map a raw process `comm` to a canonical agent name, or `None`.
+fn match_agent_comm(comm: &str) -> Option<&'static str> {
+    let c = comm.trim().to_ascii_lowercase();
+    KNOWN_AGENT_COMMS.iter().copied().find(|name| *name == c)
+}
+
+/// Direct child PIDs of `pid` via `/proc/<pid>/task/<pid>/children`, or `None`
+/// when that file is not readable (kernel built without `CONFIG_PROC_CHILDREN`).
+/// An existing process with no children yields `Some(empty)`, which is how the
+/// caller distinguishes "no kids" from "feature unavailable".
+#[cfg(target_os = "linux")]
+fn read_children(pid: u32) -> Option<Vec<u32>> {
+    fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"))
+        .ok()
+        .map(|s| s.split_ascii_whitespace().filter_map(|t| t.parse().ok()).collect())
+}
+
+/// Cap on process-tree nodes visited per detection, a defensive bound so a
+/// pathological tree can never turn one poll into an unbounded `/proc` walk.
+const AGENT_TREE_NODE_CAP: usize = 512;
+
+/// Detect which AI coding agent, if any, is running anywhere in the process
+/// tree rooted at `root` (inclusive). The pane's root PID is the pty-tee /
+/// shell wrapper; the real agent (e.g. `codex`, `claude`) is a descendant, so
+/// the whole subtree's `comm` values are checked. Returns the canonical agent
+/// name from [`KNOWN_AGENT_COMMS`]. This is the process-truth source for Agent
+/// Bar presence: independent of the agent's TUI text, OSC title, or hooks, so
+/// it detects idle agents that emit no recognizable screen signal (notably
+/// Codex, whose title is `<spinner> <cwd>`).
+///
+/// Cost: walks only `root`'s own subtree (typically 2–6 processes) via the
+/// kernel `children` file, so a poll's cost is proportional to the pane's
+/// descendants — not to the total number of system processes, and not
+/// multiplied when several panes are polled. Falls back to a full `/proc`
+/// parent-map scan only on kernels without `CONFIG_PROC_CHILDREN`.
+#[cfg(target_os = "linux")]
+pub fn agent_name_in_tree(root: u32) -> Option<&'static str> {
+    if read_children(root).is_none() {
+        // Feature unavailable: one full scan, matching the old behaviour.
+        let mut pids: Vec<u32> = descendants(root).ok()?.into_iter().collect();
+        pids.sort_unstable();
+        return pids
+            .iter()
+            .filter_map(|pid| comm_of(*pid))
+            .find_map(|comm| match_agent_comm(&comm));
+    }
+    let mut stack = vec![root];
+    let mut seen = HashSet::new();
+    while let Some(pid) = stack.pop() {
+        if !seen.insert(pid) || seen.len() > AGENT_TREE_NODE_CAP {
+            continue;
+        }
+        if let Some(comm) = comm_of(pid) {
+            if let Some(name) = match_agent_comm(&comm) {
+                return Some(name);
+            }
+        }
+        stack.extend(read_children(pid).unwrap_or_default());
+    }
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn agent_name_in_tree(root: u32) -> Option<&'static str> {
+    descendants(root)
+        .ok()?
+        .into_iter()
+        .filter_map(comm_of)
+        .find_map(|comm| match_agent_comm(&comm))
+}
+
 #[cfg(target_os = "linux")]
 fn read_ppid(pid: u32) -> Option<u32> {
     let text = fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
@@ -208,6 +287,24 @@ mod tests {
         let pid = std::process::id();
         let ds = descendants(pid).unwrap();
         assert!(ds.contains(&pid));
+    }
+
+    #[test]
+    fn match_agent_comm_maps_known_names_case_insensitively() {
+        assert_eq!(match_agent_comm("codex"), Some("codex"));
+        assert_eq!(match_agent_comm("Claude"), Some("claude"));
+        assert_eq!(match_agent_comm("  opencode  "), Some("opencode"));
+        // Wrappers and unrelated processes must not match.
+        assert_eq!(match_agent_comm("node"), None);
+        assert_eq!(match_agent_comm("bash"), None);
+        assert_eq!(match_agent_comm("python"), None);
+    }
+
+    #[test]
+    fn agent_name_in_tree_is_none_for_a_tree_without_an_agent() {
+        // The test runner's own tree contains cargo/rustc/the test binary,
+        // none of which are in KNOWN_AGENT_COMMS.
+        assert_eq!(agent_name_in_tree(std::process::id()), None);
     }
 
     #[test]

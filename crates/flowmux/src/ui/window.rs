@@ -626,6 +626,7 @@ impl WindowController {
         };
         controller.install_state_flush_on_close();
         controller.install_cwd_polling_fallback();
+        controller.install_agent_process_polling();
         controller
     }
 
@@ -2297,6 +2298,41 @@ impl WindowController {
             });
             glib::ControlFlow::Continue
         });
+    }
+
+    /// Agent Bar presence is driven primarily by *process truth*: every 2s,
+    /// resolve which AI agent (if any) is running in each terminal pane's
+    /// process subtree and reconcile the store. This shows an agent the moment
+    /// it launches — no wait for a hook, an OSC title, or recognizable TUI
+    /// text — and drops it when it exits. Screen/title events still refine the
+    /// working/idle status on top of this. Matches the daemon's 2s liveness
+    /// sweep cadence.
+    fn install_agent_process_polling(&self) {
+        let controller = self.clone();
+        glib::timeout_add_local(Duration::from_secs(2), move || {
+            let controller = controller.clone();
+            glib::MainContext::default().spawn_local(async move {
+                controller.poll_agent_processes().await;
+            });
+            glib::ControlFlow::Continue
+        });
+    }
+
+    async fn poll_agent_processes(&self) {
+        let pids = self.pane_registry.borrow().terminal_agent_pids();
+        if pids.is_empty() {
+            return;
+        }
+        // Cheap `/proc` subtree walks; a handful of agent panes at 2s is
+        // negligible and mirrors the existing cwd fallback poll.
+        let detected: Vec<(SurfaceId, Option<&'static str>)> = pids
+            .into_iter()
+            .map(|(surface, pid)| (surface, flowmux_procmon::agent_name_in_tree(pid)))
+            .collect();
+        let changed = self.store.reconcile_process_agents(&detected).await;
+        for (workspace, status) in changed {
+            self.sync_workspace_agent_status(workspace, status).await;
+        }
     }
 
     async fn poll_terminal_cwds(&self) {

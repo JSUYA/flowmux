@@ -260,6 +260,19 @@ impl PaneRegistry {
             .collect()
     }
 
+    /// (surface, shell child PID) for every live terminal. The PID is the
+    /// pty-tee/shell wrapper spawned for the pane; the agent process (if any)
+    /// is a descendant. Feeds the Agent Bar's process-truth detection sweep.
+    pub fn terminal_agent_pids(&self) -> Vec<(SurfaceId, u32)> {
+        self.terminals
+            .iter()
+            .filter_map(|(surface, terminal)| {
+                let pid = terminal.pid.get()?;
+                (pid > 0).then_some((*surface, pid as u32))
+            })
+            .collect()
+    }
+
     pub fn set_surface_title(&self, surface: SurfaceId, title: &str) {
         if let Some(label) = self.surface_tab_labels.get(&surface) {
             label.set_text(title);

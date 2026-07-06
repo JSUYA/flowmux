@@ -652,6 +652,72 @@ impl Pane {
         }
     }
 
+    /// Reconcile a surface's agent presence against process-tree truth.
+    /// `detected` is the canonical agent name found running in the pane's
+    /// process subtree, or `None` when no agent process is present. This is the
+    /// authoritative *existence* signal: it creates an idle, process-owned
+    /// presence the moment an agent process appears (independent of TUI text,
+    /// OSC title, or hooks) and drops it when the process exits back to a plain
+    /// shell. Hook/screen-owned presences are left to their own lifecycles.
+    /// Returns `Some(true)` when the presence changed, `Some(false)` when
+    /// unchanged, `None` when the surface is not in this pane tree.
+    pub fn reconcile_process_agent(
+        &mut self,
+        surface_id: SurfaceId,
+        detected: Option<&str>,
+    ) -> Option<bool> {
+        match self {
+            Pane::Leaf {
+                content: PaneContent::Tabs { surfaces, .. },
+                ..
+            } => {
+                let surface = surfaces.iter_mut().find(|s| s.id == surface_id)?;
+                Some(reconcile_surface_process_agent(&mut surface.agent, detected))
+            }
+            Pane::Leaf { .. } => None,
+            Pane::Split { first, second, .. } => first
+                .reconcile_process_agent(surface_id, detected)
+                .or_else(|| second.reconcile_process_agent(surface_id, detected)),
+        }
+    }
+
+    /// Screen scan saw the surface but detected no active status. Clear a
+    /// screen-owned presence (screen is the sole owner of what it created), but
+    /// for a process-owned presence only settle it back to Idle — the agent is
+    /// still running, it simply finished its turn. Hook-owned presences are
+    /// authoritative and left untouched.
+    pub fn settle_screen_idle(&mut self, surface_id: SurfaceId) -> Option<bool> {
+        match self {
+            Pane::Leaf {
+                content: PaneContent::Tabs { surfaces, .. },
+                ..
+            } => {
+                let surface = surfaces.iter_mut().find(|s| s.id == surface_id)?;
+                let Some(agent) = surface.agent.as_mut() else {
+                    return Some(false);
+                };
+                match agent.source.as_deref() {
+                    Some("flowmux:screen") => {
+                        surface.agent = None;
+                        Some(true)
+                    }
+                    Some(AGENT_SOURCE_PROC) if agent.status != AgentStatus::Idle => {
+                        agent.status = AgentStatus::Idle;
+                        agent.activity = AgentActivity::Idle;
+                        agent.message = None;
+                        agent.custom_status = None;
+                        Some(true)
+                    }
+                    _ => Some(false),
+                }
+            }
+            Pane::Leaf { .. } => None,
+            Pane::Split { first, second, .. } => first
+                .settle_screen_idle(surface_id)
+                .or_else(|| second.settle_screen_idle(surface_id)),
+        }
+    }
+
     /// Mark the matching surface as seen. Used when a user activates a tab that
     /// was showing the derived `done` status.
     pub fn mark_surface_agent_seen(&mut self, surface_id: SurfaceId) -> bool {
@@ -2012,6 +2078,46 @@ pub fn agent_bar_color_for_surface(surface: SurfaceId) -> String {
     format!("#{r:02x}{g:02x}{b:02x}")
 }
 
+/// Presence source tag for agents discovered by the process-tree sweep
+/// (`flowmux_procmon::agent_name_in_tree`), as opposed to `flowmux:hook`
+/// (agent hook reports) or `flowmux:screen` (terminal text heuristics).
+pub const AGENT_SOURCE_PROC: &str = "flowmux:proc";
+
+/// Apply process-truth to one surface's agent slot. See
+/// [`Pane::reconcile_process_agent`]. Split out as a free function so it can be
+/// unit-tested against a bare `Option<AgentPresence>`.
+fn reconcile_surface_process_agent(
+    slot: &mut Option<AgentPresence>,
+    detected: Option<&str>,
+) -> bool {
+    match (slot.as_mut(), detected) {
+        (None, Some(name)) => {
+            let mut presence = AgentPresence::new(name, AgentActivity::Idle, None);
+            presence.source = Some(AGENT_SOURCE_PROC.to_string());
+            *slot = Some(presence);
+            true
+        }
+        (Some(existing), None) => {
+            if existing.source.as_deref() == Some(AGENT_SOURCE_PROC) {
+                *slot = None;
+                true
+            } else {
+                false
+            }
+        }
+        (Some(existing), Some(name)) => {
+            // Same pane, different agent, and we own the slot: follow the swap.
+            if existing.source.as_deref() == Some(AGENT_SOURCE_PROC) && existing.name != name {
+                existing.name = name.to_string();
+                true
+            } else {
+                false
+            }
+        }
+        (None, None) => false,
+    }
+}
+
 /// An AI agent currently occupying a surface, with its live activity and
 /// (when known) the agent process PID used for liveness sweeps.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2112,10 +2218,18 @@ impl AgentPresence {
             self.pid = report.pid;
         }
         if let Some(source) = report.source {
-            let keep_hook_ownership = same_agent
-                && self.source.as_deref() == Some("flowmux:hook")
+            // A screen scan may refine the *status* of a presence owned by a
+            // stronger source (a hook, or the process-tree sweep), but must not
+            // steal *ownership*: otherwise the screen-cleared path would later
+            // drop a presence whose existence is guaranteed by a live process
+            // or an active hook session.
+            let keep_ownership = same_agent
+                && matches!(
+                    self.source.as_deref(),
+                    Some("flowmux:hook") | Some(AGENT_SOURCE_PROC)
+                )
                 && source == "flowmux:screen";
-            if !keep_hook_ownership {
+            if !keep_ownership {
                 self.source = Some(source);
             }
         }
@@ -4523,6 +4637,105 @@ mod tests {
             serde_json::to_string(&AgentNotificationTarget::default()).unwrap(),
             "\"agent_bar\""
         );
+    }
+
+    #[test]
+    fn reconcile_creates_idle_proc_presence_when_agent_process_appears() {
+        let mut slot = None;
+        assert!(reconcile_surface_process_agent(&mut slot, Some("codex")));
+        let p = slot.as_ref().unwrap();
+        assert_eq!(p.name, "codex");
+        assert_eq!(p.status, AgentStatus::Idle);
+        assert_eq!(p.source.as_deref(), Some(AGENT_SOURCE_PROC));
+        // Idempotent: a second identical reconcile reports no change.
+        assert!(!reconcile_surface_process_agent(&mut slot, Some("codex")));
+    }
+
+    #[test]
+    fn reconcile_drops_proc_presence_when_agent_process_exits() {
+        let mut p = AgentPresence::new("codex", AgentActivity::Idle, None);
+        p.source = Some(AGENT_SOURCE_PROC.to_string());
+        let mut slot = Some(p);
+        assert!(reconcile_surface_process_agent(&mut slot, None));
+        assert!(slot.is_none());
+    }
+
+    #[test]
+    fn reconcile_leaves_hook_owned_presence_when_process_absent() {
+        // A hook-owned presence must not be dropped by the process sweep; the
+        // hook (and the pid liveness sweep) own its lifecycle.
+        let mut p = AgentPresence::new("claude", AgentActivity::Running, Some(42));
+        p.source = Some("flowmux:hook".into());
+        let mut slot = Some(p);
+        assert!(!reconcile_surface_process_agent(&mut slot, None));
+        assert!(slot.is_some());
+    }
+
+    #[test]
+    fn reconcile_follows_agent_swap_for_proc_owned_presence() {
+        let mut p = AgentPresence::new("codex", AgentActivity::Idle, None);
+        p.source = Some(AGENT_SOURCE_PROC.to_string());
+        let mut slot = Some(p);
+        assert!(reconcile_surface_process_agent(&mut slot, Some("claude")));
+        assert_eq!(slot.as_ref().unwrap().name, "claude");
+    }
+
+    #[test]
+    fn reconcile_is_noop_for_running_screen_owned_presence() {
+        let mut p = AgentPresence::new("codex", AgentActivity::Running, None);
+        p.source = Some("flowmux:screen".into());
+        let mut slot = Some(p);
+        assert!(!reconcile_surface_process_agent(&mut slot, Some("codex")));
+        assert_eq!(slot.as_ref().unwrap().name, "codex");
+    }
+
+    #[test]
+    fn screen_working_keeps_proc_ownership_then_settles_idle_without_clearing() {
+        // Core regression fix: a screen scan may raise a proc-owned presence to
+        // Working, but must not steal ownership — otherwise the screen-idle path
+        // would later drop a still-running agent (Codex's exact failure).
+        let mut surface = PaneSurface::terminal("agent", None);
+        let surface_id = surface.id;
+        let mut presence = AgentPresence::new("codex", AgentActivity::Idle, None);
+        presence.source = Some(AGENT_SOURCE_PROC.to_string());
+        surface.agent = Some(presence);
+        let mut pane = Pane::Leaf {
+            id: PaneId::new(),
+            content: PaneContent::Tabs {
+                active: surface_id,
+                surfaces: vec![surface],
+            },
+        };
+        pane.report_surface_agent_signal(
+            surface_id,
+            AgentStatus::Working,
+            "flowmux:screen",
+            Some("codex"),
+            true,
+        );
+        // Working turn ends: proc presence settles to Idle, not cleared.
+        assert_eq!(pane.settle_screen_idle(surface_id), Some(true));
+        assert_eq!(pane.agent_status_rollup(), Some(AgentStatus::Idle));
+        // Still present — a second settle is a no-op.
+        assert_eq!(pane.settle_screen_idle(surface_id), Some(false));
+    }
+
+    #[test]
+    fn settle_screen_idle_clears_screen_owned_presence() {
+        let mut surface = PaneSurface::terminal("a", None);
+        let sid = surface.id;
+        let mut p = AgentPresence::new("codex", AgentActivity::Idle, None);
+        p.source = Some("flowmux:screen".into());
+        surface.agent = Some(p);
+        let mut pane = Pane::Leaf {
+            id: PaneId::new(),
+            content: PaneContent::Tabs {
+                active: sid,
+                surfaces: vec![surface],
+            },
+        };
+        assert_eq!(pane.settle_screen_idle(sid), Some(true));
+        assert_eq!(pane.agent_status_rollup(), None);
     }
 
     #[test]

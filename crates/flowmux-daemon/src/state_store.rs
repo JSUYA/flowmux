@@ -829,6 +829,55 @@ impl StateStore {
         accepted
     }
 
+    /// Reconcile Agent Bar presence against process-tree truth for a batch of
+    /// terminal surfaces. `detected` pairs each surface with the canonical
+    /// agent name running in its process subtree (or `None`). This is the
+    /// authoritative existence/liveness signal, independent of TUI text or
+    /// hooks. Returns the affected workspaces and their rolled-up status so the
+    /// caller can refresh the side panel and Agent Bar.
+    pub async fn reconcile_process_agents(
+        &self,
+        detected: &[(SurfaceId, Option<&str>)],
+    ) -> Vec<(WorkspaceId, Option<AgentStatus>)> {
+        let mut changed: Vec<(WorkspaceId, Option<AgentStatus>)> = Vec::new();
+        let mut created_surfaces: Vec<SurfaceId> = Vec::new();
+        {
+            let mut s = self.inner.lock().await;
+            for (surface_id, name) in detected {
+                for ws in s.workspaces.iter_mut() {
+                    let mut applied = None;
+                    for surface in ws.surfaces.iter_mut() {
+                        if let Some(result) =
+                            surface.root_pane.reconcile_process_agent(*surface_id, *name)
+                        {
+                            applied = Some(result);
+                            break;
+                        }
+                    }
+                    if let Some(result) = applied {
+                        if result {
+                            changed.push((ws.id, ws.agent_status_rollup()));
+                            if name.is_some() {
+                                created_surfaces.push(*surface_id);
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        // A live agent process is ground truth: unblock the screen-refinement
+        // path that a prior hook SessionEnd may have latched for this surface,
+        // so working/idle status can track again.
+        if !created_surfaces.is_empty() {
+            let mut cleared = self.cleared_agent_surfaces.lock().await;
+            for surface_id in created_surfaces {
+                cleared.remove(&surface_id);
+            }
+        }
+        changed
+    }
+
     pub async fn report_agent_screen_signals(
         &self,
         surface_id: SurfaceId,
@@ -897,10 +946,7 @@ impl StateStore {
             let mut found = false;
             let mut changed = false;
             for surface in ws.surfaces.iter_mut() {
-                if let Some(applied) = surface
-                    .root_pane
-                    .clear_surface_agent_from_source(surface_id, "flowmux:screen")
-                {
+                if let Some(applied) = surface.root_pane.settle_screen_idle(surface_id) {
                     found = true;
                     changed = applied;
                     break;
@@ -1858,6 +1904,83 @@ mod tests {
         assert_eq!(agent.name, "codex");
         assert_eq!(agent.status, AgentStatus::Blocked);
         assert_eq!(agent.source.as_deref(), Some("flowmux:screen"));
+    }
+
+    #[tokio::test]
+    async fn reconcile_process_agents_creates_then_drops_proc_presence() {
+        let store = StateStore::new_lazy(State::default());
+        let ws_id = store
+            .create_workspace(Some("demo".into()), std::path::PathBuf::from("/tmp/demo"))
+            .await;
+        let ws = store.get_workspace(ws_id).await.unwrap();
+        let surface = first_pane_active_surface(&ws);
+
+        // Agent process appears -> idle, process-owned presence created.
+        let changed = store
+            .reconcile_process_agents(&[(surface, Some("codex"))])
+            .await;
+        assert_eq!(changed, vec![(ws_id, Some(AgentStatus::Idle))]);
+        let state = store.snapshot().await;
+        let tree = flowmux_ipc::protocol::describe_workspaces(&state.workspaces);
+        let agent = tree[0].panes[0].tabs[0].agent.as_ref().unwrap();
+        assert_eq!(agent.name, "codex");
+        assert_eq!(agent.status, AgentStatus::Idle);
+        assert_eq!(agent.source.as_deref(), Some("flowmux:proc"));
+
+        // Idempotent: same detection reports no change.
+        assert!(store
+            .reconcile_process_agents(&[(surface, Some("codex"))])
+            .await
+            .is_empty());
+
+        // Process exits -> presence dropped.
+        let changed = store.reconcile_process_agents(&[(surface, None)]).await;
+        assert_eq!(changed, vec![(ws_id, None)]);
+        let state = store.snapshot().await;
+        let tree = flowmux_ipc::protocol::describe_workspaces(&state.workspaces);
+        assert!(tree[0].panes[0].tabs[0].agent.is_none());
+    }
+
+    #[tokio::test]
+    async fn codex_process_presence_survives_idle_after_a_working_turn() {
+        // End-to-end for the reported Codex bug: a process-owned presence must
+        // outlive a working->idle screen transition. Previously the idle scan
+        // (Codex's title is `<spinner> <cwd>`, never "codex", and its composer
+        // has no recognizable idle line) cleared the presence entirely.
+        let store = StateStore::new_lazy(State::default());
+        let ws_id = store
+            .create_workspace(Some("demo".into()), std::path::PathBuf::from("/tmp/demo"))
+            .await;
+        let ws = store.get_workspace(ws_id).await.unwrap();
+        let surface = first_pane_active_surface(&ws);
+
+        store
+            .reconcile_process_agents(&[(surface, Some("codex"))])
+            .await;
+
+        // Codex works: its spinner title raises status to Working.
+        store
+            .report_agent_screen_signals(surface, None, Some("\u{280b} scratchpad"))
+            .await;
+        let agent = {
+            let state = store.snapshot().await;
+            let tree = flowmux_ipc::protocol::describe_workspaces(&state.workspaces);
+            tree[0].panes[0].tabs[0].agent.clone().unwrap()
+        };
+        assert_eq!(agent.status, AgentStatus::Working);
+        assert_eq!(agent.source.as_deref(), Some("flowmux:proc"));
+
+        // Turn ends: idle codex emits no recognizable status signal.
+        store
+            .report_agent_screen_signals(surface, Some("~/work $"), Some("scratchpad"))
+            .await;
+        let state = store.snapshot().await;
+        let tree = flowmux_ipc::protocol::describe_workspaces(&state.workspaces);
+        let agent = tree[0].panes[0].tabs[0].agent.as_ref().unwrap();
+        // Still present, settled to Idle, still process-owned — NOT cleared.
+        assert_eq!(agent.name, "codex");
+        assert_eq!(agent.status, AgentStatus::Idle);
+        assert_eq!(agent.source.as_deref(), Some("flowmux:proc"));
     }
 
     #[tokio::test]
