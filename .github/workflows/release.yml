@@ -79,7 +79,7 @@ jobs:
       - name: Build release binaries
         run: |
           cargo build --release --locked \
-            -p flowmux -p flowmux-cli -p flowmux-daemon
+            -p flowmux -p flowmux-md-viewer -p flowmux-cli -p flowmux-daemon
 
       - name: Stage tarball
         run: |
@@ -87,9 +87,10 @@ jobs:
           stage_name="flowmux-${{ steps.ver.outputs.version }}-${TARGET_TRIPLE}"
           stage="dist/${stage_name}"
           mkdir -p "$stage"
-          cp target/release/flowmux        "$stage/"
-          cp target/release/flowmuxctl     "$stage/"
-          cp target/release/flowmux-daemon "$stage/"
+          cp target/release/flowmux            "$stage/"
+          cp target/release/flowmux-md-viewer  "$stage/"
+          cp target/release/flowmuxctl         "$stage/"
+          cp target/release/flowmux-daemon     "$stage/"
           cp LICENSE NOTICE README.md      "$stage/"
           if [ -f THIRD_PARTY_LICENSES.md ]; then
             cp THIRD_PARTY_LICENSES.md "$stage/"
