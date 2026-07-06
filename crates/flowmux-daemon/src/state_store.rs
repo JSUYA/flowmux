@@ -20,20 +20,6 @@ use std::time::Duration;
 use tokio::sync::{Mutex, Notify};
 use tracing::{error, info};
 
-/// flowmux-authored default sidebar palette. Vivid hues spaced around
-/// the wheel so adjacent workspaces stay visually distinct against
-/// the dark sidebar tint. Picked deterministically from the
-/// workspace's UUID so the color stays the same across restarts.
-const DEFAULT_PALETTE: &[&str] = &[
-    "#7ab7e6", "#e69977", "#9ad57a", "#d188e0", "#e6d077", "#7adfd0", "#e07a9a", "#a797e0",
-    "#79e0a3", "#e07a7a",
-];
-
-fn default_color_for(id: WorkspaceId) -> String {
-    let idx = (id.0.as_u128() as usize) % DEFAULT_PALETTE.len();
-    DEFAULT_PALETTE[idx].to_string()
-}
-
 #[derive(Debug, Clone, Copy)]
 pub enum CloseOutcome {
     /// One leaf removed; the surface still exists.
@@ -226,6 +212,16 @@ impl StateStore {
                 .unwrap_or("workspace")
                 .to_string()
         });
+        let mut s = self.inner.lock().await;
+        // Pick a palette color that other workspaces are not already wearing,
+        // so sidebar color bars stay distinct; the UUID seeds the random choice
+        // among the least-used colors.
+        let used: Vec<String> = s
+            .workspaces
+            .iter()
+            .filter_map(|w| w.color.clone())
+            .collect();
+        let color = flowmux_core::pick_workspace_color(&used, id.0.as_u128());
         let ws = Workspace {
             id,
             name: auto_name,
@@ -245,9 +241,8 @@ impl StateStore {
                     content: PaneContent::tabbed_terminal(tab_title, Some(root)),
                 },
             }],
-            color: Some(default_color_for(id)),
+            color: Some(color),
         };
-        let mut s = self.inner.lock().await;
         s.workspaces.push(ws);
         s.workspace_order.push(id);
         if s.active_workspace.is_none() {
@@ -847,8 +842,9 @@ impl StateStore {
                 for ws in s.workspaces.iter_mut() {
                     let mut applied = None;
                     for surface in ws.surfaces.iter_mut() {
-                        if let Some(result) =
-                            surface.root_pane.reconcile_process_agent(*surface_id, *name)
+                        if let Some(result) = surface
+                            .root_pane
+                            .reconcile_process_agent(*surface_id, *name)
                         {
                             applied = Some(result);
                             break;
@@ -1806,6 +1802,31 @@ mod tests {
         };
         assert_eq!(surfaces[0].title, "demo");
         assert!(!surfaces[0].title_locked);
+    }
+
+    #[tokio::test]
+    async fn create_workspace_colors_stay_distinct_until_palette_exhausted() {
+        let store = StateStore::new_lazy(State::default());
+        let n = flowmux_core::WORKSPACE_PALETTE.len();
+        for i in 0..n {
+            store
+                .create_workspace(None, std::path::PathBuf::from(format!("/tmp/ws{i}")))
+                .await;
+        }
+        let state = store.snapshot().await;
+        let colors: Vec<String> = state
+            .workspaces
+            .iter()
+            .filter_map(|w| w.color.clone())
+            .collect();
+        let mut unique = colors.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            n,
+            "first {n} workspaces should all differ: {colors:?}"
+        );
     }
 
     #[tokio::test]

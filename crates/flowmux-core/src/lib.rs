@@ -683,7 +683,10 @@ impl Pane {
                 ..
             } => {
                 let surface = surfaces.iter_mut().find(|s| s.id == surface_id)?;
-                Some(reconcile_surface_process_agent(&mut surface.agent, detected))
+                Some(reconcile_surface_process_agent(
+                    &mut surface.agent,
+                    detected,
+                ))
             }
             Pane::Leaf { .. } => None,
             Pane::Split { first, second, .. } => first
@@ -2077,16 +2080,55 @@ pub fn collect_agent_bar_model<'a>(
     }
 }
 
+/// flowmux workspace / agent-bar color palette. Harmonious hues at a fixed
+/// saturation and lightness, spaced around the wheel and deliberately kept
+/// clear of the pale-yellow band reserved for the focus border
+/// (`FOCUS_BORDER_COLOR_DEFAULT`), so color-bar stripes read as distinct
+/// against the dark sidebar tint while sharing one visual family. Entries are
+/// lowercase 7-char hex; keep them perceptually spaced when editing.
+pub const WORKSPACE_PALETTE: &[&str] = &[
+    "#dc7b74", "#dc9a74", "#a5dc74", "#82dc74", "#74dc8e", "#74dcba", "#74d5dc", "#74b1dc",
+    "#7489dc", "#8e74dc", "#c274dc", "#dc74c8", "#dc749a",
+];
+
+/// Choose a workspace color from [`WORKSPACE_PALETTE`]. Randomized by `seed`
+/// (pass the workspace UUID's low bits) yet biased away from colors already in
+/// `used`: while free palette slots remain every workspace gets a distinct
+/// color, and once the palette is exhausted reuse spreads evenly instead of
+/// clustering. Deterministic in `(used, seed)`, so the color chosen at creation
+/// stays stable after it is persisted.
+pub fn pick_workspace_color(used: &[String], seed: u128) -> String {
+    let mut counts = vec![0usize; WORKSPACE_PALETTE.len()];
+    for u in used {
+        if let Some(i) = WORKSPACE_PALETTE
+            .iter()
+            .position(|c| c.eq_ignore_ascii_case(u))
+        {
+            counts[i] += 1;
+        }
+    }
+    let min = counts.iter().copied().min().unwrap_or(0);
+    // Least-used palette entries are the candidates; `seed` scatters the pick
+    // among them so the choice stays random without ever landing on a color a
+    // sibling workspace already wears (until every color is spoken for).
+    let candidates: Vec<usize> = (0..WORKSPACE_PALETTE.len())
+        .filter(|&i| counts[i] == min)
+        .collect();
+    let pick = candidates[(seed % candidates.len() as u128) as usize];
+    WORKSPACE_PALETTE[pick].to_string()
+}
+
+/// Fallback stripe color for an agent-bar item whose workspace has no color
+/// set. Hashes the surface id into [`WORKSPACE_PALETTE`] so it is deterministic
+/// per surface and stays within the flowmux color family.
 pub fn agent_bar_color_for_surface(surface: SurfaceId) -> String {
     let mut hash = 0xcbf29ce484222325_u64;
     for byte in surface.0.as_bytes() {
         hash ^= *byte as u64;
         hash = hash.wrapping_mul(0x100000001b3);
     }
-    let r = 64 + ((hash & 0x9f) as u8);
-    let g = 64 + (((hash >> 16) & 0x9f) as u8);
-    let b = 64 + (((hash >> 32) & 0x9f) as u8);
-    format!("#{r:02x}{g:02x}{b:02x}")
+    let idx = (hash % WORKSPACE_PALETTE.len() as u64) as usize;
+    WORKSPACE_PALETTE[idx].to_string()
 }
 
 /// Presence source tag for agents discovered by the process-tree sweep
@@ -4105,9 +4147,16 @@ mod tests {
             true,
         );
         assert!(applied);
-        assert_eq!(presence.name, "claude", "screen must not rename a proc-owned presence");
+        assert_eq!(
+            presence.name, "claude",
+            "screen must not rename a proc-owned presence"
+        );
         assert_eq!(presence.source.as_deref(), Some(AGENT_SOURCE_PROC));
-        assert_eq!(presence.status, AgentStatus::Working, "status still refines");
+        assert_eq!(
+            presence.status,
+            AgentStatus::Working,
+            "status still refines"
+        );
     }
 
     #[test]
@@ -4599,6 +4648,37 @@ mod tests {
         );
         assert!(agent_bar_color_for_surface(surface_a).starts_with('#'));
         assert_eq!(agent_bar_color_for_surface(surface_a).len(), 7);
+        assert!(WORKSPACE_PALETTE.contains(&agent_bar_color_for_surface(surface_a).as_str()));
+    }
+
+    #[test]
+    fn pick_workspace_color_from_palette_avoids_used_until_exhausted() {
+        // Every color the picker returns is a palette member.
+        for seed in 0..40u128 {
+            assert!(WORKSPACE_PALETTE.contains(&pick_workspace_color(&[], seed).as_str()));
+        }
+        // Filling slots one at a time never repeats a color while free slots
+        // remain, so the first PALETTE.len() workspaces are all distinct.
+        let mut used: Vec<String> = Vec::new();
+        for i in 0..WORKSPACE_PALETTE.len() {
+            let c = pick_workspace_color(&used, (i as u128) * 7 + 3);
+            assert!(!used.contains(&c), "repeated {c} before palette exhausted");
+            used.push(c);
+        }
+        let mut sorted = used.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            WORKSPACE_PALETTE.len(),
+            "all colors used once"
+        );
+        // Seed varies the choice: two empty-set picks with different seeds can
+        // differ (spot-check that not every seed yields the same color).
+        let distinct: std::collections::HashSet<_> = (0..WORKSPACE_PALETTE.len() as u128)
+            .map(|s| pick_workspace_color(&[], s))
+            .collect();
+        assert!(distinct.len() > 1, "seed should scatter the pick");
     }
 
     #[test]
