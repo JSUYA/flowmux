@@ -1153,6 +1153,9 @@ fn build_meta_column(ws: &Workspace, details: &WorkspaceRowDetails) -> gtk::Box 
         status.set_halign(gtk::Align::Start);
         status.set_xalign(0.0);
         status.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        status.set_single_line_mode(true);
+        status.set_lines(1);
+        status.set_wrap(false);
         status.set_margin_start(18);
         status.add_css_class("caption");
         status.add_css_class("dim-label");
