@@ -116,15 +116,32 @@ fn match_agent_comm(comm: &str) -> Option<&'static str> {
     KNOWN_AGENT_COMMS.iter().copied().find(|name| *name == c)
 }
 
-/// Direct child PIDs of `pid` via `/proc/<pid>/task/<pid>/children`, or `None`
-/// when that file is not readable (kernel built without `CONFIG_PROC_CHILDREN`).
-/// An existing process with no children yields `Some(empty)`, which is how the
-/// caller distinguishes "no kids" from "feature unavailable".
+/// Direct child PIDs of `pid`, unioned across **every** thread of the
+/// process via `/proc/<pid>/task/<tid>/children`, or `None` when the feature
+/// is unavailable (kernel built without `CONFIG_PROC_CHILDREN`, or the process
+/// exited). An existing process with no children yields `Some(empty)`, which is
+/// how the caller distinguishes "no kids" from "feature unavailable".
+///
+/// The per-thread aggregation matters: the `children` file lists only the
+/// children forked by *that specific thread*. A multithreaded parent (e.g. the
+/// tokio-based `flowmuxctl pty-tee` that spawns the pane's shell) forks its
+/// child from a worker thread, so `/proc/<pid>/task/<pid>/children` (the main
+/// thread) is empty and reading only that file would miss the entire subtree.
 #[cfg(target_os = "linux")]
 fn read_children(pid: u32) -> Option<Vec<u32>> {
-    fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"))
-        .ok()
-        .map(|s| s.split_ascii_whitespace().filter_map(|t| t.parse().ok()).collect())
+    let entries = fs::read_dir(format!("/proc/{pid}/task")).ok()?;
+    let mut kids = Vec::new();
+    let mut any = false;
+    for entry in entries.flatten() {
+        let path = entry.path().join("children");
+        if let Ok(s) = fs::read_to_string(&path) {
+            any = true;
+            kids.extend(s.split_ascii_whitespace().filter_map(|t| t.parse::<u32>().ok()));
+        }
+    }
+    // Only report "feature unavailable" when not a single children file was
+    // readable; an empty-but-present file means the thread simply has no kids.
+    any.then_some(kids)
 }
 
 /// Cap on process-tree nodes visited per detection, a defensive bound so a
@@ -305,6 +322,35 @@ mod tests {
         // The test runner's own tree contains cargo/rustc/the test binary,
         // none of which are in KNOWN_AGENT_COMMS.
         assert_eq!(agent_name_in_tree(std::process::id()), None);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn read_children_sees_child_forked_from_worker_thread() {
+        use std::process::Command;
+        use std::sync::mpsc;
+        use std::time::Duration;
+        // Reproduce the pty-tee shape: a *worker* thread forks the child while
+        // staying alive. The kernel files children under the forking thread's
+        // tid, so `/proc/<pid>/task/<main-tid>/children` never lists it. Before
+        // the per-thread aggregation fix, agent detection walked an empty
+        // subtree from the pane root and reported "no agent".
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let (pid_tx, pid_rx) = mpsc::channel::<u32>();
+        let worker = std::thread::spawn(move || {
+            let mut child = Command::new("sleep").arg("30").spawn().expect("spawn sleep");
+            pid_tx.send(child.id()).unwrap();
+            let _ = release_rx.recv(); // keep this thread (and its children file) alive
+            let _ = child.kill();
+            let _ = child.wait();
+        });
+        let child_pid = pid_rx.recv().unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        let kids = read_children(std::process::id()).expect("children feature available");
+        let found = kids.contains(&child_pid);
+        let _ = release_tx.send(()); // let the worker reap its child and exit
+        worker.join().unwrap();
+        assert!(found, "worker-thread child {child_pid} missing from {kids:?}");
     }
 
     #[test]
