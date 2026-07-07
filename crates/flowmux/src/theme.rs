@@ -330,9 +330,8 @@ paned > separator {{
 /* Visible "active workspace" indicator. A left-edge accent
    stripe in the focus color lets the user see which workspace is
    currently active. Always full opacity (focus_full), independent of
-   the focus-border opacity slider, with no background tint, without
-   losing the flowmux-attention override below
-   (amber wins because it is layered last). The :hover/:focus/:active/
+   the focus-border opacity slider, and is the only row-level left-edge
+   accent. The :hover/:focus/:active/
    .has-open-popup variants must mirror the suppression block above: those
    selectors clear borders at the same specificity, so without matching
    variants here the stripe vanishes whenever the row is hovered. */
@@ -372,15 +371,12 @@ paned > separator {{
 }}
 .navigation-sidebar row.flowmux-attention {{
     background-color: rgba(245, 158, 11, 0.18);
-    border-left: 3px solid rgba(245, 158, 11, 0.85);
 }}
 .navigation-sidebar row.flowmux-agent-blocked {{
     background-color: rgba(239, 68, 68, 0.16);
-    border-left: 3px solid rgba(239, 68, 68, 0.85);
 }}
 .navigation-sidebar row.flowmux-agent-done {{
     background-color: rgba(59, 130, 246, 0.14);
-    border-left: 3px solid rgba(59, 130, 246, 0.78);
 }}
 .navigation-sidebar row label.flowmux-sidebar-agent-blocked,
 .navigation-sidebar row image.flowmux-sidebar-agent-blocked {{
@@ -632,6 +628,29 @@ mod tests {
             accent_block > suppression_block,
             "accent rule must follow the suppression rule so it overrides"
         );
+    }
+
+    #[test]
+    fn sidebar_status_tints_do_not_draw_active_workspace_accent() {
+        let css = sample_css();
+
+        for selector in [
+            ".navigation-sidebar row.flowmux-attention",
+            ".navigation-sidebar row.flowmux-agent-blocked",
+            ".navigation-sidebar row.flowmux-agent-done",
+        ] {
+            let rule_start = css.find(selector).expect("sidebar status rule missing");
+            let rule_tail = &css[rule_start..];
+            let rule_end = rule_tail
+                .find('}')
+                .expect("sidebar status rule unterminated");
+            let rule = &rule_tail[..rule_end];
+
+            assert!(
+                !rule.contains("border-left:"),
+                "{selector} must not draw the active workspace accent"
+            );
+        }
     }
 
     /// Trivial 1-pane / 1-tab workspaces hide the focus border via the
