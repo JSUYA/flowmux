@@ -194,22 +194,45 @@ fn custom_command_shell_line(
     Some(parts.join(" "))
 }
 
+/// Agent bar state: the live-agent overview widget plus the set of surfaces
+/// currently flagged for attention. Grouped out of two flat `WindowController`
+/// fields.
+#[derive(Clone)]
+struct AgentBarState {
+    /// The agent bar widget shown above the content area.
+    bar: AgentBar,
+    /// Surfaces flagged for attention (e.g. an agent awaiting input).
+    attentions: Rc<RefCell<HashSet<SurfaceId>>>,
+}
+
+/// Cohesive file-browser state, grouped out of five flat `WindowController`
+/// fields. Every terminal pane can reveal an in-pane file browser; this holds
+/// the shared panel plus the per-pane and focus-restore bookkeeping.
+#[derive(Clone)]
+struct FileBrowserState {
+    /// Pane that had focus when the browser opened, so focus can be restored on close.
+    source_pane: FocusedPane,
+    /// Whether the file browser currently owns keyboard focus.
+    active: Rc<Cell<bool>>,
+    /// Per-pane saved browser state (expanded dirs, selection) keyed by pane.
+    pane_states: Rc<RefCell<HashMap<PaneId, FileBrowserPaneState>>>,
+    /// Horizontal `gtk::Paned` splitting the content area and the browser panel.
+    split: gtk::Paned,
+    /// The shared file-browser widget.
+    panel: FileBrowserPanel,
+}
+
 #[derive(Clone)]
 pub struct WindowController {
     pub window: adw::ApplicationWindow,
     pub focused_pane: FocusedPane,
-    file_browser_source_pane: FocusedPane,
-    file_browser_active: Rc<Cell<bool>>,
-    file_browser_pane_states: Rc<RefCell<HashMap<PaneId, FileBrowserPaneState>>>,
     sidebar: Sidebar,
     /// Outermost `gtk::Paned` separating the side panel and content area.
     /// Its position is saved to the store on exit and restored on next launch.
     sidebar_split: gtk::Paned,
-    file_browser_split: gtk::Paned,
-    file_browser: FileBrowserPanel,
+    file_browser: FileBrowserState,
     stack: gtk::Stack,
-    agent_bar: AgentBar,
-    agent_bar_attentions: Rc<RefCell<HashSet<SurfaceId>>>,
+    agent_bar: AgentBarState,
     surfaces: Rc<RefCell<HashMap<WorkspaceId, gtk::Widget>>>,
     pane_registry: Rc<RefCell<PaneRegistry>>,
     callbacks: PaneCallbacks,
@@ -604,16 +627,20 @@ impl WindowController {
         let controller = Self {
             window,
             focused_pane,
-            file_browser_source_pane,
-            file_browser_active,
-            file_browser_pane_states,
             sidebar,
             sidebar_split: split,
-            file_browser_split,
-            file_browser,
+            file_browser: FileBrowserState {
+                source_pane: file_browser_source_pane,
+                active: file_browser_active,
+                pane_states: file_browser_pane_states,
+                split: file_browser_split,
+                panel: file_browser,
+            },
             stack,
-            agent_bar,
-            agent_bar_attentions,
+            agent_bar: AgentBarState {
+                bar: agent_bar,
+                attentions: agent_bar_attentions,
+            },
             surfaces,
             pane_registry,
             callbacks,
@@ -837,9 +864,9 @@ impl WindowController {
         // in BOTH cases because focusing the browser does not update that tracker, so
         // gating on the focus flag is what makes the first Alt+arrow do the right
         // thing instead of taking two presses.
-        if self.file_browser_active.get()
-            && self.file_browser_source_pane.get().is_some()
-            && (from.is_none() || from == self.file_browser_source_pane.get())
+        if self.file_browser.active.get()
+            && self.file_browser.source_pane.get().is_some()
+            && (from.is_none() || from == self.file_browser.source_pane.get())
         {
             self.focus_out_of_file_browser(dir);
             return;
@@ -1396,7 +1423,7 @@ impl WindowController {
                 // `None` comes from the side-panel footer button / Ctrl+Alt+F,
                 // which have no pane context — target the focused pane.
                 // Already visible → close; otherwise open for that pane.
-                if self.file_browser.widget().is_visible() {
+                if self.file_browser.panel.widget().is_visible() {
                     self.close_file_browser_and_restore_focus();
                 } else if let Some(pane) = pane.or_else(|| self.focused_pane.get()) {
                     self.show_file_browser_for_pane(pane).await;
@@ -5032,7 +5059,7 @@ mod tests {
         let (controller, _ws_id, pane) =
             build_single_workspace_controller("com.flowmux.App.UiTest.FileBrowserFocusOut").await;
 
-        controller.file_browser_source_pane.set(Some(pane));
+        controller.file_browser.source_pane.set(Some(pane));
         controller.focused_pane.set(None);
 
         controller.focus_out_of_file_browser(FocusDir::Left);
@@ -5047,12 +5074,12 @@ mod tests {
             build_single_workspace_controller("com.flowmux.App.UiTest.FileBrowserFocusCommand")
                 .await;
 
-        controller.file_browser.widget().set_visible(true);
-        controller.file_browser_source_pane.set(Some(pane));
+        controller.file_browser.panel.widget().set_visible(true);
+        controller.file_browser.source_pane.set(Some(pane));
 
         // No pane focused (e.g. after a side-panel click): the global FocusDirection
         // command is the only way out of the browser, so it must focus-out.
-        controller.file_browser_active.set(true);
+        controller.file_browser.active.set(true);
         controller.focused_pane.set(None);
         controller
             .dispatch(GtkCommand::FocusDirection {
@@ -5062,7 +5089,7 @@ mod tests {
             .await;
 
         assert_eq!(controller.focused_pane.get(), Some(pane));
-        assert!(!controller.file_browser_active.get());
+        assert!(!controller.file_browser.active.get());
     }
 
     /// Regression: with a pane focused and the browser merely open, the first
@@ -5078,10 +5105,10 @@ mod tests {
         controller.window.present();
         glib::timeout_future(std::time::Duration::from_millis(50)).await;
 
-        controller.file_browser.widget().set_visible(true);
-        controller.file_browser_source_pane.set(Some(pane));
+        controller.file_browser.panel.widget().set_visible(true);
+        controller.file_browser.source_pane.set(Some(pane));
         // Panel open but the terminal pane holds focus: active is false.
-        controller.file_browser_active.set(false);
+        controller.file_browser.active.set(false);
         controller.focused_pane.set(Some(pane));
 
         controller
@@ -5093,8 +5120,8 @@ mod tests {
 
         // First Alt+Right enters the browser: focus_file_browser sets active true.
         // The old buggy guard ran a no-op focus-out instead, needing a second press.
-        assert!(controller.file_browser_active.get());
-        assert_eq!(controller.file_browser_source_pane.get(), Some(pane));
+        assert!(controller.file_browser.active.get());
+        assert_eq!(controller.file_browser.source_pane.get(), Some(pane));
     }
 
     /// With two side-by-side panes and the browser docked on the right, Alt+Left
@@ -5123,15 +5150,15 @@ mod tests {
         glib::timeout_future(std::time::Duration::from_millis(50)).await;
 
         // Browser opened from pane_b (the right pane, adjacent to the browser).
-        controller.file_browser_source_pane.set(Some(pane_b));
-        controller.file_browser_active.set(true);
+        controller.file_browser.source_pane.set(Some(pane_b));
+        controller.file_browser.active.set(true);
         controller.focused_pane.set(Some(pane_b));
 
         controller.focus_out_of_file_browser(FocusDir::Left);
 
         // Lands on the adjacent pane_b, not its left neighbour pane_a.
         assert_eq!(controller.focused_pane.get(), Some(pane_b));
-        assert!(!controller.file_browser_active.get());
+        assert!(!controller.file_browser.active.get());
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -5208,7 +5235,7 @@ mod tests {
             .terminals
             .remove(&registry_surface_b);
 
-        controller.file_browser_pane_states.borrow_mut().insert(
+        controller.file_browser.pane_states.borrow_mut().insert(
             pane_a,
             FileBrowserPaneState {
                 root: Some(root_a.clone()),
@@ -5219,7 +5246,7 @@ mod tests {
                 scroll_value: 0.0,
             },
         );
-        controller.file_browser_pane_states.borrow_mut().insert(
+        controller.file_browser.pane_states.borrow_mut().insert(
             pane_b,
             FileBrowserPaneState {
                 root: Some(root_b.clone()),
@@ -5232,20 +5259,20 @@ mod tests {
         );
 
         controller.show_file_browser_for_pane(pane_a).await;
-        let state_a = controller.file_browser.pane_state();
+        let state_a = controller.file_browser.panel.pane_state();
         assert_eq!(state_a.root, Some(root_a.clone()));
         assert_eq!(state_a.focused, Some(root_a.join("expanded-a")));
         assert!(state_a.expanded.contains(&root_a.join("expanded-a")));
 
         controller.show_file_browser_for_pane(pane_b).await;
-        let state_b = controller.file_browser.pane_state();
+        let state_b = controller.file_browser.panel.pane_state();
         assert_eq!(state_b.root, Some(root_b.clone()));
         assert_eq!(state_b.focused, Some(root_b.join("b.txt")));
         assert!(!state_b.expanded.contains(&root_a.join("expanded-a")));
         assert!(!state_b.expanded.contains(&root_b.join("expanded-b")));
 
         controller.show_file_browser_for_pane(pane_a).await;
-        let state_a_again = controller.file_browser.pane_state();
+        let state_a_again = controller.file_browser.panel.pane_state();
         assert_eq!(state_a_again.focused, Some(root_a.join("expanded-a")));
         assert!(state_a_again.expanded.contains(&root_a.join("expanded-a")));
     }
@@ -5280,18 +5307,18 @@ mod tests {
             .remove(&surface);
 
         controller.show_file_browser_for_pane(pane).await;
-        let rebuild_count = controller.file_browser.rebuild_count();
+        let rebuild_count = controller.file_browser.panel.rebuild_count();
         assert!(rebuild_count > 0);
 
         controller.show_file_browser_for_pane(pane).await;
-        assert_eq!(controller.file_browser.rebuild_count(), rebuild_count);
+        assert_eq!(controller.file_browser.panel.rebuild_count(), rebuild_count);
 
         controller
             .store
             .update_surface_cwd(pane, surface, next_root.clone())
             .await;
         controller.show_file_browser_for_pane(pane).await;
-        assert!(controller.file_browser.rebuild_count() > rebuild_count);
+        assert!(controller.file_browser.panel.rebuild_count() > rebuild_count);
     }
 
     /// The file browser re-roots on the focused pane's new cwd. Both cwd-change
@@ -5330,7 +5357,7 @@ mod tests {
 
         controller.focused_pane.set(Some(pane));
         controller.show_file_browser_for_pane(pane).await;
-        assert!(controller.file_browser.is_showing_root(&root));
+        assert!(controller.file_browser.panel.is_showing_root(&root));
 
         // The focused pane cd's: a cwd-change refresh must move the panel with it.
         controller
@@ -5338,7 +5365,7 @@ mod tests {
             .update_surface_cwd(pane, surface, next_root.clone())
             .await;
         controller.refresh_file_browser_from_focus().await;
-        assert!(controller.file_browser.is_showing_root(&next_root));
+        assert!(controller.file_browser.panel.is_showing_root(&next_root));
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -5347,13 +5374,13 @@ mod tests {
         let (controller, _ws_id, pane) =
             build_single_workspace_controller("com.flowmux.App.UiTest.FileBrowserEscape").await;
 
-        controller.file_browser_source_pane.set(Some(pane));
+        controller.file_browser.source_pane.set(Some(pane));
         controller.focused_pane.set(None);
-        controller.file_browser.widget().set_visible(true);
+        controller.file_browser.panel.widget().set_visible(true);
 
         controller.close_file_browser_and_restore_focus();
 
-        assert!(!controller.file_browser.widget().is_visible());
+        assert!(!controller.file_browser.panel.widget().is_visible());
         assert_eq!(controller.focused_pane.get(), Some(pane));
     }
 
@@ -6366,7 +6393,7 @@ mod tests {
             "precondition: closing pane starts with an agent block"
         );
         assert!(
-            controller.agent_bar.root.is_visible(),
+            controller.agent_bar.bar.root.is_visible(),
             "precondition: closing pane starts with an Agent Bar item"
         );
 
@@ -6451,7 +6478,7 @@ mod tests {
             "closing an agent pane must refresh sidebar details"
         );
         assert!(
-            !controller.agent_bar.root.is_visible(),
+            !controller.agent_bar.bar.root.is_visible(),
             "closing an agent pane must refresh Agent Bar visibility"
         );
     }
@@ -6526,7 +6553,7 @@ mod tests {
             "precondition: closing tab starts with an agent block"
         );
         assert!(
-            controller.agent_bar.root.is_visible(),
+            controller.agent_bar.bar.root.is_visible(),
             "precondition: closing tab starts with an Agent Bar item"
         );
 
@@ -6550,7 +6577,7 @@ mod tests {
             "closing an agent tab must refresh sidebar details"
         );
         assert!(
-            !controller.agent_bar.root.is_visible(),
+            !controller.agent_bar.bar.root.is_visible(),
             "closing an agent tab must refresh Agent Bar visibility"
         );
     }
@@ -7305,7 +7332,7 @@ mod tests {
             .expect("single workspace pane should have an active surface");
 
         assert!(
-            !controller.agent_bar.root.is_visible(),
+            !controller.agent_bar.bar.root.is_visible(),
             "Agent Bar should stay hidden while no live agents exist"
         );
 
@@ -7327,7 +7354,7 @@ mod tests {
             })
             .await;
         assert!(
-            controller.agent_bar.root.is_visible(),
+            controller.agent_bar.bar.root.is_visible(),
             "SetAgentStatus must refresh Agent Bar after a live agent appears"
         );
 
@@ -7339,7 +7366,7 @@ mod tests {
             })
             .await;
         assert!(
-            !controller.agent_bar.root.is_visible(),
+            !controller.agent_bar.bar.root.is_visible(),
             "SetAgentStatus must hide Agent Bar after the last agent is cleared"
         );
     }
@@ -7374,14 +7401,14 @@ mod tests {
             })
             .await;
         assert!(
-            !controller.agent_bar.root.is_visible(),
+            !controller.agent_bar.bar.root.is_visible(),
             "disabled Agent Bar option must hide live agent items"
         );
 
         controller.options.borrow_mut().agent_bar_enabled = true;
         controller.refresh_agent_bar().await;
         assert!(
-            controller.agent_bar.root.is_visible(),
+            controller.agent_bar.bar.root.is_visible(),
             "re-enabling Agent Bar should render existing live agents"
         );
     }
@@ -7445,7 +7472,7 @@ mod tests {
             .sync_workspace_agent_status_from_store(ws_b)
             .await;
         assert!(
-            controller.agent_bar.root.is_visible(),
+            controller.agent_bar.bar.root.is_visible(),
             "precondition: Agent Bar is visible before clicking an item"
         );
 

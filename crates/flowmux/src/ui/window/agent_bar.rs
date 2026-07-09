@@ -8,7 +8,7 @@ use super::*;
 impl WindowController {
     pub(super) async fn refresh_agent_bar(&self) {
         if !self.options.borrow().agent_bar_enabled {
-            self.agent_bar.render(
+            self.agent_bar.bar.render(
                 &flowmux_core::AgentBarModel {
                     visible: false,
                     items: Vec::new(),
@@ -41,11 +41,11 @@ impl WindowController {
             .and_then(|pane| self.pane_registry.borrow().active_surface(pane))
             .filter(|surface| live_surfaces.contains(surface));
         let attentions = {
-            let mut attentions = self.agent_bar_attentions.borrow_mut();
+            let mut attentions = self.agent_bar.attentions.borrow_mut();
             attentions.retain(|surface| live_surfaces.contains(surface));
             attentions.clone()
         };
-        self.agent_bar.render(&model, &attentions, focused_surface);
+        self.agent_bar.bar.render(&model, &attentions, focused_surface);
     }
     pub(super) async fn sync_workspace_agent_status(
         &self,
@@ -61,13 +61,13 @@ impl WindowController {
         self.sync_workspace_agent_status(workspace, status).await;
     }
     pub(super) fn mark_agent_bar_attention(&self, surface: SurfaceId) {
-        if self.agent_bar_attentions.borrow_mut().insert(surface) {
-            self.agent_bar.mark_attention(surface);
+        if self.agent_bar.attentions.borrow_mut().insert(surface) {
+            self.agent_bar.bar.mark_attention(surface);
         }
     }
     pub(super) fn clear_agent_bar_attention(&self, surface: SurfaceId) {
-        if self.agent_bar_attentions.borrow_mut().remove(&surface) {
-            self.agent_bar.clear_attention(surface);
+        if self.agent_bar.attentions.borrow_mut().remove(&surface) {
+            self.agent_bar.bar.clear_attention(surface);
         }
     }
     pub(super) fn clear_agent_bar_attentions<I>(&self, surfaces: I)

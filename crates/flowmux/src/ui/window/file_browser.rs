@@ -51,9 +51,9 @@ impl WindowController {
             .or_else(|| std::env::current_dir().ok());
 
         if let Some(root) = root {
-            if self.file_browser.is_open()
-                && self.file_browser_source_pane.get() == Some(pane)
-                && self.file_browser.is_showing_root(&root)
+            if self.file_browser.panel.is_open()
+                && self.file_browser.source_pane.get() == Some(pane)
+                && self.file_browser.panel.is_showing_root(&root)
             {
                 // Opening / refreshing the panel does not move keyboard focus into
                 // it — file_browser_active is driven by connect_focus_changed.
@@ -67,37 +67,37 @@ impl WindowController {
             }
 
             self.save_file_browser_state_for_source();
-            self.file_browser_source_pane.set(Some(pane));
+            self.file_browser.source_pane.set(Some(pane));
             let width = self.window.width();
             if width > 420 {
-                self.file_browser_split.set_position((width - 320).max(240));
+                self.file_browser.split.set_position((width - 320).max(240));
             }
-            let state = self.file_browser_pane_states.borrow().get(&pane).cloned();
-            self.file_browser.show_for_root_with_state(root, state);
+            let state = self.file_browser.pane_states.borrow().get(&pane).cloned();
+            self.file_browser.panel.show_for_root_with_state(root, state);
         }
     }
     pub(super) fn save_file_browser_state_for_source(&self) {
-        let Some(pane) = self.file_browser_source_pane.get() else {
+        let Some(pane) = self.file_browser.source_pane.get() else {
             return;
         };
-        self.file_browser_pane_states
+        self.file_browser.pane_states
             .borrow_mut()
-            .insert(pane, self.file_browser.pane_state());
+            .insert(pane, self.file_browser.panel.pane_state());
     }
     pub(super) fn focus_file_browser(&self) {
-        if self.file_browser.widget().is_visible() {
+        if self.file_browser.panel.widget().is_visible() {
             if let Some(pane) = self.focused_pane.get() {
-                self.file_browser_source_pane.set(Some(pane));
+                self.file_browser.source_pane.set(Some(pane));
             }
-            self.file_browser_active.set(true);
-            self.file_browser.grab_focus();
+            self.file_browser.active.set(true);
+            self.file_browser.panel.grab_focus();
         }
     }
     pub(super) fn focus_out_of_file_browser(&self, dir: FocusDir) {
         self.save_file_browser_state_for_source();
-        self.file_browser_active.set(false);
+        self.file_browser.active.set(false);
         let Some(from) =
-            file_browser_return_pane(self.focused_pane.get(), self.file_browser_source_pane.get())
+            file_browser_return_pane(self.focused_pane.get(), self.file_browser.source_pane.get())
         else {
             return;
         };
@@ -122,10 +122,10 @@ impl WindowController {
     }
     pub(super) fn close_file_browser_and_restore_focus(&self) {
         self.save_file_browser_state_for_source();
-        self.file_browser_active.set(false);
-        self.file_browser.hide();
+        self.file_browser.active.set(false);
+        self.file_browser.panel.hide();
         if let Some(pane) =
-            file_browser_return_pane(self.focused_pane.get(), self.file_browser_source_pane.get())
+            file_browser_return_pane(self.focused_pane.get(), self.file_browser.source_pane.get())
         {
             self.focused_pane.set(Some(pane));
             self.focus_pane(pane);
@@ -133,13 +133,13 @@ impl WindowController {
     }
     pub(super) fn focus_direction_or_file_browser(&self, from: PaneId, dir: FocusDir) {
         let moved = self.focus_in_direction(from, dir).is_some();
-        if dir == FocusDir::Right && self.file_browser.widget().is_visible() && !moved {
-            self.file_browser_source_pane.set(Some(from));
+        if dir == FocusDir::Right && self.file_browser.panel.widget().is_visible() && !moved {
+            self.file_browser.source_pane.set(Some(from));
             self.focus_file_browser();
         }
     }
     pub(super) async fn refresh_file_browser_from_focus(&self) {
-        if !self.file_browser.widget().is_visible() {
+        if !self.file_browser.panel.widget().is_visible() {
             return;
         }
 
