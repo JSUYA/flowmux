@@ -6,9 +6,13 @@
 각 단계를 독립 커밋으로 만들었다. 본 문서는 개선 전/후를 수치로 비교하고,
 실제 동작 검증 결과와 실행 중 새로 드러난 추가 개선 사항을 정리한다.
 
+> **사후 감사 정정:** 아래의 8개 커밋 표와 초기 수치는 해당 시점의 기록이다.
+> 이후 전체 diff와 실제 DnD 행동을 다시 감사하면서 여러 회귀를 발견해 수정했다.
+> 현재 결과와 최종 결론은 문서 끝의 **사후 감사 addendum**가 우선한다.
+
 - 기준 커밋(개선 전): `2210f28`
 - 브랜치: `refactor/arch-improvements`
-- 검증 환경: DISPLAY=:1 (실제 X, Xorg), `dbus-run-session`, Rust stable
+- 초기 검증 환경: DISPLAY=:1 (실제 X, Xorg), `dbus-run-session`, Rust stable
 
 ## 커밋 단위 (8 커밋)
 
@@ -104,11 +108,12 @@
 ## 전체 회귀 검증 (실제 동작 테스트)
 
 ### 자동화 테스트 — 전 워크스페이스 (`cargo test --workspace --no-fail-fast`)
-전 크레이트 통과. 유일한 실패는 **환경성 4건**(코드 회귀 아님):
+초기 실행에서는 Agent Bar 4건을 환경성 실패로 분류했다. 사후 감사 결과 이 판단은
+잘못됐으며, 사용자 `options.json`과 GTK parent/mapping 상태에 의존한 테스트 격리
+문제였다. 최종 fixture 수정과 전체 결과는 addendum에 기록한다.
 
-- `ui::window::tests`의 agent-bar 가시성 4건. 원인: 테스트 빌더가
-  `window.present()`를 호출하지 않아 실제 WM 하에서 `is_visible()==true` 단정이
-  실패(CI의 xvfb는 WM 부재로 동기 가시화되어 통과). 본 리팩터가 건드리지 않은 로직.
+- 당시에는 테스트 빌더의 `window.present()` 누락과 WM 차이를 원인으로 판단했으나,
+  이 분석은 폐기한다. 실제 원인은 사용자 옵션과 GTK mapping 상태에 의존한 fixture였다.
 
 크레이트별: core 118 · cli 135 · daemon 103 · ipc 39 · notify 26 · procmon 10 ·
 ssh 9 · state 16(+cross-process 1) · terminal 16 · vcs 5 · md-viewer 15 ·
@@ -124,8 +129,9 @@ scratch state/data/config)로 별도 실행해 실제 IPC 왕복을 구동:
   `tree`가 새 워크스페이스+pane 위젯 생성 확인.
 - 잘못된 pane의 `read-screen` → 구조화된 `not_found`(패닉 없음, degrade 확인).
 
-실행 내내 현재 세션(PID 4066220)과 `/run/user/1000/flowmux.sock`는 무손상.
-샌드박스 인스턴스만 해당 PID로 종료.
+실행 내내 현재 세션(PID 4066220)과
+`/run/user/1000/flowmux-4066220.sock`는 무손상.
+보호 PID는 유지하고 샌드박스 인스턴스만 종료했다.
 
 ## 실행 중 드러난 추가 개선 사항
 
@@ -145,13 +151,87 @@ scratch state/data/config)로 별도 실행해 실제 IPC 왕복을 구동:
    재발 방지가 된다. (검증 시엔 LD_LIBRARY_PATH shim으로 우회.)
 5. **`daemon`의 헤드리스/GUI `SshConnect` 정렬**: #6에서 불일치를 문서화만 했다.
    headless를 GUI와 동일 의미(워크스페이스 + ssh 주입 상당)로 맞추는 것은 별도 과제.
-6. **GUI 테스트의 환경 민감성**: agent-bar 가시성 테스트 4건이 실제 WM에서 실패한다.
-   테스트 빌더가 `present()` 후 매핑을 기다리거나 `is_visible` 대신 위젯 visible
-   플래그를 직접 검사하도록 바꾸면 xvfb 밖에서도 결정적으로 통과한다.
+6. **GUI 테스트 격리 (사후 감사에서 해결)**: Agent Bar 옵션을 fixture에서 고정하고
+   `is_visible` 대신 위젯의 local `visible` 속성을 검사해 실제 WM에서도 결정적으로
+   통과하도록 수정했다.
 
-## 결론
+## 초기 결론 (사후 감사로 대체됨)
 
-계획의 7개 항목을 모두 **동작 변경 0**(리팩터) / **동작 보강**(#5 degrade, #6 게이트)
-원칙으로 실행했고, 단계별 커밋 + 자동화 회귀 + 리팩터 바이너리의 라이브 IPC 구동으로
-검증했다. 코드 회귀는 없으며(유일 실패는 사전존재 환경성 4건), 위 6건의 후속
-개선 여지를 남긴다.
+초기에는 “동작 변경 0 / 코드 회귀 없음”으로 결론 내렸으나, IPC smoke test만으로는
+실제 pointer DnD와 저장·재시작 결합 경로를 검증하지 못했다. 아래 addendum가 이
+결론을 철회하고 최종 감사 결과를 기록한다.
+
+## 사후 감사 addendum (2026-07-10)
+
+### 결론 정정
+
+구조 분해의 방향과 CLI/API 호환성은 유지됐지만, 브랜치 전체를 regression-free로
+판정한 초기 결론은 부정확했다. 표시 순서, pane/tab 상태 불변식, GTK DnD controller
+중재에서 실제 회귀를 발견했으며 모두 수정 후 자동화·격리 행동 테스트를 다시 수행했다.
+초기 파일 크기 표도 8커밋 snapshot이다. 사후 감사 완료 시점의 주요 파일은
+`window/mod.rs` 9,068줄, CLI `main.rs` 881줄, `ipc_handler.rs` 1,038줄이다.
+
+### 발견 및 수정
+
+1. **워크스페이스 순서 end-to-end**
+   - `workspace_order`의 누락·중복·stale ID와 stale active workspace를 정규화한다.
+   - `workspace ls`, IPC `tree`, 저장·복원 Sidebar가 모두 표시 순서를 사용한다.
+   - Sidebar 삭제의 `swap_remove`를 제거해 GTK 행과 내부 DnD 순서를 일치시켰고,
+     선택된 행을 재삽입해도 highlight를 유지한다.
+2. **pane/tab 상태 불변식**
+   - same-pane 탭 이동이 singleton pane/workspace를 삭제하지 않게 in-place reorder한다.
+   - non-`Tabs` 목적지를 변이 전에 거부해 source 탭 손실과 거짓 성공을 막는다.
+   - singleton 탭을 자기 pane으로 split-drop하면 daemon/UI 모두 no-op으로 처리한다.
+3. **#5 daemon 하드닝 재설계**
+   - 초기 `pending.take()` + 사후 목적지 재검색 방식은 source 변이 뒤 실패할 수 있었다.
+     최종 구현은 변이 전에 정확한 `Tabs` 목적지 인덱스를 확정하고 직접 insert/split해
+     payload와 목적지가 갈라질 경로를 제거한다.
+4. **워크스페이스 DnD MIME 충돌**
+   - workspace와 tab drag가 모두 `String`을 광고해 같은 Sidebar 행의 tab target이
+     workspace UUID를 먼저 받고 `missing separator`로 실패했다.
+   - workspace drag에 `application/x-flowmux-workspace` MIME과 기존 `String`을 함께
+     제공하고, Sidebar tab target만 workspace MIME을 거부한다. 기존 GTK String
+     호환성은 유지한다.
+5. **Sidebar tab MOVE의 중복 close와 dispatch 정지**
+   - tab을 다른 workspace 행으로 옮긴 뒤 drag-end가 외부 창 이동으로 오인해 옛
+     pane에 `CloseSurface`를 재전송했고, 잘못된 “Close workspace?” modal이 단일 GTK
+     dispatcher를 막았다.
+   - Sidebar와 DragSource가 동일한 seen/committed 상태를 공유하고 move ack 성공 뒤에만
+     MOVE를 완료한다. `CloseSurface`도 surface membership을 confirmation보다 먼저
+     검증해 stale command가 modal을 열 수 없게 했다.
+6. **테스트·lint 기반 정정**
+   - Agent Bar 4건은 옵션 fixture를 고정하고 local `visible` 속성을 검사하도록 바꿨다.
+   - 추출된 테스트/모듈의 rustfmt 회귀와 Rust 1.95 all-target/all-feature clippy 오류를
+     수정했다. CLI 기준 비교 79개 help, 83개 IPC request, 12개 hook 경로의 의미 차이는 0이다.
+
+### 격리 라이브 검증
+
+- 보호 대상은 PID `4066220`, 바이너리 `/home/jun/.cargo/bin/flowmux`, socket
+  `/run/user/1000/flowmux-4066220.sock`이며 감사 전후 그대로 유지했다.
+- 별도 target/prefix(`/tmp/flowmux-audit-20260710`)로 빌드·설치하고 Xephyr
+  `DISPLAY=:91`, 격리 socket
+  `/tmp/flowmux-audit-20260710/run2/runtime/flowmux.sock`에서만 조작했다.
+- 실제 pointer drag로 gamma를 alpha 위에 옮겨 `[gamma, alpha, beta]`를 만들었다.
+  gamma 선택 highlight, `workspace ls`, `tree`, `state.json` 순서가 일치했고 앱을
+  종료·재시작한 뒤에도 같은 순서와 active gamma가 복원됐다.
+- 반대 방향인 tab→workspace drop도 실제 수행했다. drag-end는 same-window target을
+  인식했고 modal 없이 완료됐으며, 이동된 탭의 `close-tab`은 5초 제한 내 `ok`를
+  반환하고 원래 한 탭씩의 tree로 복원됐다.
+- 대표 IPC `ping`, `focus-pane`, `send-keys`/`read-screen`(`FLOWMUX_IPC_OK`),
+  `split`/`close-pane`을 왕복 검증했다. in-app browser로 `https://example.com`을 열어
+  ready-state, URL, title `Example Domain`, interactive snapshot까지 확인 후 닫았다.
+
+### 최종 자동화 결과
+
+- `cargo fmt --all -- --check`: 통과
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`: 통과
+- `cargo test --workspace --locked`: **930 passed, 17 ignored, 0 failed**
+- `cargo build --release --workspace`: 통과
+- 집중 회귀: workspace MIME arbitration, stale close after cross-workspace move,
+  singleton self-split daemon/UI 테스트 모두 통과
+
+GTK 전체 테스트는 성공했지만 일부 notification 테스트 경로가 Tokio runtime 없는 GTK
+test executor에서 zbus background panic 로그를 남긴다. 프로덕션 앱은 Tokio runtime을
+제공하고 이번 변경 경로와는 무관하나, 테스트 신호 품질을 위해 별도 정리가 필요하다.
+또한 IPC bridge의 ack 대기에는 전역 timeout이 없어 dispatcher가 다른 이유로 막힐 경우
+CLI가 오래 대기할 수 있는 잔여 위험이 있다.

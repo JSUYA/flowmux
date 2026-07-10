@@ -20,16 +20,16 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 mod agent;
+mod cmd_hooks;
+mod cmd_ops;
 mod desktop_install;
 mod doctor;
 mod hook_install;
 mod hooks;
-mod pty_tee;
 mod keys;
-mod request;
-mod cmd_hooks;
-mod cmd_ops;
 mod output;
+mod pty_tee;
+mod request;
 // Bring each command module's handlers into crate-root scope so both `main`'s
 // dispatch and the `tests` module (via `use super::*`) reference them unqualified,
 // exactly as when they lived in this file. Glob form avoids per-item churn.
@@ -875,7 +875,6 @@ impl Identity {
         }
     }
 }
-
 
 #[cfg(test)]
 #[path = "main_tests.rs"]

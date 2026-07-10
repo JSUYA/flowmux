@@ -21,7 +21,10 @@ impl WindowController {
     /// Updates both store and side panel. The daemon setter is idempotent so
     /// repeated calls for the same ws_id, such as cwd polling, only mark disk
     /// dirty and rebuild GTK when values actually change.
-    pub(super) async fn file_browser_root_for_pane(&self, pane: PaneId) -> Option<std::path::PathBuf> {
+    pub(super) async fn file_browser_root_for_pane(
+        &self,
+        pane: PaneId,
+    ) -> Option<std::path::PathBuf> {
         if let Some(dir) = self.pane_registry.borrow().current_dir_for_pane(pane) {
             return Some(dir);
         }
@@ -73,14 +76,17 @@ impl WindowController {
                 self.file_browser.split.set_position((width - 320).max(240));
             }
             let state = self.file_browser.pane_states.borrow().get(&pane).cloned();
-            self.file_browser.panel.show_for_root_with_state(root, state);
+            self.file_browser
+                .panel
+                .show_for_root_with_state(root, state);
         }
     }
     pub(super) fn save_file_browser_state_for_source(&self) {
         let Some(pane) = self.file_browser.source_pane.get() else {
             return;
         };
-        self.file_browser.pane_states
+        self.file_browser
+            .pane_states
             .borrow_mut()
             .insert(pane, self.file_browser.panel.pane_state());
     }

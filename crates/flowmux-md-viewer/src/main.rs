@@ -374,15 +374,13 @@ impl NavigationState {
 
     fn handle_load_event(&self, event: webkit6::LoadEvent) {
         match event {
-            webkit6::LoadEvent::Started | webkit6::LoadEvent::Redirected => {
-                if !self.loading_markdown_home.get() {
-                    self.at_markdown_home.set(false);
-                }
+            webkit6::LoadEvent::Started | webkit6::LoadEvent::Redirected
+                if !self.loading_markdown_home.get() =>
+            {
+                self.at_markdown_home.set(false);
             }
-            webkit6::LoadEvent::Finished => {
-                if self.loading_markdown_home.replace(false) {
-                    self.at_markdown_home.set(true);
-                }
+            webkit6::LoadEvent::Finished if self.loading_markdown_home.replace(false) => {
+                self.at_markdown_home.set(true);
             }
             _ => {}
         }

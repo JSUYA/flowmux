@@ -106,6 +106,28 @@ fn remove_pane_leaf_locked(s: &mut State, target: PaneId) -> Option<CloseOutcome
     None
 }
 
+/// Return every live workspace id exactly once in sidebar order. Persisted
+/// states from older releases may have no `workspace_order`, while a damaged
+/// state can contain stale or duplicate ids; append any missing live ids in
+/// their stable `workspaces` order.
+fn workspace_ids_in_display_order(s: &State) -> Vec<WorkspaceId> {
+    let live: HashSet<WorkspaceId> = s.workspaces.iter().map(|ws| ws.id).collect();
+    let mut seen = HashSet::with_capacity(live.len());
+    let mut ordered = Vec::with_capacity(live.len());
+
+    for id in &s.workspace_order {
+        if live.contains(id) && seen.insert(*id) {
+            ordered.push(*id);
+        }
+    }
+    for ws in &s.workspaces {
+        if seen.insert(ws.id) {
+            ordered.push(ws.id);
+        }
+    }
+    ordered
+}
+
 #[derive(Clone)]
 pub struct StateStore {
     inner: Arc<Mutex<State>>,
@@ -191,7 +213,18 @@ impl StateStore {
 
     pub async fn list_workspaces(&self) -> Vec<WorkspaceId> {
         let s = self.inner.lock().await;
-        s.workspaces.iter().map(|w| w.id).collect()
+        workspace_ids_in_display_order(&s)
+    }
+
+    /// Clone workspace models in the same order shown in the sidebar. This is
+    /// the model source for IPC tree responses; returning `State::workspaces`
+    /// directly would expose creation order after a drag reorder.
+    pub async fn ordered_workspaces(&self) -> Vec<Workspace> {
+        let s = self.inner.lock().await;
+        workspace_ids_in_display_order(&s)
+            .into_iter()
+            .filter_map(|id| s.workspaces.iter().find(|ws| ws.id == id).cloned())
+            .collect()
     }
 
     pub async fn create_workspace(
@@ -357,7 +390,8 @@ impl StateStore {
     /// sibling pane created by splitting `dst_pane` in `direction`. The moved
     /// tab becomes the new pane's only tab. If the source leaf empties it is
     /// collapsed. Returns `None` (state unchanged) if the surface or
-    /// destination pane cannot be found.
+    /// destination pane cannot be found, or if the pane's only tab is being
+    /// split back into that same pane.
     pub async fn split_surface_into_pane(
         &self,
         src_pane: PaneId,
@@ -367,14 +401,33 @@ impl StateStore {
     ) -> Option<SplitMoveOutcome> {
         let mut s = self.inner.lock().await;
 
-        let dst_exists = s.workspaces.iter().any(|ws| {
-            ws.surfaces
-                .iter()
-                .any(|sf| sf.root_pane.find_leaf_content(dst_pane).is_some())
-        });
-        if !dst_exists {
+        // Splitting the only tab back into its own pane would create a split and
+        // immediately collapse the now-empty original leaf, so the returned pane
+        // would not actually have the new sibling relationship callers expect.
+        if src_pane == dst_pane
+            && s.workspaces.iter().any(|ws| {
+                ws.surfaces.iter().any(|sf| {
+                    matches!(
+                        sf.root_pane.find_leaf_content(src_pane),
+                        Some(PaneContent::Tabs { surfaces, .. })
+                            if surfaces.len() == 1 && surfaces[0].id == surface_id
+                    )
+                })
+            })
+        {
             return None;
         }
+
+        // Capture the exact destination while holding the store lock. Taking a
+        // tab mutates only a pane tree, so these vector indexes remain stable
+        // until the destination split is complete.
+        let (dst_ws_idx, dst_surface_idx) =
+            s.workspaces.iter().enumerate().find_map(|(ws_idx, ws)| {
+                ws.surfaces
+                    .iter()
+                    .position(|sf| sf.root_pane.find_leaf_content(dst_pane).is_some())
+                    .map(|surface_idx| (ws_idx, surface_idx))
+            })?;
 
         // Take from the source.
         let mut taken = None;
@@ -395,33 +448,19 @@ impl StateStore {
         let taken = taken?;
         let src_workspace = src_workspace?;
 
-        // Split the destination, placing the moved tab in the new sibling.
-        let mut dst_workspace = None;
-        let mut new_pane = None;
-        let mut pending = Some(taken);
-        'split: for ws in s.workspaces.iter_mut() {
-            for sf in ws.surfaces.iter_mut() {
-                if sf.root_pane.find_leaf_content(dst_pane).is_some() {
-                    let Some(surface) = pending.take() else {
-                        // `pending` is Some until this single match, guarded by the
-                        // `dst_exists` check above — unreachable. Degrade to a no-op
-                        // rather than panicking the embedded daemon (and the GUI).
-                        error!(pane = %dst_pane, "split_surface_into_pane: pending surface already taken");
-                        return None;
-                    };
-                    let content = PaneContent::Tabs {
-                        active: surface.id,
-                        surfaces: vec![surface],
-                    };
-                    new_pane = sf.root_pane.split_leaf(dst_pane, direction, 0.5, content);
-                    dst_workspace = Some(ws.id);
-                    break 'split;
-                }
-            }
-        }
-        // split_leaf consumed `taken`; both lookups used the same `dst_exists`
-        // check above, so this is unreachable, but guard rather than panic.
-        let (Some(new_pane), Some(dst_workspace)) = (new_pane, dst_workspace) else {
+        // Split the prevalidated destination, placing the moved tab in the new
+        // sibling. There is no second tree search or pending payload state that
+        // can diverge after the source mutation.
+        let dst_workspace = s.workspaces[dst_ws_idx].id;
+        let content = PaneContent::Tabs {
+            active: taken.id,
+            surfaces: vec![taken],
+        };
+        let Some(new_pane) = s.workspaces[dst_ws_idx].surfaces[dst_surface_idx]
+            .root_pane
+            .split_leaf(dst_pane, direction, 0.5, content)
+        else {
+            error!(pane = %dst_pane, "split_surface_into_pane: verified destination rejected split");
             return None;
         };
 
@@ -528,8 +567,9 @@ impl StateStore {
     /// `dst_pane` at `target_index` (clamped to the end). Works whether the
     /// destination is in the same workspace or a different one. If the source
     /// leaf empties it is collapsed like a pane close. Returns `None` if the
-    /// surface or destination pane cannot be found (the state is left
-    /// unchanged in that case).
+    /// surface or a tab-capable destination pane cannot be found, or a
+    /// same-pane move is already at `target_index` (the state is left unchanged
+    /// in those cases).
     pub async fn move_surface_to_pane(
         &self,
         src_pane: PaneId,
@@ -539,16 +579,51 @@ impl StateStore {
     ) -> Option<MoveSurfaceOutcome> {
         let mut s = self.inner.lock().await;
 
-        // Destination must exist before we disturb the source, so a missing
-        // target is a clean no-op rather than a lost tab.
-        let dst_exists = s.workspaces.iter().any(|ws| {
-            ws.surfaces
-                .iter()
-                .any(|sf| sf.root_pane.find_leaf_content(dst_pane).is_some())
-        });
-        if !dst_exists {
+        // Treat a same-pane move as an in-place reorder. Without this guard,
+        // moving the pane's only tab removes it, reinserts it, then collapses
+        // the pane based on the stale `src_leaf_empty` value from before the
+        // insertion, deleting the pane (and potentially its workspace).
+        if src_pane == dst_pane {
+            for ws in s.workspaces.iter_mut() {
+                for sf in ws.surfaces.iter_mut() {
+                    if sf.root_pane.find_surface(src_pane, surface_id).is_some() {
+                        let changed = sf.root_pane.reorder_surface_in_leaf(
+                            src_pane,
+                            surface_id,
+                            target_index,
+                        );
+                        if !changed {
+                            return None;
+                        }
+                        let workspace = ws.id;
+                        drop(s);
+                        self.mark_dirty();
+                        return Some(MoveSurfaceOutcome {
+                            dst_workspace: workspace,
+                            src_workspace: workspace,
+                            src_pane_removed: false,
+                            src_workspace_removed: false,
+                        });
+                    }
+                }
+            }
             return None;
         }
+
+        // Destination must exist before we disturb the source, so a missing
+        // target is a clean no-op rather than a lost tab.
+        let (dst_ws_idx, dst_surface_idx) =
+            s.workspaces.iter().enumerate().find_map(|(ws_idx, ws)| {
+                ws.surfaces
+                    .iter()
+                    .position(|sf| {
+                        matches!(
+                            sf.root_pane.find_leaf_content(dst_pane),
+                            Some(PaneContent::Tabs { .. })
+                        )
+                    })
+                    .map(|surface_idx| (ws_idx, surface_idx))
+            })?;
 
         // Take from the source.
         let mut taken = None;
@@ -569,31 +644,18 @@ impl StateStore {
         let taken = taken?;
         let src_workspace = src_workspace?;
 
-        // Insert into the destination.
-        let mut dst_workspace = None;
-        let mut pending = Some(taken);
-        'insert: for ws in s.workspaces.iter_mut() {
-            for sf in ws.surfaces.iter_mut() {
-                if sf.root_pane.find_leaf_content(dst_pane).is_some() {
-                    let Some(surface) = pending.take() else {
-                        // Unreachable: `pending` is Some until this single match.
-                        // Degrade rather than panic the embedded daemon.
-                        error!(pane = %dst_pane, "move_surface_to_pane: pending surface already taken");
-                        return None;
-                    };
-                    sf.root_pane
-                        .insert_surface_into_leaf(dst_pane, surface, target_index);
-                    dst_workspace = Some(ws.id);
-                    break 'insert;
-                }
-            }
-        }
-        let Some(dst_workspace) = dst_workspace else {
-            // Unreachable: `dst_exists` was verified before taking the source
-            // surface. Degrade rather than panic the embedded daemon.
-            error!(pane = %dst_pane, "move_surface_to_pane: destination vanished after take");
+        // Insert directly into the prevalidated destination. Capturing its
+        // location before the take removes the old pending/destination expect
+        // paths entirely.
+        let dst_workspace = s.workspaces[dst_ws_idx].id;
+        if s.workspaces[dst_ws_idx].surfaces[dst_surface_idx]
+            .root_pane
+            .insert_surface_into_leaf(dst_pane, taken, target_index)
+            .is_none()
+        {
+            error!(pane = %dst_pane, "move_surface_to_pane: verified destination rejected insert");
             return None;
-        };
+        }
 
         // Collapse the source leaf if it emptied.
         let mut src_pane_removed = false;
@@ -1708,7 +1770,18 @@ fn update_surface_cwd_in_state(
 }
 
 fn normalize_state(state: &mut State) -> bool {
-    let mut changed = false;
+    let normalized_order = workspace_ids_in_display_order(state);
+    let mut changed = normalized_order != state.workspace_order;
+    state.workspace_order = normalized_order;
+
+    if state
+        .active_workspace
+        .is_some_and(|active| !state.workspace_order.contains(&active))
+    {
+        state.active_workspace = state.workspace_order.first().copied();
+        changed = true;
+    }
+
     for ws in &mut state.workspaces {
         for surface in &mut ws.surfaces {
             let fallback_cwd = match &surface.kind {
@@ -3800,6 +3873,33 @@ Do you want to continue?";
     }
 
     #[tokio::test]
+    async fn normalization_repairs_workspace_order_and_stale_active_id() {
+        let seed = StateStore::new_lazy(State::default());
+        let a = create_named_workspace(&seed, "a").await;
+        let b = create_named_workspace(&seed, "b").await;
+        let c = create_named_workspace(&seed, "c").await;
+        let stale = WorkspaceId::new();
+        let mut state = seed.snapshot().await;
+        state.workspace_order = vec![c, stale, c];
+        state.active_workspace = Some(stale);
+
+        let store = StateStore::new_lazy(state);
+        let snapshot = store.snapshot().await;
+        assert_eq!(snapshot.workspace_order, vec![c, a, b]);
+        assert_eq!(snapshot.active_workspace, Some(c));
+        assert_eq!(store.list_workspaces().await, vec![c, a, b]);
+        assert_eq!(
+            store
+                .ordered_workspaces()
+                .await
+                .iter()
+                .map(|ws| ws.id)
+                .collect::<Vec<_>>(),
+            vec![c, a, b]
+        );
+    }
+
+    #[tokio::test]
     async fn reorder_workspace_moves_first_to_last() {
         let store = StateStore::new_lazy(State::default());
         let a = create_named_workspace(&store, "a").await;
@@ -3810,6 +3910,33 @@ Do you want to continue?";
 
         let order = store.snapshot().await.workspace_order;
         assert_eq!(order, vec![b, c, a]);
+        assert_eq!(store.list_workspaces().await, vec![b, c, a]);
+        assert_eq!(
+            store
+                .ordered_workspaces()
+                .await
+                .iter()
+                .map(|ws| ws.id)
+                .collect::<Vec<_>>(),
+            vec![b, c, a]
+        );
+    }
+
+    #[tokio::test]
+    async fn reordered_workspace_order_survives_state_file_roundtrip() {
+        let store = StateStore::new_lazy(State::default());
+        let a = create_named_workspace(&store, "a").await;
+        let b = create_named_workspace(&store, "b").await;
+        let c = create_named_workspace(&store, "c").await;
+        assert!(store.reorder_workspace(c, 0).await);
+
+        let path = std::env::temp_dir().join(format!("flowmux-order-{a}.json"));
+        flowmux_state::save_to(&path, &store.snapshot().await).unwrap();
+        let restored = StateStore::new_lazy(flowmux_state::load_from(&path).unwrap());
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(restored.list_workspaces().await, vec![c, a, b]);
+        assert_eq!(restored.snapshot().await.workspace_order, vec![c, a, b]);
     }
 
     #[tokio::test]
@@ -4615,6 +4742,107 @@ Do you want to continue?";
     }
 
     #[tokio::test]
+    async fn move_surface_to_same_pane_keeps_singleton_pane_and_workspace() {
+        let store = StateStore::new_lazy(State::default());
+        let ws = store
+            .create_workspace(Some("w".into()), std::path::PathBuf::from("/tmp/w"))
+            .await;
+        let pane = first_pane(&store.get_workspace(ws).await.unwrap());
+        let only = store.get_workspace(ws).await.unwrap().surfaces[0]
+            .root_pane
+            .active_surface_id(pane)
+            .unwrap();
+
+        assert!(store
+            .move_surface_to_pane(pane, only, pane, usize::MAX)
+            .await
+            .is_none());
+        assert_eq!(pane_tab_ids(&store, ws, pane).await, vec![only]);
+        assert!(store.get_workspace(ws).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn move_surface_within_same_pane_reorders_without_detaching() {
+        let store = StateStore::new_lazy(State::default());
+        let ws = store
+            .create_workspace(Some("w".into()), std::path::PathBuf::from("/tmp/w"))
+            .await;
+        let pane = first_pane(&store.get_workspace(ws).await.unwrap());
+        let first = store.get_workspace(ws).await.unwrap().surfaces[0]
+            .root_pane
+            .active_surface_id(pane)
+            .unwrap();
+        let (_, second) = store
+            .add_terminal_surface_to_pane(pane, None)
+            .await
+            .unwrap();
+        let (_, third) = store
+            .add_terminal_surface_to_pane(pane, None)
+            .await
+            .unwrap();
+        assert!(store.set_active_surface(pane, second).await.is_some());
+
+        let out = store
+            .move_surface_to_pane(pane, first, pane, 2)
+            .await
+            .expect("different same-pane index must reorder");
+
+        assert_eq!(out.dst_workspace, ws);
+        assert_eq!(out.src_workspace, ws);
+        assert!(!out.src_pane_removed);
+        assert!(!out.src_workspace_removed);
+        assert_eq!(
+            pane_tab_ids(&store, ws, pane).await,
+            vec![second, third, first]
+        );
+        assert_eq!(
+            store.get_workspace(ws).await.unwrap().surfaces[0]
+                .root_pane
+                .active_surface_id(pane),
+            Some(second)
+        );
+    }
+
+    #[tokio::test]
+    async fn move_surface_to_non_tab_leaf_rejects_before_taking_source() {
+        let store = StateStore::new_lazy(State::default());
+        let src_ws = store
+            .create_workspace(Some("src".into()), std::path::PathBuf::from("/tmp/src"))
+            .await;
+        let dst_ws = store
+            .create_workspace(Some("dst".into()), std::path::PathBuf::from("/tmp/dst"))
+            .await;
+        let src = first_pane(&store.get_workspace(src_ws).await.unwrap());
+        let dst = first_pane(&store.get_workspace(dst_ws).await.unwrap());
+        let moved = store.get_workspace(src_ws).await.unwrap().surfaces[0]
+            .root_pane
+            .active_surface_id(src)
+            .unwrap();
+
+        // Simulate an invariant-corrupt legacy destination after constructor
+        // normalization. The move API must reject it before taking the source.
+        {
+            let mut state = store.inner.lock().await;
+            let destination = state
+                .workspaces
+                .iter_mut()
+                .find(|ws| ws.id == dst_ws)
+                .unwrap();
+            let Pane::Leaf { content, .. } = &mut destination.surfaces[0].root_pane else {
+                panic!("expected destination root leaf")
+            };
+            *content = PaneContent::Terminal { pid: None };
+        }
+
+        assert!(store
+            .move_surface_to_pane(src, moved, dst, 0)
+            .await
+            .is_none());
+        assert_eq!(pane_tab_ids(&store, src_ws, src).await, vec![moved]);
+        assert!(store.get_workspace(src_ws).await.is_some());
+    }
+
+    #[tokio::test]
     async fn move_surface_to_pane_inserts_at_index() {
         let store = StateStore::new_lazy(State::default());
         let ws = store
@@ -4736,10 +4964,8 @@ Do you want to continue?";
 
     #[tokio::test]
     async fn move_surface_to_pane_in_other_workspace_reassigns_dst_workspace() {
-        // Drives the take -> insert -> dst_workspace assignment that the newly
-        // hardened invariant guards protect: a cross-workspace move must land the
-        // surface in the destination workspace's tree, report that workspace, and
-        // (crucially) never panic the embedded daemon on the take/insert path.
+        // The destination location captured before the take must still point at
+        // the other workspace's pane when the surface is inserted.
         let store = StateStore::new_lazy(State::default());
         let ws1 = store
             .create_workspace(Some("one".into()), std::path::PathBuf::from("/tmp/one"))
@@ -4757,7 +4983,7 @@ Do you want to continue?";
         let out = store
             .move_surface_to_pane(src, moved, dst, usize::MAX)
             .await
-            .expect("cross-workspace move must succeed, not degrade or panic");
+            .expect("cross-workspace move must succeed");
         assert_eq!(out.dst_workspace, ws2);
         assert_eq!(out.src_workspace, ws1);
         assert!(pane_tab_ids(&store, ws2, dst).await.contains(&moved));
@@ -4795,6 +5021,30 @@ Do you want to continue?";
             .root_pane
             .parent_split_id(out.new_pane)
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn split_singleton_surface_into_its_own_pane_is_noop() {
+        let store = StateStore::new_lazy(State::default());
+        let ws = store
+            .create_workspace(Some("w".into()), std::path::PathBuf::from("/tmp/w"))
+            .await;
+        let before = store.get_workspace(ws).await.unwrap();
+        let pane = first_pane(&before);
+        let only = before.surfaces[0]
+            .root_pane
+            .active_surface_id(pane)
+            .unwrap();
+
+        assert!(store
+            .split_surface_into_pane(pane, only, pane, SplitDirection::Horizontal)
+            .await
+            .is_none());
+
+        let after = store.get_workspace(ws).await.unwrap();
+        assert_eq!(after.surfaces[0].root_pane.first_leaf_id(), Some(pane));
+        assert_eq!(pane_tab_ids(&store, ws, pane).await, vec![only]);
+        assert!(after.surfaces[0].root_pane.parent_split_id(pane).is_none());
     }
 
     #[tokio::test]

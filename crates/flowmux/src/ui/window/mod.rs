@@ -438,11 +438,11 @@ fn add_resize_handle(
     overlay.add_overlay(&handle);
 }
 
-mod surface_ops;
-mod file_browser;
 mod agent_bar;
-mod polling;
 mod command_palette;
+mod file_browser;
+mod polling;
+mod surface_ops;
 
 impl WindowController {
     pub fn new(
@@ -504,12 +504,15 @@ impl WindowController {
             "options loaded"
         );
         let options = Rc::new(RefCell::new(initial_options));
+        let (tab_drag_drop_seen, tab_drag_drop_committed) = sidebar.tab_drag_drop_state();
         let callbacks = make_callbacks(
             focused_pane.clone(),
             bridge.clone(),
             options.clone(),
             pane_registry.clone(),
             sidebar.workspace_titles(),
+            tab_drag_drop_seen,
+            tab_drag_drop_committed,
         );
 
         let content_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -1482,6 +1485,15 @@ impl WindowController {
                 });
             }
             GtkCommand::CloseSurface { pane, surface, ack } => {
+                // A successful in-process MOVE can rehome the surface before
+                // DragSource::drag-end emits its fallback close for the old
+                // pane. Reject that stale close before considering whether the
+                // old pane is the workspace's last one; otherwise we present a
+                // spurious workspace-close dialog and block the GTK dispatcher.
+                if self.store.surface_title(pane, surface).await.is_none() {
+                    let _ = ack.send(Err(format!("surface not found: {surface}")));
+                    return;
+                }
                 // Closing the only tab in a leaf falls through to
                 // close_pane(pane) inside the store; if that pane is
                 // also the workspace's only pane, the workspace dies.
@@ -2768,8 +2780,21 @@ impl WindowController {
 
     pub async fn restore_from_store(&self) {
         let snap = self.store.snapshot().await;
+        let mut rendered = HashSet::new();
+        for ws_id in &snap.workspace_order {
+            if let Some(ws) = snap.workspaces.iter().find(|ws| ws.id == *ws_id) {
+                if rendered.insert(ws.id) {
+                    self.render_workspace_with_activation(ws, false);
+                }
+            }
+        }
+        // StateStore normalizes workspace_order into a complete permutation,
+        // but retain a defensive fallback for snapshots produced by older
+        // state files or tests that construct State directly.
         for ws in &snap.workspaces {
-            self.render_workspace_with_activation(ws, false);
+            if rendered.insert(ws.id) {
+                self.render_workspace_with_activation(ws, false);
+            }
         }
         // First-render the side-panel rows had no MRU yet, so their
         // subtitle area was blank. Now that every workspace's pane
@@ -3010,6 +3035,8 @@ fn make_callbacks(
     options: Rc<RefCell<flowmux_config::options::Options>>,
     pane_registry: Rc<RefCell<PaneRegistry>>,
     workspace_titles: Rc<RefCell<Vec<(WorkspaceId, String)>>>,
+    tab_drag_drop_seen: Rc<Cell<bool>>,
+    tab_drag_drop_committed: Rc<Cell<bool>>,
 ) -> PaneCallbacks {
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -3266,8 +3293,8 @@ fn make_callbacks(
                 },
             ))
         },
-        tab_drag_drop_seen: Rc::new(Cell::new(false)),
-        tab_drag_drop_committed: Rc::new(Cell::new(false)),
+        tab_drag_drop_seen,
+        tab_drag_drop_committed,
         tab_drag_split_candidate: Rc::new(RefCell::new(None)),
         on_terminal_cwd_changed: {
             let bridge = bridge.clone();
@@ -3902,6 +3929,10 @@ mod tests {
     use flowmux_core::PaneContent;
     use flowmux_state::State;
 
+    fn agent_bar_visible(controller: &WindowController) -> bool {
+        controller.agent_bar.bar.root.property::<bool>("visible")
+    }
+
     fn workspace_with_tabbed_surface(
         pane: PaneId,
         pane_surface: PaneSurface,
@@ -3980,6 +4011,63 @@ mod tests {
             stored_surface_copy_text_from_workspace(&ws, pane, surface),
             CopyableText::url("https://example.test/docs".into())
         );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[gtk::test]
+    async fn restore_from_store_renders_sidebar_in_persisted_workspace_order() {
+        adw::init().expect("libadwaita should initialize in GTK test");
+        let store = StateStore::new_lazy(State::default());
+        let first = store
+            .create_workspace(
+                Some("first".into()),
+                PathBuf::from("/tmp/flowmux-order-first"),
+            )
+            .await;
+        let second = store
+            .create_workspace(
+                Some("second".into()),
+                PathBuf::from("/tmp/flowmux-order-second"),
+            )
+            .await;
+        let third = store
+            .create_workspace(
+                Some("third".into()),
+                PathBuf::from("/tmp/flowmux-order-third"),
+            )
+            .await;
+        assert!(store.reorder_workspace(third, 0).await);
+        store.set_active_workspace(Some(second)).await;
+        assert_eq!(
+            store.snapshot().await.workspace_order,
+            vec![third, first, second]
+        );
+
+        let (bridge, _rx) = Bridge::new();
+        let app = adw::Application::builder()
+            .application_id("com.flowmux.App.UiTest.RestoreWorkspaceOrder")
+            .build();
+        app.register(None::<&gtk::gio::Cancellable>).unwrap();
+        let controller = WindowController::new(
+            &app,
+            store,
+            Arc::new(ResolvedTheme::load()),
+            bridge,
+            gtk::CssProvider::new(),
+            None,
+        );
+
+        controller.restore_from_store().await;
+
+        let restored: Vec<WorkspaceId> = controller
+            .sidebar
+            .workspace_titles()
+            .borrow()
+            .iter()
+            .map(|(id, _)| *id)
+            .collect();
+        assert_eq!(restored, vec![third, first, second]);
+        assert_eq!(controller.sidebar.selected_workspace(), Some(second));
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -6341,6 +6429,7 @@ mod tests {
             gtk::CssProvider::new(),
             None,
         );
+        controller.options.borrow_mut().agent_bar_enabled = true;
         controller.render_workspace(&ws);
 
         // Split the original pane to the right. The new pane is the
@@ -6393,7 +6482,7 @@ mod tests {
             "precondition: closing pane starts with an agent block"
         );
         assert!(
-            controller.agent_bar.bar.root.is_visible(),
+            agent_bar_visible(&controller),
             "precondition: closing pane starts with an Agent Bar item"
         );
 
@@ -6439,19 +6528,21 @@ mod tests {
         // The workspace's top-level widget should now be the surviving
         // left pane's frame, not the old paned (the old paned was
         // unparented). `surfaces` map carries that pointer.
-        let surfaces = controller.surfaces.borrow();
-        let top = surfaces
-            .get(&ws_id)
-            .expect("surfaces map has workspace widget");
-        let left_frame = controller
-            .pane_registry
-            .borrow()
-            .pane_frame(left)
-            .expect("left frame still in registry");
-        assert_eq!(
-            top, &left_frame,
-            "the workspace stack child should be the surviving left pane's frame",
-        );
+        {
+            let surfaces = controller.surfaces.borrow();
+            let top = surfaces
+                .get(&ws_id)
+                .expect("surfaces map has workspace widget");
+            let left_frame = controller
+                .pane_registry
+                .borrow()
+                .pane_frame(left)
+                .expect("left frame still in registry");
+            assert_eq!(
+                top, &left_frame,
+                "the workspace stack child should be the surviving left pane's frame",
+            );
+        }
 
         // And the daemon-side state agrees: the workspace tree is now
         // a single leaf rooted at `left`, with no split node above it.
@@ -6478,7 +6569,7 @@ mod tests {
             "closing an agent pane must refresh sidebar details"
         );
         assert!(
-            !controller.agent_bar.bar.root.is_visible(),
+            !agent_bar_visible(&controller),
             "closing an agent pane must refresh Agent Bar visibility"
         );
     }
@@ -6512,6 +6603,7 @@ mod tests {
             gtk::CssProvider::new(),
             None,
         );
+        controller.options.borrow_mut().agent_bar_enabled = true;
         controller.render_workspace(&ws);
 
         let agent_dir = root.join("agent");
@@ -6553,7 +6645,7 @@ mod tests {
             "precondition: closing tab starts with an agent block"
         );
         assert!(
-            controller.agent_bar.bar.root.is_visible(),
+            agent_bar_visible(&controller),
             "precondition: closing tab starts with an Agent Bar item"
         );
 
@@ -6577,9 +6669,84 @@ mod tests {
             "closing an agent tab must refresh sidebar details"
         );
         assert!(
-            !controller.agent_bar.bar.root.is_visible(),
+            !agent_bar_visible(&controller),
             "closing an agent tab must refresh Agent Bar visibility"
         );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[gtk::test]
+    async fn stale_close_after_cross_workspace_move_does_not_prompt_or_close_source() {
+        adw::init().expect("libadwaita should initialize in GTK test");
+        let store = StateStore::new_lazy(State::default());
+        let src_workspace = store
+            .create_workspace(
+                Some("source".into()),
+                PathBuf::from("/tmp/flowmux-stale-close-source"),
+            )
+            .await;
+        let dst_workspace = store
+            .create_workspace(
+                Some("destination".into()),
+                PathBuf::from("/tmp/flowmux-stale-close-destination"),
+            )
+            .await;
+        let src_pane = store.get_workspace(src_workspace).await.unwrap().surfaces[0]
+            .root_pane
+            .first_leaf_id()
+            .unwrap();
+        let dst_pane = store.get_workspace(dst_workspace).await.unwrap().surfaces[0]
+            .root_pane
+            .first_leaf_id()
+            .unwrap();
+        let (_, moved_surface) = store
+            .add_terminal_surface_to_pane(src_pane, None)
+            .await
+            .expect("second source tab should be added");
+        store
+            .move_surface_to_workspace(src_pane, moved_surface, dst_workspace)
+            .await
+            .expect("cross-workspace move should succeed");
+
+        assert!(store.surface_title(src_pane, moved_surface).await.is_none());
+        assert!(store.surface_title(dst_pane, moved_surface).await.is_some());
+        assert_eq!(store.tab_count_in_pane(src_pane).await, Some(1));
+        assert_eq!(
+            store.workspace_pane_count_for(src_pane).await,
+            Some((src_workspace, 1))
+        );
+
+        let (bridge, _rx) = Bridge::new();
+        let app = adw::Application::builder()
+            .application_id("com.flowmux.App.UiTest.StaleCloseAfterMove")
+            .build();
+        app.register(None::<&gtk::gio::Cancellable>).unwrap();
+        let controller = WindowController::new(
+            &app,
+            store.clone(),
+            Arc::new(ResolvedTheme::load()),
+            bridge,
+            gtk::CssProvider::new(),
+            None,
+        );
+
+        let (ack_tx, ack_rx) = oneshot::channel();
+        controller
+            .dispatch(GtkCommand::CloseSurface {
+                pane: src_pane,
+                surface: moved_surface,
+                ack: ack_tx,
+            })
+            .await;
+        let error = ack_rx
+            .await
+            .expect("stale close must acknowledge")
+            .expect_err("stale close must be rejected");
+
+        assert!(error.contains("surface not found"));
+        assert!(store.get_workspace(src_workspace).await.is_some());
+        assert_eq!(store.tab_count_in_pane(src_pane).await, Some(1));
+        assert!(store.surface_title(dst_pane, moved_surface).await.is_some());
     }
 
     /// Regression: closing the split sibling must keep the surviving pane's
@@ -7310,11 +7477,13 @@ mod tests {
             gtk::CssProvider::new(),
             None,
         );
-        // `WindowController::new` loads the developer's real options.json. These
-        // tests assert the in-app ack contract (entry recorded → `Some(id)`),
-        // which the system-notification toggle gates — pin it on so a local
-        // `system_notifications_enabled: false` can't flip the ack path.
-        controller.options.borrow_mut().system_notifications_enabled = true;
+        // `WindowController::new` loads the developer's real options.json, so
+        // pin options that affect these assertions.
+        {
+            let mut options = controller.options.borrow_mut();
+            options.system_notifications_enabled = true;
+            options.agent_bar_enabled = true;
+        }
         controller.render_workspace(&ws);
         store.set_active_workspace(Some(ws_id)).await;
         (controller, ws_id, pane)
@@ -7332,7 +7501,7 @@ mod tests {
             .expect("single workspace pane should have an active surface");
 
         assert!(
-            !controller.agent_bar.bar.root.is_visible(),
+            !agent_bar_visible(&controller),
             "Agent Bar should stay hidden while no live agents exist"
         );
 
@@ -7354,7 +7523,7 @@ mod tests {
             })
             .await;
         assert!(
-            controller.agent_bar.bar.root.is_visible(),
+            agent_bar_visible(&controller),
             "SetAgentStatus must refresh Agent Bar after a live agent appears"
         );
 
@@ -7366,7 +7535,7 @@ mod tests {
             })
             .await;
         assert!(
-            !controller.agent_bar.bar.root.is_visible(),
+            !agent_bar_visible(&controller),
             "SetAgentStatus must hide Agent Bar after the last agent is cleared"
         );
     }
@@ -7401,14 +7570,14 @@ mod tests {
             })
             .await;
         assert!(
-            !controller.agent_bar.bar.root.is_visible(),
+            !agent_bar_visible(&controller),
             "disabled Agent Bar option must hide live agent items"
         );
 
         controller.options.borrow_mut().agent_bar_enabled = true;
         controller.refresh_agent_bar().await;
         assert!(
-            controller.agent_bar.bar.root.is_visible(),
+            agent_bar_visible(&controller),
             "re-enabling Agent Bar should render existing live agents"
         );
     }
@@ -7472,7 +7641,7 @@ mod tests {
             .sync_workspace_agent_status_from_store(ws_b)
             .await;
         assert!(
-            controller.agent_bar.bar.root.is_visible(),
+            agent_bar_visible(&controller),
             "precondition: Agent Bar is visible before clicking an item"
         );
 
@@ -8746,8 +8915,75 @@ mod tests {
         found
     }
 
-    /// Dropping a tab on the split region creates a sibling pane holding the
-    /// same live terminal widget.
+    /// A singleton tab cannot split its own pane without leaving an empty source
+    /// leaf. The rejected drop must restore the same live terminal widget.
+    #[gtk::test]
+    async fn splitting_singleton_surface_into_its_own_pane_restores_live_widget() {
+        adw::init().expect("libadwaita should initialize in GTK test");
+        let root = std::env::temp_dir().join("flowmux-ui-split-singleton-self");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = StateStore::new_lazy(State::default());
+        let ws_id = store
+            .create_workspace(Some("ui".into()), root.clone())
+            .await;
+        let ws = store.get_workspace(ws_id).await.unwrap();
+        let pane = ws.surfaces[0].root_pane.first_leaf_id().unwrap();
+        let surface = ws.surfaces[0].root_pane.active_surface_id(pane).unwrap();
+
+        let (bridge, _rx) = Bridge::new();
+        let app = adw::Application::builder()
+            .application_id("com.flowmux.App.UiTest.SplitSingletonSelf")
+            .build();
+        app.register(None::<&gtk::gio::Cancellable>).unwrap();
+        let controller = WindowController::new(
+            &app,
+            store.clone(),
+            Arc::new(ResolvedTheme::load()),
+            bridge,
+            gtk::CssProvider::new(),
+            None,
+        );
+        controller.render_workspace(&ws);
+
+        let before = controller
+            .pane_registry
+            .borrow()
+            .terminals
+            .get(&surface)
+            .map(|terminal| terminal.root_widget())
+            .expect("singleton terminal should be rendered");
+
+        let (ack_tx, ack_rx) = oneshot::channel();
+        controller
+            .dispatch(GtkCommand::SplitSurfaceIntoPane {
+                src_pane: pane,
+                surface,
+                surface_model: None,
+                dst_pane: pane,
+                direction: flowmux_core::SplitDirection::Horizontal,
+                ack: ack_tx,
+            })
+            .await;
+        assert!(ack_rx.await.unwrap().is_err());
+
+        let ws_after = store.get_workspace(ws_id).await.unwrap();
+        assert_eq!(pane_of_surface(&ws_after, surface), Some(pane));
+        assert!(ws_after.surfaces[0]
+            .root_pane
+            .parent_split_id(pane)
+            .is_none());
+        let registry = controller.pane_registry.borrow();
+        let terminal = registry
+            .terminals
+            .get(&surface)
+            .expect("rejected split must reattach the live terminal");
+        assert_eq!(terminal.id(), pane);
+        assert_eq!(terminal.root_widget(), before);
+        assert!(registry.has_pane(pane));
+    }
+
+    /// Dropping a tab on another pane's split region creates a sibling pane
+    /// holding the same live terminal widget.
     #[gtk::test]
     async fn split_surface_into_pane_preserves_live_widget() {
         adw::init().expect("libadwaita should initialize in GTK test");

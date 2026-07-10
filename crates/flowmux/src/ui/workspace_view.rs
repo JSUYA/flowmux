@@ -1535,8 +1535,8 @@ mod tab_dnd_tests {
         assert!(stack.child_by_name(&surface.to_string()).is_none());
         assert!(tab_widget.parent().is_none());
         assert!(registry.surface_tabs.get(&pane).unwrap().is_empty());
-        assert!(registry.surface_tab_labels.get(&surface).is_none());
-        assert!(registry.surface_workspace.get(&surface).is_none());
+        assert!(!registry.surface_tab_labels.contains_key(&surface));
+        assert!(!registry.surface_workspace.contains_key(&surface));
         assert!(registry.active_surface(pane).is_none());
     }
 }
@@ -1939,6 +1939,7 @@ fn install_macos_tab_split_drag_fallback(
     drag_widget.add_controller(gesture);
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn tab_drag_split_direction_from_delta(dx: f64, dy: f64) -> Option<SplitDirection> {
     const MIN_DRAG_DISTANCE: f64 = 80.0;
     let right = dx >= MIN_DRAG_DISTANCE;

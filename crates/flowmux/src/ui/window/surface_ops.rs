@@ -788,7 +788,12 @@ impl WindowController {
     }
     /// Best-effort restore of a detached surface back into its source pane when
     /// a move is rejected by the store.
-    pub(super) async fn reattach_surface(&self, src_pane: PaneId, surface: SurfaceId, moving: MovingSurface) {
+    pub(super) async fn reattach_surface(
+        &self,
+        src_pane: PaneId,
+        surface: SurfaceId,
+        moving: MovingSurface,
+    ) {
         let Some(ws_id) = self.store.workspace_of_pane(src_pane).await else {
             return;
         };

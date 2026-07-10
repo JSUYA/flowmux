@@ -164,7 +164,9 @@ pub(crate) async fn run_hooks_doctor(socket: Option<PathBuf>) {
         println!("  (no HOME — debug log disabled)");
     }
 }
-pub(crate) fn parse_hook_targets(agents: &[String]) -> anyhow::Result<Vec<hook_install::HookTarget>> {
+pub(crate) fn parse_hook_targets(
+    agents: &[String],
+) -> anyhow::Result<Vec<hook_install::HookTarget>> {
     if agents.is_empty() {
         return Ok(hook_install::HookTarget::ALL.to_vec());
     }

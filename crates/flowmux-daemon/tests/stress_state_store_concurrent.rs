@@ -84,15 +84,25 @@ fn assert_state_invariants(state: &State) {
             }
         }
     }
-    // workspace_order, when present, must reference real workspaces (no
-    // dangling ids).
+    // workspace_order is a total permutation of live workspaces: no dangling
+    // ids, duplicates, or omissions.
+    let mut ordered_ws_ids = HashSet::new();
     for id in &state.workspace_order {
         assert!(
             all_ws_ids.contains(id),
             "workspace_order references unknown id {:?}",
             id
         );
+        assert!(
+            ordered_ws_ids.insert(*id),
+            "workspace_order contains duplicate id {:?}",
+            id
+        );
     }
+    assert_eq!(
+        ordered_ws_ids, all_ws_ids,
+        "workspace_order must contain every live workspace exactly once"
+    );
     if let Some(active) = state.active_workspace {
         assert!(
             all_ws_ids.contains(&active),

@@ -25,12 +25,14 @@ use crate::ui::workspace_view::{
 };
 use flowmux_core::{AgentStatus, NotificationLevel, PrState, Workspace, WorkspaceId};
 use gtk::prelude::*;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use tokio::sync::oneshot;
 
 type RowsCell = Rc<RefCell<Vec<(WorkspaceId, gtk::ListBoxRow)>>>;
+
+const WORKSPACE_DND_MIME: &str = "application/x-flowmux-workspace";
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct WorkspaceRowDetails {
@@ -81,6 +83,8 @@ pub struct Sidebar {
     /// workspace set and names at click time. Kept in sync by `upsert_inner`,
     /// `reorder`, and `remove`.
     titles: Rc<RefCell<Vec<(WorkspaceId, String)>>>,
+    tab_drag_drop_seen: Rc<Cell<bool>>,
+    tab_drag_drop_committed: Rc<Cell<bool>>,
 }
 
 impl Sidebar {
@@ -267,6 +271,8 @@ impl Sidebar {
             bridge,
             subtitle_cache: Rc::new(RefCell::new(HashMap::new())),
             titles: Rc::new(RefCell::new(Vec::new())),
+            tab_drag_drop_seen: Rc::new(Cell::new(false)),
+            tab_drag_drop_committed: Rc::new(Cell::new(false)),
         }
     }
 
@@ -290,6 +296,13 @@ impl Sidebar {
     /// the pane tab "Move" submenu so it always reflects the current set.
     pub fn workspace_titles(&self) -> Rc<RefCell<Vec<(WorkspaceId, String)>>> {
         self.titles.clone()
+    }
+
+    pub(crate) fn tab_drag_drop_state(&self) -> (Rc<Cell<bool>>, Rc<Cell<bool>>) {
+        (
+            self.tab_drag_drop_seen.clone(),
+            self.tab_drag_drop_committed.clone(),
+        )
     }
 
     fn upsert_inner(&self, ws: &Workspace, details: &WorkspaceRowDetails) {
@@ -327,7 +340,13 @@ impl Sidebar {
         let status = self.agent_status.borrow().get(&ws.id).copied();
         apply_agent_status_class(&row, status);
         attach_dnd_handlers(&row, ws.id, self.bridge.clone(), self.rows.clone());
-        attach_tab_drop_to_row(&row, ws.id, self.bridge.clone());
+        attach_tab_drop_to_row(
+            &row,
+            ws.id,
+            self.bridge.clone(),
+            self.tab_drag_drop_seen.clone(),
+            self.tab_drag_drop_committed.clone(),
+        );
         self.list.append(&row);
         rows.push((ws.id, row));
     }
@@ -350,11 +369,19 @@ impl Sidebar {
         }
 
         let (rid, row) = rows.remove(current);
+        let was_selected = self.list.selected_row().as_ref() == Some(&row);
         // Detach the row widget from ListBox and insert the same widget at the
         // new position. `gtk::ListBox::insert(_, position)` appends when
         // position is -1 or beyond the length.
         self.list.remove(&row);
         self.list.insert(&row, target as i32);
+        if was_selected {
+            // A removed ListBoxRow keeps its selected flag even though the
+            // ListBox no longer reports it as selected. Clear that stale flag
+            // before selecting the reinserted row so GTK records it again.
+            self.list.unselect_all();
+            self.list.select_row(Some(&row));
+        }
         rows.insert(target, (rid, row));
         {
             let mut titles = self.titles.borrow_mut();
@@ -370,7 +397,7 @@ impl Sidebar {
         let mut rows = self.rows.borrow_mut();
         if let Some(idx) = rows.iter().position(|(wid, _)| *wid == id) {
             self.list.remove(&rows[idx].1);
-            rows.swap_remove(idx);
+            rows.remove(idx);
         }
         self.agent_status.borrow_mut().remove(&id);
         self.titles.borrow_mut().retain(|(tid, _)| *tid != id);
@@ -697,12 +724,7 @@ fn attach_dnd_handlers(row: &gtk::ListBoxRow, id: WorkspaceId, bridge: Bridge, r
     let id_for_prepare = id;
     drag_source.connect_prepare(move |_, _, _| {
         tracing::debug!(workspace = %id_for_prepare, "sidebar drag prepare");
-        // ContentProvider::for_value + DropTarget::new(String) gives the most
-        // reliable type match. for_bytes(mime, bytes) creates MIME-specific
-        // content that did not match DropTarget::new(Bytes::static_type()), so
-        // motion/drop signals never fired.
-        let payload = id_for_prepare.to_string();
-        Some(gtk::gdk::ContentProvider::for_value(&payload.to_value()))
+        Some(workspace_dnd_content_provider(id_for_prepare))
     });
     let row_for_begin = row.clone();
     drag_source.connect_drag_begin(move |_, _| {
@@ -836,16 +858,30 @@ fn attach_dnd_handlers(row: &gtk::ListBoxRow, id: WorkspaceId, bridge: Bridge, r
     row.add_controller(drop_target);
 }
 
+fn workspace_dnd_content_provider(id: WorkspaceId) -> gtk::gdk::ContentProvider {
+    let payload = id.to_string();
+    let bytes = gtk::glib::Bytes::from_owned(payload.clone().into_bytes());
+    let mime_provider = gtk::gdk::ContentProvider::for_bytes(WORKSPACE_DND_MIME, &bytes);
+    let value_provider = gtk::gdk::ContentProvider::for_value(&payload.to_value());
+    gtk::gdk::ContentProvider::new_union(&[mime_provider, value_provider])
+}
+
 /// Make a side-panel workspace row a drop target for **pane tab** drags.
 /// Hovering a tab over the row selects that workspace mid-drag (so the user can
 /// keep dragging into one of its panes), and releasing on the row moves the tab
 /// to the last position of the workspace's first pane.
-fn attach_tab_drop_to_row(row: &gtk::ListBoxRow, ws_id: WorkspaceId, bridge: Bridge) {
+fn attach_tab_drop_to_row(
+    row: &gtk::ListBoxRow,
+    ws_id: WorkspaceId,
+    bridge: Bridge,
+    tab_drag_drop_seen: Rc<Cell<bool>>,
+    tab_drag_drop_committed: Rc<Cell<bool>>,
+) {
     let drop_target =
         gtk::DropTargetAsync::new(Some(tab_dnd_content_formats()), gtk::gdk::DragAction::MOVE);
     let bridge_accept = bridge.clone();
     drop_target.connect_accept(move |target, drop| {
-        if tab_dnd_formats_accept_payload(&drop.formats()) {
+        if sidebar_tab_drop_accepts_formats(&drop.formats()) {
             let bridge = bridge_accept.clone();
             gtk::glib::MainContext::default().spawn_local(async move {
                 let _ = bridge
@@ -861,6 +897,8 @@ fn attach_tab_drop_to_row(row: &gtk::ListBoxRow, ws_id: WorkspaceId, bridge: Bri
     });
     let bridge_drop = bridge.clone();
     drop_target.connect_drop(move |_, drop, _x, _y| {
+        tab_drag_drop_seen.set(true);
+        tab_drag_drop_committed.set(true);
         let drop = drop.clone();
         let bridge = bridge_drop.clone();
         gtk::glib::MainContext::default().spawn_local(async move {
@@ -874,8 +912,8 @@ fn attach_tab_drop_to_row(row: &gtk::ListBoxRow, ws_id: WorkspaceId, bridge: Bri
             };
             let src_pane = payload.src_pane;
             let surface = payload.src_surface;
-            let (ack_tx, _ack_rx) = oneshot::channel();
-            let _ = bridge
+            let (ack_tx, ack_rx) = oneshot::channel();
+            if let Err(error) = bridge
                 .tx
                 .send(GtkCommand::MoveSurfaceToWorkspace {
                     src_pane,
@@ -883,12 +921,31 @@ fn attach_tab_drop_to_row(row: &gtk::ListBoxRow, ws_id: WorkspaceId, bridge: Bri
                     dst_workspace: ws_id,
                     ack: ack_tx,
                 })
-                .await;
-            drop.finish(gtk::gdk::DragAction::MOVE);
+                .await
+            {
+                tracing::warn!(%error, "sidebar tab drop: bridge send failed");
+                drop.finish(gtk::gdk::DragAction::empty());
+                return;
+            }
+            match ack_rx.await {
+                Ok(Ok(())) => drop.finish(gtk::gdk::DragAction::MOVE),
+                Ok(Err(error)) => {
+                    tracing::warn!(%error, "sidebar tab drop: move rejected");
+                    drop.finish(gtk::gdk::DragAction::empty());
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "sidebar tab drop: move acknowledgement dropped");
+                    drop.finish(gtk::gdk::DragAction::empty());
+                }
+            }
         });
         true
     });
     row.add_controller(drop_target);
+}
+
+fn sidebar_tab_drop_accepts_formats(formats: &gtk::gdk::ContentFormats) -> bool {
+    !formats.contain_mime_type(WORKSPACE_DND_MIME) && tab_dnd_formats_accept_payload(formats)
 }
 
 fn row_widget(
@@ -1413,5 +1470,80 @@ mod tests {
             Some("MyName".to_string()),
             "custom title is reflected after rename",
         );
+    }
+
+    #[test]
+    fn workspace_drag_formats_are_rejected_by_sidebar_tab_target() {
+        let workspace_provider = workspace_dnd_content_provider(WorkspaceId::new());
+        let formats = workspace_provider.formats();
+
+        assert!(formats.contain_mime_type(WORKSPACE_DND_MIME));
+        assert!(formats.contains_type(gtk::glib::types::Type::STRING));
+        assert!(!sidebar_tab_drop_accepts_formats(&formats));
+        assert!(sidebar_tab_drop_accepts_formats(&tab_dnd_content_formats()));
+
+        let legacy_tab_formats = gtk::gdk::ContentFormats::builder()
+            .add_type(gtk::glib::types::Type::STRING)
+            .build();
+        assert!(sidebar_tab_drop_accepts_formats(&legacy_tab_formats));
+    }
+
+    #[gtk::test]
+    fn removing_workspace_preserves_survivor_order_for_followup_reorder() {
+        if gtk::init().is_err() {
+            return;
+        }
+        let bridge = crate::bridge::Bridge::new().0;
+        let sidebar = Sidebar::new(|_| {}, |_| {}, bridge, NotificationStore::new());
+
+        let workspaces: Vec<Workspace> = (0..4)
+            .map(|index| {
+                let mut ws = ws_with_active_terminal_cwd(Some(PathBuf::from(format!(
+                    "/tmp/flowmux-sidebar-order-{index}"
+                ))));
+                ws.name = format!("workspace-{index}");
+                ws
+            })
+            .collect();
+        for ws in &workspaces {
+            sidebar.upsert(ws);
+        }
+        let ids: Vec<WorkspaceId> = workspaces.iter().map(|ws| ws.id).collect();
+
+        sidebar.remove(ids[1]);
+
+        let row_ids: Vec<WorkspaceId> = sidebar.rows.borrow().iter().map(|(id, _)| *id).collect();
+        assert_eq!(row_ids, vec![ids[0], ids[2], ids[3]]);
+        let row_positions: Vec<i32> = sidebar
+            .rows
+            .borrow()
+            .iter()
+            .map(|(_, row)| row.index())
+            .collect();
+        assert_eq!(row_positions, vec![0, 1, 2]);
+
+        sidebar.select_workspace(ids[3]);
+        assert_eq!(sidebar.selected_workspace(), Some(ids[3]));
+        sidebar.reorder(ids[3], 0);
+
+        let expected = vec![ids[3], ids[0], ids[2]];
+        let reordered_rows: Vec<WorkspaceId> =
+            sidebar.rows.borrow().iter().map(|(id, _)| *id).collect();
+        let reordered_titles: Vec<WorkspaceId> = sidebar
+            .workspace_titles()
+            .borrow()
+            .iter()
+            .map(|(id, _)| *id)
+            .collect();
+        assert_eq!(reordered_rows, expected);
+        assert_eq!(reordered_titles, expected);
+        assert_eq!(sidebar.selected_workspace(), Some(ids[3]));
+        let reordered_positions: Vec<i32> = sidebar
+            .rows
+            .borrow()
+            .iter()
+            .map(|(_, row)| row.index())
+            .collect();
+        assert_eq!(reordered_positions, vec![0, 1, 2]);
     }
 }

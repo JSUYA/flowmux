@@ -45,7 +45,9 @@ impl WindowController {
             attentions.retain(|surface| live_surfaces.contains(surface));
             attentions.clone()
         };
-        self.agent_bar.bar.render(&model, &attentions, focused_surface);
+        self.agent_bar
+            .bar
+            .render(&model, &attentions, focused_surface);
     }
     pub(super) async fn sync_workspace_agent_status(
         &self,
@@ -126,7 +128,10 @@ impl WindowController {
             }
         }
     }
-    pub(super) fn clear_all_notification_attention_for_entries(&self, entries: &[NotificationEntry]) {
+    pub(super) fn clear_all_notification_attention_for_entries(
+        &self,
+        entries: &[NotificationEntry],
+    ) {
         for entry in entries {
             if let Some(surface) = entry.surface {
                 self.clear_agent_bar_attention(surface);
@@ -136,7 +141,11 @@ impl WindowController {
             }
         }
     }
-    pub(super) async fn refresh_agent_screen_status(&self, surface: SurfaceId, title: Option<String>) {
+    pub(super) async fn refresh_agent_screen_status(
+        &self,
+        surface: SurfaceId,
+        title: Option<String>,
+    ) {
         let (screen, title) = {
             let registry = self.pane_registry.borrow();
             let screen = registry
@@ -170,7 +179,12 @@ impl WindowController {
         }
         self.refresh_agent_bar().await;
     }
-    pub(super) async fn open_agent_bar_item(&self, workspace: WorkspaceId, pane: PaneId, surface: SurfaceId) {
+    pub(super) async fn open_agent_bar_item(
+        &self,
+        workspace: WorkspaceId,
+        pane: PaneId,
+        surface: SurfaceId,
+    ) {
         self.activate_workspace(workspace).await;
         if self.pane_registry.borrow().active_surface(pane) != Some(surface) {
             self.activate_surface_now(pane, surface).await;

@@ -2876,7 +2876,7 @@ mod tests {
         panel.set_delete_handler(move |path| {
             attempted_for_handler.borrow_mut().push(display_name(path));
             if path == failed {
-                Err(io::Error::new(io::ErrorKind::Other, "blocked"))
+                Err(io::Error::other("blocked"))
             } else {
                 fs::remove_file(path)
             }

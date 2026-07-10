@@ -34,7 +34,7 @@ pub fn pid_alive(pid: u32) -> bool {
     }
     #[cfg(target_os = "linux")]
     {
-        return std::path::Path::new(&format!("/proc/{pid}")).exists();
+        std::path::Path::new(&format!("/proc/{pid}")).exists()
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -203,7 +203,10 @@ fn read_children(pid: u32) -> Option<Vec<u32>> {
         let path = entry.path().join("children");
         if let Ok(s) = fs::read_to_string(&path) {
             any = true;
-            kids.extend(s.split_ascii_whitespace().filter_map(|t| t.parse::<u32>().ok()));
+            kids.extend(
+                s.split_ascii_whitespace()
+                    .filter_map(|t| t.parse::<u32>().ok()),
+            );
         }
     }
     // Only report "feature unavailable" when not a single children file was
@@ -394,7 +397,10 @@ mod tests {
             Some("codex")
         );
         // A `.js`/`.mjs`/`.cjs` script suffix is stripped before matching.
-        assert_eq!(agent_from_argv(&argv(&["node", "/opt/aider.js"])), Some("aider"));
+        assert_eq!(
+            agent_from_argv(&argv(&["node", "/opt/aider.js"])),
+            Some("aider")
+        );
         // python-hosted agent, argv[0] as a full path.
         assert_eq!(
             agent_from_argv(&argv(&["/usr/bin/python3", "/usr/bin/aider"])),
@@ -428,7 +434,10 @@ mod tests {
         let (release_tx, release_rx) = mpsc::channel::<()>();
         let (pid_tx, pid_rx) = mpsc::channel::<u32>();
         let worker = std::thread::spawn(move || {
-            let mut child = Command::new("sleep").arg("30").spawn().expect("spawn sleep");
+            let mut child = Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .expect("spawn sleep");
             pid_tx.send(child.id()).unwrap();
             let _ = release_rx.recv(); // keep this thread (and its children file) alive
             let _ = child.kill();
@@ -440,7 +449,10 @@ mod tests {
         let found = kids.contains(&child_pid);
         let _ = release_tx.send(()); // let the worker reap its child and exit
         worker.join().unwrap();
-        assert!(found, "worker-thread child {child_pid} missing from {kids:?}");
+        assert!(
+            found,
+            "worker-thread child {child_pid} missing from {kids:?}"
+        );
     }
 
     #[test]

@@ -329,9 +329,8 @@ impl GuiHandler {
                 // Validate the pane against live state (reusing the
                 // tree flattener), then fire the same ActivateSurface
                 // the tab bar uses. Non-destructive, no dialog.
-                let tree = flowmux_ipc::protocol::describe_workspaces(
-                    &self.inner.store().snapshot().await.workspaces,
-                );
+                let workspaces = self.inner.store().ordered_workspaces().await;
+                let tree = flowmux_ipc::protocol::describe_workspaces(&workspaces);
                 let pane_found = tree.iter().flat_map(|w| &w.panes).any(|p| p.id == pane);
                 let surface_found = tree
                     .iter()
@@ -356,9 +355,8 @@ impl GuiHandler {
             Request::SurfaceClose { pane, surface } => {
                 // Refuse the last-tab-of-last-pane case up front so the
                 // agent never trips CloseSurface's confirm dialog.
-                let tree = flowmux_ipc::protocol::describe_workspaces(
-                    &self.inner.store().snapshot().await.workspaces,
-                );
+                let workspaces = self.inner.store().ordered_workspaces().await;
+                let tree = flowmux_ipc::protocol::describe_workspaces(&workspaces);
                 let pane_found = tree.iter().flat_map(|w| &w.panes).any(|p| p.id == pane);
                 let surface_found = tree
                     .iter()

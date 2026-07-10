@@ -90,9 +90,9 @@ impl Handler for DaemonHandler {
                 }
 
                 Request::WorkspaceTree => {
-                    let state = self.store.snapshot().await;
+                    let workspaces = self.store.ordered_workspaces().await;
                     Response::Tree {
-                        workspaces: flowmux_ipc::protocol::describe_workspaces(&state.workspaces),
+                        workspaces: flowmux_ipc::protocol::describe_workspaces(&workspaces),
                     }
                 }
 
@@ -301,6 +301,39 @@ mod tests {
         assert_eq!(tabs.len(), 1);
         assert_eq!(tabs[0].kind, "terminal");
         assert!(tabs[0].active);
+    }
+
+    #[tokio::test]
+    async fn workspace_list_and_tree_follow_sidebar_order() {
+        let handler = DaemonHandler::new(StateStore::new_lazy(State::default()));
+        let a = handler
+            .store()
+            .create_workspace(Some("a".into()), "/tmp/a".into())
+            .await;
+        let b = handler
+            .store()
+            .create_workspace(Some("b".into()), "/tmp/b".into())
+            .await;
+        let c = handler
+            .store()
+            .create_workspace(Some("c".into()), "/tmp/c".into())
+            .await;
+        assert!(handler.store().reorder_workspace(a, 2).await);
+
+        assert!(matches!(
+            handler.handle(Request::WorkspaceList).await,
+            Response::WorkspaceList { ids } if ids == vec![b, c, a]
+        ));
+        let tree = match handler.handle(Request::WorkspaceTree).await {
+            Response::Tree { workspaces } => workspaces,
+            other => panic!("expected tree, got {other:?}"),
+        };
+        assert_eq!(
+            tree.iter()
+                .map(|workspace| workspace.id)
+                .collect::<Vec<_>>(),
+            vec![b, c, a]
+        );
     }
 
     #[tokio::test]
