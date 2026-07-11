@@ -16,15 +16,18 @@ use objc2::{
 };
 use objc2_app_kit::{NSBitmapImageFileType, NSBitmapImageRep, NSResponder, NSView, NSWindow};
 use objc2_foundation::{
-    NSDictionary, NSError, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString, NSURLRequest,
-    NSURL, NSUUID,
+    NSDictionary, NSError, NSObjectProtocol, NSPoint, NSProgressReporting, NSRect, NSSize,
+    NSString, NSURLRequest, NSURL, NSUUID,
 };
 use objc2_web_kit::{
-    WKAudiovisualMediaTypes, WKFrameInfo, WKMediaCaptureType, WKNavigationAction,
-    WKPermissionDecision, WKPreferences, WKSecurityOrigin, WKSnapshotConfiguration, WKUIDelegate,
-    WKWebView, WKWebViewConfiguration, WKWebsiteDataStore, WKWindowFeatures,
+    WKAudiovisualMediaTypes, WKDownload, WKDownloadDelegate, WKFrameInfo, WKMediaCaptureType,
+    WKNavigationAction, WKNavigationActionPolicy, WKNavigationDelegate, WKNavigationResponse,
+    WKNavigationResponsePolicy, WKPermissionDecision, WKPreferences, WKSecurityOrigin,
+    WKSnapshotConfiguration, WKUIDelegate, WKWebView, WKWebViewConfiguration, WKWebsiteDataStore,
+    WKWindowFeatures,
 };
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -53,9 +56,25 @@ pub struct BrowserPane {
 struct NativeBrowserView {
     web_view: Retained<WKWebView>,
     _ui_delegate: Retained<BrowserUIDelegate>,
+    _navigation_delegate: Retained<BrowserNavigationDelegate>,
     last_url: RefCell<String>,
     last_title: RefCell<String>,
     zoom: Cell<f64>,
+}
+
+struct DownloadUi {
+    name: gtk::Label,
+    progress: gtk::ProgressBar,
+    cancel: gtk::Button,
+    handle: Rc<RefCell<Option<Retained<WKDownload>>>>,
+}
+
+struct BrowserNavigationDelegateIvars {
+    downloads_button: gtk::MenuButton,
+    downloads_list: gtk::Box,
+    downloads_empty: gtk::Label,
+    download_directory: PathBuf,
+    downloads: RefCell<HashMap<usize, DownloadUi>>,
 }
 
 struct BrowserUIDelegateIvars {
@@ -127,6 +146,225 @@ define_class!(
         }
     }
 );
+
+define_class!(
+    // SAFETY: NSObject has no subclassing requirements. WebKit invokes both
+    // delegate protocols on the main thread.
+    #[unsafe(super(NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[ivars = BrowserNavigationDelegateIvars]
+    struct BrowserNavigationDelegate;
+
+    unsafe impl NSObjectProtocol for BrowserNavigationDelegate {}
+
+    unsafe impl WKNavigationDelegate for BrowserNavigationDelegate {
+        #[unsafe(method(webView:decidePolicyForNavigationAction:decisionHandler:))]
+        #[allow(non_snake_case)]
+        fn webView_decidePolicyForNavigationAction_decisionHandler(
+            &self,
+            _web_view: &WKWebView,
+            navigation_action: &WKNavigationAction,
+            decision_handler: &block2::DynBlock<dyn Fn(WKNavigationActionPolicy)>,
+        ) {
+            let policy = if unsafe { navigation_action.shouldPerformDownload() } {
+                WKNavigationActionPolicy::Download
+            } else {
+                WKNavigationActionPolicy::Allow
+            };
+            decision_handler.call((policy,));
+        }
+
+        #[unsafe(method(webView:decidePolicyForNavigationResponse:decisionHandler:))]
+        #[allow(non_snake_case)]
+        fn webView_decidePolicyForNavigationResponse_decisionHandler(
+            &self,
+            _web_view: &WKWebView,
+            navigation_response: &WKNavigationResponse,
+            decision_handler: &block2::DynBlock<dyn Fn(WKNavigationResponsePolicy)>,
+        ) {
+            let policy = if unsafe { navigation_response.canShowMIMEType() } {
+                WKNavigationResponsePolicy::Allow
+            } else {
+                WKNavigationResponsePolicy::Download
+            };
+            decision_handler.call((policy,));
+        }
+
+        #[unsafe(method(webView:navigationAction:didBecomeDownload:))]
+        #[allow(non_snake_case)]
+        fn webView_navigationAction_didBecomeDownload(
+            &self,
+            _web_view: &WKWebView,
+            _navigation_action: &WKNavigationAction,
+            download: &WKDownload,
+        ) {
+            self.begin_download(download);
+        }
+
+        #[unsafe(method(webView:navigationResponse:didBecomeDownload:))]
+        #[allow(non_snake_case)]
+        fn webView_navigationResponse_didBecomeDownload(
+            &self,
+            _web_view: &WKWebView,
+            _navigation_response: &WKNavigationResponse,
+            download: &WKDownload,
+        ) {
+            self.begin_download(download);
+        }
+    }
+
+    unsafe impl WKDownloadDelegate for BrowserNavigationDelegate {
+        #[unsafe(method(download:decideDestinationUsingResponse:suggestedFilename:completionHandler:))]
+        #[allow(non_snake_case)]
+        fn download_decideDestinationUsingResponse_suggestedFilename_completionHandler(
+            &self,
+            download: &WKDownload,
+            _response: &objc2_foundation::NSURLResponse,
+            suggested_filename: &NSString,
+            completion_handler: &block2::DynBlock<dyn Fn(*mut NSURL)>,
+        ) {
+            let key = download_key(download);
+            let directory = &self.ivars().download_directory;
+            if let Err(error) = std::fs::create_dir_all(directory) {
+                if let Some(ui) = self.ivars().downloads.borrow().get(&key) {
+                    ui.name.set_text(&format!("Download failed: {error}"));
+                }
+                completion_handler.call((std::ptr::null_mut(),));
+                return;
+            }
+
+            let destination = available_download_path(directory, &suggested_filename.to_string());
+            if let Some(ui) = self.ivars().downloads.borrow().get(&key) {
+                ui.name.set_text(
+                    destination
+                        .file_name()
+                        .and_then(|value| value.to_str())
+                        .unwrap_or("download"),
+                );
+                ui.name
+                    .set_tooltip_text(Some(&destination.display().to_string()));
+            }
+            let path = NSString::from_str(&destination.to_string_lossy());
+            let url = NSURL::fileURLWithPath(&path);
+            completion_handler.call((Retained::as_ptr(&url).cast_mut(),));
+        }
+
+        #[unsafe(method(downloadDidFinish:))]
+        #[allow(non_snake_case)]
+        fn downloadDidFinish(&self, download: &WKDownload) {
+            self.finish_download(download, None);
+        }
+
+        #[unsafe(method(download:didFailWithError:resumeData:))]
+        #[allow(non_snake_case)]
+        fn download_didFailWithError_resumeData(
+            &self,
+            download: &WKDownload,
+            error: &NSError,
+            _resume_data: Option<&objc2_foundation::NSData>,
+        ) {
+            self.finish_download(download, Some(error.localizedDescription().to_string()));
+        }
+    }
+);
+
+impl BrowserNavigationDelegate {
+    fn begin_download(&self, download: &WKDownload) {
+        let key = download_key(download);
+        if self.ivars().downloads.borrow().contains_key(&key) {
+            return;
+        }
+        unsafe {
+            download.setDelegate(Some(ProtocolObject::from_ref(self)));
+        }
+
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        let details = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        details.set_hexpand(true);
+        let name = gtk::Label::new(Some("Preparing download…"));
+        name.set_halign(gtk::Align::Start);
+        name.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+        let progress = gtk::ProgressBar::new();
+        progress.set_hexpand(true);
+        let cancel = gtk::Button::from_icon_name("process-stop-symbolic");
+        cancel.set_tooltip_text(Some("Cancel download"));
+        details.append(&name);
+        details.append(&progress);
+        row.append(&details);
+        row.append(&cancel);
+        self.ivars().downloads_empty.set_visible(false);
+        self.ivars().downloads_list.append(&row);
+        self.ivars()
+            .downloads_button
+            .set_tooltip_text(Some("Downloads in progress"));
+
+        let handle = Rc::new(RefCell::new(Some(download.retain())));
+        {
+            let handle = handle.clone();
+            cancel.connect_clicked(move |button| {
+                if let Some(download) = handle.borrow().as_ref() {
+                    unsafe {
+                        download.cancel(None);
+                    }
+                }
+                button.set_sensitive(false);
+            });
+        }
+        {
+            let handle = handle.clone();
+            let progress = progress.clone();
+            glib::timeout_add_local(Duration::from_millis(100), move || {
+                let Some(download) = handle.borrow().as_ref().cloned() else {
+                    return glib::ControlFlow::Break;
+                };
+                progress.set_fraction(download.progress().fractionCompleted().clamp(0.0, 1.0));
+                glib::ControlFlow::Continue
+            });
+        }
+        self.ivars().downloads.borrow_mut().insert(
+            key,
+            DownloadUi {
+                name,
+                progress,
+                cancel,
+                handle,
+            },
+        );
+    }
+
+    fn finish_download(&self, download: &WKDownload, error: Option<String>) {
+        let (ui, has_active_downloads) = {
+            let mut downloads = self.ivars().downloads.borrow_mut();
+            let Some(ui) = downloads.remove(&download_key(download)) else {
+                return;
+            };
+            (ui, !downloads.is_empty())
+        };
+        ui.handle.borrow_mut().take();
+        ui.cancel.set_visible(false);
+        ui.progress.set_show_text(true);
+        let failed = error.is_some();
+        if let Some(error) = error {
+            ui.progress.set_text(Some(&format!("Failed: {error}")));
+        } else {
+            ui.progress.set_fraction(1.0);
+            ui.progress.set_text(Some("Complete"));
+        }
+        if has_active_downloads {
+            self.ivars()
+                .downloads_button
+                .set_tooltip_text(Some("Downloads in progress"));
+        } else if failed {
+            self.ivars()
+                .downloads_button
+                .set_tooltip_text(Some("Download failed"));
+        } else {
+            self.ivars()
+                .downloads_button
+                .set_tooltip_text(Some("Downloads"));
+        }
+    }
+}
 
 impl Drop for NativeBrowserView {
     fn drop(&mut self) {
@@ -239,6 +477,21 @@ impl BrowserPane {
         inspector.set_tooltip_text(Some(
             "Web Inspector is available from Safari's Develop menu",
         ));
+        let downloads = gtk::MenuButton::builder()
+            .icon_name("folder-download-symbolic")
+            .tooltip_text("Downloads")
+            .build();
+        let downloads_list = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        downloads_list.set_margin_top(8);
+        downloads_list.set_margin_bottom(8);
+        downloads_list.set_margin_start(8);
+        downloads_list.set_margin_end(8);
+        let downloads_empty = gtk::Label::new(Some("No downloads yet"));
+        downloads_empty.add_css_class("dim-label");
+        downloads_list.append(&downloads_empty);
+        let downloads_popover = gtk::Popover::new();
+        downloads_popover.set_child(Some(&downloads_list));
+        downloads.set_popover(Some(&downloads_popover));
         let bookmarks = BookmarkMenu::new(
             &profile,
             {
@@ -288,6 +541,7 @@ impl BrowserPane {
         chrome.append(&zoom_out);
         chrome.append(&zoom_reset);
         chrome.append(&zoom_in);
+        chrome.append(&downloads);
         chrome.append(&inspector);
 
         let find_entry = gtk::SearchEntry::builder()
@@ -319,6 +573,13 @@ impl BrowserPane {
                 pane_id.clone(),
                 callbacks.on_open_url.clone(),
                 web_widget.downgrade(),
+            ),
+            _navigation_delegate: install_navigation_delegate(
+                mtm,
+                &web_view,
+                downloads,
+                downloads_list,
+                downloads_empty,
             ),
             last_url: RefCell::new(String::new()),
             last_title: RefCell::new(String::new()),
@@ -664,6 +925,68 @@ fn install_ui_delegate(
         web_view.setUIDelegate(Some(ProtocolObject::from_ref(&*delegate)));
     }
     delegate
+}
+
+fn install_navigation_delegate(
+    mtm: MainThreadMarker,
+    web_view: &WKWebView,
+    downloads_button: gtk::MenuButton,
+    downloads_list: gtk::Box,
+    downloads_empty: gtk::Label,
+) -> Retained<BrowserNavigationDelegate> {
+    let delegate =
+        BrowserNavigationDelegate::alloc(mtm).set_ivars(BrowserNavigationDelegateIvars {
+            downloads_button,
+            downloads_list,
+            downloads_empty,
+            download_directory: download_directory(),
+            downloads: RefCell::new(HashMap::new()),
+        });
+    let delegate: Retained<BrowserNavigationDelegate> = unsafe { msg_send![super(delegate), init] };
+    unsafe {
+        web_view.setNavigationDelegate(Some(ProtocolObject::from_ref(&*delegate)));
+    }
+    delegate
+}
+
+fn download_key(download: &WKDownload) -> usize {
+    std::ptr::from_ref(download).addr()
+}
+
+fn download_directory() -> PathBuf {
+    glib::user_special_dir(glib::UserDirectory::Downloads)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join("Downloads")))
+        .unwrap_or_else(std::env::temp_dir)
+}
+
+fn available_download_path(directory: &Path, suggested: &str) -> PathBuf {
+    let file_name = Path::new(suggested)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("download");
+    let candidate = directory.join(file_name);
+    if !candidate.exists() {
+        return candidate;
+    }
+
+    let path = Path::new(file_name);
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("download");
+    let extension = path.extension().and_then(|value| value.to_str());
+    for number in 1.. {
+        let numbered = match extension {
+            Some(extension) => format!("{stem} ({number}).{extension}"),
+            None => format!("{stem} ({number})"),
+        };
+        let candidate = directory.join(numbered);
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    unreachable!()
 }
 
 fn media_capture_name(capture_type: WKMediaCaptureType) -> &'static str {
@@ -1014,6 +1337,21 @@ mod tests {
         assert_eq!(
             media_capture_name(WKMediaCaptureType::CameraAndMicrophone),
             "camera and microphone access"
+        );
+    }
+
+    #[test]
+    fn download_path_sanitizes_names_and_avoids_collisions() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("report.txt"), b"first").unwrap();
+
+        assert_eq!(
+            available_download_path(directory.path(), "../report.txt"),
+            directory.path().join("report (1).txt")
+        );
+        assert_eq!(
+            available_download_path(directory.path(), "../../"),
+            directory.path().join("download")
         );
     }
 }
