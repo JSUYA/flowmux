@@ -16,6 +16,7 @@
 //! map to [`BrowserProfile`] values that isolate cookies, localStorage, and
 //! IndexedDB directories.
 
+use crate::ui::browser_bookmarks::BookmarkMenu;
 use crate::ui::pane_terminal::PaneCallbacks;
 use adw::prelude::*;
 use flowmux_browser::{BrowserProfile, RefScope, RefStore};
@@ -235,17 +236,6 @@ impl BrowserPane {
         zoom_in.set_tooltip_text(Some("Zoom in"));
         let zoom = Rc::new(Cell::new(1.0));
         let zoom_label = zoom_reset.clone();
-        let session_status = gtk::Button::from_icon_name("avatar-default-symbolic");
-        session_status.add_css_class("flat");
-        session_status.set_tooltip_text(Some(&format!(
-            "Profile: {}\n{}",
-            profile.display_name(),
-            if persist_session {
-                "Cookies and site data are saved in this browser profile"
-            } else {
-                "Cookies and site data are discarded when flowmux exits"
-            }
-        )));
         let address = gtk::Entry::new();
         address.set_hexpand(true);
         address.set_placeholder_text(Some("Enter URL — e.g. http://localhost:3000"));
@@ -271,6 +261,34 @@ impl BrowserPane {
         let downloads_popover = gtk::Popover::new();
         downloads_popover.set_child(Some(&downloads_list));
         downloads.set_popover(Some(&downloads_popover));
+        let bookmarks = BookmarkMenu::new(
+            &profile,
+            {
+                let web_view = web_view.clone();
+                Rc::new(move || {
+                    let url = web_view.uri()?.to_string();
+                    let title = web_view
+                        .title()
+                        .map(|title| title.to_string())
+                        .filter(|title| !title.trim().is_empty())
+                        .unwrap_or_else(|| url.clone());
+                    Some(flowmux_browser::Bookmark { title, url })
+                })
+            },
+            {
+                let web_view = web_view.clone();
+                Rc::new(move |url| web_view.load_uri(url))
+            },
+        );
+        bookmarks.button.set_tooltip_text(Some(&format!(
+            "Bookmarks\nProfile: {}\n{}",
+            profile.display_name(),
+            if persist_session {
+                "Cookies and site data are saved in this browser profile"
+            } else {
+                "Cookies and site data are discarded when flowmux exits"
+            }
+        )));
 
         let chrome = gtk::Box::new(gtk::Orientation::Horizontal, 4);
         chrome.set_margin_top(4);
@@ -281,7 +299,7 @@ impl BrowserPane {
         chrome.append(&forward);
         chrome.append(&reload);
         chrome.append(&address);
-        chrome.append(&session_status);
+        chrome.append(&bookmarks.button);
         chrome.append(&find);
         chrome.append(&zoom_out);
         chrome.append(&zoom_reset);

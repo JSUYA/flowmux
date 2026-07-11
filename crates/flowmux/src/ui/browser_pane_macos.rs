@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! macOS in-app browser pane backed by the system WebKit `WKWebView`.
 
+use crate::ui::browser_bookmarks::BookmarkMenu;
 use crate::ui::pane_terminal::PaneCallbacks;
 use flowmux_browser::{BrowserProfile, RefScope, RefStore};
 use flowmux_config::options::BrowserEngine;
@@ -198,17 +199,6 @@ impl BrowserPane {
         let zoom_in = gtk::Button::from_icon_name("zoom-in-symbolic");
         zoom_in.set_tooltip_text(Some("Zoom in"));
         let zoom_label = zoom_reset.clone();
-        let session_status = gtk::Button::from_icon_name("avatar-default-symbolic");
-        session_status.add_css_class("flat");
-        session_status.set_tooltip_text(Some(&format!(
-            "Profile: {}\n{}",
-            profile.display_name(),
-            if persist_session {
-                "Cookies and site data are saved in this browser profile"
-            } else {
-                "Cookies and site data are discarded when flowmux exits"
-            }
-        )));
         let address = gtk::Entry::new();
         address.set_hexpand(true);
         address.set_placeholder_text(Some("Enter URL — e.g. http://localhost:3000"));
@@ -217,6 +207,40 @@ impl BrowserPane {
         inspector.set_tooltip_text(Some(
             "Web Inspector is available from Safari's Develop menu",
         ));
+        let bookmarks = BookmarkMenu::new(
+            &profile,
+            {
+                let web_view = web_view.clone();
+                Rc::new(move || {
+                    let url = current_url_native(&web_view);
+                    if url.is_empty() {
+                        return None;
+                    }
+                    let title = current_title_native(&web_view);
+                    Some(flowmux_browser::Bookmark {
+                        title: if title.trim().is_empty() {
+                            url.clone()
+                        } else {
+                            title
+                        },
+                        url,
+                    })
+                })
+            },
+            {
+                let web_view = web_view.clone();
+                Rc::new(move |url| load_uri_native(&web_view, url))
+            },
+        );
+        bookmarks.button.set_tooltip_text(Some(&format!(
+            "Bookmarks\nProfile: {}\n{}",
+            profile.display_name(),
+            if persist_session {
+                "Cookies and site data are saved in this browser profile"
+            } else {
+                "Cookies and site data are discarded when flowmux exits"
+            }
+        )));
 
         let chrome = gtk::Box::new(gtk::Orientation::Horizontal, 4);
         chrome.set_margin_top(4);
@@ -227,7 +251,7 @@ impl BrowserPane {
         chrome.append(&forward);
         chrome.append(&reload);
         chrome.append(&address);
-        chrome.append(&session_status);
+        chrome.append(&bookmarks.button);
         chrome.append(&find);
         chrome.append(&zoom_out);
         chrome.append(&zoom_reset);

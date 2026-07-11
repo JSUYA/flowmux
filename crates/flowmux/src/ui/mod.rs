@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 pub mod agent_bar;
+mod browser_bookmarks;
 pub mod browser_pane;
 pub mod file_browser;
 pub mod ghostty_pane;
