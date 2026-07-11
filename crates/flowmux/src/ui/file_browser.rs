@@ -15,7 +15,10 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Instant;
+
+type DeleteHandler = Arc<dyn Fn(&Path) -> io::Result<()> + Send + Sync>;
 
 #[derive(Clone)]
 pub struct FileBrowserPanel {
@@ -26,7 +29,7 @@ pub struct FileBrowserPanel {
     status: gtk::Label,
     close_button: gtk::Button,
     model: Rc<RefCell<FileBrowserModel>>,
-    delete_handler: Rc<RefCell<Box<dyn Fn(&Path) -> io::Result<()>>>>,
+    delete_handler: Rc<RefCell<DeleteHandler>>,
     path_clipboard_writer: Rc<RefCell<Box<dyn Fn(&str)>>>,
     on_focus_out: Rc<RefCell<Option<Box<dyn Fn(FocusDir)>>>>,
     on_escape: Rc<RefCell<Option<Box<dyn Fn()>>>>,
@@ -120,6 +123,11 @@ struct PasteOutcome {
     clear_clipboard: bool,
 }
 
+struct DeleteOutcome {
+    deleted: Vec<PathBuf>,
+    failed: Vec<(PathBuf, io::Error)>,
+}
+
 impl FileBrowserPanel {
     pub fn new() -> Self {
         let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -183,7 +191,7 @@ impl FileBrowserPanel {
             status,
             close_button,
             model: Rc::new(RefCell::new(FileBrowserModel::default())),
-            delete_handler: Rc::new(RefCell::new(Box::new(move_to_trash))),
+            delete_handler: Rc::new(RefCell::new(Arc::new(move_to_trash))),
             path_clipboard_writer: Rc::new(RefCell::new(Box::new(move |path| {
                 clipboard_root.clipboard().set_text(path);
             }))),
@@ -227,8 +235,8 @@ impl FileBrowserPanel {
     }
 
     #[cfg(all(test, not(target_os = "macos")))]
-    fn set_delete_handler<F: Fn(&Path) -> io::Result<()> + 'static>(&self, f: F) {
-        *self.delete_handler.borrow_mut() = Box::new(f);
+    fn set_delete_handler<F: Fn(&Path) -> io::Result<()> + Send + Sync + 'static>(&self, f: F) {
+        *self.delete_handler.borrow_mut() = Arc::new(f);
     }
 
     #[cfg(all(test, not(target_os = "macos")))]
@@ -627,7 +635,7 @@ impl FileBrowserPanel {
 
     fn delete_focused_to_trash(&self) {
         let paths = self.model.borrow_mut().deletion_targets();
-        self.delete_paths_with(paths, |path| (self.delete_handler.borrow())(path));
+        self.delete_paths_with(paths, self.delete_handler.borrow().clone(), "trash");
     }
 
     fn show_delete_confirmation(&self) {
@@ -691,50 +699,73 @@ impl FileBrowserPanel {
     }
 
     fn delete_paths_permanently(&self, paths: Vec<PathBuf>) {
-        self.delete_paths_with(paths, permanently_delete_path);
+        self.delete_paths_with(paths, Arc::new(permanently_delete_path), "delete");
     }
 
-    fn delete_paths_with<F>(&self, paths: Vec<PathBuf>, mut delete: F)
-    where
-        F: FnMut(&Path) -> io::Result<()>,
-    {
+    fn delete_paths_with(
+        &self,
+        paths: Vec<PathBuf>,
+        delete: DeleteHandler,
+        operation: &'static str,
+    ) {
         let paths = compact_removed_paths(paths);
         if paths.is_empty() {
             return;
         }
+        if self.file_operation_in_progress.replace(true) {
+            return;
+        }
 
+        let scroll_value = self.scroll.vadjustment().value();
         let next_focus = self
             .model
             .borrow()
             .focus_candidate_after_removed_paths(&paths);
-        let mut deleted = Vec::new();
-        let mut failed = Vec::new();
-
-        for path in paths {
-            match delete(&path) {
-                Ok(()) => deleted.push(path),
-                Err(err) => failed.push((path, err)),
+        self.show_status(if operation == "trash" {
+            "Moving to Trash…"
+        } else {
+            "Deleting…"
+        });
+        let panel = self.clone();
+        glib::MainContext::default().spawn_local(async move {
+            let started = Instant::now();
+            match gio::spawn_blocking(move || execute_delete(paths, delete)).await {
+                Ok(outcome) => {
+                    let deleted_count = outcome.deleted.len();
+                    let failed_count = outcome.failed.len();
+                    let next_focus = outcome
+                        .failed
+                        .first()
+                        .map(|(path, _)| path.clone())
+                        .or(next_focus);
+                    if !outcome.deleted.is_empty() {
+                        panel
+                            .model
+                            .borrow_mut()
+                            .forget_removed_paths(&outcome.deleted, next_focus);
+                        panel.refresh_with_scroll_value(scroll_value);
+                    }
+                    if let Some((_, err)) = outcome.failed.first() {
+                        if failed_count == 1 {
+                            panel.show_status(&format!("Delete failed: {err}"));
+                        } else {
+                            panel.show_status(&format!(
+                                "Delete failed for {failed_count} items: {err}"
+                            ));
+                        }
+                    }
+                    tracing::info!(
+                        operation,
+                        deleted = deleted_count,
+                        failed = failed_count,
+                        elapsed_ms = started.elapsed().as_millis(),
+                        "file browser operation completed"
+                    );
+                }
+                Err(_) => panel.show_status("Delete failed: worker panicked"),
             }
-        }
-
-        let next_focus = failed.first().map(|(path, _)| path.clone()).or(next_focus);
-        if !deleted.is_empty() {
-            self.finish_deleted_paths(&deleted, next_focus);
-        }
-        if let Some((_, err)) = failed.first() {
-            if failed.len() == 1 {
-                self.show_status(&format!("Delete failed: {err}"));
-            } else {
-                self.show_status(&format!("Delete failed for {} items: {err}", failed.len()));
-            }
-        }
-    }
-
-    fn finish_deleted_paths(&self, paths: &[PathBuf], next_focus: Option<PathBuf>) {
-        self.model
-            .borrow_mut()
-            .forget_removed_paths(paths, next_focus);
-        self.refresh();
+            panel.file_operation_in_progress.set(false);
+        });
     }
 
     fn show_rename_dialog(&self) {
@@ -1437,6 +1468,18 @@ fn execute_paste(request: PasteRequest) -> io::Result<PasteOutcome> {
         moved,
         clear_clipboard: clipboard.operation == ClipboardOperation::Cut,
     })
+}
+
+fn execute_delete(paths: Vec<PathBuf>, delete: DeleteHandler) -> DeleteOutcome {
+    let mut deleted = Vec::new();
+    let mut failed = Vec::new();
+    for path in paths {
+        match delete(&path) {
+            Ok(()) => deleted.push(path),
+            Err(err) => failed.push((path, err)),
+        }
+    }
+    DeleteOutcome { deleted, failed }
 }
 
 fn read_dir_entries(dir: &Path) -> std::io::Result<Vec<FsEntry>> {
@@ -2795,6 +2838,7 @@ mod tests {
 
         panel.delete_focused_to_trash();
 
+        wait_until(|| !panel.file_operation_in_progress.get());
         assert!(!file.exists());
         assert_eq!(panel_focused_path(&panel), Some(tmp.path.join("b.txt")));
         assert_eq!(panel.scroll.vadjustment().value(), 180.0);
@@ -2811,10 +2855,10 @@ mod tests {
         panel.show_for_root(tmp.path.clone());
         panel.focus_path(file.clone());
 
-        let deleted = Rc::new(RefCell::new(None));
+        let deleted = Arc::new(std::sync::Mutex::new(None));
         let deleted_for_handler = deleted.clone();
         panel.set_delete_handler(move |path| {
-            *deleted_for_handler.borrow_mut() = Some(path.to_path_buf());
+            *deleted_for_handler.lock().unwrap() = Some(path.to_path_buf());
             fs::remove_file(path)
         });
 
@@ -2823,7 +2867,8 @@ mod tests {
             glib::Propagation::Stop
         );
 
-        assert_eq!(deleted.borrow().as_ref(), Some(&file));
+        wait_until(|| !panel.file_operation_in_progress.get());
+        assert_eq!(deleted.lock().unwrap().as_ref(), Some(&file));
         assert!(!file.exists());
         assert_eq!(panel_row_names(&panel), vec!["b.txt"]);
         assert_eq!(panel_focused_path(&panel), Some(tmp.path.join("b.txt")));
@@ -2843,16 +2888,17 @@ mod tests {
         panel.toggle_path_selection(c.clone());
         assert_eq!(panel_selected_names(&panel), vec!["a.txt", "c.txt"]);
 
-        let deleted = Rc::new(RefCell::new(Vec::new()));
+        let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
         let deleted_for_handler = deleted.clone();
         panel.set_delete_handler(move |path| {
-            deleted_for_handler.borrow_mut().push(display_name(path));
+            deleted_for_handler.lock().unwrap().push(display_name(path));
             fs::remove_file(path)
         });
 
         panel.delete_focused_to_trash();
 
-        assert_eq!(deleted.borrow().as_slice(), ["a.txt", "c.txt"]);
+        wait_until(|| !panel.file_operation_in_progress.get());
+        assert_eq!(deleted.lock().unwrap().as_slice(), ["a.txt", "c.txt"]);
         assert!(!a.exists());
         assert!(b.exists());
         assert!(!c.exists());
@@ -2862,7 +2908,11 @@ mod tests {
 
         panel.delete_focused_to_trash();
 
-        assert_eq!(deleted.borrow().as_slice(), ["a.txt", "c.txt", "b.txt"]);
+        wait_until(|| !panel.file_operation_in_progress.get());
+        assert_eq!(
+            deleted.lock().unwrap().as_slice(),
+            ["a.txt", "c.txt", "b.txt"]
+        );
         assert!(!b.exists());
         assert!(d.exists());
         assert_eq!(panel_selected_names(&panel), vec!["d.txt"]);
@@ -2893,16 +2943,20 @@ mod tests {
             vec!["a.txt", "b.txt", "c.txt"]
         );
 
-        let deleted = Rc::new(RefCell::new(Vec::new()));
+        let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
         let deleted_for_handler = deleted.clone();
         panel.set_delete_handler(move |path| {
-            deleted_for_handler.borrow_mut().push(display_name(path));
+            deleted_for_handler.lock().unwrap().push(display_name(path));
             fs::remove_file(path)
         });
 
         panel.delete_focused_to_trash();
 
-        assert_eq!(deleted.borrow().as_slice(), ["a.txt", "b.txt", "c.txt"]);
+        wait_until(|| !panel.file_operation_in_progress.get());
+        assert_eq!(
+            deleted.lock().unwrap().as_slice(),
+            ["a.txt", "b.txt", "c.txt"]
+        );
         assert!(!a.exists());
         assert!(!b.exists());
         assert!(!c.exists());
@@ -2925,10 +2979,10 @@ mod tests {
         panel.extend_selection_to_path(child);
         assert_eq!(panel_selected_names(&panel), vec!["folder", "child.txt"]);
 
-        let deleted = Rc::new(RefCell::new(Vec::new()));
+        let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
         let deleted_for_handler = deleted.clone();
         panel.set_delete_handler(move |path| {
-            deleted_for_handler.borrow_mut().push(display_name(path));
+            deleted_for_handler.lock().unwrap().push(display_name(path));
             if path.is_dir() {
                 fs::remove_dir_all(path)
             } else {
@@ -2938,7 +2992,8 @@ mod tests {
 
         panel.delete_focused_to_trash();
 
-        assert_eq!(deleted.borrow().as_slice(), ["folder"]);
+        wait_until(|| !panel.file_operation_in_progress.get());
+        assert_eq!(deleted.lock().unwrap().as_slice(), ["folder"]);
         assert!(!folder.exists());
         assert!(other.exists());
         assert_eq!(panel_selected_names(&panel), vec!["other.txt"]);
@@ -2962,11 +3017,14 @@ mod tests {
             vec!["a.txt", "b.txt", "c.txt"]
         );
 
-        let attempted = Rc::new(RefCell::new(Vec::new()));
+        let attempted = Arc::new(std::sync::Mutex::new(Vec::new()));
         let attempted_for_handler = attempted.clone();
         let failed = b.clone();
         panel.set_delete_handler(move |path| {
-            attempted_for_handler.borrow_mut().push(display_name(path));
+            attempted_for_handler
+                .lock()
+                .unwrap()
+                .push(display_name(path));
             if path == failed {
                 Err(io::Error::other("blocked"))
             } else {
@@ -2976,7 +3034,11 @@ mod tests {
 
         panel.delete_focused_to_trash();
 
-        assert_eq!(attempted.borrow().as_slice(), ["a.txt", "b.txt", "c.txt"]);
+        wait_until(|| !panel.file_operation_in_progress.get());
+        assert_eq!(
+            attempted.lock().unwrap().as_slice(),
+            ["a.txt", "b.txt", "c.txt"]
+        );
         assert!(!a.exists());
         assert!(b.exists());
         assert!(!c.exists());
@@ -3012,6 +3074,7 @@ mod tests {
 
         yes.emit_clicked();
 
+        wait_until(|| !panel.file_operation_in_progress.get());
         assert!(!file.exists());
         assert_eq!(panel_row_names(&panel), vec!["b.txt"]);
         assert_eq!(panel_focused_path(&panel), Some(tmp.path.join("b.txt")));
@@ -3035,6 +3098,7 @@ mod tests {
         let targets = panel.model.borrow().deletion_targets();
         panel.delete_paths_permanently(targets);
 
+        wait_until(|| !panel.file_operation_in_progress.get());
         assert!(!a.exists());
         assert!(b.exists());
         assert!(!c.exists());
