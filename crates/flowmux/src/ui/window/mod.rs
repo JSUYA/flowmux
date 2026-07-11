@@ -265,17 +265,13 @@ struct FileBrowserState {
 pub struct WindowController {
     pub window: adw::ApplicationWindow,
     pub focused_pane: FocusedPane,
-    sidebar: Sidebar,
+    workspace_presenter: workspace_presenter::WorkspacePresenter,
     /// Outermost `gtk::Paned` separating the side panel and content area.
     /// Its position is saved to the store on exit and restored on next launch.
     sidebar_split: gtk::Paned,
     file_browser: FileBrowserState,
-    stack: gtk::Stack,
     agent_bar: AgentBarState,
-    surfaces: Rc<RefCell<HashMap<WorkspaceId, gtk::Widget>>>,
-    pane_registry: Rc<RefCell<PaneRegistry>>,
     callbacks: PaneCallbacks,
-    store: StateStore,
     bridge: Bridge,
     theme: Arc<ResolvedTheme>,
     notifications: notification_coordinator::NotificationCoordinator,
@@ -460,6 +456,15 @@ mod polling;
 mod surface_ops;
 mod window_chrome_commands;
 mod workspace_commands;
+mod workspace_presenter;
+
+impl std::ops::Deref for WindowController {
+    type Target = workspace_presenter::WorkspacePresenter;
+
+    fn deref(&self) -> &Self::Target {
+        &self.workspace_presenter
+    }
+}
 
 impl WindowController {
     pub fn new(
@@ -648,7 +653,13 @@ impl WindowController {
         let controller = Self {
             window,
             focused_pane,
-            sidebar,
+            workspace_presenter: workspace_presenter::WorkspacePresenter::new(
+                store,
+                sidebar,
+                stack,
+                surfaces,
+                pane_registry,
+            ),
             sidebar_split: split,
             file_browser: FileBrowserState {
                 source_pane: file_browser_source_pane,
@@ -657,15 +668,11 @@ impl WindowController {
                 split: file_browser_split,
                 panel: file_browser,
             },
-            stack,
             agent_bar: AgentBarState {
                 bar: agent_bar,
                 attentions: agent_bar_attentions,
             },
-            surfaces,
-            pane_registry,
             callbacks,
-            store,
             bridge,
             theme,
             notifications: notification_coordinator::NotificationCoordinator::new(
