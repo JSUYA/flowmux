@@ -163,6 +163,29 @@ pub fn build_activity_update(
     build_activity_update_with_metadata(agent, activity, pid, pane, surface, None, None, None)
 }
 
+/// Register an agent whose process is known but whose turn activity has not
+/// been reported by a reliable lifecycle event.
+pub fn build_unknown_activity_update(
+    agent: &str,
+    pid: Option<u32>,
+    pane: Option<PaneId>,
+    surface: Option<SurfaceId>,
+) -> Request {
+    Request::AgentActivityUpdate {
+        pane,
+        surface,
+        agent: agent.to_ascii_lowercase(),
+        status: Some(flowmux_core::AgentStatus::Unknown),
+        activity: None,
+        pid,
+        source: Some("flowmux:hook".into()),
+        seq: hook_seq(),
+        message: None,
+        custom_status: None,
+        session_id: None,
+    }
+}
+
 /// Build a live activity update with optional agent hook metadata.
 #[allow(clippy::too_many_arguments)]
 pub fn build_activity_update_with_metadata(
@@ -478,6 +501,26 @@ mod tests {
             Request::AgentActivityUpdate { activity, pid, .. } => {
                 assert!(activity.is_none());
                 assert!(pid.is_none());
+            }
+            other => panic!("expected AgentActivityUpdate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_unknown_activity_update_keeps_presence_without_claiming_idle() {
+        let req = build_unknown_activity_update("Codex", Some(42), None, None);
+        match req {
+            Request::AgentActivityUpdate {
+                agent,
+                status,
+                activity,
+                pid,
+                ..
+            } => {
+                assert_eq!(agent, "codex");
+                assert_eq!(status, Some(flowmux_core::AgentStatus::Unknown));
+                assert_eq!(activity, None);
+                assert_eq!(pid, Some(42));
             }
             other => panic!("expected AgentActivityUpdate, got {other:?}"),
         }

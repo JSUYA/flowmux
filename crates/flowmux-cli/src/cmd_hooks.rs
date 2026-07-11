@@ -312,6 +312,7 @@ pub(crate) async fn run_generic_agent_hook_event(
     let (cli_pane, cli_surface) = match event {
         AgentHookEvent::Stop { pane, surface, .. } => (*pane, *surface),
         AgentHookEvent::Notification { pane, surface, .. } => (*pane, *surface),
+        AgentHookEvent::Running { pane, surface, .. } => (*pane, *surface),
         AgentHookEvent::SessionStart { .. } => (None, None),
     };
     // CLI flags win over env so the OpenCode Flatpak plugin (which
@@ -325,7 +326,7 @@ pub(crate) async fn run_generic_agent_hook_event(
         "cli/hook",
         "entry agent={agent:?} event={event:?} cli_pane={cli_pane:?} cli_surface={cli_surface:?} env_pane={env_pane:?} env_surface={env_surface:?} resolved_pane={pane:?} resolved_surface={surface:?} socket_arg={socket:?}"
     );
-    use flowmux_core::AgentActivity::{Idle, NeedsInput};
+    use flowmux_core::AgentActivity::{Idle, NeedsInput, Running};
     let pid = match event {
         AgentHookEvent::SessionStart { .. } => hooks::pid_from_env_or_parent(),
         _ => hooks::pid_from_env(),
@@ -362,11 +363,20 @@ pub(crate) async fn run_generic_agent_hook_event(
             ));
             reqs.push(build_notification_notify(agent, msg, pane, surface));
         }
-        // Codex / OpenCode register presence on session start (no
-        // wrapper PID for these, so the daemon clears them via Stop→Idle
-        // plus the liveness sweep rather than a SessionEnd hook).
+        AgentHookEvent::Running { .. } => {
+            reqs.push(build_activity_update(
+                agent,
+                Some(Running),
+                pid,
+                pane,
+                surface,
+            ));
+        }
+        // Codex / OpenCode register presence on session start without claiming
+        // a turn is idle. The wrapper PID, when available, lets the liveness
+        // sweep clear sessions that have no SessionEnd hook.
         AgentHookEvent::SessionStart { .. } => {
-            reqs.push(build_activity_update(agent, Some(Idle), pid, pane, surface));
+            reqs.push(build_unknown_activity_update(agent, pid, pane, surface));
         }
     };
     match hooks::connect_daemon(socket).await {

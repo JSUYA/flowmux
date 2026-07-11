@@ -1260,6 +1260,39 @@ fn hooks_opencode_stop_accepts_pane_and_surface_flags() {
 }
 
 #[test]
+fn hooks_opencode_running_accepts_pane_and_surface_flags() {
+    let pane = PaneId::new();
+    let surface = SurfaceId::new();
+    let cli = Cli::try_parse_from([
+        "flowmuxctl",
+        "hooks",
+        "opencode",
+        "running",
+        "--pane",
+        &pane.to_string(),
+        "--surface",
+        &surface.to_string(),
+    ])
+    .expect("running hook should parse");
+    let Cmd::Hooks {
+        op:
+            HooksOp::Opencode {
+                event:
+                    AgentHookEvent::Running {
+                        pane: p,
+                        surface: s,
+                        ..
+                    },
+            },
+    } = cli.cmd
+    else {
+        panic!("expected opencode running hook");
+    };
+    assert_eq!(p, Some(pane));
+    assert_eq!(s, Some(surface));
+}
+
+#[test]
 fn hooks_opencode_stop_keeps_trailing_payload_after_flags() {
     // The plugin always emits flags before the optional JSON
     // payload (Codex-compat) so clap can split them cleanly. Make

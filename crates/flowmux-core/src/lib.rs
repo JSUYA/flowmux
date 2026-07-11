@@ -880,9 +880,6 @@ impl Pane {
                         continue;
                     };
                     let status = agent.public_status();
-                    if status == AgentStatus::Unknown {
-                        continue;
-                    }
                     let cwd = match &surface.kind {
                         SurfaceKind::Terminal { cwd: Some(cwd), .. } => {
                             Some(cwd.display().to_string())
@@ -1866,7 +1863,10 @@ impl AgentStatus {
     }
 
     fn should_mark_unseen_on_idle(prev: AgentStatus, next: AgentStatus) -> bool {
-        matches!(prev, AgentStatus::Working | AgentStatus::Blocked) && next == AgentStatus::Idle
+        matches!(
+            prev,
+            AgentStatus::Unknown | AgentStatus::Working | AgentStatus::Blocked
+        ) && next == AgentStatus::Idle
     }
 }
 
@@ -1956,6 +1956,7 @@ pub struct WorkspaceAgentBlock {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentBarVisualStatus {
+    Unknown,
     Working,
     Waiting,
     Done,
@@ -1966,7 +1967,7 @@ pub fn agent_bar_visual_status(status: AgentStatus) -> Option<AgentBarVisualStat
         AgentStatus::Working => Some(AgentBarVisualStatus::Working),
         AgentStatus::Idle | AgentStatus::Blocked => Some(AgentBarVisualStatus::Waiting),
         AgentStatus::Done => Some(AgentBarVisualStatus::Done),
-        AgentStatus::Unknown => None,
+        AgentStatus::Unknown => Some(AgentBarVisualStatus::Unknown),
     }
 }
 

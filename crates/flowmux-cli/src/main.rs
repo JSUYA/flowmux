@@ -691,7 +691,16 @@ enum AgentHookEvent {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    /// Session started; flowmux currently no-ops on this event.
+    /// Agent started or resumed a turn.
+    Running {
+        #[arg(long)]
+        pane: Option<PaneId>,
+        #[arg(long)]
+        surface: Option<SurfaceId>,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Session started; registers presence with unknown turn activity.
     SessionStart {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,

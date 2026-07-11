@@ -29,7 +29,7 @@ pub const FLOWMUX_HOOK_MARKER: &str = "flowmux-hook";
 
 /// Plugin source-marker for the OpenCode JS plugin file. Lets a re-run
 /// detect that the file is owned by flowmux and may be overwritten.
-pub const FLOWMUX_OPENCODE_PLUGIN_MARKER: &str = "flowmux-opencode-session-plugin v1";
+pub const FLOWMUX_OPENCODE_PLUGIN_MARKER: &str = "flowmux-opencode-session-plugin v2";
 
 /// One agent flowmux knows how to install hooks for. Same enum shape
 /// as `agent::Target` so future merges can collapse them, but kept
@@ -960,12 +960,12 @@ fn opencode_plugin_source_with_argv(argv: &[String]) -> String {
     // `flowmux hooks opencode <event>` for the ones we care about.
     //
     // Events we surface today:
-    // - `session.idle`        → `stop`         ("agent finished")
-    // - `session.error`       → `notification` ("agent errored, look")
-    // - `permission.updated`  → `notification` (mid-turn "agent needs
-    //   approval"). OpenCode fires the same event when the user replies,
-    //   so we forward both halves and let the daemon's bell popover
-    //   dedupe; silence here would defeat the whole purpose.
+    // - `session.status` busy/retry → `running` (agent started/resumed)
+    // - `session.idle`              → `stop` (agent finished)
+    // - `session.error`             → `notification` (agent errored)
+    // - `permission.asked`          → `notification` (needs approval)
+    // - `permission.replied`        → `running` (approval handled)
+    // - `permission.updated` remains a legacy request-event fallback.
     //
     // The optional second positional arg is a JSON payload that the
     // matching Rust handler (`AgentHookEvent::Notification`) parses to
@@ -1074,10 +1074,17 @@ export const server = async () => ({{
     if (!event || typeof event.type !== "string") return;
     const t = event.type;
     if (t === "session.idle") fireFlowmuxHook("stop");
-    else if (t === "session.error") {{
+    else if (t === "session.status") {{
+      const status = event.properties && event.properties.status;
+      if (status && (status.type === "busy" || status.type === "retry")) {{
+        fireFlowmuxHook("running");
+      }}
+    }} else if (t === "session.error") {{
       fireFlowmuxHook("notification", JSON.stringify({{ message: "OpenCode session error" }}));
-    }} else if (t === "permission.updated") {{
+    }} else if (t === "permission.asked" || t === "permission.updated") {{
       fireFlowmuxHook("notification", JSON.stringify({{ message: "OpenCode needs your input" }}));
+    }} else if (t === "permission.replied") {{
+      fireFlowmuxHook("running");
     }}
   }},
 }});
@@ -1533,15 +1540,15 @@ hooks = true
 
     #[test]
     fn opencode_plugin_source_routes_permission_events_to_notification() {
-        // Mid-turn approval prompts surface via OpenCode's
-        // `permission.updated` event — without this routing the user
-        // never gets a desktop alert when an agent is waiting for them.
         let src = opencode_plugin_source("flowmux");
-        assert!(
-            src.contains("permission.updated"),
-            "plugin must route permission.updated: {src}"
-        );
-        // Errors and permission events both go through the
+        assert!(src.contains("permission.asked"));
+        assert!(src.contains("permission.updated"));
+        assert!(src.contains("permission.replied"));
+        assert!(src.contains("session.status"));
+        assert!(src.contains("status.type === \"busy\""));
+        assert!(src.contains("status.type === \"retry\""));
+        assert!(src.contains("fireFlowmuxHook(\"running\")"));
+        // Errors and permission requests both go through the
         // `notification` subcommand with a JSON payload so the toast
         // body is informative.
         assert!(src.contains("OpenCode needs your input"));

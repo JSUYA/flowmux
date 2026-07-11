@@ -1909,7 +1909,7 @@ fn workspace_agent_blocks_sort_by_status_then_recent_focus() {
 }
 
 #[test]
-fn workspace_agent_blocks_exclude_unknown_status() {
+fn workspace_agent_blocks_include_unknown_status_explicitly() {
     let unknown = PaneId::new();
     let idle = PaneId::new();
     let ws = workspace_with_agent_leaves(vec![
@@ -1924,9 +1924,11 @@ fn workspace_agent_blocks_exclude_unknown_status() {
     ]);
 
     let blocks = ws.collect_agent_blocks(&[unknown, idle]);
-    assert_eq!(blocks.len(), 1);
+    assert_eq!(blocks.len(), 2);
     assert_eq!(blocks[0].pane, idle);
     assert_eq!(blocks[0].status, AgentStatus::Idle);
+    assert_eq!(blocks[1].pane, unknown);
+    assert_eq!(blocks[1].status, AgentStatus::Unknown);
 }
 
 #[test]
@@ -2058,11 +2060,14 @@ fn agent_bar_visual_status_maps_public_statuses() {
         agent_bar_visual_status(AgentStatus::Done),
         Some(AgentBarVisualStatus::Done)
     );
-    assert_eq!(agent_bar_visual_status(AgentStatus::Unknown), None);
+    assert_eq!(
+        agent_bar_visual_status(AgentStatus::Unknown),
+        Some(AgentBarVisualStatus::Unknown)
+    );
 }
 
 #[test]
-fn agent_bar_model_excludes_unknown_status() {
+fn agent_bar_model_shows_unknown_status_explicitly() {
     let pane = PaneId::new();
     let ws = workspace_with_agent_leaves(vec![(
         pane,
@@ -2071,8 +2076,10 @@ fn agent_bar_model_excludes_unknown_status() {
 
     let model = collect_agent_bar_model([&ws]);
 
-    assert!(!model.visible);
-    assert!(model.items.is_empty());
+    assert!(model.visible);
+    assert_eq!(model.items.len(), 1);
+    assert_eq!(model.items[0].status, AgentStatus::Unknown);
+    assert_eq!(model.items[0].visual_status, AgentBarVisualStatus::Unknown);
 }
 
 #[test]
