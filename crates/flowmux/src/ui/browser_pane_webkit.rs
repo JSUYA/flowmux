@@ -17,10 +17,10 @@
 //! IndexedDB directories.
 
 use crate::ui::pane_terminal::PaneCallbacks;
+use adw::prelude::*;
 use flowmux_browser::{BrowserProfile, RefScope, RefStore};
 use flowmux_config::options::BrowserEngine;
 use flowmux_core::{PaneId, SurfaceId};
-use gtk::prelude::*;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use webkit6::prelude::*;
@@ -188,6 +188,39 @@ impl BrowserPane {
                 true
             });
         }
+        web_view.connect_permission_request(move |web_view, request| {
+            let Some(parent) = web_view.root() else {
+                request.deny();
+                return true;
+            };
+            let permission = permission_name(request);
+            let site = web_view
+                .uri()
+                .and_then(|uri| gtk::glib::Uri::parse(&uri, gtk::glib::UriFlags::NONE).ok())
+                .and_then(|uri| uri.host().map(|host| host.to_string()))
+                .unwrap_or_else(|| "This page".into());
+            let dialog = adw::AlertDialog::new(
+                Some(&format!("Allow {permission}?")),
+                Some(&format!("{site} is requesting access.")),
+            );
+            dialog.add_response("deny", "Deny");
+            dialog.add_response("allow", "Allow");
+            dialog.set_default_response(Some("deny"));
+            dialog.set_close_response("deny");
+            dialog.set_response_appearance("allow", adw::ResponseAppearance::Suggested);
+
+            let request = request.clone();
+            dialog.connect_response(None, move |dialog, response| {
+                if response == "allow" {
+                    request.allow();
+                } else {
+                    request.deny();
+                }
+                dialog.close();
+            });
+            dialog.present(Some(&parent));
+            true
+        });
 
         let back = gtk::Button::from_icon_name("go-previous-symbolic");
         let forward = gtk::Button::from_icon_name("go-next-symbolic");
@@ -662,6 +695,43 @@ fn download_directory() -> std::path::PathBuf {
             std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join("Downloads"))
         })
         .unwrap_or_else(std::env::temp_dir)
+}
+
+fn permission_name(request: &webkit6::PermissionRequest) -> String {
+    if let Some(media) = request.downcast_ref::<webkit6::UserMediaPermissionRequest>() {
+        let mut devices = Vec::new();
+        if webkit6::functions::user_media_permission_is_for_audio_device(media) {
+            devices.push("microphone");
+        }
+        if webkit6::functions::user_media_permission_is_for_video_device(media) {
+            devices.push("camera");
+        }
+        if webkit6::functions::user_media_permission_is_for_display_device(media) {
+            devices.push("screen sharing");
+        }
+        return if devices.is_empty() {
+            "media devices".into()
+        } else {
+            devices.join(" and ")
+        };
+    }
+    if request.type_().name() == "WebKitClipboardPermissionRequest" {
+        "clipboard".into()
+    } else if request.is::<webkit6::GeolocationPermissionRequest>() {
+        "location".into()
+    } else if request.is::<webkit6::NotificationPermissionRequest>() {
+        "notifications".into()
+    } else if request.is::<webkit6::PointerLockPermissionRequest>() {
+        "pointer lock".into()
+    } else if request.is::<webkit6::DeviceInfoPermissionRequest>() {
+        "device information".into()
+    } else if request.is::<webkit6::WebsiteDataAccessPermissionRequest>() {
+        "cross-site data".into()
+    } else if request.is::<webkit6::MediaKeySystemPermissionRequest>() {
+        "protected media".into()
+    } else {
+        "site permission".into()
+    }
 }
 
 fn available_download_path(directory: &std::path::Path, suggested: &str) -> std::path::PathBuf {
