@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 type DeleteHandler = Arc<dyn Fn(&Path) -> io::Result<()> + Send + Sync>;
+const ROW_BATCH_SIZE: usize = 500;
 
 #[derive(Clone)]
 pub struct FileBrowserPanel {
@@ -27,6 +28,7 @@ pub struct FileBrowserPanel {
     list: gtk::ListBox,
     scroll: gtk::ScrolledWindow,
     status: gtk::Label,
+    load_more_button: gtk::Button,
     close_button: gtk::Button,
     model: Rc<RefCell<FileBrowserModel>>,
     delete_handler: Rc<RefCell<DeleteHandler>>,
@@ -45,6 +47,7 @@ pub struct FileBrowserPanel {
     monitor_epoch: Rc<Cell<u64>>,
     #[cfg_attr(test, allow(dead_code))]
     monitor_refresh_scheduled: Rc<Cell<bool>>,
+    visible_row_limit: Rc<Cell<usize>>,
     #[cfg(all(test, not(target_os = "macos")))]
     rebuild_count: Rc<Cell<usize>>,
 }
@@ -184,12 +187,21 @@ impl FileBrowserPanel {
         status.set_margin_end(16);
         status.set_wrap(true);
 
+        let load_more_button = gtk::Button::with_label("Load 500 more");
+        load_more_button.add_css_class("flat");
+        load_more_button.set_margin_top(6);
+        load_more_button.set_margin_bottom(6);
+        load_more_button.set_margin_start(16);
+        load_more_button.set_margin_end(16);
+        load_more_button.set_visible(false);
+
         let scroll = gtk::ScrolledWindow::builder()
             .child(&list)
             .hexpand(true)
             .vexpand(true)
             .build();
         root.append(&scroll);
+        root.append(&load_more_button);
         root.append(&status);
 
         let clipboard_root = root.clone();
@@ -199,6 +211,7 @@ impl FileBrowserPanel {
             list,
             scroll,
             status,
+            load_more_button,
             close_button,
             model: Rc::new(RefCell::new(FileBrowserModel::default())),
             delete_handler: Rc::new(RefCell::new(Arc::new(move_to_trash))),
@@ -217,6 +230,7 @@ impl FileBrowserPanel {
             monitor_ready: Rc::new(Cell::new(false)),
             monitor_epoch: Rc::new(Cell::new(0)),
             monitor_refresh_scheduled: Rc::new(Cell::new(false)),
+            visible_row_limit: Rc::new(Cell::new(ROW_BATCH_SIZE)),
             #[cfg(all(test, not(target_os = "macos")))]
             rebuild_count: Rc::new(Cell::new(0)),
         };
@@ -224,6 +238,16 @@ impl FileBrowserPanel {
         panel.install_focus_style();
         panel.install_pointer_focus();
         panel.install_keyboard();
+        let panel_for_more = panel.clone();
+        panel.load_more_button.connect_clicked(move |_| {
+            panel_for_more.visible_row_limit.set(
+                panel_for_more
+                    .visible_row_limit
+                    .get()
+                    .saturating_add(ROW_BATCH_SIZE),
+            );
+            panel_for_more.rebuild_rows();
+        });
 
         panel
     }
@@ -276,6 +300,7 @@ impl FileBrowserPanel {
     ) {
         if !self.is_showing_root(&root) {
             self.clear_directory_monitors();
+            self.visible_row_limit.set(ROW_BATCH_SIZE);
         }
         let scroll_value = self.model.borrow_mut().set_root_with_state(root, state);
         self.open.set(true);
@@ -487,6 +512,7 @@ impl FileBrowserPanel {
         while let Some(child) = self.list.first_child() {
             self.list.remove(&child);
         }
+        self.load_more_button.set_visible(false);
 
         let root = {
             let model = self.model.borrow();
@@ -528,8 +554,17 @@ impl FileBrowserPanel {
             return;
         }
 
-        self.status.set_visible(false);
-        for row in rows {
+        let row_count = rows.len();
+        let visible_count = row_count.min(self.visible_row_limit.get());
+        if visible_count < row_count {
+            self.status
+                .set_text(&format!("Showing {visible_count} of {row_count} items"));
+            self.status.set_visible(true);
+            self.load_more_button.set_visible(true);
+        } else {
+            self.status.set_visible(false);
+        }
+        for row in rows.into_iter().take(visible_count) {
             self.list.append(&self.build_row(&row));
         }
     }
@@ -683,6 +718,7 @@ impl FileBrowserPanel {
 
     fn move_focus(&self, delta: isize) {
         if self.model.borrow_mut().move_focus(delta) {
+            self.ensure_focused_row_rendered();
             self.sync_focus_classes();
             self.scroll_focused_row_into_view();
         }
@@ -690,9 +726,22 @@ impl FileBrowserPanel {
 
     fn extend_selection_focus(&self, delta: isize) {
         if self.model.borrow_mut().extend_selection_focus(delta) {
+            self.ensure_focused_row_rendered();
             self.sync_focus_classes();
             self.scroll_focused_row_into_view();
         }
+    }
+
+    fn ensure_focused_row_rendered(&self) {
+        let Some(index) = self.model.borrow().focused_index() else {
+            return;
+        };
+        if index < self.visible_row_limit.get() {
+            return;
+        }
+        let required = ((index / ROW_BATCH_SIZE) + 1) * ROW_BATCH_SIZE;
+        self.visible_row_limit.set(required);
+        self.rebuild_rows();
     }
 
     fn expand_focused(&self) {
@@ -2144,6 +2193,16 @@ mod tests {
         row_names(&panel.model.borrow())
     }
 
+    fn rendered_row_count(panel: &FileBrowserPanel) -> usize {
+        let mut count = 0;
+        let mut child = panel.list.first_child();
+        while let Some(row) = child {
+            count += 1;
+            child = row.next_sibling();
+        }
+        count
+    }
+
     fn panel_focused_path(panel: &FileBrowserPanel) -> Option<PathBuf> {
         panel.model.borrow().focused.clone()
     }
@@ -2299,6 +2358,28 @@ mod tests {
             Some(&tmp.path.join("a-dir")),
             "initial focus follows the first visible row"
         );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[gtk::test]
+    fn large_directory_rows_are_loaded_in_batches() {
+        let tmp = TestDir::new("row-batches");
+        for index in 0..525 {
+            tmp.file(&format!("file-{index:03}.txt"));
+        }
+        let panel = FileBrowserPanel::new();
+
+        panel.show_for_root(tmp.path.clone());
+
+        assert_eq!(rendered_row_count(&panel), ROW_BATCH_SIZE);
+        assert!(panel.load_more_button.is_visible());
+        assert_eq!(panel.status.text(), "Showing 500 of 525 items");
+
+        panel.load_more_button.emit_clicked();
+
+        assert_eq!(rendered_row_count(&panel), 525);
+        assert!(!panel.load_more_button.is_visible());
+        assert!(!panel.status.is_visible());
     }
 
     #[test]
