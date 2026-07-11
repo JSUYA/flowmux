@@ -39,6 +39,12 @@ pub struct FileBrowserPanel {
     #[cfg_attr(test, allow(dead_code))]
     directory_generation: Rc<Cell<u64>>,
     directory_error: Rc<RefCell<Option<String>>>,
+    directory_monitors: Rc<RefCell<Vec<gio::FileMonitor>>>,
+    monitored_directories: Rc<RefCell<HashSet<PathBuf>>>,
+    monitor_ready: Rc<Cell<bool>>,
+    monitor_epoch: Rc<Cell<u64>>,
+    #[cfg_attr(test, allow(dead_code))]
+    monitor_refresh_scheduled: Rc<Cell<bool>>,
     #[cfg(all(test, not(target_os = "macos")))]
     rebuild_count: Rc<Cell<usize>>,
 }
@@ -206,6 +212,11 @@ impl FileBrowserPanel {
             file_operation_in_progress: Rc::new(Cell::new(false)),
             directory_generation: Rc::new(Cell::new(0)),
             directory_error: Rc::new(RefCell::new(None)),
+            directory_monitors: Rc::new(RefCell::new(Vec::new())),
+            monitored_directories: Rc::new(RefCell::new(HashSet::new())),
+            monitor_ready: Rc::new(Cell::new(false)),
+            monitor_epoch: Rc::new(Cell::new(0)),
+            monitor_refresh_scheduled: Rc::new(Cell::new(false)),
             #[cfg(all(test, not(target_os = "macos")))]
             rebuild_count: Rc::new(Cell::new(0)),
         };
@@ -263,6 +274,9 @@ impl FileBrowserPanel {
         root: PathBuf,
         state: Option<FileBrowserPaneState>,
     ) {
+        if !self.is_showing_root(&root) {
+            self.clear_directory_monitors();
+        }
         let scroll_value = self.model.borrow_mut().set_root_with_state(root, state);
         self.open.set(true);
         self.root.set_visible(true);
@@ -297,6 +311,9 @@ impl FileBrowserPanel {
 
     pub fn hide(&self) {
         self.open.set(false);
+        self.directory_generation
+            .set(self.directory_generation.get().wrapping_add(1));
+        self.clear_directory_monitors();
         self.root.set_visible(false);
     }
 
@@ -354,8 +371,10 @@ impl FileBrowserPanel {
                 Ok(Ok(entries)) => {
                     let directory_count = entries.len();
                     let entry_count = entries.values().map(Vec::len).sum::<usize>();
+                    let monitored_directories = entries.keys().cloned().collect::<Vec<_>>();
                     panel.model.borrow_mut().entries_by_dir = entries;
                     panel.directory_error.borrow_mut().take();
+                    panel.install_directory_monitors(monitored_directories);
                     tracing::info!(
                         operation = "file_browser_read_dir",
                         directory_count,
@@ -372,10 +391,12 @@ impl FileBrowserPanel {
                         "file browser directory snapshot failed"
                     );
                     panel.model.borrow_mut().entries_by_dir.clear();
+                    panel.clear_directory_monitors();
                     *panel.directory_error.borrow_mut() = Some(error.to_string());
                 }
                 Err(_) => {
                     panel.model.borrow_mut().entries_by_dir.clear();
+                    panel.clear_directory_monitors();
                     *panel.directory_error.borrow_mut() =
                         Some("Directory worker panicked".to_string());
                 }
@@ -383,6 +404,74 @@ impl FileBrowserPanel {
             panel.rebuild_rows();
             panel.restore_scroll_value(scroll_value);
         });
+    }
+
+    #[cfg(not(test))]
+    fn install_directory_monitors(&self, directories: Vec<PathBuf>) {
+        let directories = directories.into_iter().collect::<HashSet<_>>();
+        if *self.monitored_directories.borrow() == directories {
+            return;
+        }
+        self.clear_directory_monitors();
+        let mut monitors = Vec::new();
+        for directory in &directories {
+            let file = gio::File::for_path(&directory);
+            let Ok(monitor) =
+                file.monitor_directory(gio::FileMonitorFlags::NONE, gio::Cancellable::NONE)
+            else {
+                tracing::debug!(directory = %directory.display(), "file browser monitor unavailable");
+                continue;
+            };
+            let panel = self.clone();
+            monitor.connect_changed(move |_, _, _, event| {
+                if !matches!(
+                    event,
+                    gio::FileMonitorEvent::Created
+                        | gio::FileMonitorEvent::Deleted
+                        | gio::FileMonitorEvent::Moved
+                        | gio::FileMonitorEvent::Renamed
+                        | gio::FileMonitorEvent::MovedIn
+                        | gio::FileMonitorEvent::MovedOut
+                ) {
+                    return;
+                }
+                if panel.monitor_ready.get() {
+                    panel.schedule_monitored_directory_refresh();
+                }
+            });
+            monitors.push(monitor);
+        }
+        *self.directory_monitors.borrow_mut() = monitors;
+        *self.monitored_directories.borrow_mut() = directories;
+        let epoch = self.monitor_epoch.get();
+        let panel = self.clone();
+        glib::timeout_add_local_once(std::time::Duration::from_millis(250), move || {
+            if panel.open.get() && panel.monitor_epoch.get() == epoch {
+                panel.monitor_ready.set(true);
+            }
+        });
+    }
+
+    #[cfg(not(test))]
+    fn schedule_monitored_directory_refresh(&self) {
+        if !self.open.get() || self.monitor_refresh_scheduled.replace(true) {
+            return;
+        }
+        let panel = self.clone();
+        glib::timeout_add_local_once(std::time::Duration::from_millis(100), move || {
+            panel.monitor_refresh_scheduled.set(false);
+            if panel.open.get() {
+                panel.refresh();
+            }
+        });
+    }
+
+    fn clear_directory_monitors(&self) {
+        self.monitor_epoch
+            .set(self.monitor_epoch.get().wrapping_add(1));
+        self.monitor_ready.set(false);
+        self.directory_monitors.borrow_mut().clear();
+        self.monitored_directories.borrow_mut().clear();
     }
 
     #[cfg(all(test, not(target_os = "macos")))]
