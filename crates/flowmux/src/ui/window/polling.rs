@@ -174,47 +174,6 @@ impl WindowController {
     /// `unread_count()` after each `await` so bursty pushes/sweeps
     /// always converge to the freshest value.
     pub(super) fn refresh_launcher_badge(&self) {
-        if self.badge_publisher_busy.get() {
-            // Another spawn_local is already publishing. Just signal it
-            // to republish once it finishes its current await — the
-            // store will be re-read after the in-flight publish so the
-            // latest count wins without us starting a racing task.
-            self.badge_dirty.set(true);
-            return;
-        }
-        self.badge_publisher_busy.set(true);
-        self.badge_dirty.set(false);
-        let notifier_cell = self.notifier.clone();
-        let store = self.notifications.clone();
-        let busy = self.badge_publisher_busy.clone();
-        let dirty = self.badge_dirty.clone();
-        let handle = self.tokio_handle.clone();
-        glib::MainContext::default().spawn_local(async move {
-            // zbus's tokio executor needs an active runtime context
-            // across every `await`. Without it, `update_launcher_count`
-            // panics inside `spawn_local`, GLib swallows the panic, and
-            // the dock badge never updates.
-            let _enter = handle.as_ref().map(|h| h.enter());
-            let app_uri = format!(
-                "application://{}.desktop",
-                flowmux_notify::DESKTOP_FILE_BASENAME
-            );
-            loop {
-                let Some(notifier) = ensure_desktop_notifier(&notifier_cell).await else {
-                    dirty.set(false);
-                    busy.set(false);
-                    return;
-                };
-                let count = store.unread_count() as i64;
-                if let Err(e) = notifier.update_launcher_count(&app_uri, count).await {
-                    tracing::debug!(error = %e, count, "launcher entry update failed");
-                }
-                if !dirty.get() {
-                    busy.set(false);
-                    return;
-                }
-                dirty.set(false);
-            }
-        });
+        self.notifications.refresh_launcher_badge();
     }
 }

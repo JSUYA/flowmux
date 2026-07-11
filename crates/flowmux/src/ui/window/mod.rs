@@ -278,7 +278,7 @@ pub struct WindowController {
     store: StateStore,
     bridge: Bridge,
     theme: Arc<ResolvedTheme>,
-    notifications: NotificationStore,
+    notifications: notification_coordinator::NotificationCoordinator,
     options: Rc<RefCell<flowmux_config::options::Options>>,
     /// Global CssProvider. When the options dialog changes focus border color
     /// or opacity, reload CSS into this same instance so every pane updates immediately.
@@ -291,43 +291,10 @@ pub struct WindowController {
     /// the head through third panes, shortened to the last 3 folders with a
     /// "..." prefix. Updated on focus moves within a workspace.
     focus_mru: Rc<RefCell<HashMap<WorkspaceId, std::collections::VecDeque<PaneId>>>>,
-    /// `org.gtk.Notifications` client used to withdraw toasts when the
-    /// user acknowledges them in flowmux. Defaults to a fresh empty
-    /// cell; `main.rs` swaps in the same cell `DaemonHandler` uses to
-    /// send `AddNotification` (via [`Self::use_shared_notifier`]) so
-    /// both sides run through the same `Connection::session()`.
-    /// gnome-shell keys entries by `(sender bus name, app_id)`, so a
-    /// withdraw from a second connection silently fails to match — the
-    /// dock badge and message-tray entry stay until the user clears
-    /// them by hand. Uses a `tokio::sync::Mutex` so the same handle
-    /// can be shared with the tokio-side daemon handler.
-    notifier: Arc<tokio::sync::Mutex<Option<flowmux_notify::DesktopNotifier>>>,
-    /// Set while a launcher-badge publish task is in flight on the main
-    /// context. Combined with `badge_dirty` it serializes overlapping
-    /// `refresh_launcher_badge` calls so the *last* state of
-    /// `NotificationStore` always wins — without it two concurrent
-    /// `spawn_local` tasks could publish their counts out of order and
-    /// leave the dock badge stuck on a stale value.
-    badge_publisher_busy: Rc<Cell<bool>>,
-    /// Set when a refresh request arrived while another publish task was
-    /// already running. The in-flight task drains it after each publish
-    /// and republishes the latest `unread_count()` until the flag stays
-    /// false — guaranteeing the dock badge converges to the freshest
-    /// state regardless of `spawn_local` scheduling order.
-    badge_dirty: Rc<Cell<bool>>,
     /// Monotonic id for process-tree sweeps. A slower older worker result is
     /// discarded instead of overwriting a newer agent observation.
     agent_poll_generation: Rc<Cell<u64>>,
     cwd_poll_generation: Rc<Cell<u64>>,
-    /// Handle to the Tokio runtime so D-Bus calls dispatched from
-    /// `glib::spawn_local` can enter the runtime before they `await`.
-    /// `zbus` (with the `tokio` feature) calls `Handle::current()` to
-    /// pick a reactor; without an active runtime context every
-    /// `update_launcher_count`, `close`, and `send` panics, the panic
-    /// is swallowed by GLib's task wrapper, and the dock badge / FDO
-    /// toast never updates. Captured from `tokio::runtime::Handle` at
-    /// controller construction so every D-Bus path can `enter()` it.
-    tokio_handle: Option<tokio::runtime::Handle>,
 }
 
 fn wsl_resize_handles_enabled() -> bool {
@@ -486,6 +453,7 @@ mod browser_commands;
 mod command_palette;
 mod file_browser;
 mod notification_commands;
+mod notification_coordinator;
 mod pane_callbacks;
 mod pane_commands;
 mod polling;
@@ -700,17 +668,16 @@ impl WindowController {
             store,
             bridge,
             theme,
-            notifications,
+            notifications: notification_coordinator::NotificationCoordinator::new(
+                notifications,
+                tokio_handle,
+            ),
             options,
             css_provider,
             clipboard_toast,
             focus_mru: Rc::new(RefCell::new(HashMap::new())),
-            notifier: Arc::new(tokio::sync::Mutex::new(None)),
-            badge_publisher_busy: Rc::new(Cell::new(false)),
-            badge_dirty: Rc::new(Cell::new(false)),
             agent_poll_generation: Rc::new(Cell::new(0)),
             cwd_poll_generation: Rc::new(Cell::new(0)),
-            tokio_handle,
         };
         controller.install_state_flush_on_close();
         controller.install_cwd_polling_fallback();
@@ -729,7 +696,7 @@ impl WindowController {
         &mut self,
         handle: Arc<tokio::sync::Mutex<Option<flowmux_notify::DesktopNotifier>>>,
     ) {
-        self.notifier = handle;
+        self.notifications.use_shared_notifier(handle);
     }
 
     pub fn show_status_when_empty(&self) {

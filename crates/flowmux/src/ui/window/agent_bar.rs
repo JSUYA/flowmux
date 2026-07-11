@@ -234,29 +234,6 @@ impl WindowController {
         true
     }
     pub(super) fn close_desktop_notifications(&self, desktop_ids: Vec<String>) {
-        if desktop_ids.is_empty() {
-            return;
-        }
-        let notifier_cell = self.notifier.clone();
-        let handle = self.tokio_handle.clone();
-        glib::MainContext::default().spawn_local(async move {
-            // `zbus` (tokio feature) needs an active Tokio runtime
-            // context for every `await`. The GTK main thread is not a
-            // Tokio worker, so without this guard the first `.await`
-            // panics with "no reactor running"; the panic is swallowed
-            // by GLib's task wrapper and the toast never closes,
-            // leaving the message tray inflated and the dock badge
-            // stuck. The guard lives for the entire async block,
-            // covering connect + every `close().await`.
-            let _enter = handle.as_ref().map(|h| h.enter());
-            let Some(notifier) = ensure_desktop_notifier(&notifier_cell).await else {
-                return;
-            };
-            for did in desktop_ids {
-                if let Err(e) = notifier.close(&did).await {
-                    tracing::debug!(error = %e, %did, "close notification failed");
-                }
-            }
-        });
+        self.notifications.close_desktop_notifications(desktop_ids);
     }
 }
