@@ -303,7 +303,16 @@ fn main() -> anyhow::Result<()> {
             .as_ref()
             .and_then(|window| window.upgrade())
         {
-            window.present();
+            // macOS can emit another application activation while presenting
+            // a secondary window. Do not raise the main window over an image
+            // viewer (or another FlowMux window) that is already active.
+            let active_window_is_active = app
+                .active_window()
+                .as_ref()
+                .is_some_and(|window| window.is_active());
+            if should_present_existing_main_window(active_window_is_active) {
+                window.present();
+            }
             return;
         }
 
@@ -397,6 +406,10 @@ fn build_application() -> adw::Application {
         .application_id(APP_ID)
         .flags(gtk::gio::ApplicationFlags::NON_UNIQUE)
         .build()
+}
+
+fn should_present_existing_main_window(active_window_is_active: bool) -> bool {
+    !active_window_is_active
 }
 
 /// Refresh the stable "current daemon" pointer used by env-less CLI
@@ -614,6 +627,12 @@ mod tests {
         assert!(!should_force_ibus_im_module(Some("fcitx5"), true));
         assert!(!should_force_ibus_im_module(None, false));
         assert!(!should_force_ibus_im_module(Some("wayland"), false));
+    }
+
+    #[test]
+    fn activation_does_not_raise_main_over_an_active_viewer() {
+        assert!(!should_present_existing_main_window(true));
+        assert!(should_present_existing_main_window(false));
     }
 
     #[test]
