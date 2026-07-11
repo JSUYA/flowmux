@@ -1215,6 +1215,24 @@ impl StateStore {
         out
     }
 
+    /// Whether a live agent presence is currently backed by lifecycle hooks.
+    /// Process-only and screen-only detections stay on the fast polling path.
+    pub async fn has_hook_agent_presence(&self) -> bool {
+        let s = self.inner.lock().await;
+        s.workspaces.iter().any(|workspace| {
+            let mut found = Vec::new();
+            for surface in &workspace.surfaces {
+                surface.root_pane.collect_agent_presences(&mut found);
+            }
+            found.iter().any(|(_, presence)| {
+                presence
+                    .source
+                    .as_deref()
+                    .is_some_and(|source| source.starts_with("flowmux:hook"))
+            })
+        })
+    }
+
     pub async fn update_surface_cwd(
         &self,
         pane: PaneId,
@@ -2377,6 +2395,7 @@ mod tests {
         assert_eq!(agent.name, "codex");
         assert_eq!(agent.status, AgentStatus::Idle);
         assert_eq!(agent.source.as_deref(), Some("flowmux:proc"));
+        assert!(!store.has_hook_agent_presence().await);
 
         // Idempotent: same detection reports no change.
         assert!(store
@@ -2613,6 +2632,7 @@ Do you want to continue?";
             store.live_agent_presences().await,
             vec![(ws_id, surface, 42)]
         );
+        assert!(store.has_hook_agent_presence().await);
     }
 
     #[tokio::test]

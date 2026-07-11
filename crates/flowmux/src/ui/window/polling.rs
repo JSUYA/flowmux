@@ -5,6 +5,24 @@
 
 use super::*;
 
+fn agent_poll_delay(has_hook_presence: bool) -> Duration {
+    if has_hook_presence {
+        Duration::from_secs(10)
+    } else {
+        Duration::from_secs(2)
+    }
+}
+
+fn schedule_agent_process_poll(controller: WindowController, delay: Duration) {
+    glib::timeout_add_local_once(delay, move || {
+        glib::MainContext::default().spawn_local(async move {
+            controller.poll_agent_processes().await;
+            let delay = agent_poll_delay(controller.store.has_hook_agent_presence().await);
+            schedule_agent_process_poll(controller, delay);
+        });
+    });
+}
+
 impl WindowController {
     pub(super) async fn update_terminal_cwd(
         &self,
@@ -42,22 +60,11 @@ impl WindowController {
             glib::ControlFlow::Continue
         });
     }
-    /// Agent Bar presence is driven primarily by *process truth*: every 2s,
-    /// resolve which AI agent (if any) is running in each terminal pane's
-    /// process subtree and reconcile the store. This shows an agent the moment
-    /// it launches — no wait for a hook, an OSC title, or recognizable TUI
-    /// text — and drops it when it exits. Screen/title events still refine the
-    /// working/idle status on top of this. Matches the daemon's 2s liveness
-    /// sweep cadence.
+    /// Agent Bar presence is driven primarily by process truth. Poll every 2s
+    /// when process detection is the only signal, then relax to 10s while a
+    /// lifecycle-hook presence is healthy.
     pub(super) fn install_agent_process_polling(&self) {
-        let controller = self.clone();
-        glib::timeout_add_local(Duration::from_secs(2), move || {
-            let controller = controller.clone();
-            glib::MainContext::default().spawn_local(async move {
-                controller.poll_agent_processes().await;
-            });
-            glib::ControlFlow::Continue
-        });
+        schedule_agent_process_poll(self.clone(), Duration::from_secs(2));
     }
     pub(super) async fn poll_agent_processes(&self) {
         let pids = self.pane_registry.borrow().terminal_agent_pids();
@@ -175,5 +182,15 @@ impl WindowController {
     /// always converge to the freshest value.
     pub(super) fn refresh_launcher_badge(&self) {
         self.notifications.refresh_launcher_badge();
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agent_polling_relaxes_for_hook_backed_sessions() {
+        assert_eq!(agent_poll_delay(false), Duration::from_secs(2));
+        assert_eq!(agent_poll_delay(true), Duration::from_secs(10));
     }
 }
