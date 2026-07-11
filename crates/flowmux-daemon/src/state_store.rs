@@ -16,7 +16,7 @@ use flowmux_state::{State, WindowLayout};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Notify};
 use tracing::{error, info};
 
@@ -201,6 +201,24 @@ fn collapse_empty_source_locked(s: &mut State, pane: PaneId, leaf_empty: bool) -
         Some(_) => (true, false),
         None => (false, false),
     }
+}
+
+async fn save_snapshot_blocking(snapshot: State) -> Result<u64, flowmux_state::StateError> {
+    tokio::task::spawn_blocking(move || {
+        flowmux_state::save(&snapshot)?;
+        let file_size = flowmux_state::default_path()
+            .ok()
+            .and_then(|path| std::fs::metadata(path).ok())
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        Ok(file_size)
+    })
+    .await
+    .map_err(|err| {
+        flowmux_state::StateError::Io(std::io::Error::other(format!(
+            "state persistence worker failed: {err}"
+        )))
+    })?
 }
 
 /// Return every live workspace id exactly once in sidebar order. Persisted
@@ -1782,8 +1800,15 @@ impl StateStore {
                 continue;
             }
             let snap = self.snapshot().await;
-            match flowmux_state::save(&snap) {
-                Ok(()) => info!(workspaces = snap.workspaces.len(), "state persisted"),
+            let workspaces = snap.workspaces.len();
+            let started = Instant::now();
+            match save_snapshot_blocking(snap).await {
+                Ok(file_size) => info!(
+                    workspaces,
+                    file_size,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "state persisted"
+                ),
                 Err(e) => error!(error = %e, "state save failed"),
             }
         }
@@ -1794,7 +1819,7 @@ impl StateStore {
             return Ok(());
         }
         let snap = self.snapshot().await;
-        flowmux_state::save(&snap)
+        save_snapshot_blocking(snap).await.map(|_| ())
     }
 
     pub fn save_now_blocking(&self) -> Result<(), flowmux_state::StateError> {
