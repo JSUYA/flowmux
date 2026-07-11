@@ -216,9 +216,6 @@ enum Cmd {
         op: BrowserOp,
     },
 
-    /// Open a remote workspace over SSH.
-    Ssh { target: String },
-
     /// Pipe a byte stream through the OSC parser and forward each
     /// notification to the daemon. Useful for wiring agent hooks:
     ///

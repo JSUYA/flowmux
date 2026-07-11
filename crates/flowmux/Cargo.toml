@@ -44,7 +44,6 @@ path = "src/main.rs"
 flowmux-core = { workspace = true }
 flowmux-config = { workspace = true }
 flowmux-ipc = { workspace = true }
-flowmux-ssh = { workspace = true }
 flowmux-notify = { workspace = true }
 flowmux-terminal = { workspace = true }
 flowmux-state = { workspace = true }

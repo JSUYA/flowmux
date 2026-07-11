@@ -2036,9 +2036,6 @@ Used by:
 
 ### Apache License 2.0
 
-Used by:
-- russh-sftp 2.2.2
-
 ```text
                                  Apache License
                            Version 2.0, January 2004
@@ -5330,9 +5327,6 @@ Used by:
 - sha2 0.10.9
 - signature 2.2.0
 - spki 0.7.3
-- ssh-cipher 0.2.0
-- ssh-encoding 0.2.0
-- ssh-key 0.6.7
 - universal-hash 0.5.1
 
 ```text
@@ -6980,10 +6974,6 @@ Used by:
 - quote 1.0.45
 - r-efi 6.0.0
 - rand 0.8.6
-- russh-cryptovec 0.7.3
-- russh-keys 0.46.0
-- russh-util 0.46.0
-- russh 0.46.0
 - rustversion 1.0.22
 - semver 1.0.28
 - serde 1.0.228
@@ -9513,4 +9503,3 @@ the following restrictions:
 
 3. This notice may not be removed or altered from any source distribution.
 ```
-

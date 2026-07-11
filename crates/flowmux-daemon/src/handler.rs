@@ -11,7 +11,6 @@ use crate::state_store::StateStore;
 use flowmux_core::{Notification, NotificationId, PaneId};
 use flowmux_ipc::protocol::{Request, Response, RpcError};
 use flowmux_ipc::server::Handler;
-use flowmux_ssh::SshTarget;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -175,19 +174,6 @@ impl Handler for DaemonHandler {
                 Request::PaneResize { pane, ratio } => {
                     resize_pane_in_store(&self.store, pane, ratio).await
                 }
-                Request::SshConnect { target } => match SshTarget::parse(&target) {
-                    Ok(target) => {
-                        let root = std::env::current_dir()
-                            .unwrap_or_else(|_| std::path::PathBuf::from("/"));
-                        let id = self
-                            .store
-                            .create_workspace(Some(target.workspace_name()), root)
-                            .await;
-                        Response::WorkspaceCreated { id }
-                    }
-                    Err(e) => Response::Error(RpcError::InvalidArgument(e.to_string())),
-                },
-
                 other => Response::Error(RpcError::Unimplemented(format!("{other:?}"))),
             }
         })
@@ -377,41 +363,5 @@ mod tests {
         };
         assert_eq!(*id, split_id);
         assert!((*ratio - 0.7).abs() < f32::EPSILON);
-    }
-
-    #[tokio::test]
-    async fn ssh_connect_creates_workspace_after_parse() {
-        let handler = DaemonHandler::new(StateStore::new_lazy(State::default()));
-
-        let response = handler
-            .handle(Request::SshConnect {
-                target: "alice@example.com".into(),
-            })
-            .await;
-
-        let Response::WorkspaceCreated { id } = response else {
-            panic!("expected ssh workspace creation");
-        };
-        assert_eq!(
-            handler.store().get_workspace(id).await.unwrap().name,
-            "ssh alice@example.com"
-        );
-    }
-
-    #[tokio::test]
-    async fn rejects_malformed_ssh_target_before_workspace_creation() {
-        let handler = DaemonHandler::new(StateStore::new_lazy(State::default()));
-
-        let response = handler
-            .handle(Request::SshConnect {
-                target: "alice@".into(),
-            })
-            .await;
-
-        assert!(matches!(
-            response,
-            Response::Error(RpcError::InvalidArgument(message))
-                if message.contains("invalid ssh target")
-        ));
     }
 }

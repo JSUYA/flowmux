@@ -165,8 +165,8 @@ points worth knowing when navigating:
   `FLOWMUX_SOCKET_PATH` / `FLOWMUX_PANE_ID` from env so hooks running
   inside a pane can omit pane arguments.
 - `flowmux-cookies` — host browser session import (libsecret + sqlite).
-- `flowmux-procmon` / `flowmux-ssh` / `flowmux-vcs` — auxiliary
-  features (PID/port watcher, SSH workspaces via russh, Git/PR sidebar).
+- `flowmux-procmon` / `flowmux-vcs` — auxiliary features (PID watcher
+  and Git/PR sidebar).
 
 ### Pane-aware env vars
 

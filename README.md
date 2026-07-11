@@ -108,7 +108,6 @@ flowmux/
 │   ├── flowmux-ipc/        Unix-socket IPC (cmux socket-API compatible)
 │   ├── flowmux-daemon/     Background daemon orchestrating IPC and panes
 │   ├── flowmux-procmon/    PID-tree process / listening-port monitor
-│   ├── flowmux-ssh/        SSH workspaces via russh
 │   ├── flowmux-vcs/        Git/PR sidebar integration
 │   ├── flowmux-cli/        `flowmuxctl` helper for CLI subcommands
 │   └── flowmux/            GTK4 + libadwaita main app and public `flowmux` binary
@@ -126,7 +125,7 @@ sudo apt install \
     build-essential pkg-config git \
     libgtk-4-dev libadwaita-1-dev libvte-2.91-gtk4-dev \
     libwebkitgtk-6.0-dev libssl-dev \
-    libssh2-1-dev libdbus-1-dev libsecret-1-dev
+    libdbus-1-dev libsecret-1-dev
 # rustup (Rust 1.93+) required.
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```

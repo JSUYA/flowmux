@@ -218,7 +218,6 @@ pub(crate) fn build_request(cmd: Cmd) -> anyhow::Result<Request> {
             surface,
         },
         Cmd::Browser { op } => browser_op_to_request(op)?,
-        Cmd::Ssh { target } => Request::SshConnect { target },
         Cmd::NotifyStream { .. } => unreachable!("handled before request build"),
         Cmd::ClaudeTeams { count, root, args } => Request::ClaudeTeams {
             count,

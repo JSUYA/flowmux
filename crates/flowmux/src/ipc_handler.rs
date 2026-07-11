@@ -12,7 +12,6 @@ use flowmux_core::{AgentStatusReport, SplitDirection};
 use flowmux_daemon::DaemonHandler;
 use flowmux_ipc::protocol::{Request, Response, RpcError};
 use flowmux_ipc::server::Handler;
-use flowmux_ssh::SshTarget;
 use std::future::Future;
 use std::pin::Pin;
 use tokio::sync::oneshot;
@@ -39,6 +38,12 @@ fn browser_error_response(error: String) -> Response {
 }
 
 async fn browser_action(bridge: &Bridge, pane: flowmux_core::PaneId, op: BrowserOp) -> Response {
+    tracing::debug!(
+        %pane,
+        verb = op.capability_name(),
+        query = op.is_query(),
+        "dispatching browser action"
+    );
     let (tx, rx) = oneshot::channel();
     let _ = bridge
         .tx
@@ -53,6 +58,74 @@ async fn browser_action(bridge: &Bridge, pane: flowmux_core::PaneId, op: Browser
     }
 }
 
+/// Browser requests that map directly to the shared GTK browser action path.
+/// Open, cookie import, and raw eval keep their dedicated response contracts.
+struct BrowserActionRequest {
+    pane: flowmux_core::PaneId,
+    op: BrowserOp,
+}
+
+impl TryFrom<Request> for BrowserActionRequest {
+    type Error = Request;
+
+    fn try_from(request: Request) -> Result<Self, Self::Error> {
+        let (pane, op) = match request {
+            Request::BrowserNavigate { pane, url } => (pane, BrowserOp::Navigate { url }),
+            Request::BrowserBack { pane } => (pane, BrowserOp::Back),
+            Request::BrowserForward { pane } => (pane, BrowserOp::Forward),
+            Request::BrowserReload { pane } => (pane, BrowserOp::Reload),
+            Request::BrowserUrl { pane } => (pane, BrowserOp::Url),
+            Request::BrowserTitle { pane } => (pane, BrowserOp::Title),
+            Request::BrowserClick { pane, target } => (pane, BrowserOp::Click { target }),
+            Request::BrowserFill {
+                pane,
+                target,
+                value,
+            } => (pane, BrowserOp::Fill { target, value }),
+            Request::BrowserSelect {
+                pane,
+                target,
+                value,
+            } => (pane, BrowserOp::Select { target, value }),
+            Request::BrowserScroll { pane, target, x, y } => {
+                (pane, BrowserOp::Scroll { target, x, y })
+            }
+            Request::BrowserType { pane, text } => (pane, BrowserOp::Type { text }),
+            Request::BrowserPress { pane, key } => (pane, BrowserOp::Press { key }),
+            Request::BrowserText { pane, target } => (pane, BrowserOp::Text { target }),
+            Request::BrowserValue { pane, target } => (pane, BrowserOp::Value { target }),
+            Request::BrowserAttr { pane, target, name } => (pane, BrowserOp::Attr { target, name }),
+            Request::BrowserWait {
+                pane,
+                condition,
+                timeout_ms,
+                poll_ms,
+            } => (
+                pane,
+                BrowserOp::Wait {
+                    condition,
+                    timeout_ms,
+                    poll_ms,
+                },
+            ),
+            Request::BrowserScreenshot { pane, path } => (pane, BrowserOp::Screenshot { path }),
+            Request::BrowserDblClick { pane, target } => (pane, BrowserOp::DblClick { target }),
+            Request::BrowserHover { pane, target } => (pane, BrowserOp::Hover { target }),
+            Request::BrowserFocus { pane, target } => (pane, BrowserOp::Focus { target }),
+            Request::BrowserBlur { pane, target } => (pane, BrowserOp::Blur { target }),
+            Request::BrowserCheck { pane, target } => (pane, BrowserOp::Check { target }),
+            Request::BrowserUncheck { pane, target } => (pane, BrowserOp::Uncheck { target }),
+            Request::BrowserIsVisible { pane, target } => (pane, BrowserOp::IsVisible { target }),
+            Request::BrowserIsEnabled { pane, target } => (pane, BrowserOp::IsEnabled { target }),
+            Request::BrowserIsChecked { pane, target } => (pane, BrowserOp::IsChecked { target }),
+            Request::BrowserCount { pane, selector } => (pane, BrowserOp::Count { selector }),
+            Request::BrowserSnapshot { pane } => (pane, BrowserOp::Snapshot),
+            other => return Err(other),
+        };
+        Ok(Self { pane, op })
+    }
+}
+
 pub struct GuiHandler {
     inner: DaemonHandler,
     bridge: Bridge,
@@ -62,66 +135,15 @@ impl GuiHandler {
     pub fn new(inner: DaemonHandler, bridge: Bridge) -> Self {
         Self { inner, bridge }
     }
-
-    async fn open_ssh_workspace(&self, target: SshTarget) -> Response {
-        let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
-        let name = target.workspace_name();
-        let command = format!("{}\r", target.command_line());
-        let id = self
-            .inner
-            .store()
-            .create_workspace(Some(name.clone()), root.clone())
-            .await;
-
-        let (tx, rx) = oneshot::channel();
-        if let Err(e) = self
-            .bridge
-            .tx
-            .send(GtkCommand::WorkspaceCreated {
-                id,
-                name,
-                root,
-                ack: tx,
-            })
-            .await
-        {
-            return Response::Error(RpcError::Internal(e.to_string()));
-        }
-        if let Err(e) = rx.await {
-            return Response::Error(RpcError::Internal(e.to_string()));
-        }
-
-        let pane = self
-            .inner
-            .store()
-            .get_workspace(id)
-            .await
-            .and_then(|workspace| workspace.surfaces.first()?.root_pane.first_leaf_id());
-        if let Some(pane) = pane {
-            let (tx, rx) = oneshot::channel();
-            let _ = self
-                .bridge
-                .tx
-                .send(GtkCommand::PaneSendKeys {
-                    pane,
-                    keys: command,
-                    ack: tx,
-                })
-                .await;
-            let _ = rx.await;
-        }
-
-        Response::WorkspaceCreated { id }
-    }
 }
 
 impl Handler for GuiHandler {
     fn handle<'a>(&'a self, req: Request) -> Pin<Box<dyn Future<Output = Response> + Send + 'a>> {
         Box::pin(async move {
             match req {
-                Request::WorkspaceCreate { .. }
-                | Request::SshConnect { .. }
-                | Request::WorkspaceFocus { .. } => self.handle_workspace_verb(req).await,
+                Request::WorkspaceCreate { .. } | Request::WorkspaceFocus { .. } => {
+                    self.handle_workspace_verb(req).await
+                }
                 Request::PaneSplit { .. }
                 | Request::PaneSendKeys { .. }
                 | Request::PaneReadScreen { .. }
@@ -232,10 +254,6 @@ impl GuiHandler {
                 let _ = rx.await;
                 Response::WorkspaceCreated { id }
             }
-            Request::SshConnect { target } => match SshTarget::parse(&target) {
-                Ok(target) => self.open_ssh_workspace(target).await,
-                Err(e) => Response::Error(RpcError::InvalidArgument(e.to_string())),
-            },
             Request::WorkspaceFocus { workspace } => {
                 // Validate against live state so a bad id returns a
                 // clean NotFound instead of a silent no-op. The focus
@@ -457,6 +475,10 @@ impl GuiHandler {
 
     /// Dispatch for the browser verb group (split out of the `handle` match).
     async fn handle_browser_verb(&self, req: Request) -> Response {
+        let req = match BrowserActionRequest::try_from(req) {
+            Ok(action) => return browser_action(&self.bridge, action.pane, action.op).await,
+            Err(req) => req,
+        };
         match req {
             Request::BrowserOpen {
                 url,
@@ -482,114 +504,6 @@ impl GuiHandler {
                     Ok(Err(e)) => browser_error_response(e),
                     Err(_) => Response::Error(RpcError::Internal("bridge closed".into())),
                 }
-            }
-            Request::BrowserNavigate { pane, url } => {
-                browser_action(&self.bridge, pane, BrowserOp::Navigate { url }).await
-            }
-            Request::BrowserBack { pane } => {
-                browser_action(&self.bridge, pane, BrowserOp::Back).await
-            }
-            Request::BrowserForward { pane } => {
-                browser_action(&self.bridge, pane, BrowserOp::Forward).await
-            }
-            Request::BrowserReload { pane } => {
-                browser_action(&self.bridge, pane, BrowserOp::Reload).await
-            }
-            Request::BrowserUrl { pane } => {
-                browser_action(&self.bridge, pane, BrowserOp::Url).await
-            }
-            Request::BrowserTitle { pane } => {
-                browser_action(&self.bridge, pane, BrowserOp::Title).await
-            }
-            Request::BrowserClick { pane, target } => {
-                browser_action(&self.bridge, pane, BrowserOp::Click { target }).await
-            }
-            Request::BrowserFill {
-                pane,
-                target,
-                value,
-            } => browser_action(&self.bridge, pane, BrowserOp::Fill { target, value }).await,
-            Request::BrowserSelect {
-                pane,
-                target,
-                value,
-            } => browser_action(&self.bridge, pane, BrowserOp::Select { target, value }).await,
-            Request::BrowserScroll { pane, target, x, y } => {
-                browser_action(&self.bridge, pane, BrowserOp::Scroll { target, x, y }).await
-            }
-            Request::BrowserType { pane, text } => {
-                browser_action(&self.bridge, pane, BrowserOp::Type { text }).await
-            }
-            Request::BrowserPress { pane, key } => {
-                browser_action(&self.bridge, pane, BrowserOp::Press { key }).await
-            }
-            Request::BrowserText { pane, target } => {
-                browser_action(&self.bridge, pane, BrowserOp::Text { target }).await
-            }
-            Request::BrowserValue { pane, target } => {
-                browser_action(&self.bridge, pane, BrowserOp::Value { target }).await
-            }
-            Request::BrowserAttr { pane, target, name } => {
-                browser_action(&self.bridge, pane, BrowserOp::Attr { target, name }).await
-            }
-
-            // ---- Phase 5 P0 action gap ------------------------
-            Request::BrowserWait {
-                pane,
-                condition,
-                timeout_ms,
-                poll_ms,
-            } => {
-                browser_action(
-                    &self.bridge,
-                    pane,
-                    BrowserOp::Wait {
-                        condition,
-                        timeout_ms,
-                        poll_ms,
-                    },
-                )
-                .await
-            }
-            Request::BrowserScreenshot { pane, path } => {
-                browser_action(&self.bridge, pane, BrowserOp::Screenshot { path }).await
-            }
-            Request::BrowserDblClick { pane, target } => {
-                browser_action(&self.bridge, pane, BrowserOp::DblClick { target }).await
-            }
-            Request::BrowserHover { pane, target } => {
-                browser_action(&self.bridge, pane, BrowserOp::Hover { target }).await
-            }
-            Request::BrowserFocus { pane, target } => {
-                browser_action(&self.bridge, pane, BrowserOp::Focus { target }).await
-            }
-            Request::BrowserBlur { pane, target } => {
-                browser_action(&self.bridge, pane, BrowserOp::Blur { target }).await
-            }
-            Request::BrowserCheck { pane, target } => {
-                browser_action(&self.bridge, pane, BrowserOp::Check { target }).await
-            }
-            Request::BrowserUncheck { pane, target } => {
-                browser_action(&self.bridge, pane, BrowserOp::Uncheck { target }).await
-            }
-            Request::BrowserIsVisible { pane, target } => {
-                browser_action(&self.bridge, pane, BrowserOp::IsVisible { target }).await
-            }
-            Request::BrowserIsEnabled { pane, target } => {
-                browser_action(&self.bridge, pane, BrowserOp::IsEnabled { target }).await
-            }
-            Request::BrowserIsChecked { pane, target } => {
-                browser_action(&self.bridge, pane, BrowserOp::IsChecked { target }).await
-            }
-            Request::BrowserCount { pane, selector } => {
-                browser_action(&self.bridge, pane, BrowserOp::Count { selector }).await
-            }
-            Request::BrowserSnapshot { pane } => {
-                // Routed through the shared browser_action path so the
-                // GTK side runs the non-mutating SNAPSHOT_JS and
-                // repopulates the pane's RefStore. The response shape
-                // (BrowserResult { value }) is unchanged.
-                browser_action(&self.bridge, pane, BrowserOp::Snapshot).await
             }
             Request::ImportCookies { source, domain } => {
                 // Read cookies inside an inner scope so the !Send
@@ -1036,8 +950,8 @@ impl GuiHandler {
                 }
             }
 
-            // Everything else is fully GUI-independent: ping, list,
-            // notify (delegated above), ssh — delegate.
+            // Everything else is fully GUI-independent: ping, list, and
+            // notification operations delegated above.
             other => unreachable!("notification router got a non-notification verb: {other:?}"),
         }
     }

@@ -77,37 +77,6 @@ async fn workspace_create_dispatches_workspace_created_and_waits_for_ack() {
 }
 
 #[tokio::test]
-async fn ssh_connect_creates_workspace_and_sends_ssh_command() {
-    let (handler, rx, _pane, _tab) = single_pane_handler().await;
-    let response = handler.handle(Request::SshConnect {
-        target: "alice@example.com:2222".into(),
-    });
-    tokio::pin!(response);
-
-    let command = tokio::select! {
-        response = &mut response => panic!("ssh completed before workspace ack: {response:?}"),
-        command = rx.recv() => command.expect("ssh should create workspace"),
-    };
-    let GtkCommand::WorkspaceCreated { id, name, ack, .. } = command else {
-        panic!("expected WorkspaceCreated command");
-    };
-    assert_eq!(name, "ssh alice@example.com");
-    ack.send(()).unwrap();
-
-    let command = tokio::select! {
-        response = &mut response => panic!("ssh completed before send-keys ack: {response:?}"),
-        command = rx.recv() => command.expect("ssh should send command to terminal"),
-    };
-    let GtkCommand::PaneSendKeys { keys, ack, .. } = command else {
-        panic!("expected PaneSendKeys command");
-    };
-    assert_eq!(keys, "ssh -p 2222 alice@example.com\r");
-    ack.send(Ok(())).unwrap();
-
-    assert!(matches!(response.await, Response::WorkspaceCreated { id: got } if got == id));
-}
-
-#[tokio::test]
 async fn read_only_requests_delegate_without_gtk_dispatch() {
     let (handler, rx, _pane, _tab) = single_pane_handler().await;
 
@@ -945,6 +914,52 @@ async fn assert_browser_action_dispatches(
     assert_op(op);
     ack.send(Ok(BrowserActionResult::Ok)).unwrap();
     assert!(matches!(response.await, Response::BrowserOk));
+}
+
+#[test]
+fn browser_action_request_preserves_non_action_requests() {
+    let request = Request::BrowserOpen {
+        url: "https://example.com".into(),
+        target_pane: None,
+        direction: SplitDirection::Vertical,
+    };
+    let Err(request) = BrowserActionRequest::try_from(request) else {
+        panic!("browser open must keep its dedicated dispatch path");
+    };
+    assert!(matches!(request, Request::BrowserOpen { .. }));
+
+    let request = Request::BrowserEval {
+        pane: PaneId::new(),
+        source: "document.title".into(),
+    };
+    let Err(request) = BrowserActionRequest::try_from(request) else {
+        panic!("browser eval must keep its dedicated response contract");
+    };
+    assert!(matches!(request, Request::BrowserEval { .. }));
+}
+
+#[test]
+fn browser_op_metadata_distinguishes_queries_from_actions() {
+    let query = BrowserOp::IsVisible {
+        target: "e1".into(),
+    };
+    assert_eq!(query.capability_name(), "is-visible");
+    assert!(query.is_query());
+
+    let action = BrowserOp::Fill {
+        target: "e1".into(),
+        value: "flowmux".into(),
+    };
+    assert_eq!(action.capability_name(), "fill");
+    assert!(!action.is_query());
+
+    let wait = BrowserOp::Wait {
+        condition: flowmux_ipc::protocol::BrowserWaitCondition::ReadyState("complete".into()),
+        timeout_ms: 1_000,
+        poll_ms: 50,
+    };
+    assert_eq!(wait.capability_name(), "wait");
+    assert!(wait.is_query());
 }
 
 #[tokio::test]

@@ -117,6 +117,63 @@ pub enum BrowserOp {
     },
 }
 
+impl BrowserOp {
+    /// Stable public verb name used by capability reporting and diagnostics.
+    /// Keep this mapping next to the operation enum so adding an operation
+    /// cannot silently omit its agent-facing name.
+    pub fn capability_name(&self) -> &'static str {
+        match self {
+            Self::Snapshot => "snapshot",
+            Self::Navigate { .. } => "navigate",
+            Self::Back => "back",
+            Self::Forward => "forward",
+            Self::Reload => "reload",
+            Self::Url => "url",
+            Self::Title => "title",
+            Self::Click { .. } => "click",
+            Self::Fill { .. } => "fill",
+            Self::Select { .. } => "select",
+            Self::Scroll { .. } => "scroll",
+            Self::Type { .. } => "type",
+            Self::Press { .. } => "press",
+            Self::Text { .. } => "text",
+            Self::Value { .. } => "value",
+            Self::Attr { .. } => "attr",
+            Self::Wait { .. } => "wait",
+            Self::Screenshot { .. } => "screenshot",
+            Self::DblClick { .. } => "dblclick",
+            Self::Hover { .. } => "hover",
+            Self::Focus { .. } => "focus",
+            Self::Blur { .. } => "blur",
+            Self::Check { .. } => "check",
+            Self::Uncheck { .. } => "uncheck",
+            Self::IsVisible { .. } => "is-visible",
+            Self::IsEnabled { .. } => "is-enabled",
+            Self::IsChecked { .. } => "is-checked",
+            Self::Count { .. } => "count",
+        }
+    }
+
+    /// Whether this operation primarily reads browser state. `wait` is a
+    /// query because it observes a condition without mutating the page.
+    pub fn is_query(&self) -> bool {
+        matches!(
+            self,
+            Self::Snapshot
+                | Self::Url
+                | Self::Title
+                | Self::Text { .. }
+                | Self::Value { .. }
+                | Self::Attr { .. }
+                | Self::Wait { .. }
+                | Self::IsVisible { .. }
+                | Self::IsEnabled { .. }
+                | Self::IsChecked { .. }
+                | Self::Count { .. }
+        )
+    }
+}
+
 /// Result shape returned by [`BrowserOp`] dispatch.
 #[derive(Debug, Clone)]
 pub enum BrowserActionResult {

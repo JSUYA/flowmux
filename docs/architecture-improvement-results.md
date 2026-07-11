@@ -24,7 +24,6 @@
 | 4 | `46b01aa` | #3 GUI IPC 디스패치 verb-group 분할 |
 | 5 | `769a547` | #2 Pane 트리 surface finder 통합 |
 | 6 | `57e79d4` | #5 daemon panic → degrade 하드닝 |
-| 7 | `56c7d43` | #6 flowmux-ssh 데드코드 feature 게이트 + 문서 정정 |
 | 8 | `c20c163` | #7 core lib.rs 테스트 외부 분리 |
 
 ## 파일 규모 비교 (before → after)
@@ -88,18 +87,6 @@
   경로(하드닝 지점)를 통과하는 케이스 추가(기존엔 same-ws/degrade 경로만 커버).
 - 검증: `cargo test -p flowmux-daemon` 102 → **103** pass, clippy clean.
 
-### #6 flowmux-ssh 데드코드 게이트 + 문서 정정 (P4)
-- `SshClient`/`ClientHandler`(russh 네이티브 전송, `connect`는 Unimplemented,
-  비-테스트 호출부 0 = 데드코드)를 `native` 모듈로 옮기고 off-by-default
-  `native-ssh` feature로 게이트. `russh`/`russh-keys`/`async-trait`를 optional
-  의존성으로 전환 → 기본 빌드에서 russh 제거. 전송 전용 `SshError` variant
-  (Handshake/AuthFailed/Io/Unimplemented)도 동일 게이트, `ParseTarget`은 상시.
-- 문서 정정: 크레이트 doc과 Cargo description이 포트포워딩/SFTP/네이티브
-  핸드셰이크를 동작인 양 서술하던 것을 실제 상태(타깃 파서 + 시스템 ssh 주입)로
-  정정. GUI/headless `SshConnect` 동작 불일치를 명시.
-- 검증: `cargo check -p flowmux-ssh` (feature on/off 양쪽), `cargo test` 9 pass,
-  clippy clean 양쪽, 워크스페이스/GUI 빌드 정상.
-
 ### #7 core lib.rs 테스트 외부 분리 (Optional)
 - `#[cfg(test)] mod tests`(~2,937줄)를 `lib_tests.rs`로 `#[path]` 분리.
   lib.rs 프로덕션 코드 5,419 → 2,485.
@@ -116,7 +103,7 @@
   이 분석은 폐기한다. 실제 원인은 사용자 옵션과 GTK mapping 상태에 의존한 fixture였다.
 
 크레이트별: core 118 · cli 135 · daemon 103 · ipc 39 · notify 26 · procmon 10 ·
-ssh 9 · state 16(+cross-process 1) · terminal 16 · vcs 5 · md-viewer 15 ·
+state 16(+cross-process 1) · terminal 16 · vcs 5 · md-viewer 15 ·
 GUI 282 (+4 환경성 실패).
 
 ### 라이브 앱 동작 테스트 (현재 세션 미종료)
@@ -149,9 +136,7 @@ scratch state/data/config)로 별도 실행해 실제 IPC 왕복을 구동:
    실패했다. 코드와 무관(파일 바이트 동일). `scripts/install-thorvg.sh`가 soname을
    확정적으로 1.0.6에 고정하거나, 테스트가 C-API 부재를 skip 처리하도록 하면
    재발 방지가 된다. (검증 시엔 LD_LIBRARY_PATH shim으로 우회.)
-5. **`daemon`의 헤드리스/GUI `SshConnect` 정렬**: #6에서 불일치를 문서화만 했다.
-   headless를 GUI와 동일 의미(워크스페이스 + ssh 주입 상당)로 맞추는 것은 별도 과제.
-6. **GUI 테스트 격리 (사후 감사에서 해결)**: Agent Bar 옵션을 fixture에서 고정하고
+5. **GUI 테스트 격리 (사후 감사에서 해결)**: Agent Bar 옵션을 fixture에서 고정하고
    `is_visible` 대신 위젯의 local `visible` 속성을 검사해 실제 WM에서도 결정적으로
    통과하도록 수정했다.
 

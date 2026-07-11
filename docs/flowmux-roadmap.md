@@ -49,9 +49,6 @@ P1 ("daily usability") is implemented:
 
 P2 ("compatibility conveniences") is implemented:
 
-- P2-1 — `flowmux ssh`: implemented as an OpenSSH-backed workspace flow. The
-  GUI path creates a workspace and sends `ssh ...` into its terminal; the
-  headless handler creates the corresponding SSH workspace state.
 - P2-2 — Browser `wait`: implemented for selector, text, URL substring,
   `document.readyState`, and JavaScript predicate polling. Network-idle waits
   are intentionally not promised.
@@ -87,7 +84,6 @@ AI coding agents:
 | Agent hooks | Claude Code, Codex, and OpenCode hook installation plus notification/activity updates. | Harden the supported agents before adding more integrations. |
 | Session restore | Persistent workspace/window/sidebar state and agent session storage exist. | Needs reliable user-visible restore for core surfaces. |
 | Notifications | Desktop notifications and in-app notification state exist. | Needs CLI notification management for scripted and keyboard-driven workflows. |
-| SSH/remote | `flowmux ssh` command surface exists, but real SSH workspace handling is not wired through. | Start with a minimal remote terminal workflow before adding advanced remote features. |
 | Config | Reads a useful project command/config subset. | Extend only the parts that unlock daily workflow. |
 | Tmux-style compatibility | Not a primary surface today. | Minimal aliases are useful for agent scripts, but full terminal multiplexer replacement is not required. |
 | Sidebar/feed surfaces | Notifications/activity surfaces exist; a full decision feed is not present. | Defer larger sidebar/feed features until core workflow is stable. |
@@ -158,7 +154,6 @@ These items improve compatibility, but they should not delay P0/P1.
 
 | Priority | Feature unit | Importance | Necessity | Implementation target |
 |---|---|---:|---:|---|
-| P2-1 | Minimal `flowmux ssh` | A | near-required | Start with OpenSSH-based remote terminal workspaces, cwd/title propagation, and notification routing. Defer remote daemon/proxy architecture. |
 | P2-2 | Browser `wait` | A | near-required | Add selector/text/url/readyState/JS-predicate polling. Do not promise network-idle waits. |
 | P2-3 | Browser screenshot | B | optional | Add viewport screenshot only if WebKitGTK support is stable enough. Full-page capture can wait. |
 | P2-4 | Minimal terminal multiplexer aliases | B | optional | Support aliases most likely used by agent scripts: capture/read-screen, send-keys, list/select pane, resize-pane where feasible. |
@@ -255,7 +250,6 @@ Use macOS for fast development, then gate user-facing changes with this matrix:
 4. Improve browser login reuse with Chromium-family cookie import.
 5. Add compatibility conveniences: project config, command palette,
    rename/reorder UX, and minimal terminal multiplexer aliases.
-6. Implement minimal SSH after local workflow stability is proven.
 
 ## Practical release gate
 

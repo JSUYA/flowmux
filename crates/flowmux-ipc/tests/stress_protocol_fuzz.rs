@@ -97,9 +97,6 @@ fn requests_for_round_trip(rng: &mut Xs) -> Vec<Request> {
             body: String::new(),
             level: NotificationLevel::NeedsInput,
         },
-        Request::SshConnect {
-            target: "user@host:22".into(),
-        },
         Request::BrowserOpen {
             url: "https://example.com".into(),
             target_pane: Some(pane),

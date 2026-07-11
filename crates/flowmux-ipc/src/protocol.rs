@@ -317,11 +317,6 @@ pub enum Request {
     /// `flowmux notifications clear`
     NotificationsClear,
 
-    /// `flowmux ssh user@host` — open a remote workspace.
-    SshConnect {
-        target: String,
-    },
-
     /// `flowmux browser open <url> [--right|--down]` — split a target
     /// terminal/browser pane and put a browser pane in the new
     /// sibling. `target_pane = None` means "use the currently

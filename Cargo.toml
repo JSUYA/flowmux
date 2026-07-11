@@ -14,7 +14,6 @@ default-members = [
     "crates/flowmux-state",
     "crates/flowmux-vcs",
     "crates/flowmux-procmon",
-    "crates/flowmux-ssh",
     "crates/flowmux-daemon",
     "crates/flowmux-cookies",
     "crates/flowmux-browser",
@@ -69,7 +68,6 @@ flowmux-ipc = { path = "crates/flowmux-ipc" }
 flowmux-state = { path = "crates/flowmux-state" }
 flowmux-vcs = { path = "crates/flowmux-vcs" }
 flowmux-procmon = { path = "crates/flowmux-procmon" }
-flowmux-ssh = { path = "crates/flowmux-ssh" }
 flowmux-daemon = { path = "crates/flowmux-daemon" }
 flowmux-cookies = { path = "crates/flowmux-cookies" }
 flowmux-browser = { path = "crates/flowmux-browser" }

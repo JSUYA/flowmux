@@ -15,7 +15,6 @@
 초기 도출본 대비 교차 검증에서 **2건이 실질적으로 조정**되었다. 이 문서의 판정이 최종본이다.
 
 - **#2 (트리 재귀 통합)**: "헬퍼 24개 → 1개"는 과장. 실제로는 읽기 전용 finder와 leaf 페이로드 변이자 6~8개만 하나의 제네릭 finder로 접힌다. split/remove/형제탐색 같은 구조 변이자는 제어 흐름·소유권 제약이 달라 별개로 유지된다.
-- **#6 (SSH 스텁)**: "사용자가 도달하는 가짜 기능"은 **오판**. GUI의 SSH 워크스페이스는 pane에 **시스템 `ssh` 명령을 키스트로크로 주입**하므로 실제로 동작한다(`ipc_handler.rs:66`). 미완성인 것은 `flowmux-ssh::SshClient`(russh 네이티브 전송)인데, **이 타입은 비-테스트 코드 어디에서도 생성/호출되지 않는 데드 코드**다. 즉 사용자 영향 버그가 아니라 "미배선 데드 코드 + 크레이트 문서 과장" 문제로 성격이 바뀐다.
 
 ---
 
@@ -28,15 +27,7 @@
 | 3 | IPC verb 디스패치 이중화 | 부분(과장 축소) | PARTIAL | **PARTIALLY-VALID** | 유의미(주로 탐색성) | P2 |
 | 4 | `flowmux-cli/main.rs` 단일 3.3k줄 | VALID | VALID | **VALID** | 유의미 | P2 |
 | 5 | 임베디드 daemon panic 반경 | VALID(저확률) | PARTIAL(저확률) | **PARTIALLY-VALID** | 유의미, 저확률 | P3 |
-| 6 | `flowmux-ssh` 데드코드/문서과장 | 격상→**정정** | PARTIAL | **PARTIALLY-VALID (성격변경)** | 유의미(데드코드·정직성) | P4 |
 | 7 | `flowmux-core/lib.rs` 인라인 테스트 | VALID(사소) | VALID(cosmetic) | **VALID (cosmetic)** | 낮음 | Optional |
-
-**추가 발견 (Codex)**
-
-- SSH 런타임별 동작 불일치: GUI `SshConnect`는 워크스페이스 생성 + `ssh` 명령 주입, headless daemon `SshConnect`(`handler.rs:178`)는 워크스페이스만 생성. 같은 verb가 실행 환경에 따라 다르게 동작.
-- `flowmux-ssh` 크레이트 문서가 구현 범위를 과장(포트 포워딩/SFTP를 동작인 양 서술하나 헤더에는 follow-on으로 명시).
-
----
 
 ## 항목별 실행 계획
 
@@ -74,11 +65,11 @@
 
 **근거**
 - `crates/flowmux-cli/src/main.rs` ≈ 3,260줄, 함수 84개
-- 서브커맨드 디스패치와 요청 빌드가 인라인: `match &cmd`(`main.rs:756`), `build_request`(`main.rs:1051`, `1057`), `Cmd::Ssh`(`main.rs:1147`)
+- 서브커맨드 디스패치와 요청 빌드가 인라인: `match &cmd`(`main.rs:756`), `build_request`(`main.rs:1051`, `1057`)
 
 **판정**: VALID, 기계적. 두 리뷰어 일치.
 
-**작업 범위**: clap `Cmd` enum은 이미 구조가 있으므로 핸들러 본문만 `cmd/` 하위 모듈로 이동(`cmd/workspace.rs`, `cmd/pane`, `cmd/browser.rs`, `cmd/ssh.rs` 등). `main.rs`는 파싱 + 디스패치만 남긴다.
+**작업 범위**: clap `Cmd` enum은 이미 구조가 있으므로 핸들러 본문만 `cmd/` 하위 모듈로 이동(`cmd/workspace.rs`, `cmd/pane`, `cmd/browser.rs` 등). `main.rs`는 파싱 + 디스패치만 남긴다.
 
 **검증**: `cargo check -p flowmux-cli`, `cargo test -p flowmux-cli`(테스트 129개) 통과.
 
@@ -139,29 +130,6 @@ fn find_surface_mut(node: &mut Pane, pane: PaneId, surface: SurfaceId) -> Option
 
 ---
 
-### P4 — #6. `flowmux-ssh` 데드 코드 게이트 + 문서 정정
-
-> 걷어낸 것: "사용자 도달 가짜 기능" 프레임(오판 — GUI ssh는 시스템 `ssh` 주입으로 실동작), 그리고 "russh 네이티브 전송 완성"이라는 신규 구현 야심(투기적, 계획 아님). 검증된 실제 문제 = **미배선 데드 코드 + 문서 과장**만 남긴다.
-
-**근거 (교차 검증으로 확정)**
-- GUI 경로는 **동작한다**: `open_ssh_workspace`(`ipc_handler.rs:66`)가 워크스페이스를 만들고 시스템 `ssh …`를 pane에 키스트로크로 주입(`ipc_handler.rs:95`).
-- `flowmux-ssh::SshClient`(russh, `lib.rs:119`)의 `connect`는 `Unimplemented` 반환(`lib.rs:129`)이며 **비-테스트 코드에서 생성/호출되는 곳이 없다 = 데드 코드**.
-- 크레이트 문서가 포트 포워딩/SFTP를 동작처럼 서술(`lib.rs:6`)하나 헤더는 follow-on으로 명시(`lib.rs:13`) → 정직성 문제.
-- headless `SshConnect`(`handler.rs:178`)는 워크스페이스만 생성 → GUI와 동작 불일치.
-
-**작업 범위 (저위험 정리만)**
-1. `SshClient` 및 관련 데드 코드를 `#[cfg(feature = "native-ssh")]`로 게이트(기본 off). 미래에 러스트 네이티브 전송을 쓸 여지는 남기되 기본 빌드에서 빠짐.
-2. 크레이트 doc의 미구현 범위(포트 포워딩/SFTP/네이티브 핸드셰이크)를 현재 상태에 맞게 정정.
-3. GUI/headless `SshConnect` 동작 불일치를 문서화(또는 headless도 동일 의미로 정렬).
-
-> 네이티브 전송을 실제 로드맵으로 삼는다면 `SshClient` 완성(russh 핸드셰이크 + `known_hosts`, `lib.rs:112`)이 별도 과제 — 본 계획 범위 밖.
-
-**검증**: `cargo check -p flowmux-ssh`(feature on/off 양쪽), `cargo test --workspace` 통과.
-
-**리스크**: 낮음(게이트/문서). 네이티브 전송 구현은 하지 않는다.
-
----
-
 ### Optional — #7. `flowmux-core/lib.rs` 테스트 외부 분리
 
 **근거**: `crates/flowmux-core/src/lib.rs` ≈ 5,511줄 중 `#[cfg(test)] mod tests`가 `lib.rs:2575`부터 끝까지 ≈ 2,936줄.
@@ -183,7 +151,6 @@ P2  #4 CLI 커맨드 모듈화 (기계적, 병렬 가능)
     #3 GUI IPC match 그룹 분할
 P3  #2 트리 surface finder 통합 (테스트 가드)
     #5 daemon panic → RpcError 하드닝 (값쌈)
-P4  #6 SSH 데드코드 feature 게이트 + 문서 정정 (저위험)
 Opt #7 core 테스트 파일 분리 (여유 시)
 ```
 

@@ -20,7 +20,6 @@ flowmux-config = { workspace = true }
 flowmux-state = { workspace = true }
 flowmux-vcs = { workspace = true }
 flowmux-procmon = { workspace = true }
-flowmux-ssh = { workspace = true }
 flowmux-notify = { workspace = true }
 flowmux-ipc = { workspace = true }
 
