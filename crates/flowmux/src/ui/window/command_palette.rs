@@ -5,6 +5,36 @@
 
 use super::*;
 
+fn fuzzy_matches(query: &str, candidate: &str) -> bool {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return true;
+    }
+    let candidate = candidate.to_lowercase();
+    query.split_whitespace().all(|token| {
+        let mut chars = candidate.chars();
+        token.chars().all(|needle| chars.any(|ch| ch == needle))
+    })
+}
+
+fn palette_button(label: &str, shortcut: Option<&str>) -> gtk::Button {
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    let title = gtk::Label::new(Some(label));
+    title.set_xalign(0.0);
+    title.set_hexpand(true);
+    row.append(&title);
+    if let Some(shortcut) = shortcut {
+        let shortcut = gtk::Label::new(Some(shortcut));
+        shortcut.add_css_class("dim-label");
+        row.append(&shortcut);
+    }
+    let button = gtk::Button::new();
+    button.set_child(Some(&row));
+    button.set_hexpand(true);
+    button.set_halign(gtk::Align::Fill);
+    button
+}
+
 impl WindowController {
     /// Connect (lazily) to the `org.gtk.Notifications` service and ask
     /// it to withdraw the given `desktop_id`s. Used by the bell popover
@@ -19,7 +49,8 @@ impl WindowController {
             .transient_for(&self.window)
             .modal(true)
             .title("Command Palette")
-            .default_width(360)
+            .default_width(480)
+            .default_height(420)
             .build();
 
         let content = gtk::Box::new(gtk::Orientation::Vertical, 6);
@@ -30,10 +61,32 @@ impl WindowController {
         content.set_margin_end(12);
         dialog.set_child(Some(&content));
 
+        let search = gtk::SearchEntry::builder()
+            .placeholder_text("Search commands…")
+            .build();
+        content.append(&search);
+
+        let list = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        let scroll = gtk::ScrolledWindow::builder()
+            .child(&list)
+            .vexpand(true)
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .build();
+        content.append(&scroll);
+        let no_results = gtk::Label::new(Some("No matching commands"));
+        no_results.add_css_class("dim-label");
+        no_results.set_visible(false);
+        content.append(&no_results);
+
+        let mut entries = Vec::new();
+
         for command in command_palette_commands() {
-            let button = gtk::Button::with_label(command_palette_label(*command));
-            button.set_hexpand(true);
-            button.set_halign(gtk::Align::Fill);
+            let label = command_palette_label(*command);
+            let shortcut = match command {
+                CommandPaletteCommand::OpenBrowser => Some("Ctrl+Shift+B"),
+                _ => None,
+            };
+            let button = palette_button(label, shortcut);
             let controller = self.clone();
             let dialog_for_click = dialog.clone();
             let command = *command;
@@ -44,14 +97,14 @@ impl WindowController {
                     controller.run_command_palette_command(command).await;
                 });
             });
-            content.append(&button);
+            list.append(&button);
+            entries.push((label.to_string(), button));
         }
 
         if let Some((base_dir, config)) = self.command_palette_project_config() {
             for command in config.commands.clone() {
-                let button = gtk::Button::with_label(&command.label);
-                button.set_hexpand(true);
-                button.set_halign(gtk::Align::Fill);
+                let button = palette_button(&command.label, None);
+                let search_text = format!("{} {}", command.label, command.id);
                 let controller = self.clone();
                 let dialog_for_click = dialog.clone();
                 let env = config.env.clone();
@@ -66,11 +119,38 @@ impl WindowController {
                         controller.run_project_command(base_dir, env, command).await;
                     });
                 });
-                content.append(&button);
+                list.append(&button);
+                entries.push((search_text, button));
             }
         }
 
+        let entries = Rc::new(entries);
+        let entries_for_search = entries.clone();
+        let no_results_for_search = no_results.clone();
+        search.connect_search_changed(move |entry| {
+            let query = entry.text();
+            let mut any_visible = false;
+            for (search_text, button) in entries_for_search.iter() {
+                let visible = fuzzy_matches(&query, search_text);
+                button.set_visible(visible);
+                any_visible |= visible;
+            }
+            no_results_for_search.set_visible(!any_visible);
+        });
+        let entries_for_activate = entries.clone();
+        search.connect_activate(move |_| {
+            if let Some((_, button)) = entries_for_activate
+                .iter()
+                .find(|(_, button)| button.is_visible())
+            {
+                button.emit_clicked();
+            }
+        });
+        let dialog_for_stop = dialog.clone();
+        search.connect_stop_search(move |_| dialog_for_stop.close());
+
         dialog.present();
+        search.grab_focus();
     }
     pub(super) fn command_palette_project_config(&self) -> Option<(std::path::PathBuf, CmuxJson)> {
         let base_dir = self
@@ -244,5 +324,24 @@ impl WindowController {
                 "config reloaded without keybinding re-install — window had no Application"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fuzzy_matches;
+
+    #[test]
+    fn fuzzy_match_supports_subsequences_and_multiple_terms() {
+        assert!(fuzzy_matches("op br", "Open browser"));
+        assert!(fuzzy_matches("rn tab", "Rename tab"));
+        assert!(fuzzy_matches("RLCFG", "Reload config"));
+        assert!(!fuzzy_matches("browser rename", "Open browser"));
+    }
+
+    #[test]
+    fn empty_fuzzy_query_matches_every_command() {
+        assert!(fuzzy_matches("", "Open browser"));
+        assert!(fuzzy_matches("   ", "Project test"));
     }
 }
