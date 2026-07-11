@@ -2049,7 +2049,7 @@ fn show_path_in_folder(path: &Path) {
     show_in_folder::open_directory(dir);
 }
 
-fn open_file(path: &Path) {
+pub(crate) fn open_file(path: &Path) {
     if is_markdown_file(path) {
         match launch_markdown_viewer(path) {
             Ok(()) => return,

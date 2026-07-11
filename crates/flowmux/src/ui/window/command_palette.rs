@@ -80,6 +80,33 @@ fn record_palette_mru(mru: &mut std::collections::VecDeque<String>, key: &str) {
     mru.truncate(20);
 }
 
+fn quick_open_files(root: &std::path::Path, limit: usize) -> Vec<std::path::PathBuf> {
+    let mut files = Vec::new();
+    let mut directories = std::collections::VecDeque::from([root.to_path_buf()]);
+    while let Some(directory) = directories.pop_front() {
+        let Ok(entries) = std::fs::read_dir(directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                let name = entry.file_name();
+                if !matches!(name.to_str(), Some(".git" | "target" | "node_modules")) {
+                    directories.push_back(path);
+                }
+            } else if path.is_file() {
+                files.push(path);
+                if files.len() >= limit {
+                    files.sort_by_key(|path| (path.components().count(), path.clone()));
+                    return files;
+                }
+            }
+        }
+    }
+    files.sort_by_key(|path| (path.components().count(), path.clone()));
+    files
+}
+
 pub(super) fn development_workspace_template() -> WorkspaceTemplate {
     WorkspaceTemplate {
         id: "agent-tests-browser".into(),
@@ -301,6 +328,20 @@ impl WindowController {
     /// message-tray entry and the badge stuck.
     pub(super) async fn show_command_palette(&self) {
         let workspaces = self.store.ordered_workspaces().await;
+        let state = self.store.snapshot().await;
+        let quick_open_root = state.active_workspace.and_then(|active| {
+            workspaces
+                .iter()
+                .find(|workspace| workspace.id == active)
+                .map(|workspace| workspace.root_dir.clone())
+        });
+        let quick_open = if let Some(root) = quick_open_root.clone() {
+            gtk::gio::spawn_blocking(move || quick_open_files(&root, 2_000))
+                .await
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         let project_config = self.command_palette_project_config();
         let dialog = gtk::Window::builder()
             .transient_for(&self.window)
@@ -382,6 +423,21 @@ impl WindowController {
         });
         list.append(&button);
         entries.push((label, button));
+
+        if let Some(root) = quick_open_root {
+            for path in quick_open {
+                let relative = path.strip_prefix(&root).unwrap_or(&path);
+                let label = format!("File: {}", relative.display());
+                let button = palette_button(&label, None);
+                let dialog_for_click = dialog.clone();
+                button.connect_clicked(move |_| {
+                    dialog_for_click.close();
+                    crate::ui::file_browser::open_file(&path);
+                });
+                list.append(&button);
+                entries.push((label, button));
+            }
+        }
 
         for workspace in &workspaces {
             let workspace_name = workspace.custom_title.as_deref().unwrap_or(&workspace.name);
@@ -833,7 +889,7 @@ impl WindowController {
 
 #[cfg(test)]
 mod tests {
-    use super::{fuzzy_matches, record_palette_mru};
+    use super::{fuzzy_matches, quick_open_files, record_palette_mru};
 
     #[test]
     fn fuzzy_match_supports_subsequences_and_multiple_terms() {
@@ -873,5 +929,22 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn quick_open_skips_build_trees_and_respects_limit() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("one.rs"), "one").unwrap();
+        std::fs::create_dir(root.path().join("src")).unwrap();
+        std::fs::write(root.path().join("src/two.rs"), "two").unwrap();
+        std::fs::create_dir(root.path().join("target")).unwrap();
+        std::fs::write(root.path().join("target/generated.rs"), "generated").unwrap();
+
+        let files = quick_open_files(root.path(), 2);
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0], root.path().join("one.rs"));
+        assert!(files
+            .iter()
+            .all(|path| !path.starts_with(root.path().join("target"))));
     }
 }
