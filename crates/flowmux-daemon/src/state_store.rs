@@ -34,6 +34,9 @@ pub enum CloseOutcome {
 /// [`StateStore::move_surface_to_workspace`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MoveSurfaceOutcome {
+    pub surface: SurfaceId,
+    pub src_pane: PaneId,
+    pub dst_pane: PaneId,
     /// Workspace the tab now lives in.
     pub dst_workspace: WorkspaceId,
     /// Workspace the tab came from.
@@ -44,17 +47,67 @@ pub struct MoveSurfaceOutcome {
     pub src_workspace_removed: bool,
 }
 
+impl MoveSurfaceOutcome {
+    pub fn changed_workspaces(&self) -> Vec<WorkspaceId> {
+        if self.src_workspace == self.dst_workspace {
+            vec![self.src_workspace]
+        } else {
+            vec![self.src_workspace, self.dst_workspace]
+        }
+    }
+
+    pub fn changed_panes(&self) -> Vec<PaneId> {
+        if self.src_pane == self.dst_pane {
+            vec![self.src_pane]
+        } else {
+            vec![self.src_pane, self.dst_pane]
+        }
+    }
+
+    pub fn changed_surfaces(&self) -> [SurfaceId; 1] {
+        [self.surface]
+    }
+}
+
 /// Result of [`StateStore::split_surface_into_pane`]: like
 /// [`MoveSurfaceOutcome`] but also reports the freshly created sibling pane the
 /// tab was placed into.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SplitMoveOutcome {
+    pub surface: SurfaceId,
+    pub src_pane: PaneId,
+    pub dst_pane: PaneId,
     /// The new sibling pane that now holds the moved tab.
     pub new_pane: PaneId,
     pub dst_workspace: WorkspaceId,
     pub src_workspace: WorkspaceId,
     pub src_pane_removed: bool,
     pub src_workspace_removed: bool,
+}
+
+impl SplitMoveOutcome {
+    pub fn changed_workspaces(&self) -> Vec<WorkspaceId> {
+        if self.src_workspace == self.dst_workspace {
+            vec![self.src_workspace]
+        } else {
+            vec![self.src_workspace, self.dst_workspace]
+        }
+    }
+
+    pub fn changed_panes(&self) -> Vec<PaneId> {
+        let mut panes = vec![self.src_pane];
+        if self.dst_pane != self.src_pane {
+            panes.push(self.dst_pane);
+        }
+        if self.new_pane != self.src_pane && self.new_pane != self.dst_pane {
+            panes.push(self.new_pane);
+        }
+        panes
+    }
+
+    pub fn changed_surfaces(&self) -> [SurfaceId; 1] {
+        [self.surface]
+    }
 }
 
 /// Remove the leaf pane `target` from an already-locked [`State`], collapsing
@@ -498,6 +551,9 @@ impl StateStore {
         drop(s);
         self.mark_dirty();
         Some(SplitMoveOutcome {
+            surface: surface_id,
+            src_pane,
+            dst_pane,
             new_pane,
             dst_workspace,
             src_workspace,
@@ -617,6 +673,9 @@ impl StateStore {
                         drop(s);
                         self.mark_dirty();
                         return Some(MoveSurfaceOutcome {
+                            surface: surface_id,
+                            src_pane,
+                            dst_pane,
                             dst_workspace: workspace,
                             src_workspace: workspace,
                             src_pane_removed: false,
@@ -665,6 +724,9 @@ impl StateStore {
         drop(s);
         self.mark_dirty();
         Some(MoveSurfaceOutcome {
+            surface: surface_id,
+            src_pane,
+            dst_pane,
             dst_workspace,
             src_workspace,
             src_pane_removed,
@@ -4973,6 +5035,12 @@ Do you want to continue?";
             .unwrap();
         assert_eq!(out.dst_workspace, ws);
         assert_eq!(out.src_workspace, ws);
+        assert_eq!(out.surface, moved);
+        assert_eq!(out.src_pane, src);
+        assert_eq!(out.dst_pane, dst);
+        assert_eq!(out.changed_workspaces(), vec![ws]);
+        assert_eq!(out.changed_panes(), vec![src, dst]);
+        assert_eq!(out.changed_surfaces(), [moved]);
         assert!(!out.src_pane_removed);
         assert!(!out.src_workspace_removed);
 
@@ -5031,6 +5099,9 @@ Do you want to continue?";
 
         assert_eq!(out.dst_workspace, ws);
         assert_eq!(out.src_workspace, ws);
+        assert_eq!(out.src_pane, pane);
+        assert_eq!(out.dst_pane, pane);
+        assert_eq!(out.changed_panes(), vec![pane]);
         assert!(!out.src_pane_removed);
         assert!(!out.src_workspace_removed);
         assert_eq!(
@@ -5252,6 +5323,12 @@ Do you want to continue?";
             .await
             .unwrap();
         assert_eq!(out.dst_workspace, ws);
+        assert_eq!(out.surface, moved);
+        assert_eq!(out.src_pane, src);
+        assert_eq!(out.dst_pane, dst);
+        assert_eq!(out.changed_workspaces(), vec![ws]);
+        assert_eq!(out.changed_panes(), vec![src, dst, out.new_pane]);
+        assert_eq!(out.changed_surfaces(), [moved]);
         assert!(!out.src_pane_removed);
 
         // The new sibling pane holds exactly the moved tab.

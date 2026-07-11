@@ -686,9 +686,9 @@ impl WindowController {
 
         let mounted = self
             .mount_moved_surface(
-                dst_pane,
+                outcome.dst_pane,
                 outcome.dst_workspace,
-                surface,
+                outcome.surface,
                 moving,
                 target_index,
             )
@@ -701,10 +701,10 @@ impl WindowController {
             self.drop_workspace(outcome.src_workspace);
             self.activate_active_or_show_empty().await;
         } else if outcome.src_pane_removed {
-            self.apply_close_pane_incremental_or_rerender(outcome.src_workspace, src_pane)
+            self.apply_close_pane_incremental_or_rerender(outcome.src_workspace, outcome.src_pane)
                 .await;
         } else {
-            self.sync_pane_active_from_store(outcome.src_workspace, src_pane)
+            self.sync_pane_active_from_store(outcome.src_workspace, outcome.src_pane)
                 .await;
         }
 
@@ -718,7 +718,7 @@ impl WindowController {
                 .await;
         }
         self.refresh_window_title().await;
-        self.focus_pane(dst_pane);
+        self.focus_pane(outcome.dst_pane);
         Ok(())
     }
     /// Move a live surface tab to the last position of the first pane of
@@ -946,6 +946,8 @@ impl WindowController {
         };
         let dst_ws = outcome.dst_workspace;
         let new_pane = outcome.new_pane;
+        let dst_pane = outcome.dst_pane;
+        let surface = outcome.surface;
 
         // Build the new sibling pane empty, then mount the live tab into it.
         let Some(ws) = self.store.get_workspace(dst_ws).await else {
@@ -1007,10 +1009,10 @@ impl WindowController {
             self.drop_workspace(outcome.src_workspace);
             self.activate_active_or_show_empty().await;
         } else if outcome.src_pane_removed {
-            self.apply_close_pane_incremental_or_rerender(outcome.src_workspace, src_pane)
+            self.apply_close_pane_incremental_or_rerender(outcome.src_workspace, outcome.src_pane)
                 .await;
         } else {
-            self.sync_pane_active_from_store(outcome.src_workspace, src_pane)
+            self.sync_pane_active_from_store(outcome.src_workspace, outcome.src_pane)
                 .await;
         }
 
