@@ -6045,6 +6045,62 @@ mod tests {
     }
 
     #[test]
+    fn workspace_template_preview_describes_all_panes() {
+        let preview = command_palette::workspace_template_preview(
+            &command_palette::development_workspace_template(),
+        );
+        assert_eq!(
+            preview,
+            "• agent: terminal\n• browser: browser — about:blank\n• tests: terminal"
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_template_materializes_three_panes() {
+        let store = StateStore::new_lazy(State::default());
+        let base_dir = std::path::PathBuf::from("/tmp/flowmux-template-project");
+        let template = command_palette::development_workspace_template();
+
+        let materialized = command_palette::materialize_workspace_template(
+            &store,
+            &base_dir,
+            &std::collections::BTreeMap::new(),
+            &template,
+        )
+        .await
+        .unwrap();
+        let workspace = store.get_workspace(materialized.workspace).await.unwrap();
+        let mut panes = Vec::new();
+        workspace.surfaces[0]
+            .root_pane
+            .for_each_leaf(|pane| panes.push(pane));
+        let kinds: Vec<_> = panes
+            .iter()
+            .filter_map(|pane| {
+                let PaneContent::Tabs { surfaces, .. } =
+                    workspace.surfaces[0].root_pane.find_leaf_content(*pane)?
+                else {
+                    return None;
+                };
+                surfaces.first().map(|surface| match surface.kind {
+                    SurfaceKind::Terminal { .. } => "terminal",
+                    SurfaceKind::Browser { .. } => "browser",
+                })
+            })
+            .collect();
+
+        assert_eq!(workspace.name, "Agent + tests + browser");
+        assert_eq!(
+            workspace.custom_title.as_deref(),
+            Some("Agent + tests + browser")
+        );
+        assert_eq!(panes.len(), 3);
+        assert_eq!(kinds.iter().filter(|kind| **kind == "terminal").count(), 2);
+        assert_eq!(kinds.iter().filter(|kind| **kind == "browser").count(), 1);
+        assert!(materialized.terminal_commands.is_empty());
+    }
+
+    #[test]
     fn focused_source_suppresses_completed_but_not_blocking_notifications() {
         assert!(should_suppress_notification(
             flowmux_core::NotificationLevel::TurnCompleted,

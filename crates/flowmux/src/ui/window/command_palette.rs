@@ -40,6 +40,248 @@ fn accelerator_label(accelerator: &str) -> Option<String> {
         .map(|(key, modifiers)| gtk::accelerator_get_label(key, modifiers).to_string())
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct WorkspaceTemplate {
+    id: String,
+    label: String,
+    panes: Vec<TemplatePane>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TemplatePane {
+    id: String,
+    target: Option<String>,
+    split: TemplateSplit,
+    content: TemplatePaneContent,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TemplateSplit {
+    Right,
+    Down,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum TemplatePaneContent {
+    Terminal {
+        run: Vec<String>,
+        cwd: Option<String>,
+    },
+    Browser {
+        url: String,
+    },
+}
+
+pub(super) fn development_workspace_template() -> WorkspaceTemplate {
+    WorkspaceTemplate {
+        id: "agent-tests-browser".into(),
+        label: "Agent + tests + browser".into(),
+        panes: vec![
+            TemplatePane {
+                id: "agent".into(),
+                target: None,
+                split: TemplateSplit::Right,
+                content: TemplatePaneContent::Terminal {
+                    run: Vec::new(),
+                    cwd: None,
+                },
+            },
+            TemplatePane {
+                id: "browser".into(),
+                target: Some("agent".into()),
+                split: TemplateSplit::Right,
+                content: TemplatePaneContent::Browser {
+                    url: "about:blank".into(),
+                },
+            },
+            TemplatePane {
+                id: "tests".into(),
+                target: Some("agent".into()),
+                split: TemplateSplit::Down,
+                content: TemplatePaneContent::Terminal {
+                    run: Vec::new(),
+                    cwd: None,
+                },
+            },
+        ],
+    }
+}
+
+pub(super) fn workspace_template_preview(template: &WorkspaceTemplate) -> String {
+    template
+        .panes
+        .iter()
+        .map(|pane| {
+            let detail = match &pane.content {
+                TemplatePaneContent::Terminal { run, .. } if run.is_empty() => "terminal".into(),
+                TemplatePaneContent::Terminal { run, .. } => {
+                    format!("terminal — {}", run.join(" "))
+                }
+                TemplatePaneContent::Browser { url } => format!("browser — {url}"),
+            };
+            format!("• {}: {detail}", pane.id)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn template_terminal_shell_line(
+    base_dir: &std::path::Path,
+    env: &std::collections::BTreeMap<String, String>,
+    run: &[String],
+    cwd: Option<&str>,
+) -> Option<String> {
+    if run.is_empty() && cwd.is_none() {
+        return None;
+    }
+    let command = CustomCommand {
+        id: "workspace-template".into(),
+        label: "Workspace template".into(),
+        run: run.to_vec(),
+        cwd: cwd.map(str::to_string),
+        target: CommandTarget::FocusedPane,
+        confirm: false,
+    };
+    if run.is_empty() {
+        Some(format!(
+            "cd {}",
+            shell_quote(&custom_command_cwd(base_dir, &command).to_string_lossy())
+        ))
+    } else {
+        custom_command_shell_line(base_dir, env, &command)
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct MaterializedWorkspaceTemplate {
+    pub(super) workspace: WorkspaceId,
+    pub(super) terminal_commands: Vec<(PaneId, String)>,
+}
+
+pub(super) async fn materialize_workspace_template(
+    store: &StateStore,
+    base_dir: &std::path::Path,
+    env: &std::collections::BTreeMap<String, String>,
+    template: &WorkspaceTemplate,
+) -> Result<MaterializedWorkspaceTemplate, String> {
+    let workspace = store
+        .create_workspace(Some(template.label.clone()), base_dir.to_path_buf())
+        .await;
+    store
+        .rename_workspace(workspace, template.label.clone())
+        .await;
+    let result = async {
+        let model = store
+            .get_workspace(workspace)
+            .await
+            .ok_or_else(|| "new workspace disappeared".to_string())?;
+        let first_pane = model
+            .surfaces
+            .first()
+            .and_then(|surface| surface.root_pane.first_leaf_id())
+            .ok_or_else(|| "new workspace has no pane".to_string())?;
+        let first_id = template
+            .panes
+            .first()
+            .map(|pane| pane.id.clone())
+            .ok_or_else(|| "workspace template has no panes".to_string())?;
+        let mut panes = std::collections::HashMap::from([(first_id.clone(), first_pane)]);
+        let mut terminal_commands = Vec::new();
+
+        for (index, definition) in template.panes.iter().enumerate() {
+            let pane = if index == 0 {
+                first_pane
+            } else {
+                let target_name = definition.target.as_deref().unwrap_or(&first_id);
+                let target = panes
+                    .get(target_name)
+                    .copied()
+                    .ok_or_else(|| format!("unknown template target '{target_name}'"))?;
+                let direction = match definition.split {
+                    TemplateSplit::Right => SplitDirection::Vertical,
+                    TemplateSplit::Down => SplitDirection::Horizontal,
+                };
+                let created = match &definition.content {
+                    TemplatePaneContent::Terminal { .. } => {
+                        store.split_pane(target, direction).await
+                    }
+                    TemplatePaneContent::Browser { url } => {
+                        store
+                            .split_pane_with_browser(target, direction, url.clone())
+                            .await
+                    }
+                };
+                let (created_workspace, pane) =
+                    created.ok_or_else(|| format!("failed to create pane '{}'", definition.id))?;
+                if created_workspace != workspace {
+                    return Err("template split targeted another workspace".into());
+                }
+                panes.insert(definition.id.clone(), pane);
+                pane
+            };
+
+            let surface = if index == 0 {
+                match &definition.content {
+                    TemplatePaneContent::Terminal { .. } => active_surface_from_workspace(
+                        &store
+                            .get_workspace(workspace)
+                            .await
+                            .ok_or_else(|| "new workspace disappeared".to_string())?,
+                        pane,
+                    )
+                    .ok_or_else(|| "first terminal pane has no surface".to_string())?,
+                    TemplatePaneContent::Browser { url } => {
+                        let model = store
+                            .get_workspace(workspace)
+                            .await
+                            .ok_or_else(|| "new workspace disappeared".to_string())?;
+                        let terminal = active_surface_from_workspace(&model, pane)
+                            .ok_or_else(|| "first pane has no surface".to_string())?;
+                        let (_, browser) = store
+                            .add_browser_surface_to_pane(pane, url.clone())
+                            .await
+                            .ok_or_else(|| "failed to create first browser pane".to_string())?;
+                        store
+                            .close_surface(pane, terminal)
+                            .await
+                            .ok_or_else(|| "failed to remove placeholder terminal".to_string())?;
+                        browser
+                    }
+                }
+            } else {
+                let model = store
+                    .get_workspace(workspace)
+                    .await
+                    .ok_or_else(|| "new workspace disappeared".to_string())?;
+                active_surface_from_workspace(&model, pane)
+                    .ok_or_else(|| format!("pane '{}' has no surface", definition.id))?
+            };
+            store
+                .rename_surface(pane, surface, definition.id.clone())
+                .await
+                .ok_or_else(|| format!("failed to label pane '{}'", definition.id))?;
+
+            if let TemplatePaneContent::Terminal { run, cwd } = &definition.content {
+                if let Some(line) = template_terminal_shell_line(base_dir, env, run, cwd.as_deref())
+                {
+                    terminal_commands.push((pane, line));
+                }
+            }
+        }
+
+        Ok(MaterializedWorkspaceTemplate {
+            workspace,
+            terminal_commands,
+        })
+    }
+    .await;
+
+    if result.is_err() {
+        store.remove_workspace(workspace).await;
+    }
+    result
+}
+
 impl WindowController {
     /// Connect (lazily) to the `org.gtk.Notifications` service and ask
     /// it to withdraw the given `desktop_id`s. Used by the bell popover
@@ -51,6 +293,7 @@ impl WindowController {
     /// message-tray entry and the badge stuck.
     pub(super) async fn show_command_palette(&self) {
         let workspaces = self.store.ordered_workspaces().await;
+        let project_config = self.command_palette_project_config();
         let dialog = gtk::Window::builder()
             .transient_for(&self.window)
             .modal(true)
@@ -106,6 +349,31 @@ impl WindowController {
             list.append(&button);
             entries.push((label.to_string(), button));
         }
+
+        let builtin_template = development_workspace_template();
+        let builtin_base_dir = self
+            .focused_pane
+            .get()
+            .and_then(|pane| self.pane_registry.borrow().current_dir_for_pane(pane))
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| std::path::PathBuf::from("/"));
+        let label = format!("Workspace template: {}", builtin_template.label);
+        let button = palette_button(&label, None);
+        let controller = self.clone();
+        let dialog_for_click = dialog.clone();
+        button.connect_clicked(move |_| {
+            dialog_for_click.close();
+            let controller = controller.clone();
+            let template = builtin_template.clone();
+            let base_dir = builtin_base_dir.clone();
+            glib::MainContext::default().spawn_local(async move {
+                controller
+                    .run_workspace_template(base_dir, std::collections::BTreeMap::new(), template)
+                    .await;
+            });
+        });
+        list.append(&button);
+        entries.push((label, button));
 
         for workspace in &workspaces {
             let workspace_name = workspace.custom_title.as_deref().unwrap_or(&workspace.name);
@@ -218,7 +486,7 @@ impl WindowController {
             entries.push((format!("{} {}", label, action.as_str()), button));
         }
 
-        if let Some((base_dir, config)) = self.command_palette_project_config() {
+        if let Some((base_dir, config)) = project_config {
             for command in config.commands.clone() {
                 let button = palette_button(&command.label, None);
                 let search_text = format!("{} {}", command.label, command.id);
@@ -269,6 +537,77 @@ impl WindowController {
         dialog.present();
         search.grab_focus();
     }
+    async fn run_workspace_template(
+        &self,
+        base_dir: std::path::PathBuf,
+        env: std::collections::BTreeMap<String, String>,
+        template: WorkspaceTemplate,
+    ) {
+        if !self.confirm_workspace_template(&template).await {
+            return;
+        }
+        let materialized =
+            match materialize_workspace_template(&self.store, &base_dir, &env, &template).await {
+                Ok(materialized) => materialized,
+                Err(error) => {
+                    tracing::warn!(template = %template.id, %error, "workspace template failed");
+                    return;
+                }
+            };
+
+        let Some(workspace) = self.store.get_workspace(materialized.workspace).await else {
+            tracing::warn!(template = %template.id, "materialized workspace disappeared");
+            return;
+        };
+        self.render_workspace(&workspace);
+        self.activate_workspace(materialized.workspace).await;
+
+        for (pane, line) in materialized.terminal_commands {
+            let (ack_tx, ack_rx) = oneshot::channel();
+            self.dispatch(GtkCommand::PaneSendKeys {
+                pane,
+                keys: format!("{line}\r"),
+                ack: ack_tx,
+            })
+            .await;
+            match ack_rx.await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!(template = %template.id, %pane, %error, "template command failed")
+                }
+                Err(error) => {
+                    tracing::warn!(template = %template.id, %pane, %error, "template command ack dropped")
+                }
+            }
+        }
+    }
+
+    async fn confirm_workspace_template(&self, template: &WorkspaceTemplate) -> bool {
+        let dialog = adw::AlertDialog::new(
+            Some("Create workspace from template?"),
+            Some(&workspace_template_preview(template)),
+        );
+        dialog.add_response("cancel", "Cancel");
+        dialog.add_response("create", "Create");
+        dialog.set_default_response(Some("create"));
+        dialog.set_close_response("cancel");
+
+        let (tx, rx) = oneshot::channel();
+        let tx = Rc::new(RefCell::new(Some(tx)));
+        dialog.connect_response(None, move |dialog, response| {
+            if let Some(tx) = tx.borrow_mut().take() {
+                let _ = tx.send(response == "create");
+            }
+            dialog.close();
+        });
+        let _native_browser_suspend =
+            crate::ui::browser_pane::suspend_native_browser_views_for_window(
+                self.window.upcast_ref(),
+            );
+        dialog.present(Some(&self.window));
+        rx.await.unwrap_or(false)
+    }
+
     pub(super) fn command_palette_project_config(&self) -> Option<(std::path::PathBuf, CmuxJson)> {
         let base_dir = self
             .focused_pane
