@@ -212,6 +212,14 @@ impl Workspace {
         )
     }
 
+    pub fn agent_attention_rollup(&self) -> Option<AgentStatus> {
+        rollup_agent_statuses(
+            self.surfaces
+                .iter()
+                .filter_map(|surface| surface.root_pane.agent_attention_rollup()),
+        )
+    }
+
     pub fn collect_agent_blocks(&self, mru: &[PaneId]) -> Vec<WorkspaceAgentBlock> {
         let mut blocks = Vec::new();
         for surface in &self.surfaces {
@@ -753,22 +761,21 @@ impl Pane {
         }
     }
 
-    /// Mark every active tab in this pane tree as seen. Used when a workspace is
-    /// brought to the foreground.
-    pub fn mark_active_agents_seen(&mut self) -> bool {
+    /// Mark every agent in this pane tree as acknowledged. Workspace activation
+    /// is the user's workspace-wide acknowledgement gesture, including agents
+    /// living in inactive tabs.
+    pub fn mark_all_agents_seen(&mut self) -> bool {
         match self {
             Pane::Leaf {
-                content: PaneContent::Tabs { active, surfaces },
+                content: PaneContent::Tabs { surfaces, .. },
                 ..
             } => surfaces
                 .iter_mut()
-                .find(|surface| surface.id == *active)
-                .and_then(|surface| surface.agent.as_mut())
-                .map(AgentPresence::mark_seen)
-                .unwrap_or(false),
+                .filter_map(|surface| surface.agent.as_mut())
+                .fold(false, |changed, agent| agent.mark_seen() | changed),
             Pane::Leaf { .. } => false,
             Pane::Split { first, second, .. } => {
-                first.mark_active_agents_seen() | second.mark_active_agents_seen()
+                first.mark_all_agents_seen() | second.mark_all_agents_seen()
             }
         }
     }
@@ -788,6 +795,31 @@ impl Pane {
                     .agent_status_rollup()
                     .into_iter()
                     .chain(second.agent_status_rollup()),
+            ),
+        }
+    }
+
+    pub fn agent_attention_rollup(&self) -> Option<AgentStatus> {
+        match self {
+            Pane::Leaf {
+                content: PaneContent::Tabs { surfaces, .. },
+                ..
+            } => rollup_agent_statuses(surfaces.iter().filter_map(|surface| {
+                let agent = surface.agent.as_ref()?;
+                if agent.seen {
+                    return None;
+                }
+                match agent.public_status() {
+                    AgentStatus::Blocked | AgentStatus::Done => Some(agent.public_status()),
+                    _ => None,
+                }
+            })),
+            Pane::Leaf { .. } => None,
+            Pane::Split { first, second, .. } => rollup_agent_statuses(
+                first
+                    .agent_attention_rollup()
+                    .into_iter()
+                    .chain(second.agent_attention_rollup()),
             ),
         }
     }
@@ -2137,7 +2169,7 @@ impl AgentPresence {
         }
     }
 
-    pub fn from_report(report: AgentStatusReport, _visible: bool) -> Option<Self> {
+    pub fn from_report(report: AgentStatusReport, visible: bool) -> Option<Self> {
         let status = report.effective_status()?;
         let mut presence = Self::new(report.name, status.to_activity(), report.pid);
         presence.status = status;
@@ -2146,10 +2178,10 @@ impl AgentPresence {
         presence.message = report.message;
         presence.custom_status = report.custom_status;
         presence.session_id = report.session_id;
-        // A freshly reported idle agent is an active session waiting for input,
-        // not an unseen completed turn. Only transitions from a prior live state
-        // to hidden Idle become public Done until the user sees them.
-        presence.seen = true;
+        // Initial idle/unknown/working reports establish presence without an
+        // alert. A blocking report is unacknowledged only when its source is not
+        // actually visible.
+        presence.seen = status != AgentStatus::Blocked || visible;
         Some(presence)
     }
 
@@ -2228,17 +2260,17 @@ impl AgentPresence {
         if report.session_id.is_some() {
             self.session_id = report.session_id;
         }
-        let should_remain_unseen = !visible
-            && (AgentStatus::should_mark_unseen_on_idle(prev, next)
-                || (prev == AgentStatus::Idle && !self.seen));
-        self.seen = next != AgentStatus::Idle || !should_remain_unseen;
+        let needs_acknowledgement = next == AgentStatus::Blocked
+            || AgentStatus::should_mark_unseen_on_idle(prev, next)
+            || (next == AgentStatus::Idle && prev == AgentStatus::Idle && !self.seen);
+        self.seen = !needs_acknowledgement || visible;
         true
     }
 
     pub fn mark_seen(&mut self) -> bool {
-        let was_done = self.public_status() == AgentStatus::Done;
+        let changed = !self.seen;
         self.seen = true;
-        was_done
+        changed
     }
 }
 

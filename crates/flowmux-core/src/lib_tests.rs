@@ -1635,6 +1635,40 @@ fn working_to_idle_in_hidden_surface_becomes_done_until_seen() {
 }
 
 #[test]
+fn hidden_blocked_alert_clears_on_workspace_acknowledgement_without_losing_status() {
+    let mut surface = PaneSurface::terminal("codex", None);
+    let surface_id = surface.id;
+    surface.agent = AgentPresence::from_report(
+        AgentStatusReport {
+            name: "codex".into(),
+            status: Some(AgentStatus::Blocked),
+            activity: Some(AgentActivity::NeedsInput),
+            pid: None,
+            source: Some("flowmux:hook".into()),
+            seq: Some(1),
+            message: Some("approval needed".into()),
+            custom_status: None,
+            session_id: None,
+        },
+        false,
+    );
+    let mut pane = Pane::Leaf {
+        id: PaneId::new(),
+        content: PaneContent::Tabs {
+            active: surface_id,
+            surfaces: vec![surface],
+        },
+    };
+
+    assert_eq!(pane.agent_status_rollup(), Some(AgentStatus::Blocked));
+    assert_eq!(pane.agent_attention_rollup(), Some(AgentStatus::Blocked));
+    assert!(pane.mark_all_agents_seen());
+    assert_eq!(pane.agent_status_rollup(), Some(AgentStatus::Blocked));
+    assert_eq!(pane.agent_attention_rollup(), None);
+    assert!(!pane.mark_all_agents_seen());
+}
+
+#[test]
 fn initial_idle_agent_report_in_hidden_surface_stays_idle() {
     let presence = AgentPresence::from_report(
         AgentStatusReport {

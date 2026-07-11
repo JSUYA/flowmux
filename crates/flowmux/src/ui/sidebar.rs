@@ -1327,7 +1327,8 @@ fn agent_status_icon_name(status: AgentStatus, seen: bool) -> &'static str {
 
 fn agent_status_css_class(status: AgentStatus, seen: bool) -> &'static str {
     match status {
-        AgentStatus::Blocked => "flowmux-sidebar-agent-blocked",
+        AgentStatus::Blocked if !seen => "flowmux-sidebar-agent-blocked",
+        AgentStatus::Blocked => "flowmux-sidebar-agent-idle",
         AgentStatus::Working => "flowmux-sidebar-agent-working",
         AgentStatus::Done if !seen => "flowmux-sidebar-agent-done",
         AgentStatus::Done | AgentStatus::Idle => "flowmux-sidebar-agent-idle",

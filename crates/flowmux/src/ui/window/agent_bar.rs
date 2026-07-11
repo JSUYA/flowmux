@@ -52,9 +52,10 @@ impl WindowController {
     pub(super) async fn sync_workspace_agent_status(
         &self,
         workspace: WorkspaceId,
-        status: Option<AgentStatus>,
+        _status: Option<AgentStatus>,
     ) {
-        self.sidebar.set_agent_status(workspace, status);
+        let attention = self.store.workspace_agent_attention_status(workspace).await;
+        self.sidebar.set_agent_status(workspace, attention);
         self.sync_workspace_label(workspace).await;
         self.refresh_agent_bar().await;
     }

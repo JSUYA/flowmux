@@ -712,7 +712,7 @@ impl StateStore {
         }
         if let Some(id) = id {
             if let Some(ws) = s.workspaces.iter_mut().find(|w| w.id == id) {
-                Self::mark_active_agents_seen_locked(ws);
+                Self::mark_all_agents_seen_locked(ws);
             }
         }
         drop(s);
@@ -1044,6 +1044,17 @@ impl StateStore {
             .and_then(Workspace::agent_status_rollup)
     }
 
+    pub async fn workspace_agent_attention_status(
+        &self,
+        workspace: WorkspaceId,
+    ) -> Option<AgentStatus> {
+        let s = self.inner.lock().await;
+        s.workspaces
+            .iter()
+            .find(|ws| ws.id == workspace)
+            .and_then(Workspace::agent_attention_rollup)
+    }
+
     pub async fn workspace_agent_blocks(
         &self,
         workspace: WorkspaceId,
@@ -1057,10 +1068,10 @@ impl StateStore {
             .unwrap_or_default()
     }
 
-    fn mark_active_agents_seen_locked(ws: &mut Workspace) -> bool {
+    fn mark_all_agents_seen_locked(ws: &mut Workspace) -> bool {
         let mut changed = false;
         for surface in ws.surfaces.iter_mut() {
-            changed |= surface.root_pane.mark_active_agents_seen();
+            changed |= surface.root_pane.mark_all_agents_seen();
         }
         changed
     }
@@ -1962,6 +1973,45 @@ mod tests {
         let agent = tree[0].panes[0].tabs[0].agent.as_ref().unwrap();
         assert_eq!(agent.name, "claude");
         assert_eq!(agent.status, AgentStatus::Working);
+    }
+
+    #[tokio::test]
+    async fn workspace_activation_acknowledges_blocked_alert_but_keeps_blocked_status() {
+        let store = StateStore::new_lazy(State::default());
+        let ws_id = store
+            .create_workspace(Some("demo".into()), std::path::PathBuf::from("/tmp/demo"))
+            .await;
+        let ws = store.get_workspace(ws_id).await.unwrap();
+        let surface = first_pane_active_surface(&ws);
+        store.set_active_workspace(None).await;
+
+        store
+            .report_agent_status(
+                surface,
+                AgentStatusReport {
+                    name: "codex".into(),
+                    status: Some(AgentStatus::Blocked),
+                    activity: Some(flowmux_core::AgentActivity::NeedsInput),
+                    pid: None,
+                    source: Some("flowmux:hook".into()),
+                    seq: Some(1),
+                    message: Some("approval needed".into()),
+                    custom_status: None,
+                    session_id: None,
+                },
+            )
+            .await;
+
+        assert_eq!(
+            store.workspace_agent_attention_status(ws_id).await,
+            Some(AgentStatus::Blocked)
+        );
+        store.set_active_workspace(Some(ws_id)).await;
+        assert_eq!(store.workspace_agent_attention_status(ws_id).await, None);
+        assert_eq!(
+            store.workspace_agent_status(ws_id).await,
+            Some(AgentStatus::Blocked)
+        );
     }
 
     #[tokio::test]

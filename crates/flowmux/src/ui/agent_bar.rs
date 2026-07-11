@@ -376,7 +376,8 @@ fn agent_status_icon_name(status: AgentStatus, seen: bool) -> &'static str {
 
 fn agent_status_css_class(status: AgentStatus, seen: bool) -> &'static str {
     match status {
-        AgentStatus::Blocked => "flowmux-sidebar-agent-blocked",
+        AgentStatus::Blocked if !seen => "flowmux-sidebar-agent-blocked",
+        AgentStatus::Blocked => "flowmux-sidebar-agent-idle",
         AgentStatus::Working => "flowmux-sidebar-agent-working",
         AgentStatus::Done if !seen => "flowmux-sidebar-agent-done",
         AgentStatus::Done | AgentStatus::Idle => "flowmux-sidebar-agent-idle",
@@ -412,5 +413,17 @@ mod tests {
             Some(vec![a, c, b])
         );
         assert_eq!(reordered_agent_bar_order(&order, b, b, true), None);
+    }
+
+    #[test]
+    fn acknowledged_blocked_agent_keeps_status_without_alert_color() {
+        assert_eq!(
+            agent_status_css_class(AgentStatus::Blocked, false),
+            "flowmux-sidebar-agent-blocked"
+        );
+        assert_eq!(
+            agent_status_css_class(AgentStatus::Blocked, true),
+            "flowmux-sidebar-agent-idle"
+        );
     }
 }
