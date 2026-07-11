@@ -373,6 +373,23 @@ impl WindowController {
                     }
                 }
             }
+            GtkCommand::OpenUrlInBrowserTab { pane, url } => {
+                // Open a Ctrl-clicked terminal URL in a new browser tab in the
+                // same pane. BrowserPane::build receives the URL as initial_url
+                // and immediately load_uri's it, so no extra navigate command is
+                // needed. If surface creation fails, for example because the pane
+                // disappeared right after the click, ignore it quietly.
+                if let Some((ws_id, surface_id)) =
+                    self.store.add_browser_surface_to_pane(pane, url).await
+                {
+                    self.attach_or_rerender_surface(ws_id, pane, surface_id)
+                        .await;
+                }
+            }
+            GtkCommand::InjectCookies { cookies, ack } => {
+                let result = inject_cookies_into_webkit(&cookies);
+                let _ = ack.send(result);
+            }
             other => unreachable!("browser router got a non-browser command: {other:?}"),
         }
     }

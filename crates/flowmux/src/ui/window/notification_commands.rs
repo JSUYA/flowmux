@@ -294,6 +294,17 @@ impl WindowController {
             GtkCommand::QueryAgentSurfaceVisible { surface, ack } => {
                 let _ = ack.send(self.is_agent_surface_visible(surface));
             }
+            GtkCommand::OpenAgentBarItem {
+                workspace,
+                pane,
+                surface,
+            } => {
+                self.open_agent_bar_item(workspace, pane, surface).await;
+            }
+            GtkCommand::NotificationOnPane { pane, title, body } => {
+                tracing::info!(%pane, %title, %body, "pane notification");
+                // TODO: paint blue ring + sidebar badge.
+            }
             other => {
                 unreachable!("notification router got a non-notification command: {other:?}")
             }
