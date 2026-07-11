@@ -49,7 +49,8 @@ impl WindowController {
     /// what actually shrinks Ubuntu Dock's per-app notification count —
     /// the legacy FDO `CloseNotification` path used to leave both the
     /// message-tray entry and the badge stuck.
-    pub(super) fn show_command_palette(&self) {
+    pub(super) async fn show_command_palette(&self) {
+        let workspaces = self.store.ordered_workspaces().await;
         let dialog = gtk::Window::builder()
             .transient_for(&self.window)
             .modal(true)
@@ -104,6 +105,93 @@ impl WindowController {
             });
             list.append(&button);
             entries.push((label.to_string(), button));
+        }
+
+        for workspace in &workspaces {
+            let workspace_name = workspace.custom_title.as_deref().unwrap_or(&workspace.name);
+            let label = format!("Workspace: {workspace_name}");
+            let button = palette_button(&label, None);
+            let controller = self.clone();
+            let dialog_for_click = dialog.clone();
+            let command = CommandPaletteCommand::ActivateWorkspace(workspace.id);
+            button.connect_clicked(move |_| {
+                dialog_for_click.close();
+                let controller = controller.clone();
+                glib::MainContext::default().spawn_local(async move {
+                    controller.run_command_palette_command(command).await;
+                });
+            });
+            list.append(&button);
+            entries.push((label, button));
+
+            let mut pane_ids = Vec::new();
+            for surface_root in &workspace.surfaces {
+                surface_root
+                    .root_pane
+                    .for_each_leaf(|pane| pane_ids.push(pane));
+            }
+            for pane in pane_ids {
+                let active_surface = workspace
+                    .surfaces
+                    .iter()
+                    .find_map(|root| root.root_pane.active_surface_id(pane));
+                let pane_title = active_surface
+                    .and_then(|surface| {
+                        workspace
+                            .surfaces
+                            .iter()
+                            .find_map(|root| root.root_pane.surface_title(pane, surface))
+                    })
+                    .unwrap_or("Pane");
+                let label = format!("Pane: {workspace_name} / {pane_title}");
+                let button = palette_button(&label, None);
+                let controller = self.clone();
+                let dialog_for_click = dialog.clone();
+                let command = CommandPaletteCommand::FocusPane {
+                    workspace: workspace.id,
+                    pane,
+                };
+                button.connect_clicked(move |_| {
+                    dialog_for_click.close();
+                    let controller = controller.clone();
+                    glib::MainContext::default().spawn_local(async move {
+                        controller.run_command_palette_command(command).await;
+                    });
+                });
+                list.append(&button);
+                entries.push((label, button));
+
+                for root in &workspace.surfaces {
+                    let Some(PaneContent::Tabs { surfaces, .. }) =
+                        root.root_pane.find_leaf_content(pane)
+                    else {
+                        continue;
+                    };
+                    for surface in surfaces {
+                        let label = format!(
+                            "Tab: {} / {} / {}",
+                            workspace_name, pane_title, surface.title
+                        );
+                        let button = palette_button(&label, None);
+                        let controller = self.clone();
+                        let dialog_for_click = dialog.clone();
+                        let command = CommandPaletteCommand::ActivateSurface {
+                            workspace: workspace.id,
+                            pane,
+                            surface: surface.id,
+                        };
+                        button.connect_clicked(move |_| {
+                            dialog_for_click.close();
+                            let controller = controller.clone();
+                            glib::MainContext::default().spawn_local(async move {
+                                controller.run_command_palette_command(command).await;
+                            });
+                        });
+                        list.append(&button);
+                        entries.push((label, button));
+                    }
+                }
+            }
         }
 
         for (action, accelerators) in self.options.borrow().keybindings.resolve() {
@@ -238,6 +326,23 @@ impl WindowController {
                         "command palette action failed"
                     );
                 }
+            }
+            CommandPaletteCommand::ActivateWorkspace(workspace) => {
+                self.activate_workspace(workspace).await;
+            }
+            CommandPaletteCommand::FocusPane { workspace, pane } => {
+                self.activate_workspace(workspace).await;
+                self.focus_pane(pane);
+                self.on_pane_focused(pane).await;
+            }
+            CommandPaletteCommand::ActivateSurface {
+                workspace,
+                pane,
+                surface,
+            } => {
+                self.activate_workspace(workspace).await;
+                self.dispatch(GtkCommand::ActivateSurface { pane, surface })
+                    .await;
             }
         }
     }

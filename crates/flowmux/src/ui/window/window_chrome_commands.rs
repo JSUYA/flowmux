@@ -79,7 +79,7 @@ impl WindowController {
                 );
             }
             GtkCommand::ShowCommandPalette => {
-                self.show_command_palette();
+                self.show_command_palette().await;
             }
 
             GtkCommand::FileBrowserFocusOut { dir } => {

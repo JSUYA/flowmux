@@ -82,6 +82,16 @@ enum CommandPaletteCommand {
     ReloadConfig,
     OpenUnread,
     Keybinding(flowmux_config::keybindings::ActionId),
+    ActivateWorkspace(WorkspaceId),
+    FocusPane {
+        workspace: WorkspaceId,
+        pane: PaneId,
+    },
+    ActivateSurface {
+        workspace: WorkspaceId,
+        pane: PaneId,
+        surface: SurfaceId,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -133,6 +143,9 @@ fn command_palette_label(command: CommandPaletteCommand) -> &'static str {
         CommandPaletteCommand::ReloadConfig => "Reload config",
         CommandPaletteCommand::OpenUnread => "Open unread notification",
         CommandPaletteCommand::Keybinding(action) => action.label(),
+        CommandPaletteCommand::ActivateWorkspace(_) => "Go to workspace",
+        CommandPaletteCommand::FocusPane { .. } => "Focus pane",
+        CommandPaletteCommand::ActivateSurface { .. } => "Go to tab",
     }
 }
 
