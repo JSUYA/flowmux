@@ -49,6 +49,11 @@ pub struct ClaudeHookInput {
     pub cwd: Option<PathBuf>,
     #[serde(default)]
     pub hook_event_name: Option<String>,
+    /// Claude `SessionEnd` reason. Intentional exits such as Ctrl+C at the
+    /// prompt use `prompt_input_exit`; the non-specific `other` reason remains
+    /// resumable so an ambiguous teardown cannot discard recovery state.
+    #[serde(default)]
+    pub reason: Option<String>,
     /// Set when `Notification` fires for permission/info popups.
     #[serde(default)]
     pub message: Option<String>,
@@ -682,6 +687,15 @@ mod tests {
         assert_eq!(parsed.session_id.as_deref(), Some("abc"));
         assert_eq!(parsed.hook_event_name.as_deref(), Some("Stop"));
         assert!(parsed.transcript_path.is_some());
+    }
+
+    #[test]
+    fn parse_claude_session_end_reason() {
+        let parsed: ClaudeHookInput = serde_json::from_str(
+            r#"{"session_id":"abc","hook_event_name":"SessionEnd","reason":"prompt_input_exit"}"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.reason.as_deref(), Some("prompt_input_exit"));
     }
 
     #[test]

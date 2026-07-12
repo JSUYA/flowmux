@@ -6884,7 +6884,7 @@ mod tests {
     //   * The dispatcher coalesces overlapping `RefreshLauncherBadge`
     //     bursts without panicking and the store ends in a sane state.
 
-    /// Push 200 notifications (the MAX_RETAINED cap) interleaved with
+    /// Push 50 notifications (the MAX_RETAINED cap) interleaved with
     /// SetNotificationDesktopId and periodic workspace-activation
     /// sweeps. After the final activation the badge must be at 0 and
     /// every entry whose desktop_id was attached before the sweep must
@@ -6894,7 +6894,7 @@ mod tests {
     async fn stress_many_notifications_with_periodic_sweeps_drains_to_zero() {
         let (controller, ws_id, pane) =
             build_single_workspace_controller("com.flowmux.App.UiTest.StressManyNotif").await;
-        const TOTAL: usize = 200;
+        const TOTAL: usize = 50;
         let mut ids = Vec::with_capacity(TOTAL);
         for i in 0..TOTAL {
             let id = push_notification(&controller, Some(pane), Some(ws_id), &format!("evt-{i}"))
@@ -6938,7 +6938,7 @@ mod tests {
             "after the stress sequence ends on a sweep boundary, unread_count must be 0",
         );
 
-        // The total entry count is capped at MAX_RETAINED (200). The
+        // The total entry count is capped at MAX_RETAINED (50). The
         // first push is at index 0, the last at TOTAL-1; with TOTAL ==
         // MAX_RETAINED we expect exactly TOTAL entries to survive.
         let entries = controller.notifications.entries();

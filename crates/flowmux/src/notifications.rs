@@ -19,8 +19,7 @@ use std::rc::Rc;
 
 /// Cap on retained entries. A chatty agent (Claude Code's per-step OSC
 /// 9 stream) can otherwise grow this unbounded over a long session.
-/// 200 matches cmux's `TerminalNotificationStore` policy.
-const MAX_RETAINED: usize = 200;
+const MAX_RETAINED: usize = 50;
 
 /// Suppress a fresh entry when an entry with the same `(pane, surface,
 /// level)` arrived within this window. Codex / Claude Code emit Stop
@@ -522,6 +521,7 @@ mod tests {
     #[test]
     fn push_drops_oldest_entry_once_cap_is_reached() {
         let s = store();
+        assert_eq!(MAX_RETAINED, 50, "the notification list is capped at 50");
         // Insert MAX_RETAINED + 5 — the first 5 should age out and the
         // newest 5 must keep their order at the tail.
         let mut ids = Vec::new();

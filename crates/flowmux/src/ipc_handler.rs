@@ -695,9 +695,10 @@ impl GuiHandler {
                 ..
             } => match surface {
                 Some(surface) => {
-                    // SessionEnd clears only live presence. Keep the native
-                    // session binding so app quit/relaunch can resume it; an
-                    // explicit tab close removes the binding separately.
+                    // Start/activity hooks refresh the native binding. An
+                    // intentional Claude SessionEnd follows this update with
+                    // AgentSessionForget; app teardown leaves it intact so a
+                    // relaunch can resume the still-active session.
                     if let Some(session_id) = session_id.as_deref() {
                         if let Some(store) = agent_session_store() {
                             if let Err(error) = store.record(&agent, surface, session_id) {

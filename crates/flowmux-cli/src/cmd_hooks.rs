@@ -5,6 +5,46 @@
 
 use super::*;
 
+const RESUME_RETURNED_REASON: &str = "flowmux_resume_returned";
+
+/// Claude reports deliberate session replacement/termination with a specific
+/// reason. `other` is non-specific, so retaining that binding preserves
+/// recovery across an ambiguous app/terminal teardown. Unknown future reasons
+/// also stay resumable rather than risking data loss.
+pub(crate) fn claude_session_end_forgets_resume_binding(reason: Option<&str>) -> bool {
+    matches!(
+        reason,
+        Some("clear" | "resume" | "logout" | "prompt_input_exit" | "bypass_permissions_disabled")
+    )
+}
+
+pub(crate) fn claude_session_end_forget_request(
+    reason: Option<&str>,
+    surface: Option<SurfaceId>,
+) -> Option<Request> {
+    if !claude_session_end_forgets_resume_binding(reason) {
+        return None;
+    }
+    Some(Request::AgentSessionForget {
+        agent: "claude".into(),
+        surface: surface?,
+    })
+}
+
+pub(crate) fn generic_resume_return_forget_request(
+    agent: &str,
+    reason: Option<&str>,
+    surface: Option<SurfaceId>,
+) -> Option<Request> {
+    if reason != Some(RESUME_RETURNED_REASON) {
+        return None;
+    }
+    Some(Request::AgentSessionForget {
+        agent: agent.to_ascii_lowercase(),
+        surface: surface?,
+    })
+}
+
 /// Dispatch every `flowmux hooks <op>` invocation. Setup/Doctor/Uninstall
 /// only touch user config files and never need the daemon. The runtime
 /// hook events (Claude/Codex/Opencode) talk to the daemon themselves.
@@ -292,6 +332,11 @@ pub(crate) async fn run_claude_hook_event(
                 None,
                 input.session_id.as_deref(),
             ));
+            if let Some(request) =
+                claude_session_end_forget_request(input.reason.as_deref(), surface)
+            {
+                reqs.push(request);
+            }
         }
     };
     if let Some(client) = hooks::connect_daemon(socket).await {
@@ -335,18 +380,24 @@ pub(crate) async fn run_generic_agent_hook_event(
     match event {
         AgentHookEvent::Stop { args, .. } => {
             let input = read_codex_hook_input(args);
-            let body = input.last_assistant_message.as_deref();
-            reqs.push(build_activity_update_with_metadata(
-                agent,
-                Some(Idle),
-                pid,
-                pane,
-                surface,
-                body,
-                None,
-                input.session_id.as_deref(),
-            ));
-            reqs.push(build_stop_notify(agent, body, pane, surface));
+            if let Some(request) =
+                generic_resume_return_forget_request(agent, input.reason.as_deref(), surface)
+            {
+                reqs.push(request);
+            } else {
+                let body = input.last_assistant_message.as_deref();
+                reqs.push(build_activity_update_with_metadata(
+                    agent,
+                    Some(Idle),
+                    pid,
+                    pane,
+                    surface,
+                    body,
+                    None,
+                    input.session_id.as_deref(),
+                ));
+                reqs.push(build_stop_notify(agent, body, pane, surface));
+            }
         }
         AgentHookEvent::Notification { args, .. } => {
             let input = read_codex_hook_input(args);

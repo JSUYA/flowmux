@@ -2106,7 +2106,7 @@ fn dedup_path_entries(entries: &mut Vec<PathBuf>) {
 /// sandbox. Flatpak sets `FLATPAK_ID` for sandboxed apps and writes a
 /// `/.flatpak-info` file at the sandbox root; either is sufficient
 /// proof.
-fn is_flatpak_sandbox() -> bool {
+pub(crate) fn is_flatpak_sandbox() -> bool {
     std::env::var_os("FLATPAK_ID").is_some() || std::path::Path::new("/.flatpak-info").exists()
 }
 

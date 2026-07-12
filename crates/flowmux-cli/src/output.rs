@@ -26,6 +26,10 @@ pub(crate) fn print_response(r: &Response, json_mode: bool) -> anyhow::Result<()
             print!("{text}");
             return Ok(());
         }
+        if let Some(value) = plain_browser_response(r) {
+            println!("{value}");
+            return Ok(());
+        }
         if let Response::Notifications {
             entries,
             unread_count,
@@ -52,7 +56,7 @@ pub(crate) fn print_response(r: &Response, json_mode: bool) -> anyhow::Result<()
     }
     let s = if json_mode {
         // Single-line JSON — easier to parse from agent scripts
-        // (`jq -r .pane` etc.). Mirrors cmux's `--json` shape.
+        // (`jq -r .browser_pane_opened.pane` etc.).
         serde_json::to_string(r)?
     } else {
         serde_json::to_string_pretty(r)?
@@ -60,6 +64,39 @@ pub(crate) fn print_response(r: &Response, json_mode: bool) -> anyhow::Result<()
     println!("{s}");
     Ok(())
 }
+
+fn plain_browser_response(response: &Response) -> Option<String> {
+    match response {
+        Response::BrowserResult { value } => Some(value.clone()),
+        Response::BrowserOk => Some("ok".into()),
+        Response::BrowserBoolResult { value } => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn browser_responses_render_as_agent_friendly_values() {
+        assert_eq!(
+            plain_browser_response(&Response::BrowserResult {
+                value: "page title".into(),
+            }),
+            Some("page title".into())
+        );
+        assert_eq!(
+            plain_browser_response(&Response::BrowserBoolResult { value: true }),
+            Some("true".into())
+        );
+        assert_eq!(
+            plain_browser_response(&Response::BrowserOk),
+            Some("ok".into())
+        );
+    }
+}
+
 /// Render `flowmux tree` as an indented workspace → leaf-pane → tab
 /// view. The active tab in each pane is marked with `*`.
 pub(crate) fn render_tree(workspaces: &[flowmux_ipc::protocol::TreeWorkspace]) -> String {

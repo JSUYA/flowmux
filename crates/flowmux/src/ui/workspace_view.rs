@@ -7,7 +7,7 @@
 
 use crate::theme::ResolvedTheme;
 use crate::ui::browser_pane::BrowserPane;
-use crate::ui::ghostty_pane::GhosttyPane;
+use crate::ui::ghostty_pane::{is_flatpak_sandbox, GhosttyPane};
 use crate::ui::pane_terminal::{PaneCallbacks, PaneTerminal};
 use flowmux_core::{
     terminal_tab_title_for_cwd, Pane, PaneContent, PaneId, PaneSurface, SplitDirection, Surface,
@@ -279,9 +279,13 @@ impl PaneRegistry {
         self.terminals
             .iter()
             .filter_map(|(surface, terminal)| {
-                terminal
-                    .screen_text()
-                    .map(|text| (terminal.id(), *surface, text))
+                terminal.screen_text().map(|text| {
+                    (
+                        terminal.id(),
+                        *surface,
+                        normalize_scrollback_snapshot(&text),
+                    )
+                })
             })
             .collect()
     }
@@ -2349,16 +2353,27 @@ fn build_panel(
             // options so a freshly spawned tab matches the live ones.
             let opts = (callbacks.read_options)();
             let font = theme.font_with_overrides(opts.font_family.as_deref(), opts.font_size);
-            let resume_command = restored_agent_shell_command(
+            let resume_command = take_restored_agent_shell_command(
                 surface.id,
                 opts.auto_resume_agent_sessions,
                 flowmux_state::default_agent_session_store(),
             );
-            if resume_command.is_some() {
-                // Resume inside an interactive shell so a missing binary or
-                // stale session returns to a usable prompt instead of leaving
-                // a dead terminal tab.
-                argv = shell.clone().map(|s| vec![s]).unwrap_or_default();
+            let is_resuming_agent = resume_command.is_some();
+            let mut resume_input = None;
+            if let Some(command) = resume_command {
+                if is_flatpak_sandbox() {
+                    // Flatpak's host-shell bridge needs to own the controlling
+                    // terminal, so keep its normal spawn path and feed there.
+                    argv = shell.clone().map(|s| vec![s]).unwrap_or_default();
+                    resume_input = Some(format!("{command}\n"));
+                } else {
+                    let shell = shell
+                        .clone()
+                        .or_else(|| argv.first().cloned())
+                        .or_else(|| std::env::var("SHELL").ok())
+                        .unwrap_or_else(|| "/bin/bash".into());
+                    argv = resumed_agent_shell_argv(&shell, &command);
+                }
             }
 
             // VTE is the only terminal backend. GhosttyPane owns the
@@ -2375,12 +2390,14 @@ fn build_panel(
             pane.set_font(&font);
             pane.set_font_scale(opts.zoom_factor());
             pane.set_cursor_blink(opts.cursor_blink, opts.cursor_blink_interval_ms);
-            if opts.restore_terminal_scrollback {
-                if let Some(scrollback) = surface.scrollback.as_deref() {
-                    pane.restore_scrollback(scrollback);
-                }
+            if let Some(scrollback) = scrollback_to_restore(
+                opts.restore_terminal_scrollback,
+                is_resuming_agent,
+                surface.scrollback.as_deref(),
+            ) {
+                pane.restore_scrollback(&scrollback);
             }
-            if let Some(command) = resume_command {
+            if let Some(command) = resume_input {
                 let terminal = pane.clone();
                 gtk::glib::idle_add_local_once(move || {
                     if let Err(error) = terminal.write_input(command.as_bytes()) {
@@ -2468,7 +2485,7 @@ fn build_panel(
     }
 }
 
-fn restored_agent_shell_command(
+fn take_restored_agent_shell_command(
     surface: SurfaceId,
     enabled: bool,
     store: Option<flowmux_state::AgentSessionStore>,
@@ -2476,8 +2493,51 @@ fn restored_agent_shell_command(
     enabled
         .then_some(store)
         .flatten()
-        .and_then(|store| store.lookup_surface(surface))
+        .and_then(|store| store.take_surface(surface).ok().flatten())
         .and_then(|session| session.shell_command())
+}
+
+fn resumed_agent_shell_argv(shell: &str, command: &str) -> Vec<String> {
+    let shell_command = format!("{command}; exec {} -l", shell_quote(shell));
+    vec![shell.into(), "-lc".into(), shell_command]
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn scrollback_to_restore(
+    enabled: bool,
+    is_resuming_agent: bool,
+    scrollback: Option<&str>,
+) -> Option<String> {
+    if !enabled || is_resuming_agent {
+        return None;
+    }
+    scrollback
+        .map(normalize_scrollback_snapshot)
+        .filter(|text| !text.is_empty())
+}
+
+fn normalize_scrollback_snapshot(text: &str) -> String {
+    let lines: Vec<_> = text.lines().collect();
+    let Some(first) = lines.iter().position(|line| !line.trim().is_empty()) else {
+        return String::new();
+    };
+    let last = lines
+        .iter()
+        .rposition(|line| !line.trim().is_empty())
+        .unwrap_or(first);
+    let meaningful = &lines[first..=last];
+    if meaningful
+        .iter()
+        .filter(|line| !line.trim().is_empty())
+        .count()
+        <= 1
+    {
+        return String::new();
+    }
+    meaningful.join("\n")
 }
 
 #[cfg(test)]
@@ -2491,9 +2551,61 @@ mod resume_tests {
         let surface = SurfaceId::new();
         store.record("claude", surface, "session-1").unwrap();
 
-        assert!(restored_agent_shell_command(surface, false, Some(store.clone())).is_none());
-        let command = restored_agent_shell_command(surface, true, Some(store)).unwrap();
+        assert!(take_restored_agent_shell_command(surface, false, Some(store.clone())).is_none());
+        assert!(store.lookup_surface(surface).is_some());
+        let command =
+            take_restored_agent_shell_command(surface, true, Some(store.clone())).unwrap();
         assert!(command.contains("'claude' '--resume' 'session-1'"));
-        assert!(restored_agent_shell_command(SurfaceId::new(), true, None).is_none());
+        assert!(store.lookup_surface(surface).is_none());
+        assert!(take_restored_agent_shell_command(SurfaceId::new(), true, None).is_none());
+    }
+
+    #[test]
+    fn resumed_agent_starts_as_hidden_shell_command_then_returns_to_login_shell() {
+        let argv = resumed_agent_shell_argv("/bin/zsh", "resume-command");
+        assert_eq!(argv[0], "/bin/zsh");
+        assert_eq!(argv[1], "-lc");
+        assert_eq!(
+            argv[2], "resume-command; exec '/bin/zsh' -l",
+            "resume text must be a shell argv, never terminal input"
+        );
+    }
+
+    #[test]
+    fn agent_resume_does_not_replay_scrollback_after_the_clear_sequence() {
+        let scrollback = Some("old prompt\n\n\nold cursor");
+        assert_eq!(
+            scrollback_to_restore(true, false, scrollback),
+            Some("old prompt\n\n\nold cursor".into())
+        );
+        assert_eq!(scrollback_to_restore(true, true, scrollback), None);
+        assert_eq!(scrollback_to_restore(false, false, scrollback), None);
+        assert_eq!(
+            scrollback_to_restore(true, false, Some("\n\n➜  work \n")),
+            None,
+            "legacy idle viewport padding must not move the new cursor"
+        );
+    }
+
+    #[test]
+    fn empty_shell_viewport_is_not_persisted_as_scrollback() {
+        assert_eq!(
+            normalize_scrollback_snapshot("\n\n\n➜  work \n"),
+            "",
+            "viewport padding plus one idle prompt is not history"
+        );
+        assert_eq!(
+            normalize_scrollback_snapshot("➜  work \n\n\n"),
+            "",
+            "trailing viewport padding is not history"
+        );
+    }
+
+    #[test]
+    fn meaningful_scrollback_drops_only_viewport_padding() {
+        assert_eq!(
+            normalize_scrollback_snapshot("\n\ncommand output\n\n➜  work \n\n"),
+            "command output\n\n➜  work "
+        );
     }
 }

@@ -179,6 +179,23 @@ pub fn resolved_codex_home() -> Option<PathBuf> {
     std::env::var_os("CODEX_HOME").map(PathBuf::from)
 }
 
+/// Existing shared skill copies that Codex may discover in addition to the
+/// flowmux-managed `$CODEX_HOME/skills` copy. These are user-owned, so doctor
+/// reports them but install/fix never overwrites or removes them.
+pub fn codex_unmanaged_skill_paths(home: &Path, codex_home: Option<&Path>) -> Vec<PathBuf> {
+    let managed = Target::Codex.resolved_install_path(home, codex_home);
+    let shared = home
+        .join(".agents")
+        .join("skills")
+        .join("flowmux-browser")
+        .join("SKILL.md");
+    if shared != managed && shared.exists() {
+        vec![shared]
+    } else {
+        Vec::new()
+    }
+}
+
 /// Install for every requested target. Returns one outcome per
 /// target; the first error short-circuits.
 pub fn install_all(
@@ -325,6 +342,27 @@ mod tests {
                 .join("flowmux-browser")
                 .join("SKILL.md"),
         );
+    }
+
+    #[test]
+    fn codex_unmanaged_skill_paths_reports_shared_copy() {
+        let home = fake_home();
+        let shared = home.path().join(".agents/skills/flowmux-browser/SKILL.md");
+        fs::create_dir_all(shared.parent().unwrap()).unwrap();
+        fs::write(&shared, SKILL_BODY).unwrap();
+
+        assert_eq!(codex_unmanaged_skill_paths(home.path(), None), vec![shared]);
+    }
+
+    #[test]
+    fn codex_unmanaged_skill_paths_ignores_managed_shared_root() {
+        let home = fake_home();
+        let codex_home = home.path().join(".agents");
+        let managed = Target::Codex.resolved_install_path(home.path(), Some(&codex_home));
+        fs::create_dir_all(managed.parent().unwrap()).unwrap();
+        fs::write(&managed, SKILL_BODY).unwrap();
+
+        assert!(codex_unmanaged_skill_paths(home.path(), Some(&codex_home)).is_empty());
     }
 
     #[test]

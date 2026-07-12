@@ -1441,6 +1441,67 @@ fn hooks_cline_notification_uses_generic_agent_event_parser() {
 }
 
 #[test]
+fn claude_session_end_only_forgets_deliberate_termination() {
+    use crate::cmd_hooks::{
+        claude_session_end_forget_request, claude_session_end_forgets_resume_binding,
+    };
+
+    for reason in [
+        "clear",
+        "resume",
+        "logout",
+        "prompt_input_exit",
+        "bypass_permissions_disabled",
+    ] {
+        assert!(
+            claude_session_end_forgets_resume_binding(Some(reason)),
+            "{reason} must not auto-resume"
+        );
+    }
+    assert!(!claude_session_end_forgets_resume_binding(Some("other")));
+    assert!(!claude_session_end_forgets_resume_binding(None));
+    assert!(!claude_session_end_forgets_resume_binding(Some(
+        "future_reason"
+    )));
+
+    let surface = SurfaceId::new();
+    assert!(matches!(
+        claude_session_end_forget_request(Some("prompt_input_exit"), Some(surface)),
+        Some(Request::AgentSessionForget {
+            agent,
+            surface: got_surface,
+        }) if agent == "claude" && got_surface == surface
+    ));
+    assert!(claude_session_end_forget_request(Some("other"), Some(surface)).is_none());
+    assert!(claude_session_end_forget_request(Some("prompt_input_exit"), None).is_none());
+}
+
+#[test]
+fn codex_and_opencode_resume_return_only_forget_their_binding() {
+    use crate::cmd_hooks::generic_resume_return_forget_request;
+
+    for agent in ["codex", "opencode"] {
+        let surface = SurfaceId::new();
+        assert!(matches!(
+            generic_resume_return_forget_request(
+                agent,
+                Some("flowmux_resume_returned"),
+                Some(surface),
+            ),
+            Some(Request::AgentSessionForget {
+                agent: got_agent,
+                surface: got_surface,
+            }) if got_agent == agent && got_surface == surface
+        ));
+        assert!(generic_resume_return_forget_request(agent, None, Some(surface)).is_none());
+        assert!(
+            generic_resume_return_forget_request(agent, Some("ordinary_stop"), Some(surface),)
+                .is_none()
+        );
+    }
+}
+
+#[test]
 fn notification_management_commands_map_to_ipc_requests() {
     let id = NotificationId::new();
 

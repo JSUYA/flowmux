@@ -46,17 +46,22 @@ flow below.
 Web work follows the same shape every time:
 
 ```bash
-# 1. Open a browser pane next to the terminal. flowmux auto-detects the
-#    calling pane via FLOWMUX_PANE_ID — no flags needed. If a browser
+# 1. Open a browser pane next to the terminal and capture its id. flowmux
+#    auto-detects the calling pane via FLOWMUX_PANE_ID — no flags needed.
+#    If a browser
 #    pane already exists to the right, the URL opens as a new tab in
 #    that pane (placement_strategy = "reuse_right_sibling"); otherwise
 #    flowmux splits the source pane vertically.
-flowmux --json browser open https://example.com
-# → {"pane":"<uuid>","placement_strategy":"split_right"|"reuse_right_sibling"}
+OPEN=$(flowmux --json browser open https://example.com)
+PANE=$(printf '%s' "$OPEN" | jq -r '.browser_pane_opened.pane')
+# → {"browser_pane_opened":{"pane":"<uuid>","placement_strategy":"split_right"|"reuse_right_sibling"}}
 
-# 2. Capture the pane id and use it in subsequent calls. Both
-#    `pane:<uuid>`, `surface:<uuid>`, and bare uuids are accepted.
-PANE=$(flowmux --json browser open https://example.com | jq -r '.pane')
+# 2. A new WebView starts at about:blank. Wait for the requested URL first,
+#    then for that document to finish loading.
+flowmux browser wait pane:$PANE --url example.com
+flowmux browser wait pane:$PANE --ready-state complete
+# Each wait prints true on success and false on timeout. Do not continue
+# when it prints false.
 
 # 3. Take an interactive snapshot. The result is a Markdown tree with
 #    `eN` ref tokens, plus a refs map carrying selectors. Refs are only

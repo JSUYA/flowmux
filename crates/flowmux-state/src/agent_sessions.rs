@@ -53,10 +53,10 @@ impl SavedAgentSession {
         }
     }
 
-    /// Command fed to the restored interactive shell. The agent and flags are
-    /// fixed by [`resume_argv`]; the opaque session id is single-quote escaped.
-    /// A non-zero agent exit leaves the normal shell alive and explains the
-    /// failure instead of closing the restored tab.
+    /// Command used as a shell startup argument while restoring a session. The
+    /// agent and flags are fixed by [`resume_argv`]; the opaque session id is
+    /// single-quote escaped. When the agent exits or fails to start, erase both
+    /// the visible screen and scrollback so the replacement shell starts clean.
     pub fn shell_command(&self) -> Option<String> {
         let argv = self.resume_argv();
         let executable = argv.first()?;
@@ -65,10 +65,17 @@ impl SavedAgentSession {
             .map(|arg| shell_quote(arg))
             .collect::<Vec<_>>()
             .join(" ");
+        let cleanup = match self.agent.as_str() {
+            "claude" => "if command -v flowmuxctl >/dev/null 2>&1; then printf '%s' '{\"reason\":\"prompt_input_exit\"}' | flowmuxctl hooks claude session-end >/dev/null 2>&1; fi; ".to_string(),
+            "codex" | "opencode" => format!(
+                "if command -v flowmuxctl >/dev/null 2>&1; then flowmuxctl hooks {agent} stop '{{\"reason\":\"flowmux_resume_returned\"}}' >/dev/null 2>&1; fi; ",
+                agent = self.agent,
+            ),
+            _ => String::new(),
+        };
         Some(format!(
-            "if command -v {exe} >/dev/null 2>&1; then {command}; _flowmux_resume_status=$?; if [ $_flowmux_resume_status -ne 0 ]; then printf '\\nFlowMux could not resume the {agent} session (exit %s). A normal shell is ready.\\n' \"$_flowmux_resume_status\"; fi; else printf '\\nFlowMux could not resume the {agent} session because {agent} was not found. A normal shell is ready.\\n'; fi; printf '\\033]0;%s\\007' \"${{PWD##*/}}\"\n",
+            "if command -v {exe} >/dev/null 2>&1; then {command}; fi; printf '\\033[3J\\033[2J\\033[H'; {cleanup}printf '\\033c'",
             exe = shell_quote(executable),
-            agent = self.agent,
         ))
     }
 }
@@ -187,6 +194,28 @@ impl AgentSessionStore {
                     agent: agent.to_string(),
                     session_id,
                 })
+        })
+    }
+
+    /// Atomically remove and return the binding for `surface`. Restore is a
+    /// consume operation: agents that report the resumed session record it
+    /// again, while a stale/empty session cannot loop on every app launch.
+    pub fn take_surface(&self, surface: SurfaceId) -> io::Result<Option<SavedAgentSession>> {
+        self.with_exclusive_lock(|| {
+            for agent in RESUMABLE_AGENTS {
+                let mut map = self.load(agent)?;
+                let Some(session_id) = map.remove(&surface.to_string()) else {
+                    continue;
+                };
+                let bytes = serde_json::to_vec_pretty(&map)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                Self::write_atomic(&self.agent_path(agent), &bytes)?;
+                return Ok(Some(SavedAgentSession {
+                    agent: agent.to_string(),
+                    session_id,
+                }));
+            }
+            Ok(None)
         })
     }
 
@@ -333,6 +362,26 @@ mod tests {
     }
 
     #[test]
+    fn take_surface_consumes_only_the_resumed_binding() {
+        let (s, _td) = store();
+        let resumed = SurfaceId::new();
+        let kept = SurfaceId::new();
+        s.record("claude", resumed, "resume-once").unwrap();
+        s.record("codex", kept, "keep-me").unwrap();
+
+        assert_eq!(
+            s.take_surface(resumed).unwrap(),
+            Some(SavedAgentSession {
+                agent: "claude".into(),
+                session_id: "resume-once".into(),
+            })
+        );
+        assert_eq!(s.lookup_surface(resumed), None);
+        assert_eq!(s.lookup("codex", kept), Some("keep-me".into()));
+        assert_eq!(s.take_surface(resumed).unwrap(), None);
+    }
+
+    #[test]
     fn concurrent_hook_writes_do_not_drop_other_surface_bindings() {
         let (s, _td) = store();
         let surfaces: Vec<_> = (0..16).map(|_| SurfaceId::new()).collect();
@@ -418,7 +467,7 @@ mod tests {
     }
 
     #[test]
-    fn resume_failure_keeps_shell_and_prints_actionable_message() {
+    fn resume_failure_clears_terminal_without_a_message() {
         let td = tempfile::tempdir().unwrap();
         let agent = td.path().join("codex");
         std::fs::write(&agent, "#!/bin/sh\nexit 7\n").unwrap();
@@ -441,13 +490,78 @@ mod tests {
             output.status.success(),
             "wrapper shell must stay successful"
         );
-        let stdout = String::from_utf8(output.stdout).unwrap();
-        assert!(stdout.contains("FlowMux could not resume the codex session (exit 7)"));
-        assert!(stdout.contains("A normal shell is ready"));
+        assert_eq!(output.stdout, b"\x1b[3J\x1b[2J\x1b[H\x1bc");
+        assert!(output.stderr.is_empty());
     }
 
     #[test]
-    fn missing_agent_binary_prints_fallback_message() {
+    fn claude_resume_return_forgets_racing_session_start_binding() {
+        let td = tempfile::tempdir().unwrap();
+        let claude = td.path().join("claude");
+        let flowmuxctl = td.path().join("flowmuxctl");
+        let args_file = td.path().join("cleanup-args");
+        let input_file = td.path().join("cleanup-input");
+        std::fs::write(&claude, "#!/bin/sh\nexit 7\n").unwrap();
+        std::fs::write(
+            &flowmuxctl,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nIFS= read -r payload\nprintf '%s' \"$payload\" > '{}'\n",
+                args_file.display(),
+                input_file.display()
+            ),
+        )
+        .unwrap();
+        for executable in [&claude, &flowmuxctl] {
+            let mut perms = std::fs::metadata(executable).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(executable, perms).unwrap();
+        }
+        let saved = SavedAgentSession {
+            agent: "claude".into(),
+            session_id: "stale-session".into(),
+        };
+
+        let output = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(saved.shell_command().unwrap())
+            .env("PATH", td.path())
+            .output()
+            .unwrap();
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"\x1b[3J\x1b[2J\x1b[H\x1bc");
+        assert_eq!(
+            std::fs::read_to_string(args_file).unwrap(),
+            "hooks\nclaude\nsession-end\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(input_file).unwrap(),
+            r#"{"reason":"prompt_input_exit"}"#
+        );
+    }
+
+    #[test]
+    fn codex_and_opencode_resume_return_emit_silent_cleanup_hooks() {
+        for (agent, expected) in [
+            (
+                "codex",
+                "flowmuxctl hooks codex stop '{\"reason\":\"flowmux_resume_returned\"}'",
+            ),
+            (
+                "opencode",
+                "flowmuxctl hooks opencode stop '{\"reason\":\"flowmux_resume_returned\"}'",
+            ),
+        ] {
+            let saved = SavedAgentSession {
+                agent: agent.into(),
+                session_id: "stale-session".into(),
+            };
+            assert!(saved.shell_command().unwrap().contains(expected));
+        }
+    }
+
+    #[test]
+    fn missing_agent_binary_clears_terminal_without_a_message() {
         let td = tempfile::tempdir().unwrap();
         let saved = SavedAgentSession {
             agent: "opencode".into(),
@@ -460,9 +574,7 @@ mod tests {
             .output()
             .unwrap();
         assert!(output.status.success());
-        let stdout = String::from_utf8(output.stdout).unwrap();
-        assert!(stdout.contains("opencode was not found"));
-        assert!(stdout.contains("A normal shell is ready"));
+        assert_eq!(output.stdout, b"\x1b[3J\x1b[2J\x1b[H\x1bc");
         assert!(output.stderr.is_empty());
     }
 

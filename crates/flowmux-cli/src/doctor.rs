@@ -198,6 +198,16 @@ fn section_agents(home: &Path, codex_home: Option<&Path>) -> Section {
             if let Some(entry) = codex_legacy_entry(home, codex_home) {
                 entries.push(entry);
             }
+            for path in agent::codex_unmanaged_skill_paths(home, codex_home) {
+                entries.push(Entry {
+                    name: "codex duplicate skill".into(),
+                    status: Status::Warn,
+                    detail: format!(
+                        "{} is outside flowmux management; remove it or keep it synchronized",
+                        path.display()
+                    ),
+                });
+            }
         }
         entries.push(hook_entry);
     }
@@ -1016,6 +1026,27 @@ mod tests {
         assert!(txt.contains("AI agents"));
         assert!(txt.contains("Browser"));
         assert!(txt.contains("host browsers"));
+    }
+
+    #[test]
+    fn doctor_warns_about_unmanaged_codex_skill_copy() {
+        let home = fake_home();
+        let duplicate = home.path().join(".agents/skills/flowmux-browser/SKILL.md");
+        fs::create_dir_all(duplicate.parent().unwrap()).unwrap();
+        fs::write(&duplicate, agent::SKILL_BODY).unwrap();
+
+        let report = collect_offline(home.path(), None);
+        let entry = report
+            .sections
+            .iter()
+            .find(|s| s.title == "AI agents")
+            .unwrap()
+            .entries
+            .iter()
+            .find(|e| e.name == "codex duplicate skill")
+            .unwrap();
+        assert_eq!(entry.status, Status::Warn);
+        assert!(entry.detail.contains(&duplicate.display().to_string()));
     }
 
     #[test]

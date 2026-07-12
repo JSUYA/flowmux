@@ -93,6 +93,11 @@ pub(crate) fn run_agent_op(op: &AgentOp, json: bool) -> anyhow::Result<()> {
         AgentOp::Doctor { agent: slugs } => {
             let targets = parse_targets(slugs)?;
             let report = agent::doctor_all(&targets, &home, codex_home.as_deref());
+            let codex_duplicates = if targets.contains(&agent::Target::Codex) {
+                agent::codex_unmanaged_skill_paths(&home, codex_home.as_deref())
+            } else {
+                Vec::new()
+            };
             let any_bad = report
                 .iter()
                 .any(|e| !matches!(e.status, agent::DoctorStatus::Ok));
@@ -104,6 +109,14 @@ pub(crate) fn run_agent_op(op: &AgentOp, json: bool) -> anyhow::Result<()> {
                             "agent": e.target.slug(),
                             "path": e.path.display().to_string(),
                             "status": e.status.label(),
+                            "unmanaged_duplicates": if e.target == agent::Target::Codex {
+                                codex_duplicates
+                                    .iter()
+                                    .map(|p| p.display().to_string())
+                                    .collect::<Vec<_>>()
+                            } else {
+                                Vec::new()
+                            },
                         })
                     })
                     .collect::<Vec<_>>();
@@ -115,6 +128,12 @@ pub(crate) fn run_agent_op(op: &AgentOp, json: bool) -> anyhow::Result<()> {
                         entry.status.label(),
                         entry.target.slug(),
                         entry.path.display()
+                    );
+                }
+                for path in &codex_duplicates {
+                    println!(
+                        "warn       codex         {} (unmanaged duplicate)",
+                        path.display()
                     );
                 }
             }
