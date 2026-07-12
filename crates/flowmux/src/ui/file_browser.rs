@@ -3735,6 +3735,33 @@ mod tests {
 
     #[cfg(not(target_os = "macos"))]
     #[gtk::test]
+    fn behavior_ctrl_copy_paste_uses_the_selected_range() {
+        let tmp = TestDir::new("behavior-copy-selection");
+        let first = tmp.file("a.txt");
+        let second = tmp.file("b.txt");
+        let target = tmp.dir("target");
+        let panel = FileBrowserPanel::new();
+        panel.show_for_root(tmp.path.clone());
+        panel.focus_path(first);
+        panel.extend_selection_to_path(second);
+
+        assert_eq!(
+            panel.handle_key(key("c"), gdk::ModifierType::CONTROL_MASK),
+            glib::Propagation::Stop
+        );
+        panel.focus_path(target.clone());
+        assert_eq!(
+            panel.handle_key(key("v"), gdk::ModifierType::CONTROL_MASK),
+            glib::Propagation::Stop
+        );
+
+        wait_until(|| !panel.file_operation_in_progress.get());
+        assert!(target.join("a.txt").exists());
+        assert!(target.join("b.txt").exists());
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[gtk::test]
     fn behavior_ctrl_cut_marks_row_then_paste_moves_and_clears_cut_state() {
         let tmp = TestDir::new("behavior-cut");
         let file = tmp.file("a.txt");
