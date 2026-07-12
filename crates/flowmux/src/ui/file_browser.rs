@@ -133,7 +133,9 @@ struct PasteRequest {
 struct PasteOutcome {
     pasted: Vec<PathBuf>,
     moved: Vec<(PathBuf, PathBuf)>,
-    clear_clipboard: bool,
+    clipboard_after: Option<FileClipboard>,
+    error: Option<io::Error>,
+    cancelled: bool,
 }
 
 struct DeleteOutcome {
@@ -223,7 +225,7 @@ impl FileBrowserPanel {
         status.set_margin_end(16);
         status.set_wrap(true);
 
-        let load_more_button = gtk::Button::with_label("Load 500 more");
+        let load_more_button = gtk::Button::with_label("Show 500 more");
         load_more_button.add_css_class("flat");
         load_more_button.set_margin_top(6);
         load_more_button.set_margin_bottom(6);
@@ -1059,16 +1061,23 @@ impl FileBrowserPanel {
                 gio::spawn_blocking(move || execute_paste_with_control(request, &worker_control))
                     .await;
             match result {
-                Ok(Ok(outcome)) => {
+                Ok(outcome) => {
                     let pasted = outcome.pasted.len();
+                    let error = outcome.error.as_ref().map(ToString::to_string);
+                    let cancelled = outcome.cancelled;
                     if panel.operation_context_is_active(&operation_root) {
                         if panel.model.borrow_mut().apply_paste_outcome(outcome) {
                             panel.refresh_with_scroll_value(scroll_value);
-                        } else {
+                        } else if error.is_none() && !cancelled {
                             panel.show_status("Nothing to paste");
                         }
-                    } else if outcome.clear_clipboard {
-                        panel.model.borrow_mut().clipboard = None;
+                        if cancelled {
+                            panel.show_status("Paste cancelled");
+                        } else if let Some(error) = error {
+                            panel.show_status(&format!("Paste failed: {error}"));
+                        }
+                    } else {
+                        panel.model.borrow_mut().clipboard = outcome.clipboard_after;
                     }
                     tracing::info!(
                         operation = "paste",
@@ -1076,18 +1085,6 @@ impl FileBrowserPanel {
                         elapsed_ms = started.elapsed().as_millis(),
                         "file browser operation completed"
                     );
-                }
-                Ok(Err(err)) if err.kind() == io::ErrorKind::Interrupted => {
-                    if panel.operation_context_is_active(&operation_root) {
-                        panel.refresh_with_scroll_value(scroll_value);
-                        panel.show_status("Paste cancelled");
-                    }
-                }
-                Ok(Err(err)) => {
-                    if panel.operation_context_is_active(&operation_root) {
-                        panel.refresh_with_scroll_value(scroll_value);
-                        panel.show_status(&format!("Paste failed: {err}"));
-                    }
                 }
                 Err(_) if panel.operation_context_is_active(&operation_root) => {
                     panel.show_status("Paste failed: worker panicked");
@@ -1904,8 +1901,13 @@ impl FileBrowserModel {
         let Some(request) = self.paste_request() else {
             return Ok(false);
         };
-        let outcome = execute_paste(request)?;
-        Ok(self.apply_paste_outcome(outcome))
+        let mut outcome = execute_paste(request);
+        let error = outcome.error.take();
+        let changed = self.apply_paste_outcome(outcome);
+        match error {
+            Some(error) => Err(error),
+            None => Ok(changed),
+        }
     }
 
     fn paste_request(&mut self) -> Option<PasteRequest> {
@@ -1919,9 +1921,7 @@ impl FileBrowserModel {
         for (source, destination) in outcome.moved {
             self.rewrite_tracked_paths(&source, &destination);
         }
-        if outcome.clear_clipboard {
-            self.clipboard = None;
-        }
+        self.clipboard = outcome.clipboard_after;
         self.sync_focus();
         !outcome.pasted.is_empty()
     }
@@ -1947,7 +1947,7 @@ impl FileBrowserModel {
 }
 
 #[cfg(test)]
-fn execute_paste(request: PasteRequest) -> io::Result<PasteOutcome> {
+fn execute_paste(request: PasteRequest) -> PasteOutcome {
     let control = FileOperationControl::new(request.clipboard.paths.len());
     execute_paste_with_control(request, &control)
 }
@@ -1955,24 +1955,35 @@ fn execute_paste(request: PasteRequest) -> io::Result<PasteOutcome> {
 fn execute_paste_with_control(
     request: PasteRequest,
     control: &FileOperationControl,
-) -> io::Result<PasteOutcome> {
+) -> PasteOutcome {
     let PasteRequest {
         clipboard,
         target_dir,
     } = request;
+    let clipboard_after_copy = clipboard.clone();
     let mut pasted = Vec::new();
     let mut moved = Vec::new();
-    for source in &clipboard.paths {
-        control.check_cancelled()?;
+    let mut remaining = Vec::new();
+    let mut error = None;
+    let mut cancelled = false;
+    for (index, source) in clipboard.paths.iter().enumerate() {
+        if let Err(cancel_error) = control.check_cancelled() {
+            cancelled = true;
+            error = Some(cancel_error);
+            remaining.extend_from_slice(&clipboard.paths[index..]);
+            break;
+        }
         if !source.exists() {
             control.mark_completed();
             continue;
         }
         if source.is_dir() && target_dir.starts_with(source) {
-            return Err(io::Error::new(
+            error = Some(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "cannot paste a directory into itself",
             ));
+            remaining.extend_from_slice(&clipboard.paths[index..]);
+            break;
         }
 
         if clipboard.operation == ClipboardOperation::Cut
@@ -1983,14 +1994,24 @@ fn execute_paste_with_control(
             continue;
         }
 
-        let destination = unique_destination(&target_dir, source)?;
+        let destination = match unique_destination(&target_dir, source) {
+            Ok(destination) => destination,
+            Err(err) => {
+                error = Some(err);
+                remaining.extend_from_slice(&clipboard.paths[index..]);
+                break;
+            }
+        };
         let result = match clipboard.operation {
             ClipboardOperation::Copy => copy_path_with_control(source, &destination, control),
             ClipboardOperation::Cut => move_path_with_control(source, &destination, control),
         };
-        if let Err(error) = result {
+        if let Err(operation_error) = result {
             let _ = permanently_delete_path(&destination);
-            return Err(error);
+            cancelled = operation_error.kind() == io::ErrorKind::Interrupted;
+            error = Some(operation_error);
+            remaining.extend_from_slice(&clipboard.paths[index..]);
+            break;
         }
         if clipboard.operation == ClipboardOperation::Cut {
             moved.push((source.clone(), destination.clone()));
@@ -1999,11 +2020,21 @@ fn execute_paste_with_control(
         control.mark_completed();
     }
 
-    Ok(PasteOutcome {
+    let clipboard_after = match clipboard.operation {
+        ClipboardOperation::Copy => Some(clipboard_after_copy),
+        ClipboardOperation::Cut if remaining.is_empty() => None,
+        ClipboardOperation::Cut => Some(FileClipboard {
+            operation: ClipboardOperation::Cut,
+            paths: remaining,
+        }),
+    };
+    PasteOutcome {
         pasted,
         moved,
-        clear_clipboard: clipboard.operation == ClipboardOperation::Cut,
-    })
+        clipboard_after,
+        error,
+        cancelled,
+    }
 }
 
 fn execute_delete_with_control(
@@ -2847,9 +2878,10 @@ mod tests {
             target_dir: target.clone(),
         };
 
-        let error = execute_paste_with_control(request, &control).unwrap_err();
+        let outcome = execute_paste_with_control(request, &control);
 
-        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(outcome.cancelled);
+        assert_eq!(outcome.error.unwrap().kind(), io::ErrorKind::Interrupted);
         assert!(!target.join("source").exists());
         assert_eq!(control.completed.load(AtomicOrdering::Relaxed), 0);
     }
@@ -3128,6 +3160,35 @@ mod tests {
 
         assert!(target.join("a.txt").exists());
         assert!(target.join("b.txt").exists());
+    }
+
+    #[test]
+    fn partial_cut_keeps_unprocessed_entries_in_clipboard() {
+        let tmp = TestDir::new("partial-cut");
+        let first = tmp.file("a.txt");
+        let directory = tmp.dir("source");
+        let target = tmp.dir("source/target");
+        let control = FileOperationControl::new(2);
+        let request = PasteRequest {
+            clipboard: FileClipboard {
+                operation: ClipboardOperation::Cut,
+                paths: vec![first.clone(), directory.clone()],
+            },
+            target_dir: target.clone(),
+        };
+
+        let outcome = execute_paste_with_control(request, &control);
+
+        assert_eq!(
+            outcome.error.as_ref().unwrap().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert!(!first.exists());
+        assert!(target.join("a.txt").exists());
+        assert_eq!(
+            outcome.clipboard_after.as_ref().unwrap().paths,
+            vec![directory]
+        );
     }
 
     #[test]
