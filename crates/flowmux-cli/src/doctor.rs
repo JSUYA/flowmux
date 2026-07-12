@@ -211,10 +211,81 @@ fn section_agents(home: &Path, codex_home: Option<&Path>) -> Section {
         }
         entries.push(hook_entry);
     }
+    entries.push(tmux_shim_entry(agent_is_installed(
+        agent::Target::ClaudeCode,
+        home,
+        codex_home,
+    )));
 
     Section {
         title: "AI agents".into(),
         entries,
+    }
+}
+
+/// Audit the flowmux-managed `tmux` shim used by Claude Code agent
+/// teams. A missing shim is only actionable when Claude is installed;
+/// an existing but stale or non-executable shim always needs repair.
+fn tmux_shim_entry(claude_present: bool) -> Entry {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Some(dir) = flowmux_config::paths::agent_shim_dir() else {
+        return Entry {
+            name: "tmux compat shim".into(),
+            status: Status::Error,
+            detail: "cannot resolve flowmux data directory".into(),
+        };
+    };
+    let path = dir.join("tmux");
+    if !path.exists() {
+        return Entry {
+            name: "tmux compat shim".into(),
+            status: if claude_present {
+                Status::NeedsFix
+            } else {
+                Status::Warn
+            },
+            detail: format!("{} (missing; `flowmux fix` installs it)", path.display()),
+        };
+    }
+
+    let body = match std::fs::read_to_string(&path) {
+        Ok(body) => body,
+        Err(e) => {
+            return Entry {
+                name: "tmux compat shim".into(),
+                status: Status::Error,
+                detail: format!("{}: {e}", path.display()),
+            }
+        }
+    };
+    let executable = match std::fs::metadata(&path) {
+        Ok(metadata) => metadata.permissions().mode() & 0o111 == 0o111,
+        Err(e) => {
+            return Entry {
+                name: "tmux compat shim".into(),
+                status: Status::Error,
+                detail: format!("{}: {e}", path.display()),
+            }
+        }
+    };
+    if body == hook_install::tmux_shim_script() && executable {
+        Entry {
+            name: "tmux compat shim".into(),
+            status: Status::Ok,
+            detail: path.display().to_string(),
+        }
+    } else {
+        let reason = if !executable {
+            "not executable"
+        } else {
+            "drift"
+        };
+        Entry {
+            name: "tmux compat shim".into(),
+            status: Status::NeedsFix,
+            detail: format!("{} ({reason}; `flowmux fix` re-syncs)", path.display()),
+        }
     }
 }
 
@@ -844,6 +915,34 @@ pub fn run_fix(home: &Path, codex_home: Option<&Path>, flowmux_bin: &str) -> Fix
         }),
     }
 
+    // tmux compat shim — lets Claude Code agent teams open teammate
+    // panes as flowmux panes (no tmux needed). Same shim dir the GUI
+    // already prepends to every PTY's PATH.
+    match hook_install::install_tmux_shim() {
+        Ok(paths) if paths.is_empty() => outcomes.push(FixOutcome {
+            area: "tmux compat shim".into(),
+            status: Status::Ok,
+            detail: "already up-to-date".into(),
+        }),
+        Ok(paths) => outcomes.push(FixOutcome {
+            area: "tmux compat shim".into(),
+            status: Status::Ok,
+            detail: format!(
+                "wrote {}",
+                paths
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        }),
+        Err(e) => outcomes.push(FixOutcome {
+            area: "tmux compat shim".into(),
+            status: Status::Error,
+            detail: e.to_string(),
+        }),
+    }
+
     FixReport { outcomes }
 }
 
@@ -1016,6 +1115,16 @@ mod tests {
             .find(|e| e.name == "claude-code skill")
             .unwrap();
         assert_eq!(skill.status, Status::Ok, "{}", skill.detail);
+        let tmux_shim = report
+            .sections
+            .iter()
+            .find(|s| s.title == "AI agents")
+            .unwrap()
+            .entries
+            .iter()
+            .find(|e| e.name == "tmux compat shim")
+            .unwrap();
+        assert_eq!(tmux_shim.status, Status::Ok, "{}", tmux_shim.detail);
     }
 
     #[test]

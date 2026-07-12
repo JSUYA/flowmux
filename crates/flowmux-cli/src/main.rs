@@ -159,6 +159,16 @@ enum Cmd {
     /// Send keystrokes to a pane (escape sequences accepted).
     SendKeys { pane: PaneId, keys: String },
 
+    /// tmux CLI compatibility bridge (Claude Code agent teams).
+    /// Invoked by the `tmux` shim in the agent shim dir with the raw
+    /// tmux argv; swarm sessions become workspaces, teammate panes
+    /// become flowmux panes. Exits with the mirrored tmux status.
+    #[command(hide = true)]
+    TmuxCompat {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
     /// Send a single named key to a pane (`Enter`, `Tab`, `ArrowUp`, …,
     /// or one character). `--pane` falls back to `$FLOWMUX_PANE_ID`. For
     /// raw or multi-byte input use `send-keys`.
@@ -771,6 +781,13 @@ async fn main() -> anyhow::Result<()> {
         // ping the daemon; `Fix` never does.
         Cmd::Doctor => return run_doctor(cli.socket.clone(), cli.json).await,
         Cmd::Fix => return run_fix(cli.json),
+        // `tmux -V` is Claude Code's availability probe; answer it
+        // without a daemon round-trip so detection succeeds even while
+        // the GUI is still starting.
+        Cmd::TmuxCompat { ref args } if args.first().map(String::as_str) == Some("-V") => {
+            println!("{}", flowmux_ipc::tmux_compat::SHIM_VERSION_LINE);
+            return Ok(());
+        }
         Cmd::PtyTee { .. } => {} // handled below, after the connect block
         _ => {}
     }
@@ -815,11 +832,38 @@ async fn main() -> anyhow::Result<()> {
         return notify_stream(&client, pane).await;
     }
 
+    if let Cmd::TmuxCompat { args } = cmd {
+        return tmux_compat_cmd(&client, args).await;
+    }
+
     let json_mode = cli.json;
     let req = build_request(cmd)?;
     let resp = client.call(req).await?;
     print_response(&resp, json_mode)?;
     Ok(())
+}
+
+/// Forward one shim-intercepted tmux invocation to the daemon and
+/// mirror the result as if tmux itself had run: stdout, stderr, and
+/// the exit status all reproduce the daemon's answer.
+async fn tmux_compat_cmd(client: &Client, args: Vec<String>) -> anyhow::Result<()> {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+    let resp = client.call(Request::TmuxCompat { args, cwd }).await?;
+    match resp {
+        Response::TmuxCompatResult(out) => {
+            use std::io::Write;
+            if !out.stdout.is_empty() {
+                print!("{}", out.stdout);
+                std::io::stdout().flush().ok();
+            }
+            if !out.stderr.is_empty() {
+                eprint!("{}", out.stderr);
+            }
+            std::process::exit(out.code);
+        }
+        Response::Error(e) => anyhow::bail!("tmux-compat: {e:?}"),
+        other => anyhow::bail!("tmux-compat: unexpected response: {other:?}"),
+    }
 }
 
 async fn notify_stream(client: &Client, pane: Option<PaneId>) -> anyhow::Result<()> {

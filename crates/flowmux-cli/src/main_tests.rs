@@ -1538,3 +1538,38 @@ fn notification_management_commands_map_to_ipc_requests() {
     .unwrap();
     assert!(matches!(clear, Request::NotificationsClear));
 }
+
+#[test]
+fn parses_tmux_compat_with_raw_tmux_argv() {
+    // The shim forwards tmux argv verbatim — leading dashes included.
+    let cli = Cli::try_parse_from([
+        "flowmuxctl",
+        "tmux-compat",
+        "-L",
+        "claude-swarm-123",
+        "new-session",
+        "-d",
+        "-s",
+        "claude-swarm",
+        "-P",
+        "-F",
+        "#{pane_id}",
+        "--",
+        "cat",
+    ])
+    .unwrap();
+    let Cmd::TmuxCompat { args } = cli.cmd else {
+        panic!("expected TmuxCompat");
+    };
+    assert_eq!(args[0], "-L");
+    assert_eq!(args[1], "claude-swarm-123");
+    assert!(args.contains(&"new-session".to_string()));
+    assert_eq!(args.last().map(String::as_str), Some("cat"));
+
+    // The version probe parses too (answered without a daemon).
+    let cli = Cli::try_parse_from(["flowmuxctl", "tmux-compat", "-V"]).unwrap();
+    let Cmd::TmuxCompat { args } = cli.cmd else {
+        panic!("expected TmuxCompat");
+    };
+    assert_eq!(args, vec!["-V".to_string()]);
+}

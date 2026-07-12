@@ -522,7 +522,11 @@ impl WindowController {
                 let (tx, rx) = oneshot::channel();
                 let _ = bridge
                     .tx
-                    .send(GtkCommand::RemoveWorkspace { id, ack: tx })
+                    .send(GtkCommand::RemoveWorkspace {
+                        id,
+                        confirm: true,
+                        ack: tx,
+                    })
                     .await;
                 let _ = rx.await;
             });
@@ -1823,7 +1827,11 @@ fn register_workspace_actions(
                 let (tx, rx) = oneshot::channel();
                 let _ = bridge
                     .tx
-                    .send(GtkCommand::RemoveWorkspace { id, ack: tx })
+                    .send(GtkCommand::RemoveWorkspace {
+                        id,
+                        confirm: true,
+                        ack: tx,
+                    })
                     .await;
                 let _ = rx.await;
             });

@@ -155,6 +155,36 @@ workspace, so they never pop a confirmation dialog or block your call.
 it works in every build (no feature flag); it only returns not-supported for
 a pane that has no terminal surface (e.g. a browser tab).
 
+## Claude Code agent teams — no tmux required
+
+flowmux ships a `tmux` compatibility shim (installed by `flowmux fix`
+into the agent shim dir, which is already on every pane's `PATH`).
+When a Claude Code lead runs with `teammateMode: "tmux"` inside a
+flowmux pane, its swarm calls are translated natively: the swarm
+session becomes a workspace, and every teammate runs in its own pane
+of that workspace. Teammates keep coordinating through Claude Code's
+own task list and messaging; flowmux only provides the panes.
+
+```bash
+# One-time setup:
+flowmux fix
+
+# In the lead's settings (or per session):
+#   { "env": { "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1" },
+#     "teammateMode": "tmux" }
+claude   # then ask the lead to spawn teammates
+```
+
+Notes:
+
+- Only swarm-scoped invocations (`tmux -L claude-swarm-*`, the
+  `claude-swarm` session, or pane ids flowmux handed out) are
+  intercepted; any other `tmux` usage inside a pane still reaches the
+  real tmux binary. Set `FLOWMUX_TMUX_SHIM=0` to disable interception.
+- Because teammate panes are flowmux PTYs, each teammate also gets
+  `FLOWMUX_PANE_ID` etc. and can drive the in-app browser and the
+  verbs above.
+
 ## DO NOT
 
 - Do not invoke `playwright install`, `npx playwright open`,

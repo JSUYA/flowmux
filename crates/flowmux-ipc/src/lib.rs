@@ -12,5 +12,6 @@
 pub mod client;
 pub mod protocol;
 pub mod server;
+pub mod tmux_compat;
 
 pub use protocol::{Envelope, Request, Response, RpcError};

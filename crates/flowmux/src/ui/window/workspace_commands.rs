@@ -40,9 +40,9 @@ impl WindowController {
                     self.render_workspace(&ws);
                 }
             }
-            GtkCommand::RemoveWorkspace { id, ack } => {
+            GtkCommand::RemoveWorkspace { id, confirm, ack } => {
                 flowmux_config::notify_debug!("gui/dispatch", "RemoveWorkspace id={id}");
-                if !self.confirm_close_workspace(id).await {
+                if confirm && !self.confirm_close_workspace(id).await {
                     let _ = ack.send(());
                     return;
                 }

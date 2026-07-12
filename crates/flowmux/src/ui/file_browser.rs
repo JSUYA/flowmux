@@ -544,7 +544,7 @@ impl FileBrowserPanel {
         self.clear_directory_monitors();
         let mut monitors = Vec::new();
         for directory in &directories {
-            let file = gio::File::for_path(&directory);
+            let file = gio::File::for_path(directory);
             let Ok(monitor) =
                 file.monitor_directory(gio::FileMonitorFlags::NONE, gio::Cancellable::NONE)
             else {

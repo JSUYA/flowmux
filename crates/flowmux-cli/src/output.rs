@@ -74,29 +74,6 @@ fn plain_browser_response(response: &Response) -> Option<String> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn browser_responses_render_as_agent_friendly_values() {
-        assert_eq!(
-            plain_browser_response(&Response::BrowserResult {
-                value: "page title".into(),
-            }),
-            Some("page title".into())
-        );
-        assert_eq!(
-            plain_browser_response(&Response::BrowserBoolResult { value: true }),
-            Some("true".into())
-        );
-        assert_eq!(
-            plain_browser_response(&Response::BrowserOk),
-            Some("ok".into())
-        );
-    }
-}
-
 /// Render `flowmux tree` as an indented workspace → leaf-pane → tab
 /// view. The active tab in each pane is marked with `*`.
 pub(crate) fn render_tree(workspaces: &[flowmux_ipc::protocol::TreeWorkspace]) -> String {
@@ -131,4 +108,27 @@ pub(crate) fn render_tree(workspaces: &[flowmux_ipc::protocol::TreeWorkspace]) -
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn browser_responses_render_as_agent_friendly_values() {
+        assert_eq!(
+            plain_browser_response(&Response::BrowserResult {
+                value: "page title".into(),
+            }),
+            Some("page title".into())
+        );
+        assert_eq!(
+            plain_browser_response(&Response::BrowserBoolResult { value: true }),
+            Some("true".into())
+        );
+        assert_eq!(
+            plain_browser_response(&Response::BrowserOk),
+            Some("ok".into())
+        );
+    }
 }

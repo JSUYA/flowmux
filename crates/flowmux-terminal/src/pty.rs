@@ -63,6 +63,10 @@ impl Pty {
         };
 
         let mut master: RawFd = -1;
+        // libc declares forkpty's `winp` as `*const winsize` on Linux
+        // but `*mut winsize` on macOS; go through a raw pointer so one
+        // call site type-checks (and passes clippy) on both.
+        let winp = std::ptr::addr_of_mut!(ws);
         // SAFETY: forkpty allocates a PTY pair and forks. We pass a valid
         // master-out pointer and winsize; name/termios default to NULL.
         let pid = unsafe {
@@ -70,7 +74,7 @@ impl Pty {
                 &mut master,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                &mut ws,
+                winp as _,
             )
         };
 

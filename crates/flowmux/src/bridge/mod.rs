@@ -394,9 +394,13 @@ pub enum GtkCommand {
     /// Create a brand-new workspace and add it to the sidebar.
     NewWorkspace { root: std::path::PathBuf },
     /// Remove a workspace entirely (sidebar row + stack page + state).
-    /// Triggered by the hover X button on a sidebar row.
+    /// Triggered by the hover X button on a sidebar row, and by
+    /// tmux-compat teardown (kill-pane of the last pane / kill-server).
+    /// `confirm: false` skips the modal dialog — agent-driven paths
+    /// must never block on user input.
     RemoveWorkspace {
         id: WorkspaceId,
+        confirm: bool,
         ack: oneshot::Sender<()>,
     },
     /// Remove every open workspace. Triggered by the sidebar context

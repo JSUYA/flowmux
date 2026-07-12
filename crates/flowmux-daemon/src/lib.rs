@@ -6,6 +6,7 @@
 
 pub mod handler;
 pub mod state_store;
+pub mod tmux_compat;
 
 pub use handler::DaemonHandler;
 pub use state_store::{CloseOutcome, StateStore};

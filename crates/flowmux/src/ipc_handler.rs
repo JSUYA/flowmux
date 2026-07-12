@@ -183,6 +183,7 @@ impl Handler for GuiHandler {
                 | Request::ImportCookies { .. }
                 | Request::BrowserEval { .. } => self.handle_browser_verb(req).await,
                 Request::ClaudeTeams { .. }
+                | Request::TmuxCompat { .. }
                 | Request::AgentSessionUpdate { .. }
                 | Request::AgentSessionGet { .. }
                 | Request::AgentSessionForget { .. }
@@ -560,6 +561,19 @@ impl GuiHandler {
     /// Dispatch for the agent verb group (split out of the `handle` match).
     async fn handle_agent_verb(&self, req: Request) -> Response {
         match req {
+            // One tmux CLI invocation forwarded by the `tmux` shim —
+            // Claude Code agent teams driving flowmux panes natively.
+            // State mutations run in the shared orchestrator; widget
+            // work goes through the bridge-backed UI below.
+            Request::TmuxCompat { args, cwd } => {
+                let ui = GuiTmuxUi {
+                    bridge: &self.bridge,
+                };
+                let out =
+                    flowmux_daemon::tmux_compat::execute(self.inner.store(), &ui, &args, &cwd)
+                        .await;
+                Response::TmuxCompatResult(out)
+            }
             Request::ClaudeTeams { count, args, root } => {
                 let count = count.clamp(1, 8);
                 let store = self.inner.store();
@@ -964,6 +978,136 @@ impl GuiHandler {
             // notification operations delegated above.
             other => unreachable!("notification router got a non-notification verb: {other:?}"),
         }
+    }
+}
+
+/// Bridge-backed [`TmuxCompatUi`]: applies each tmux-compat side effect
+/// on the GTK main thread, mirroring how the plain pane verbs dispatch.
+///
+/// [`TmuxCompatUi`]: flowmux_daemon::tmux_compat::TmuxCompatUi
+struct GuiTmuxUi<'a> {
+    bridge: &'a Bridge,
+}
+
+impl flowmux_daemon::tmux_compat::TmuxCompatUi for GuiTmuxUi<'_> {
+    async fn workspace_created(
+        &self,
+        id: flowmux_core::WorkspaceId,
+        name: &str,
+        root: &std::path::Path,
+    ) {
+        let (tx, rx) = oneshot::channel();
+        let _ = self
+            .bridge
+            .tx
+            .send(GtkCommand::WorkspaceCreated {
+                id,
+                name: name.to_string(),
+                root: root.to_path_buf(),
+                ack: tx,
+            })
+            .await;
+        let _ = rx.await;
+    }
+
+    async fn pane_split_applied(
+        &self,
+        workspace: flowmux_core::WorkspaceId,
+        pane: flowmux_core::PaneId,
+        new_pane: flowmux_core::PaneId,
+        direction: SplitDirection,
+    ) {
+        let (tx, rx) = oneshot::channel();
+        let _ = self
+            .bridge
+            .tx
+            .send(GtkCommand::PaneSplitApplied {
+                id: workspace,
+                pane,
+                new_pane,
+                direction,
+                ack: tx,
+            })
+            .await;
+        let _ = rx.await;
+    }
+
+    async fn send_keys(&self, pane: flowmux_core::PaneId, keys: &str) -> Result<(), String> {
+        let (tx, rx) = oneshot::channel();
+        let _ = self
+            .bridge
+            .tx
+            .send(GtkCommand::PaneSendKeys {
+                pane,
+                keys: keys.to_string(),
+                ack: tx,
+            })
+            .await;
+        match rx.await {
+            Ok(result) => result,
+            Err(_) => Err("bridge closed".into()),
+        }
+    }
+
+    async fn rename_surface(
+        &self,
+        pane: flowmux_core::PaneId,
+        surface: flowmux_core::SurfaceId,
+        title: &str,
+    ) -> Result<(), String> {
+        let (tx, rx) = oneshot::channel();
+        let _ = self
+            .bridge
+            .tx
+            .send(GtkCommand::RenameSurface {
+                pane,
+                surface,
+                title: title.to_string(),
+                ack: tx,
+            })
+            .await;
+        match rx.await {
+            Ok(result) => result,
+            Err(_) => Err("bridge closed".into()),
+        }
+    }
+
+    async fn close_pane(&self, pane: flowmux_core::PaneId) -> Result<(), String> {
+        // The orchestrator only closes non-last panes, so this stays on
+        // CloseFocused's no-dialog path.
+        let (tx, rx) = oneshot::channel();
+        let _ = self
+            .bridge
+            .tx
+            .send(GtkCommand::CloseFocused { pane, ack: tx })
+            .await;
+        match rx.await {
+            Ok(result) => result,
+            Err(_) => Err("bridge closed".into()),
+        }
+    }
+
+    async fn remove_workspace(&self, id: flowmux_core::WorkspaceId) {
+        let (tx, rx) = oneshot::channel();
+        let _ = self
+            .bridge
+            .tx
+            .send(GtkCommand::RemoveWorkspace {
+                id,
+                // Agent-driven teardown must never block on a modal.
+                confirm: false,
+                ack: tx,
+            })
+            .await;
+        let _ = rx.await;
+    }
+
+    async fn workspace_activated(&self, id: flowmux_core::WorkspaceId) {
+        let _ = self
+            .bridge
+            .tx
+            .send(GtkCommand::ActivateWorkspace { id })
+            .await;
     }
 }
 

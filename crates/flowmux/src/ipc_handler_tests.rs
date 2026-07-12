@@ -1632,3 +1632,208 @@ async fn browser_eval_reports_not_found_for_missing_browser_pane() {
         Response::Error(RpcError::NotFound(_))
     ));
 }
+
+// ---- tmux-compat (Claude Code agent teams) ------------------------------
+
+/// Drive one `Request::TmuxCompat` to completion, answering every
+/// bridge command with `answer` and returning the commands seen plus
+/// the final output.
+async fn run_tmux_compat(
+    handler: &GuiHandler,
+    rx: &async_channel::Receiver<GtkCommand>,
+    args: &[&str],
+    answer: impl Fn(GtkCommand) -> &'static str,
+) -> (
+    Vec<&'static str>,
+    flowmux_ipc::tmux_compat::TmuxCompatOutput,
+) {
+    let response = handler.handle(Request::TmuxCompat {
+        args: args.iter().map(|s| s.to_string()).collect(),
+        cwd: std::path::PathBuf::from("/tmp/flowmux-tmux-compat"),
+    });
+    tokio::pin!(response);
+    let mut seen = Vec::new();
+    let response = loop {
+        tokio::select! {
+            response = &mut response => break response,
+            command = rx.recv() => {
+                seen.push(answer(command.expect("bridge open")));
+            }
+        }
+    };
+    let Response::TmuxCompatResult(out) = response else {
+        panic!("expected TmuxCompatResult, got {response:?}");
+    };
+    (seen, out)
+}
+
+/// Ack any tmux-compat bridge command positively and label it.
+fn ack_any(command: GtkCommand) -> &'static str {
+    match command {
+        GtkCommand::WorkspaceCreated { ack, .. } => {
+            ack.send(()).unwrap();
+            "workspace-created"
+        }
+        GtkCommand::PaneSplitApplied { ack, .. } => {
+            ack.send(()).unwrap();
+            "pane-split"
+        }
+        GtkCommand::PaneSendKeys { ack, .. } => {
+            ack.send(Ok(())).unwrap();
+            "send-keys"
+        }
+        GtkCommand::RenameSurface { ack, .. } => {
+            ack.send(Ok(())).unwrap();
+            "rename-surface"
+        }
+        GtkCommand::CloseFocused { ack, .. } => {
+            ack.send(Ok(())).unwrap();
+            "close-pane"
+        }
+        GtkCommand::RemoveWorkspace { confirm, ack, .. } => {
+            assert!(
+                !confirm,
+                "agent-driven teardown must skip the confirm dialog"
+            );
+            ack.send(()).unwrap();
+            "remove-workspace"
+        }
+        GtkCommand::ActivateWorkspace { .. } => "activate-workspace",
+        other => panic!("unexpected bridge command: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn tmux_compat_external_swarm_drives_bridge_commands() {
+    let (handler, rx, _pane, _tab) = single_pane_handler().await;
+    let sock = "claude-swarm-31337";
+
+    // has-session before creation fails without touching the bridge.
+    let (seen, out) = run_tmux_compat(
+        &handler,
+        &rx,
+        &["-L", sock, "has-session", "-t", "claude-swarm"],
+        ack_any,
+    )
+    .await;
+    assert!(seen.is_empty());
+    assert_eq!(out.code, 1);
+
+    // new-session renders a workspace and prints the first pane id.
+    let (seen, out) = run_tmux_compat(
+        &handler,
+        &rx,
+        &[
+            "-L",
+            sock,
+            "new-session",
+            "-d",
+            "-s",
+            "claude-swarm",
+            "-n",
+            "swarm-view",
+            "-P",
+            "-F",
+            "#{pane_id}",
+            "--",
+            "cat",
+        ],
+        ack_any,
+    )
+    .await;
+    assert_eq!(seen, ["workspace-created"]);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    let first_pane = out.stdout.trim().to_string();
+    assert!(first_pane.parse::<PaneId>().is_ok());
+
+    // Teammate #1: title + command go to the existing pane.
+    let (seen, out) = run_tmux_compat(
+        &handler,
+        &rx,
+        &[
+            "-L",
+            sock,
+            "select-pane",
+            "-t",
+            &first_pane,
+            "-T",
+            "researcher",
+        ],
+        ack_any,
+    )
+    .await;
+    assert_eq!(seen, ["rename-surface"]);
+    assert_eq!(out.code, 0);
+
+    let (seen, out) = run_tmux_compat(
+        &handler,
+        &rx,
+        &[
+            "-L",
+            sock,
+            "respawn-pane",
+            "-k",
+            "-t",
+            &first_pane,
+            "--",
+            "cd /tmp && env CLAUDECODE=1 claude --agent-name researcher",
+        ],
+        ack_any,
+    )
+    .await;
+    assert_eq!(seen, ["send-keys"]);
+    assert_eq!(out.code, 0);
+
+    // Teammate #2: split prints a fresh pane id.
+    let (seen, out) = run_tmux_compat(
+        &handler,
+        &rx,
+        &[
+            "-L",
+            sock,
+            "split-window",
+            "-d",
+            "-t",
+            &first_pane,
+            "-v",
+            "-P",
+            "-F",
+            "#{pane_id}",
+            "--",
+            "cat",
+        ],
+        ack_any,
+    )
+    .await;
+    assert_eq!(seen, ["pane-split"]);
+    assert_eq!(out.code, 0);
+    let second_pane = out.stdout.trim().to_string();
+    assert_ne!(second_pane, first_pane);
+
+    // Teardown: pane close, then last pane removes the workspace
+    // without a confirm dialog.
+    let (seen, out) = run_tmux_compat(
+        &handler,
+        &rx,
+        &["-L", sock, "kill-pane", "-t", &second_pane],
+        ack_any,
+    )
+    .await;
+    assert_eq!(seen, ["close-pane"]);
+    assert_eq!(out.code, 0);
+
+    // CloseFocused's GTK dispatch owns the store mutation; emulate it
+    // here so the orchestrator sees the pane count drop to 1.
+    let closed: PaneId = second_pane.parse().unwrap();
+    handler.inner.store().close_pane(closed).await.unwrap();
+
+    let (seen, out) = run_tmux_compat(
+        &handler,
+        &rx,
+        &["-L", sock, "kill-pane", "-t", &first_pane],
+        ack_any,
+    )
+    .await;
+    assert_eq!(seen, ["remove-workspace"]);
+    assert_eq!(out.code, 0);
+}

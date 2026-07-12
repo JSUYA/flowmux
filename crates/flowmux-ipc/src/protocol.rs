@@ -543,6 +543,17 @@ pub enum Request {
     CloseDesktopNotification {
         desktop_id: String,
     },
+
+    /// `flowmuxctl tmux-compat -- <tmux args…>` — one tmux CLI
+    /// invocation forwarded by the `tmux` shim in the agent shim dir.
+    /// Backs Claude Code agent teams natively: swarm sessions become
+    /// workspaces and teammate panes become flowmux panes (see
+    /// `crate::tmux_compat`). `cwd` is the shim's working directory,
+    /// used as the workspace root for `new-session`.
+    TmuxCompat {
+        args: Vec<String>,
+        cwd: PathBuf,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -625,6 +636,9 @@ pub enum Response {
     NotificationState {
         changed: bool,
     },
+    /// Reply to `Request::TmuxCompat` — a process-exit mirror the shim
+    /// reproduces 1:1 (status code, stdout, stderr).
+    TmuxCompatResult(crate::tmux_compat::TmuxCompatOutput),
     Error(RpcError),
 }
 

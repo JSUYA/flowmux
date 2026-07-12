@@ -174,6 +174,16 @@ impl Handler for DaemonHandler {
                 Request::PaneResize { pane, ratio } => {
                     resize_pane_in_store(&self.store, pane, ratio).await
                 }
+
+                Request::TmuxCompat { args, cwd } => {
+                    // Headless: state mutations are real, widget work is
+                    // logged. The GUI wrapper overrides this verb with a
+                    // bridge-backed UI.
+                    let ui = crate::tmux_compat::HeadlessTmuxUi { store: &self.store };
+                    let out = crate::tmux_compat::execute(&self.store, &ui, &args, &cwd).await;
+                    Response::TmuxCompatResult(out)
+                }
+
                 other => Response::Error(RpcError::Unimplemented(format!("{other:?}"))),
             }
         })

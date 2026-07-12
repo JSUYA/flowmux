@@ -422,6 +422,121 @@ pub fn install_agent_shims() -> Result<Vec<PathBuf>> {
     Ok(written)
 }
 
+/// Body of the `tmux` compatibility shim (Claude Code agent teams).
+///
+/// The GUI prepends the agent shim dir to every PTY's `PATH`, so a
+/// Claude Code lead running inside a flowmux pane resolves `tmux` to
+/// this script. Swarm-scoped invocations (the `claude-swarm` server
+/// socket / session names, or a pane UUID handed out by tmux-compat)
+/// are translated into flowmux workspaces and panes via
+/// `flowmuxctl tmux-compat`; every other invocation falls through to
+/// the real tmux, so humans using tmux inside flowmux are unaffected.
+/// `FLOWMUX_TMUX_SHIM=0` disables interception entirely. Unlike the
+/// agent wrapper shims this is deliberately NOT mirrored into
+/// `~/.local/bin` — hijacking `tmux` outside flowmux panes would be
+/// wrong.
+pub fn tmux_shim_script() -> String {
+    r#"#!/usr/bin/env bash
+# flowmux tmux compat shim (managed by `flowmux fix`).
+# Routes Claude Code agent-teams swarm calls into flowmux panes and
+# passes everything else through to the real tmux.
+self_dir=$(cd "$(dirname "$0")" && pwd)
+find_real_tmux() {
+  local saved_ifs=$IFS d candidate
+  IFS=:
+  for d in $PATH; do
+    [ "$d" = "$self_dir" ] && continue
+    candidate="$d/tmux"
+    [ -x "$candidate" ] || continue
+    grep -q "flowmux tmux compat shim" "$candidate" 2>/dev/null && continue
+    printf '%s' "$candidate"
+    IFS=$saved_ifs
+    return 0
+  done
+  IFS=$saved_ifs
+  return 1
+}
+
+swarm=0
+if [ -n "${FLOWMUX_SOCKET_PATH:-}" ] && [ "${FLOWMUX_TMUX_SHIM:-1}" != "0" ]; then
+  prev=""
+  for a in "$@"; do
+    case "$prev" in
+      -L|-t|-s)
+        case "$a" in
+          claude-swarm|claude-swarm:*|claude-swarm-*) swarm=1 ;;
+          # Pane UUIDs handed out by tmux-compat (legacy default-socket path).
+          ????????-????-????-????-????????????) swarm=1 ;;
+        esac
+        ;;
+    esac
+    prev="$a"
+  done
+fi
+
+if [ "$swarm" = "1" ]; then
+  if command -v flowmuxctl >/dev/null 2>&1; then
+    exec flowmuxctl tmux-compat "$@"
+  elif command -v flowmux >/dev/null 2>&1; then
+    exec flowmux tmux-compat "$@"
+  fi
+  echo "flowmux tmux shim: flowmuxctl not found on PATH" >&2
+  exit 127
+fi
+
+if real=$(find_real_tmux); then
+  exec "$real" "$@"
+fi
+
+# No real tmux installed. Inside a flowmux pane, still answer the
+# availability probe so Claude Code's agent-teams detection succeeds.
+if [ -n "${FLOWMUX_SOCKET_PATH:-}" ] && [ "$1" = "-V" ]; then
+  if command -v flowmuxctl >/dev/null 2>&1; then
+    exec flowmuxctl tmux-compat -V
+  elif command -v flowmux >/dev/null 2>&1; then
+    exec flowmux tmux-compat -V
+  fi
+fi
+echo "flowmux tmux shim: tmux not found on PATH" >&2
+exit 127
+"#
+    .to_string()
+}
+
+/// Write/refresh the `tmux` compat shim into the shim dir. Idempotent;
+/// returns the paths touched. `Ok(vec![])` when no data dir resolves.
+pub fn install_tmux_shim() -> Result<Vec<PathBuf>> {
+    let dir = match flowmux_config::paths::agent_shim_dir() {
+        Some(d) => d,
+        None => return Ok(vec![]),
+    };
+    install_tmux_shim_into(&dir)
+}
+
+fn install_tmux_shim_into(dir: &Path) -> Result<Vec<PathBuf>> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::create_dir_all(dir)?;
+    let path = dir.join("tmux");
+    let body = tmux_shim_script();
+    let mut written = Vec::new();
+    let up_to_date = fs::read_to_string(&path)
+        .map(|c| c == body)
+        .unwrap_or(false);
+    if !up_to_date {
+        fs::write(&path, &body)?;
+        written.push(path.clone());
+    }
+    let mut perms = fs::metadata(&path)?.permissions();
+    if perms.mode() & 0o111 != 0o111 {
+        perms.set_mode(0o755);
+        fs::set_permissions(&path, perms)?;
+        if !written.contains(&path) {
+            written.push(path);
+        }
+    }
+    Ok(written)
+}
+
 fn user_local_bin_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local").join("bin"))
 }
@@ -1283,6 +1398,156 @@ mod tests {
         )
         .unwrap();
         assert!(should_write_local_agent_shim(&path, &body));
+    }
+
+    #[test]
+    fn tmux_shim_intercepts_swarm_and_passes_through_everything_else() {
+        let body = tmux_shim_script();
+        // Marker so the shim recognizes (and skips) itself on PATH.
+        assert!(body.contains("flowmux tmux compat shim"));
+        // Swarm socket/session names and pane UUIDs are intercepted…
+        assert!(body.contains("claude-swarm|claude-swarm:*|claude-swarm-*"));
+        assert!(body.contains("????????-????-????-????-????????????"));
+        // …and routed to the tmux-compat verb.
+        assert!(body.contains("exec flowmuxctl tmux-compat \"$@\""));
+        // Interception only happens inside a flowmux pane, with an
+        // escape hatch.
+        assert!(body.contains("FLOWMUX_SOCKET_PATH"));
+        assert!(body.contains("FLOWMUX_TMUX_SHIM"));
+        // Non-swarm usage execs the real tmux, skipping the shim dir.
+        assert!(body.contains("[ \"$d\" = \"$self_dir\" ] && continue"));
+        assert!(body.contains("exec \"$real\" \"$@\""));
+    }
+
+    #[test]
+    fn tmux_shim_install_is_idempotent_and_executable() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tmp();
+        let written = install_tmux_shim_into(dir.path()).unwrap();
+        assert_eq!(written.len(), 1);
+        let path = &written[0];
+        assert_eq!(path.file_name().unwrap(), "tmux");
+        let mode = fs::metadata(path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o111, 0o111, "shim must be executable");
+
+        // Second run: nothing to do.
+        let written = install_tmux_shim_into(dir.path()).unwrap();
+        assert!(written.is_empty());
+
+        // Drift (edited body) is re-synced.
+        fs::write(dir.path().join("tmux"), "#!/bin/sh\n").unwrap();
+        let written = install_tmux_shim_into(dir.path()).unwrap();
+        assert_eq!(written.len(), 1);
+        assert_eq!(
+            fs::read_to_string(dir.path().join("tmux")).unwrap(),
+            tmux_shim_script()
+        );
+    }
+
+    /// Run the installed shim under real bash with a controlled PATH:
+    /// fake `flowmuxctl` and fake `tmux` record their argv, so the
+    /// routing decision (intercept vs pass-through) is observable.
+    #[test]
+    fn tmux_shim_routes_correctly_under_bash() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let dir = tmp();
+        let shim_dir = dir.path().join("shims");
+        install_tmux_shim_into(&shim_dir).unwrap();
+        let bin_dir = dir.path().join("bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        let log = dir.path().join("calls.log");
+
+        let fake = |name: &str, label: &str| {
+            let path = bin_dir.join(name);
+            fs::write(
+                &path,
+                format!("#!/bin/sh\necho \"{label}: $*\" >> '{}'\n", log.display()),
+            )
+            .unwrap();
+            let mut p = fs::metadata(&path).unwrap().permissions();
+            p.set_mode(0o755);
+            fs::set_permissions(&path, p).unwrap();
+        };
+        fake("flowmuxctl", "ctl");
+        fake("tmux", "realtmux");
+
+        let run = |args: &[&str], socket: Option<&str>, shim_env: Option<&str>| {
+            let mut cmd = Command::new(shim_dir.join("tmux"));
+            // Keep the system dirs so bash/dirname/grep resolve; our
+            // dirs come first so the fakes win.
+            cmd.args(args).env_clear().env(
+                "PATH",
+                format!("{}:{}:/usr/bin:/bin", shim_dir.display(), bin_dir.display()),
+            );
+            if let Some(s) = socket {
+                cmd.env("FLOWMUX_SOCKET_PATH", s);
+            }
+            if let Some(v) = shim_env {
+                cmd.env("FLOWMUX_TMUX_SHIM", v);
+            }
+            let status = cmd.status().unwrap();
+            let calls = fs::read_to_string(&log).unwrap_or_default();
+            fs::write(&log, "").unwrap();
+            (status, calls)
+        };
+
+        // Swarm-shaped + inside flowmux pane → intercepted.
+        let (status, calls) = run(
+            &["-L", "claude-swarm-42", "has-session", "-t", "claude-swarm"],
+            Some("/tmp/flowmux.sock"),
+            None,
+        );
+        assert!(status.success());
+        assert_eq!(
+            calls.trim(),
+            "ctl: tmux-compat -L claude-swarm-42 has-session -t claude-swarm"
+        );
+
+        // Legacy path: pane-UUID target without -L is intercepted too.
+        let (_, calls) = run(
+            &["kill-pane", "-t", "0b8e7f66-90bc-4f74-9e2e-7f3f4be2a111"],
+            Some("/tmp/flowmux.sock"),
+            None,
+        );
+        assert!(calls.starts_with("ctl: tmux-compat kill-pane"));
+
+        // Ordinary tmux usage passes through to the real tmux.
+        let (_, calls) = run(
+            &["new-session", "-s", "mywork"],
+            Some("/tmp/flowmux.sock"),
+            None,
+        );
+        assert_eq!(calls.trim(), "realtmux: new-session -s mywork");
+
+        // Outside a flowmux pane, even swarm shapes pass through.
+        let (_, calls) = run(
+            &["-L", "claude-swarm-42", "has-session", "-t", "claude-swarm"],
+            None,
+            None,
+        );
+        assert!(calls.starts_with("realtmux:"));
+
+        // Escape hatch disables interception.
+        let (_, calls) = run(
+            &["-L", "claude-swarm-42", "has-session", "-t", "claude-swarm"],
+            Some("/tmp/flowmux.sock"),
+            Some("0"),
+        );
+        assert!(calls.starts_with("realtmux:"));
+
+        // No real tmux installed: the availability probe still answers
+        // through tmux-compat inside a flowmux pane.
+        fs::remove_file(bin_dir.join("tmux")).unwrap();
+        let (status, calls) = run(&["-V"], Some("/tmp/flowmux.sock"), None);
+        assert!(status.success());
+        assert_eq!(calls.trim(), "ctl: tmux-compat -V");
+
+        // …but outside a pane it reports tmux as missing.
+        let (status, calls) = run(&["-V"], None, None);
+        assert_eq!(status.code(), Some(127));
+        assert_eq!(calls.trim(), "");
     }
 
     #[test]
