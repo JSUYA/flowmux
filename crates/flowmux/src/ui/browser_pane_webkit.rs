@@ -184,15 +184,37 @@ impl BrowserPane {
                 // WebKit requires a related WebView return value before it
                 // completes window.open(). The real destination is routed to
                 // a FlowMux browser tab above, so keep this contract-only view
-                // hidden, block its duplicate navigation, and close it on the
-                // next main-loop turn.
+                // hidden and block its duplicate navigation.
+                //
+                // Tearing the view down on the next main-loop turn is NOT
+                // safe: disposing a WebKitWebViewBase whose web process is
+                // still handshaking nulls its AcceleratedBackingStore while
+                // an accelerated-compositing update is in flight, and the
+                // unguarded update() call segfaults the whole GUI process
+                // (WebKitGTK 2.52, UIProcess/gtk — release-build ASSERT).
+                // Instead, ask the view to close only once WebKit reports it
+                // ready (or after a grace period), and drop the last strong
+                // ref only from the `close` signal so dispose always runs on
+                // a page that finished the close handshake.
                 let placeholder = webkit6::WebView::builder().related_view(parent).build();
                 placeholder.connect_decide_policy(|_, decision, _| {
                     decision.ignore();
                     true
                 });
-                let placeholder_for_close = placeholder.clone();
-                gtk::glib::idle_add_local_once(move || placeholder_for_close.try_close());
+                let keep_alive = Rc::new(RefCell::new(Some(placeholder.clone())));
+                {
+                    let keep_alive = keep_alive.clone();
+                    placeholder.connect_close(move |_| {
+                        keep_alive.borrow_mut().take();
+                    });
+                }
+                placeholder.connect_ready_to_show(|view| view.try_close());
+                let weak = placeholder.downgrade();
+                gtk::glib::timeout_add_local_once(std::time::Duration::from_secs(10), move || {
+                    if let Some(view) = weak.upgrade() {
+                        view.try_close();
+                    }
+                });
                 placeholder.upcast()
             });
         }
