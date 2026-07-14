@@ -621,6 +621,11 @@ impl BrowserPane {
         self.web_view.stop_loading();
     }
 
+    pub fn prepare_for_close(&self) {
+        self.stop_loading();
+        self.web_view.terminate_web_process();
+    }
+
     pub fn grab_focus(&self) {
         self.web_view.grab_focus();
     }
