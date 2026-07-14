@@ -1,6 +1,28 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use chrono::{DateTime, Duration, Utc};
+use std::future::Future;
+use std::path::PathBuf;
+
+mod claude;
+mod codex;
+
+pub(crate) async fn collect_all(home: PathBuf) -> [ProviderRefresh; 2] {
+    join_provider_refreshes(
+        claude::collect(home, reqwest::Client::new()),
+        codex::collect(),
+    )
+    .await
+}
+
+async fn join_provider_refreshes<C, D>(claude: C, codex: D) -> [ProviderRefresh; 2]
+where
+    C: Future<Output = ProviderRefresh>,
+    D: Future<Output = ProviderRefresh>,
+{
+    let (claude, codex) = tokio::join!(claude, codex);
+    [claude, codex]
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Provider {
@@ -41,18 +63,25 @@ pub(crate) struct UsageError {
 }
 
 impl UsageError {
-    pub(crate) fn network() -> Self {
+    pub(crate) fn new(kind: UsageErrorKind, message: impl Into<String>) -> Self {
         Self {
-            kind: UsageErrorKind::Network,
-            message: "사용량 서비스에 연결하지 못했습니다.".into(),
+            kind,
+            message: message.into(),
         }
     }
 
+    pub(crate) fn network() -> Self {
+        Self::new(
+            UsageErrorKind::Network,
+            "사용량 서비스에 연결하지 못했습니다.",
+        )
+    }
+
     pub(crate) fn unauthorized() -> Self {
-        Self {
-            kind: UsageErrorKind::Unauthorized,
-            message: "Claude를 한 번 실행해 로컬 로그인을 갱신해 주세요.".into(),
-        }
+        Self::new(
+            UsageErrorKind::Unauthorized,
+            "Claude를 한 번 실행해 로컬 로그인을 갱신해 주세요.",
+        )
     }
 }
 
@@ -222,10 +251,7 @@ mod tests {
             collected_at: now + Duration::minutes(1),
         });
 
-        assert_eq!(
-            state.claude.tokens.as_ref().unwrap().value.today,
-            Some(123)
-        );
+        assert_eq!(state.claude.tokens.as_ref().unwrap().value.today, Some(123));
         assert_eq!(
             state.claude.limits.as_ref().unwrap().value[0].used_percent,
             25.0
@@ -258,5 +284,25 @@ mod tests {
         state.finish_refresh(now + Duration::seconds(2));
         assert!(!state.begin_refresh(now + Duration::seconds(59)));
         assert!(state.begin_refresh(now + Duration::seconds(63)));
+    }
+
+    #[tokio::test]
+    async fn concurrent_refresh_results_keep_provider_order() {
+        fn refresh(provider: Provider) -> ProviderRefresh {
+            ProviderRefresh {
+                provider,
+                tokens: FieldRefresh::Success(TokenTotals::default()),
+                limits: FieldRefresh::Success(Vec::new()),
+                collected_at: Utc::now(),
+            }
+        }
+
+        let results = join_provider_refreshes(async { refresh(Provider::Claude) }, async {
+            refresh(Provider::Codex)
+        })
+        .await;
+
+        assert_eq!(results[0].provider, Provider::Claude);
+        assert_eq!(results[1].provider, Provider::Codex);
     }
 }
