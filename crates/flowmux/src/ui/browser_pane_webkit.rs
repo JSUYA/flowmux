@@ -279,8 +279,9 @@ impl BrowserPane {
         let bookmarks = BookmarkMenu::new(
             &profile,
             {
-                let web_view = web_view.clone();
+                let web_view = web_view.downgrade();
                 Rc::new(move || {
+                    let web_view = web_view.upgrade()?;
                     let url = web_view.uri()?.to_string();
                     let title = web_view
                         .title()
@@ -291,8 +292,12 @@ impl BrowserPane {
                 })
             },
             {
-                let web_view = web_view.clone();
-                Rc::new(move |url| web_view.load_uri(url))
+                let web_view = web_view.downgrade();
+                Rc::new(move |url| {
+                    if let Some(web_view) = web_view.upgrade() {
+                        web_view.load_uri(url);
+                    }
+                })
             },
         );
         bookmarks.button.set_tooltip_text(Some(&format!(
@@ -380,28 +385,41 @@ impl BrowserPane {
 
         // Wire chrome buttons.
         {
-            let v = web_view.clone();
+            let v = web_view.downgrade();
             back.connect_clicked(move |_| {
+                let Some(v) = v.upgrade() else {
+                    return;
+                };
                 if v.can_go_back() {
                     v.go_back();
                 }
             });
         }
         {
-            let v = web_view.clone();
+            let v = web_view.downgrade();
             forward.connect_clicked(move |_| {
+                let Some(v) = v.upgrade() else {
+                    return;
+                };
                 if v.can_go_forward() {
                     v.go_forward();
                 }
             });
         }
         {
-            let v = web_view.clone();
-            reload.connect_clicked(move |_| v.reload());
+            let v = web_view.downgrade();
+            reload.connect_clicked(move |_| {
+                if let Some(v) = v.upgrade() {
+                    v.reload();
+                }
+            });
         }
         {
-            let entry = find_entry.clone();
+            let entry = find_entry.downgrade();
             find.connect_clicked(move |_| {
+                let Some(entry) = entry.upgrade() else {
+                    return;
+                };
                 let visible = !entry.is_visible();
                 entry.set_visible(visible);
                 if visible {
@@ -410,30 +428,43 @@ impl BrowserPane {
             });
         }
         {
-            let v = web_view.clone();
+            let v = web_view.downgrade();
             let zoom = zoom.clone();
-            let label = zoom_label.clone();
+            let label = zoom_label.downgrade();
             zoom_out.connect_clicked(move |_| {
+                let (Some(v), Some(label)) = (v.upgrade(), label.upgrade()) else {
+                    return;
+                };
                 set_webkit_zoom(&v, &zoom, &label, zoom.get() - 0.1);
             });
         }
         {
-            let v = web_view.clone();
+            let v = web_view.downgrade();
             let zoom = zoom.clone();
-            let label = zoom_label.clone();
-            zoom_reset.connect_clicked(move |_| set_webkit_zoom(&v, &zoom, &label, 1.0));
+            zoom_reset.connect_clicked(move |label| {
+                let Some(v) = v.upgrade() else {
+                    return;
+                };
+                set_webkit_zoom(&v, &zoom, label, 1.0);
+            });
         }
         {
-            let v = web_view.clone();
+            let v = web_view.downgrade();
             let zoom = zoom.clone();
-            let label = zoom_label.clone();
+            let label = zoom_label.downgrade();
             zoom_in.connect_clicked(move |_| {
+                let (Some(v), Some(label)) = (v.upgrade(), label.upgrade()) else {
+                    return;
+                };
                 set_webkit_zoom(&v, &zoom, &label, zoom.get() + 0.1);
             });
         }
         {
-            let v = web_view.clone();
+            let v = web_view.downgrade();
             find_entry.connect_search_changed(move |entry| {
+                let Some(v) = v.upgrade() else {
+                    return;
+                };
                 let Some(controller) = v.find_controller() else {
                     return;
                 };
@@ -452,27 +483,34 @@ impl BrowserPane {
             });
         }
         {
-            let v = web_view.clone();
+            let v = web_view.downgrade();
             find_entry.connect_activate(move |_| {
+                let Some(v) = v.upgrade() else {
+                    return;
+                };
                 if let Some(controller) = v.find_controller() {
                     controller.search_next();
                 }
             });
         }
         {
-            let v = web_view.clone();
-            let entry = find_entry.clone();
-            find_entry.connect_stop_search(move |_| {
-                if let Some(controller) = v.find_controller() {
-                    controller.search_finish();
+            let v = web_view.downgrade();
+            find_entry.connect_stop_search(move |entry| {
+                if let Some(v) = v.upgrade() {
+                    if let Some(controller) = v.find_controller() {
+                        controller.search_finish();
+                    }
+                    v.grab_focus();
                 }
                 entry.set_visible(false);
-                v.grab_focus();
             });
         }
         {
-            let v = web_view.clone();
+            let v = web_view.downgrade();
             inspector.connect_clicked(move |_| {
+                let Some(v) = v.upgrade() else {
+                    return;
+                };
                 if let Some(insp) = v.inspector() {
                     insp.show();
                     insp.detach();
@@ -482,11 +520,12 @@ impl BrowserPane {
             });
         }
         {
-            let v = web_view.clone();
-            let a = address.clone();
-            address.connect_activate(move |_| {
-                let raw = a.text().to_string();
-                let uri = normalize_uri(&raw);
+            let v = web_view.downgrade();
+            address.connect_activate(move |address| {
+                let Some(v) = v.upgrade() else {
+                    return;
+                };
+                let uri = normalize_uri(&address.text());
                 v.load_uri(&uri);
             });
         }
@@ -494,14 +533,16 @@ impl BrowserPane {
         // Reflect navigation in the address bar AND mirror the new URL
         // back to the daemon so state can restore the last page on next launch.
         {
-            let a = address.clone();
+            let address = address.downgrade();
             let uri_cb = callbacks.on_browser_uri_changed.clone();
             let pane_id = pane_id.clone();
-            web_view.connect_uri_notify(move |w| {
-                if let Some(uri) = w.uri() {
-                    let uri_str = uri.to_string();
-                    a.set_text(&uri_str);
-                    (uri_cb.borrow_mut())(pane_id.get(), surface_id, uri_str);
+            web_view.connect_uri_notify(move |web_view| {
+                if let Some(uri) = web_view.uri() {
+                    let uri = uri.to_string();
+                    if let Some(address) = address.upgrade() {
+                        address.set_text(&uri);
+                    }
+                    (uri_cb.borrow_mut())(pane_id.get(), surface_id, uri);
                 }
             });
         }
@@ -867,6 +908,40 @@ pub(crate) fn cookies_sqlite_path(data_dir: &std::path::Path) -> std::path::Path
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dropping_browser_pane_releases_root_and_web_view() {
+        // GTK binds to its first test thread. The focused test below performs
+        // the real check; a full suite may have initialized GTK elsewhere.
+        if gtk::is_initialized() && !gtk::is_initialized_main_thread() {
+            return;
+        }
+        if !gtk::is_initialized() {
+            gtk::init().expect("GTK must initialize for the browser lifetime test");
+        }
+
+        let pane = BrowserPane::new(
+            PaneId::new(),
+            SurfaceId::new(),
+            None,
+            PaneCallbacks::noop_for_test(),
+            BrowserEngine::Webkit,
+            false,
+        );
+        let root = pane.root.downgrade();
+        let web_view = pane.web_view.downgrade();
+
+        drop(pane);
+
+        assert!(
+            root.upgrade().is_none(),
+            "closed browser tab retained its GTK root"
+        );
+        assert!(
+            web_view.upgrade().is_none(),
+            "closed browser tab retained its WebView"
+        );
+    }
 
     #[test]
     fn engine_to_profile_maps_each_builtin_to_its_data_slot() {

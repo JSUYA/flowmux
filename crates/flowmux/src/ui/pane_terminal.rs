@@ -123,3 +123,42 @@ pub struct PaneCallbacks {
     /// The caller opens it in the Markdown viewer binary.
     pub on_open_markdown: Rc<RefCell<dyn FnMut(PaneId, PathBuf)>>,
 }
+
+#[cfg(test)]
+impl PaneCallbacks {
+    pub(crate) fn noop_for_test() -> Self {
+        Self {
+            on_child_exited: Rc::new(RefCell::new(|_, _| {})),
+            on_focus: Rc::new(RefCell::new(|_| {})),
+            on_close_pane: Rc::new(RefCell::new(|_| {})),
+            on_split_right: Rc::new(RefCell::new(|_| {})),
+            on_split_down: Rc::new(RefCell::new(|_| {})),
+            on_activate_surface: Rc::new(RefCell::new(|_, _| {})),
+            on_new_surface: Rc::new(RefCell::new(|_| {})),
+            on_new_browser_surface: Rc::new(RefCell::new(|_| {})),
+            on_close_surface: Rc::new(RefCell::new(|_, _| {})),
+            on_rename_surface: Rc::new(RefCell::new(|_, _| {})),
+            on_show_surface_folder: Rc::new(RefCell::new(|_, _| {})),
+            on_copy_surface_text: Rc::new(RefCell::new(|_, _| {})),
+            on_reorder_surface: Rc::new(RefCell::new(|_, _, _| {})),
+            on_tab_drag_to_new_window: Rc::new(RefCell::new(|_, _| {})),
+            on_move_surface_to_pane: Rc::new(RefCell::new(|_, _, _, _, _| {})),
+            on_move_surface_to_workspace: Rc::new(RefCell::new(|_, _, _| {})),
+            on_split_surface_into_pane: Rc::new(RefCell::new(|_, _, _, _, _| {})),
+            list_workspaces: Rc::new(Vec::new),
+            workspace_of_pane: Rc::new(|_| None),
+            tab_drag_drop_seen: Rc::new(Cell::new(false)),
+            tab_drag_drop_committed: Rc::new(Cell::new(false)),
+            tab_drag_split_candidate: Rc::new(RefCell::new(None)),
+            on_terminal_cwd_changed: Rc::new(RefCell::new(|_, _, _| {})),
+            on_browser_uri_changed: Rc::new(RefCell::new(|_, _, _| {})),
+            on_browser_title_changed: Rc::new(RefCell::new(|_, _, _| {})),
+            on_terminal_title_changed: Rc::new(RefCell::new(|_, _, _| {})),
+            read_options: Rc::new(flowmux_config::options::Options::default),
+            position_of_surface_in_pane: Rc::new(|_, _| None),
+            on_open_url: Rc::new(RefCell::new(|_, _| {})),
+            on_open_image: Rc::new(RefCell::new(|_, _| {})),
+            on_open_markdown: Rc::new(RefCell::new(|_, _| {})),
+        }
+    }
+}

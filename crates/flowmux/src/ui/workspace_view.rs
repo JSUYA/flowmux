@@ -381,7 +381,9 @@ impl PaneRegistry {
             .collect();
         for surface in surfaces {
             self.terminals.remove(&surface);
-            self.browsers.remove(&surface);
+            if let Some(browser) = self.browsers.remove(&surface) {
+                browser.stop_loading();
+            }
             self.surface_tab_labels.remove(&surface);
             self.surface_workspace.remove(&surface);
         }
@@ -541,7 +543,9 @@ impl PaneRegistry {
             .unwrap_or_default();
         for s in surfaces {
             self.terminals.remove(&s);
-            self.browsers.remove(&s);
+            if let Some(browser) = self.browsers.remove(&s) {
+                browser.stop_loading();
+            }
             self.surface_tab_labels.remove(&s);
             self.surface_workspace.remove(&s);
         }
@@ -601,7 +605,9 @@ impl PaneRegistry {
         }
         // Clean PaneRegistry indexes.
         self.terminals.remove(&surface);
-        self.browsers.remove(&surface);
+        if let Some(browser) = self.browsers.remove(&surface) {
+            browser.stop_loading();
+        }
         self.surface_tab_labels.remove(&surface);
         self.surface_workspace.remove(&surface);
         if self.active_terminal_by_pane.get(&pane) == Some(&surface) {
