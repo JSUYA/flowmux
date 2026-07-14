@@ -485,6 +485,25 @@ paned > separator {{
 .flowmux-file-browser-row.cut {{
     opacity: 0.45;
 }}
+.flowmux-worktree-panel {{
+    background-color: {sidebar};
+    color: {fg};
+    border-left: 1px solid {border};
+}}
+.flowmux-worktree-panel.focused {{
+    border-left: 2px solid {focus};
+}}
+.flowmux-worktree-panel-header {{
+    padding: 8px 8px 6px 10px;
+    border-bottom: 1px solid {border};
+}}
+.flowmux-worktree-list {{
+    background: transparent;
+}}
+.flowmux-worktree-row:hover,
+.flowmux-worktree-row:selected {{
+    background-color: {sidebar_hover};
+}}
 .flowmux-clipboard-toast {{
     background-color: {toast_bg};
     color: {fg};
@@ -723,5 +742,23 @@ mod tests {
                 && css.contains(&format!("min-width: {AGENT_BAR_ITEM_MIN_WIDTH_PX}px")),
             "agent bar must keep its bottom-bar and item sizing rules"
         );
+    }
+
+    #[test]
+    fn worktree_panel_styles_cover_focus_header_list_and_rows() {
+        let css = sample_css();
+        for selector in [
+            ".flowmux-worktree-panel {",
+            ".flowmux-worktree-panel.focused {",
+            ".flowmux-worktree-panel-header {",
+            ".flowmux-worktree-list {",
+            ".flowmux-worktree-row:hover,",
+            ".flowmux-worktree-row:selected {",
+        ] {
+            assert!(
+                css.contains(selector),
+                "worktree selector missing: {selector}"
+            );
+        }
     }
 }
