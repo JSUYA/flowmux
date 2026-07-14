@@ -9,8 +9,8 @@ mod codex;
 
 pub(crate) async fn collect_all(home: PathBuf) -> [ProviderRefresh; 2] {
     join_provider_refreshes(
-        claude::collect(home, reqwest::Client::new()),
-        codex::collect(),
+        claude::collect(home.clone(), reqwest::Client::new()),
+        codex::collect(home),
     )
     .await
 }
@@ -73,14 +73,14 @@ impl UsageError {
     pub(crate) fn network() -> Self {
         Self::new(
             UsageErrorKind::Network,
-            "사용량 서비스에 연결하지 못했습니다.",
+            "Could not connect to the usage service.",
         )
     }
 
     pub(crate) fn unauthorized() -> Self {
         Self::new(
             UsageErrorKind::Unauthorized,
-            "Claude를 한 번 실행해 로컬 로그인을 갱신해 주세요.",
+            "Run Claude once to refresh the local login.",
         )
     }
 }
@@ -189,15 +189,23 @@ impl UsagePanelState {
         self.refreshing = false;
         self.last_finished_at = Some(now);
     }
+
+    pub(crate) fn begin_forced_refresh(&mut self) -> bool {
+        if self.refreshing {
+            return false;
+        }
+        self.refreshing = true;
+        true
+    }
 }
 
 pub(crate) fn duration_label(minutes: Option<u64>) -> String {
     match minutes {
-        Some(10_080) => "주간".into(),
-        Some(value) if value % 1_440 == 0 => format!("{}일", value / 1_440),
-        Some(value) if value % 60 == 0 => format!("{}시간", value / 60),
-        Some(value) => format!("{value}분"),
-        None => "사용 제한".into(),
+        Some(10_080) => "Weekly".into(),
+        Some(value) if value % 1_440 == 0 => format!("{} days", value / 1_440),
+        Some(value) if value % 60 == 0 => format!("{} hours", value / 60),
+        Some(value) => format!("{value} minutes"),
+        None => "Usage limit".into(),
     }
 }
 
@@ -261,11 +269,11 @@ mod tests {
 
     #[test]
     fn duration_labels_are_metadata_driven() {
-        assert_eq!(duration_label(Some(300)), "5시간");
-        assert_eq!(duration_label(Some(10_080)), "주간");
-        assert_eq!(duration_label(Some(4_320)), "3일");
-        assert_eq!(duration_label(Some(90)), "90분");
-        assert_eq!(duration_label(None), "사용 제한");
+        assert_eq!(duration_label(Some(300)), "5 hours");
+        assert_eq!(duration_label(Some(10_080)), "Weekly");
+        assert_eq!(duration_label(Some(4_320)), "3 days");
+        assert_eq!(duration_label(Some(90)), "90 minutes");
+        assert_eq!(duration_label(None), "Usage limit");
     }
 
     #[test]
@@ -284,6 +292,17 @@ mod tests {
         state.finish_refresh(now + Duration::seconds(2));
         assert!(!state.begin_refresh(now + Duration::seconds(59)));
         assert!(state.begin_refresh(now + Duration::seconds(63)));
+    }
+
+    #[test]
+    fn forced_refresh_bypasses_cache_but_not_an_active_refresh() {
+        let now = Utc::now();
+        let mut state = UsagePanelState::default();
+        assert!(state.begin_refresh(now));
+        state.finish_refresh(now + Duration::seconds(1));
+        assert!(!state.begin_refresh(now + Duration::seconds(2)));
+        assert!(state.begin_forced_refresh());
+        assert!(!state.begin_forced_refresh());
     }
 
     #[tokio::test]

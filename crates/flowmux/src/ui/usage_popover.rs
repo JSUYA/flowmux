@@ -32,11 +32,50 @@ impl UsagePopover {
         popover.set_position(gtk::PositionType::Top);
 
         let state = Rc::new(RefCell::new(UsagePanelState::default()));
-        popover.set_child(Some(&render_usage(&state.borrow())));
+
+        let root = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        root.set_margin_top(10);
+        root.set_margin_bottom(10);
+        root.set_margin_start(10);
+        root.set_margin_end(10);
+
+        let header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let title = gtk::Label::new(Some("AI Usage"));
+        title.add_css_class("heading");
+        title.set_halign(gtk::Align::Start);
+        title.set_hexpand(true);
+        header.append(&title);
+
+        let refresh_button = gtk::Button::from_icon_name("view-refresh-symbolic");
+        refresh_button.add_css_class("flat");
+        refresh_button.set_tooltip_text(Some("Refresh usage"));
+        refresh_button.set_focus_on_click(false);
+        refresh_button.set_widget_name("flowmux-usage-refresh-button");
+        header.append(&refresh_button);
+
+        let spinner = gtk::Spinner::new();
+        spinner.set_tooltip_text(Some("Refreshing usage"));
+        spinner.set_widget_name("flowmux-usage-refresh-spinner");
+        header.append(&spinner);
+        root.append(&header);
+
+        let cards = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        let scroll = gtk::ScrolledWindow::new();
+        scroll.set_hscrollbar_policy(gtk::PolicyType::Never);
+        scroll.set_min_content_height(180);
+        scroll.set_max_content_height(520);
+        scroll.set_propagate_natural_height(true);
+        scroll.set_child(Some(&cards));
+        root.append(&scroll);
+        popover.set_child(Some(&root));
+        render_usage(&cards, &refresh_button, &spinner, &state.borrow());
 
         let (result_tx, result_rx) = async_channel::bounded(1);
         let state_for_results = state.clone();
         let popover_weak = popover.downgrade();
+        let cards_for_results = cards.clone();
+        let refresh_for_results = refresh_button.clone();
+        let spinner_for_results = spinner.clone();
         gtk::glib::MainContext::default().spawn_local(async move {
             while let Ok(refreshes) = result_rx.recv().await {
                 {
@@ -48,7 +87,12 @@ impl UsagePopover {
                 }
                 if let Some(popover) = popover_weak.upgrade() {
                     if popover.is_visible() {
-                        popover.set_child(Some(&render_usage(&state_for_results.borrow())));
+                        render_usage(
+                            &cards_for_results,
+                            &refresh_for_results,
+                            &spinner_for_results,
+                            &state_for_results.borrow(),
+                        );
                     }
                 }
             }
@@ -56,37 +100,43 @@ impl UsagePopover {
 
         let state_for_show = state.clone();
         let result_tx_for_show = result_tx.clone();
-        popover.connect_show(move |popover| {
-            popover.set_child(Some(&render_usage(&state_for_show.borrow())));
-            let now = Utc::now();
-            if !state_for_show.borrow_mut().begin_refresh(now) {
-                return;
-            }
-            popover.set_child(Some(&render_usage(&state_for_show.borrow())));
+        let handle_for_show = tokio_handle.clone();
+        let cards_for_show = cards.clone();
+        let refresh_for_show = refresh_button.clone();
+        let spinner_for_show = spinner.clone();
+        popover.connect_show(move |_| {
+            request_refresh(
+                &state_for_show,
+                false,
+                &handle_for_show,
+                &result_tx_for_show,
+            );
+            render_usage(
+                &cards_for_show,
+                &refresh_for_show,
+                &spinner_for_show,
+                &state_for_show.borrow(),
+            );
+        });
 
-            let Some(handle) = tokio_handle.clone() else {
-                apply_local_failure(
-                    &state_for_show,
-                    UsageError::new(UsageErrorKind::Io, "사용량 수집기를 시작하지 못했습니다."),
-                );
-                popover.set_child(Some(&render_usage(&state_for_show.borrow())));
-                return;
-            };
-            let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
-                apply_local_failure(
-                    &state_for_show,
-                    UsageError::new(
-                        UsageErrorKind::NotLoggedIn,
-                        "로컬 홈 디렉터리를 찾지 못했습니다.",
-                    ),
-                );
-                popover.set_child(Some(&render_usage(&state_for_show.borrow())));
-                return;
-            };
-            let result_tx = result_tx_for_show.clone();
-            handle.spawn(async move {
-                let _ = result_tx.send(collect_all(home).await).await;
-            });
+        let state_for_refresh = state.clone();
+        let result_tx_for_refresh = result_tx.clone();
+        let handle_for_refresh = tokio_handle.clone();
+        let cards_for_refresh = cards.clone();
+        let spinner_for_refresh = spinner.clone();
+        refresh_button.connect_clicked(move |button| {
+            request_refresh(
+                &state_for_refresh,
+                true,
+                &handle_for_refresh,
+                &result_tx_for_refresh,
+            );
+            render_usage(
+                &cards_for_refresh,
+                button,
+                &spinner_for_refresh,
+                &state_for_refresh.borrow(),
+            );
         });
 
         Self { button }
@@ -95,6 +145,44 @@ impl UsagePopover {
     pub(crate) fn button(&self) -> &gtk::MenuButton {
         &self.button
     }
+}
+
+fn request_refresh(
+    state: &Rc<RefCell<UsagePanelState>>,
+    forced: bool,
+    tokio_handle: &Option<tokio::runtime::Handle>,
+    result_tx: &async_channel::Sender<[ProviderRefresh; 2]>,
+) {
+    let started = if forced {
+        state.borrow_mut().begin_forced_refresh()
+    } else {
+        state.borrow_mut().begin_refresh(Utc::now())
+    };
+    if !started {
+        return;
+    }
+
+    let Some(handle) = tokio_handle.clone() else {
+        apply_local_failure(
+            state,
+            UsageError::new(UsageErrorKind::Io, "Could not start the usage collector."),
+        );
+        return;
+    };
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        apply_local_failure(
+            state,
+            UsageError::new(
+                UsageErrorKind::NotLoggedIn,
+                "The local home directory was not found.",
+            ),
+        );
+        return;
+    };
+    let result_tx = result_tx.clone();
+    handle.spawn(async move {
+        let _ = result_tx.send(collect_all(home).await).await;
+    });
 }
 
 fn apply_local_failure(state: &Rc<RefCell<UsagePanelState>>, error: UsageError) {
@@ -111,39 +199,28 @@ fn apply_local_failure(state: &Rc<RefCell<UsagePanelState>>, error: UsageError) 
     state.finish_refresh(now);
 }
 
-fn render_usage(state: &UsagePanelState) -> gtk::Widget {
-    let root = gtk::Box::new(gtk::Orientation::Vertical, 8);
-    root.set_margin_top(10);
-    root.set_margin_bottom(10);
-    root.set_margin_start(10);
-    root.set_margin_end(10);
-
-    let header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    let title = gtk::Label::new(Some("AI 사용량"));
-    title.add_css_class("heading");
-    title.set_halign(gtk::Align::Start);
-    title.set_hexpand(true);
-    header.append(&title);
-    if state.refreshing {
-        let spinner = gtk::Spinner::new();
-        spinner.set_tooltip_text(Some("Refreshing usage"));
-        spinner.start();
-        header.append(&spinner);
+fn render_usage(
+    cards: &gtk::Box,
+    refresh_button: &gtk::Button,
+    spinner: &gtk::Spinner,
+    state: &UsagePanelState,
+) {
+    set_refresh_controls(refresh_button, spinner, state.refreshing);
+    while let Some(child) = cards.first_child() {
+        cards.remove(&child);
     }
-    root.append(&header);
-
-    let cards = gtk::Box::new(gtk::Orientation::Vertical, 8);
     cards.append(&provider_card(&state.claude, state.refreshing));
     cards.append(&provider_card(&state.codex, state.refreshing));
+}
 
-    let scroll = gtk::ScrolledWindow::new();
-    scroll.set_hscrollbar_policy(gtk::PolicyType::Never);
-    scroll.set_min_content_height(180);
-    scroll.set_max_content_height(520);
-    scroll.set_propagate_natural_height(true);
-    scroll.set_child(Some(&cards));
-    root.append(&scroll);
-    root.upcast()
+fn set_refresh_controls(refresh_button: &gtk::Button, spinner: &gtk::Spinner, refreshing: bool) {
+    refresh_button.set_sensitive(!refreshing);
+    spinner.set_visible(refreshing);
+    if refreshing {
+        spinner.start();
+    } else {
+        spinner.stop();
+    }
 }
 
 fn provider_card(state: &ProviderState, refreshing: bool) -> gtk::Widget {
@@ -193,7 +270,7 @@ fn provider_card(state: &ProviderState, refreshing: bool) -> gtk::Widget {
 
     if let Some(limits) = &state.limits {
         if limits.value.is_empty() {
-            let empty = gtk::Label::new(Some("사용 제한 정보 없음"));
+            let empty = gtk::Label::new(Some("No rate limit data"));
             empty.set_halign(gtk::Align::Start);
             empty.add_css_class("caption");
             empty.add_css_class("dim-label");
@@ -207,9 +284,9 @@ fn provider_card(state: &ProviderState, refreshing: bool) -> gtk::Widget {
 
     if text_rows.is_empty() && state.limits.is_none() {
         let empty = gtk::Label::new(Some(if refreshing {
-            "사용량 불러오는 중…"
+            "Loading usage…"
         } else {
-            "사용량 정보 없음"
+            "No usage data"
         }));
         empty.set_halign(gtk::Align::Start);
         empty.add_css_class("dim-label");
@@ -266,10 +343,10 @@ fn provider_text_rows(state: &ProviderState) -> Vec<String> {
     let mut rows = Vec::new();
     if let Some(tokens) = &state.tokens {
         if let Some(today) = tokens.value.today {
-            rows.push(format!("오늘 토큰 {}", format_token_count(today)));
+            rows.push(format!("Tokens today {}", format_token_count(today)));
         }
         if let Some(lifetime) = tokens.value.lifetime {
-            rows.push(format!("누적 토큰 {}", format_token_count(lifetime)));
+            rows.push(format!("Lifetime tokens {}", format_token_count(lifetime)));
         }
     }
     let mut seen_errors = HashSet::new();
@@ -293,15 +370,15 @@ fn latest_update(state: &ProviderState) -> Option<DateTime<Utc>> {
 
 fn format_updated_at(value: DateTime<Utc>) -> String {
     let local: DateTime<Local> = value.into();
-    format!("갱신 {}", local.format("%H:%M"))
+    format!("Updated {}", local.format("%H:%M"))
 }
 
 fn format_reset_at(value: DateTime<Utc>) -> String {
     let local: DateTime<Local> = value.into();
     if local.date_naive() == Local::now().date_naive() {
-        format!("오늘 {} 초기화", local.format("%H:%M"))
+        format!("Resets today at {}", local.format("%H:%M"))
     } else {
-        format!("{} 초기화", local.format("%m/%d %H:%M"))
+        format!("Resets at {}", local.format("%m/%d %H:%M"))
     }
 }
 
@@ -355,14 +432,14 @@ mod tests {
             limits: None,
             errors: vec![UsageError::new(
                 UsageErrorKind::Unauthorized,
-                "Claude를 한 번 실행해 로컬 로그인을 갱신해 주세요.",
+                "Run Claude once to refresh the local login.",
             )],
         };
 
         let rows = provider_text_rows(&state);
 
-        assert!(rows.iter().any(|row| row.contains("오늘 토큰 12.5K")));
-        assert!(rows.iter().any(|row| row.contains("Claude를 한 번 실행")));
+        assert!(rows.iter().any(|row| row.contains("Tokens today 12.5K")));
+        assert!(rows.iter().any(|row| row.contains("Run Claude once")));
     }
 
     #[gtk::test]
@@ -385,5 +462,37 @@ mod tests {
         );
         assert_eq!(popover.position(), gtk::PositionType::Top);
         assert_eq!(popover.width_request(), 360);
+
+        let root = popover.child().unwrap();
+        let refresh = find_named_widget(&root, "flowmux-usage-refresh-button")
+            .unwrap()
+            .downcast::<gtk::Button>()
+            .unwrap();
+        let spinner = find_named_widget(&root, "flowmux-usage-refresh-spinner")
+            .unwrap()
+            .downcast::<gtk::Spinner>()
+            .unwrap();
+        assert_eq!(
+            refresh.icon_name().as_deref(),
+            Some("view-refresh-symbolic")
+        );
+        assert_eq!(refresh.tooltip_text().as_deref(), Some("Refresh usage"));
+        set_refresh_controls(&refresh, &spinner, true);
+        assert!(!refresh.is_sensitive());
+        assert!(spinner.is_spinning());
+    }
+
+    fn find_named_widget(root: &gtk::Widget, name: &str) -> Option<gtk::Widget> {
+        if root.widget_name() == name {
+            return Some(root.clone());
+        }
+        let mut child = root.first_child();
+        while let Some(widget) = child {
+            if let Some(found) = find_named_widget(&widget, name) {
+                return Some(found);
+            }
+            child = widget.next_sibling();
+        }
+        None
     }
 }

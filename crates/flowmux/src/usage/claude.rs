@@ -38,7 +38,7 @@ pub(crate) async fn collect(home: PathBuf, client: reqwest::Client) -> ProviderR
         Ok(Err(error)) => FieldRefresh::Failure(error),
         Err(_) => FieldRefresh::Failure(UsageError::new(
             UsageErrorKind::Io,
-            "Claude 토큰 로그를 읽지 못했습니다.",
+            "Could not read the Claude token logs.",
         )),
     };
     let limits = match limits_result {
@@ -63,13 +63,13 @@ async fn fetch_limits(
         .map_err(|_| {
             UsageError::new(
                 UsageErrorKind::NotLoggedIn,
-                "Claude 로컬 로그인을 찾지 못했습니다.",
+                "The local Claude login was not found.",
             )
         })?;
     let credentials: Value = serde_json::from_str(&raw).map_err(|_| {
         UsageError::new(
             UsageErrorKind::InvalidData,
-            "Claude 로그인 정보를 읽지 못했습니다.",
+            "Could not read the Claude login information.",
         )
     })?;
     let access_token = access_token_from_credentials(&credentials)?;
@@ -92,7 +92,7 @@ async fn fetch_limits(
         let value = response.json::<Value>().await.map_err(|_| {
             UsageError::new(
                 UsageErrorKind::InvalidData,
-                "Claude 사용량 응답을 읽지 못했습니다.",
+                "Could not read the Claude usage response.",
             )
         })?;
         parse_usage_response(&value)
@@ -103,7 +103,7 @@ async fn fetch_limits(
         .map_err(|_| {
             UsageError::new(
                 UsageErrorKind::Timeout,
-                "Claude 사용량 요청 시간이 초과되었습니다.",
+                "The Claude usage request timed out.",
             )
         })?
 }
@@ -117,7 +117,7 @@ fn access_token_from_credentials(value: &Value) -> Result<&str, UsageError> {
         .ok_or_else(|| {
             UsageError::new(
                 UsageErrorKind::NotLoggedIn,
-                "Claude 로컬 로그인을 찾지 못했습니다.",
+                "The local Claude login was not found.",
             )
         })
 }
@@ -126,7 +126,7 @@ fn parse_usage_response(value: &Value) -> Result<Vec<UsageWindow>, UsageError> {
     let object = value.as_object().ok_or_else(|| {
         UsageError::new(
             UsageErrorKind::InvalidData,
-            "Claude 사용량 응답 형식이 올바르지 않습니다.",
+            "The Claude usage response was invalid.",
         )
     })?;
     let mut windows = Vec::new();
@@ -170,7 +170,7 @@ fn parse_named_window(
     let Some(object) = value.as_object() else {
         return Err(UsageError::new(
             UsageErrorKind::InvalidData,
-            "Claude 제한 사용량 형식이 올바르지 않습니다.",
+            "The Claude rate limit response was invalid.",
         ));
     };
     let Some(used_percent) = object
@@ -261,7 +261,7 @@ fn sum_transcript_tree(
     if !root.is_dir() {
         return Err(UsageError::new(
             UsageErrorKind::NotLoggedIn,
-            "Claude 로컬 사용 기록을 찾지 못했습니다.",
+            "The local Claude usage history was not found.",
         ));
     }
     let mut directories = vec![root.to_path_buf()];
@@ -270,7 +270,7 @@ fn sum_transcript_tree(
         let entries = std::fs::read_dir(directory).map_err(|_| {
             UsageError::new(
                 UsageErrorKind::Io,
-                "Claude 로컬 사용 기록을 읽지 못했습니다.",
+                "Could not read the local Claude usage history.",
             )
         })?;
         for entry in entries.flatten() {
