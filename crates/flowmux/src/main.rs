@@ -14,6 +14,7 @@ mod notifications;
 mod platform;
 mod theme;
 mod ui;
+mod usage;
 
 use adw::prelude::*;
 use bridge::Bridge;
