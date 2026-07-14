@@ -39,6 +39,7 @@ pub struct WorktreePanel {
     repository_label: gtk::Label,
     content: gtk::Stack,
     list: gtk::ListBox,
+    scroll: gtk::ScrolledWindow,
     status: adw::StatusPage,
     spinner: gtk::Spinner,
     close_button: gtk::Button,
@@ -136,6 +137,7 @@ impl WorktreePanel {
             repository_label,
             content,
             list,
+            scroll,
             status,
             spinner,
             close_button,
@@ -357,15 +359,12 @@ impl WorktreePanel {
         let info = gtk::Button::with_label("Info");
         let remove = gtk::Button::with_label("Remove");
 
-        let open_block_reason = if row.workspace_active {
-            Some("This worktree is already active")
-        } else if row.operation_in_progress {
-            Some("A worktree operation is in progress")
-        } else {
-            None
-        };
+        let open_block_reason = open_block_reason(row);
         open.set_sensitive(open_block_reason.is_none());
         open.set_tooltip_text(Some(open_block_reason.unwrap_or("Open worktree")));
+        if let Some(reason) = open_block_reason {
+            open.update_property(&[gtk::accessible::Property::Description(reason)]);
+        }
         info.set_tooltip_text(Some("Show worktree information"));
 
         let remove_block_reason = row.remove_block_reason.as_deref().or(row
@@ -373,6 +372,9 @@ impl WorktreePanel {
             .then_some("A worktree operation is in progress"));
         remove.set_sensitive(remove_block_reason.is_none());
         remove.set_tooltip_text(Some(remove_block_reason.unwrap_or("Remove worktree")));
+        if let Some(reason) = remove_block_reason {
+            remove.update_property(&[gtk::accessible::Property::Description(reason)]);
+        }
 
         let path_for_open = row.info.path.clone();
         let on_open = self.on_open.clone();
@@ -410,17 +412,23 @@ impl WorktreePanel {
 
     fn install_focus_style(&self) {
         let focus = gtk::EventControllerFocus::new();
-        let root = self.root.clone();
+        let root = self.root.downgrade();
         let on_focus_changed = self.on_focus_changed.clone();
         focus.connect_enter(move |_| {
+            let Some(root) = root.upgrade() else {
+                return;
+            };
             root.add_css_class("focused");
             if let Some(callback) = on_focus_changed.borrow().as_ref() {
                 callback(true);
             }
         });
-        let root = self.root.clone();
+        let root = self.root.downgrade();
         let on_focus_changed = self.on_focus_changed.clone();
         focus.connect_leave(move |_| {
+            let Some(root) = root.upgrade() else {
+                return;
+            };
             root.remove_css_class("focused");
             if let Some(callback) = on_focus_changed.borrow().as_ref() {
                 callback(false);
@@ -431,9 +439,11 @@ impl WorktreePanel {
 
     fn install_pointer_focus(&self) {
         let click = gtk::GestureClick::new();
-        let root = self.root.clone();
+        let root = self.root.downgrade();
         click.connect_pressed(move |_, _, _, _| {
-            root.grab_focus();
+            if let Some(root) = root.upgrade() {
+                root.grab_focus();
+            }
         });
         self.root.add_controller(click);
     }
@@ -441,80 +451,64 @@ impl WorktreePanel {
     fn install_keyboard(&self) {
         let key = gtk::EventControllerKey::new();
         key.set_propagation_phase(gtk::PropagationPhase::Capture);
-        let panel = self.clone();
-        key.connect_key_pressed(move |_, key, _, state| panel.handle_key(key, state));
+        let list = self.list.downgrade();
+        let scroll = self.scroll.downgrade();
+        let rows = Rc::downgrade(&self.rows);
+        let on_open = Rc::downgrade(&self.on_open);
+        let on_close = Rc::downgrade(&self.on_close);
+        let on_focus_out = Rc::downgrade(&self.on_focus_out);
+        key.connect_key_pressed(move |_, key, _, state| {
+            let (
+                Some(list),
+                Some(scroll),
+                Some(rows),
+                Some(on_open),
+                Some(on_close),
+                Some(on_focus_out),
+            ) = (
+                list.upgrade(),
+                scroll.upgrade(),
+                rows.upgrade(),
+                on_open.upgrade(),
+                on_close.upgrade(),
+                on_focus_out.upgrade(),
+            )
+            else {
+                return glib::Propagation::Proceed;
+            };
+            dispatch_key(
+                &list,
+                &scroll,
+                &rows,
+                &on_open,
+                &on_close,
+                &on_focus_out,
+                key,
+                state,
+            )
+        });
         self.root.add_controller(key);
     }
 
     fn handle_key(&self, key: gdk::Key, state: gdk::ModifierType) -> glib::Propagation {
-        if key == gdk::Key::Escape {
-            self.emit_close();
-            return glib::Propagation::Stop;
-        }
-        let plain_alt = state.contains(gdk::ModifierType::ALT_MASK)
-            && !state.intersects(
-                gdk::ModifierType::CONTROL_MASK
-                    | gdk::ModifierType::SHIFT_MASK
-                    | gdk::ModifierType::SUPER_MASK,
-            );
-        if plain_alt {
-            if let Some(direction) = key_to_focus_dir(key) {
-                self.emit_focus_out(direction);
-                return glib::Propagation::Stop;
-            }
-        }
-        if state.intersects(
-            gdk::ModifierType::ALT_MASK
-                | gdk::ModifierType::CONTROL_MASK
-                | gdk::ModifierType::SUPER_MASK,
-        ) {
-            return glib::Propagation::Proceed;
-        }
-        self.handle_navigation_key(key)
+        dispatch_key(
+            &self.list,
+            &self.scroll,
+            &self.rows,
+            &self.on_open,
+            &self.on_close,
+            &self.on_focus_out,
+            key,
+            state,
+        )
     }
 
     fn handle_navigation_key(&self, key: gdk::Key) -> glib::Propagation {
-        let row_count = self.rows.borrow().len();
-        if row_count == 0 {
-            return glib::Propagation::Proceed;
-        }
-
-        let selected = self.list.selected_row().map(|row| row.index() as usize);
-        let next = if key == gdk::Key::Up {
-            Some(selected.map_or(row_count - 1, |index| {
-                if index == 0 {
-                    row_count - 1
-                } else {
-                    index - 1
-                }
-            }))
-        } else if key == gdk::Key::Down {
-            Some(selected.map_or(0, |index| (index + 1) % row_count))
-        } else if key == gdk::Key::Home {
-            Some(0)
-        } else if key == gdk::Key::End {
-            Some(row_count - 1)
-        } else {
-            None
-        };
-        if let Some(index) = next {
-            self.select_index_internal(index);
-            return glib::Propagation::Stop;
-        }
-
-        if key == gdk::Key::Return || key == gdk::Key::KP_Enter {
-            if let Some(path) = self.selected_path() {
-                self.emit_open(path);
-                return glib::Propagation::Stop;
-            }
-        }
-        glib::Propagation::Proceed
+        dispatch_navigation_key(&self.list, &self.scroll, &self.rows, &self.on_open, key)
     }
 
     fn select_index_internal(&self, index: usize) {
-        if let Some(row) = self.list.row_at_index(index as i32) {
-            self.list.select_row(Some(&row));
-        }
+        select_index_and_scroll(&self.list, &self.scroll, index);
     }
 
     fn path_at_index(&self, index: i32) -> Option<PathBuf> {
@@ -524,24 +518,6 @@ impl WorktreePanel {
                 .get(index)
                 .map(|row| row.info.path.clone())
         })
-    }
-
-    fn emit_open(&self, path: PathBuf) {
-        if let Some(callback) = self.on_open.borrow().as_ref() {
-            callback(path);
-        }
-    }
-
-    fn emit_close(&self) {
-        if let Some(callback) = self.on_close.borrow().as_ref() {
-            callback();
-        }
-    }
-
-    fn emit_focus_out(&self, direction: FocusDir) {
-        if let Some(callback) = self.on_focus_out.borrow().as_ref() {
-            callback(direction);
-        }
     }
 
     #[cfg(test)]
@@ -571,6 +547,133 @@ impl WorktreePanel {
     pub(crate) fn repository_name(&self) -> Option<String> {
         let name = self.repository_label.text();
         (!name.is_empty()).then(|| name.into())
+    }
+}
+
+fn dispatch_key(
+    list: &gtk::ListBox,
+    scroll: &gtk::ScrolledWindow,
+    rows: &RefCell<Vec<WorktreeRowView>>,
+    on_open: &RefCell<Option<Box<dyn Fn(PathBuf)>>>,
+    on_close: &RefCell<Option<Box<dyn Fn()>>>,
+    on_focus_out: &RefCell<Option<Box<dyn Fn(FocusDir)>>>,
+    key: gdk::Key,
+    state: gdk::ModifierType,
+) -> glib::Propagation {
+    if key == gdk::Key::Escape {
+        if let Some(callback) = on_close.borrow().as_ref() {
+            callback();
+        }
+        return glib::Propagation::Stop;
+    }
+    let plain_alt = state.contains(gdk::ModifierType::ALT_MASK)
+        && !state.intersects(
+            gdk::ModifierType::CONTROL_MASK
+                | gdk::ModifierType::SHIFT_MASK
+                | gdk::ModifierType::SUPER_MASK,
+        );
+    if plain_alt {
+        if let Some(direction) = key_to_focus_dir(key) {
+            if let Some(callback) = on_focus_out.borrow().as_ref() {
+                callback(direction);
+            }
+            return glib::Propagation::Stop;
+        }
+    }
+    if state.intersects(
+        gdk::ModifierType::ALT_MASK
+            | gdk::ModifierType::CONTROL_MASK
+            | gdk::ModifierType::SUPER_MASK,
+    ) {
+        return glib::Propagation::Proceed;
+    }
+    dispatch_navigation_key(list, scroll, rows, on_open, key)
+}
+
+fn dispatch_navigation_key(
+    list: &gtk::ListBox,
+    scroll: &gtk::ScrolledWindow,
+    rows: &RefCell<Vec<WorktreeRowView>>,
+    on_open: &RefCell<Option<Box<dyn Fn(PathBuf)>>>,
+    key: gdk::Key,
+) -> glib::Propagation {
+    let row_count = rows.borrow().len();
+    if row_count == 0 {
+        return glib::Propagation::Proceed;
+    }
+
+    let selected = list.selected_row().map(|row| row.index() as usize);
+    let next = if key == gdk::Key::Up {
+        Some(selected.map_or(row_count - 1, |index| {
+            if index == 0 {
+                row_count - 1
+            } else {
+                index - 1
+            }
+        }))
+    } else if key == gdk::Key::Down {
+        Some(selected.map_or(0, |index| (index + 1) % row_count))
+    } else if key == gdk::Key::Home {
+        Some(0)
+    } else if key == gdk::Key::End {
+        Some(row_count - 1)
+    } else {
+        None
+    };
+    if let Some(index) = next {
+        select_index_and_scroll(list, scroll, index);
+        return glib::Propagation::Stop;
+    }
+
+    if key == gdk::Key::Return || key == gdk::Key::KP_Enter {
+        let selected = list
+            .selected_row()
+            .and_then(|row| usize::try_from(row.index()).ok())
+            .and_then(|index| rows.borrow().get(index).cloned());
+        if let Some(row) = selected {
+            if open_block_reason(&row).is_none() {
+                if let Some(callback) = on_open.borrow().as_ref() {
+                    callback(row.info.path);
+                }
+            }
+            return glib::Propagation::Stop;
+        }
+    }
+    glib::Propagation::Proceed
+}
+
+fn select_index_and_scroll(list: &gtk::ListBox, scroll: &gtk::ScrolledWindow, index: usize) {
+    let Some(row) = list.row_at_index(index as i32) else {
+        return;
+    };
+    list.select_row(Some(&row));
+    scroll_row_into_view(list, scroll, &row);
+}
+
+fn scroll_row_into_view(list: &gtk::ListBox, scroll: &gtk::ScrolledWindow, row: &gtk::ListBoxRow) {
+    let Some(bounds) = row.compute_bounds(list) else {
+        return;
+    };
+    let adjustment = scroll.vadjustment();
+    let row_top = bounds.y() as f64;
+    let row_bottom = row_top + bounds.height() as f64;
+    let view_top = adjustment.value();
+    let view_bottom = view_top + adjustment.page_size();
+
+    if row_top < view_top {
+        adjustment.set_value(row_top);
+    } else if row_bottom > view_bottom {
+        adjustment.set_value((row_bottom - adjustment.page_size()).max(0.0));
+    }
+}
+
+fn open_block_reason(row: &WorktreeRowView) -> Option<&'static str> {
+    if row.workspace_active {
+        Some("This worktree is already active")
+    } else if row.operation_in_progress {
+        Some("A worktree operation is in progress")
+    } else {
+        None
     }
 }
 
@@ -640,8 +743,10 @@ mod tests {
     use flowmux_vcs::worktree::{WorktreeChanges, WorktreeInfo};
     use gtk::{gdk, glib};
     use std::cell::{Cell, RefCell};
+    use std::ffi::{CStr, CString};
     use std::path::{Path, PathBuf};
     use std::rc::Rc;
+    use std::time::Duration;
 
     fn info(path: &str, branch: &str) -> WorktreeInfo {
         WorktreeInfo {
@@ -679,6 +784,44 @@ mod tests {
         let mut labels = Vec::new();
         collect(widget, &mut labels);
         labels
+    }
+
+    fn assert_accessible_description(button: &gtk::Button, expected: &str) {
+        let expected = CString::new(expected).expect("accessible description");
+        let mismatch = unsafe {
+            gtk::ffi::gtk_test_accessible_check_property(
+                button.as_ptr().cast(),
+                gtk::ffi::GTK_ACCESSIBLE_PROPERTY_DESCRIPTION,
+                expected.as_ptr(),
+            )
+        };
+        if mismatch.is_null() {
+            return;
+        }
+
+        let mismatch_text = unsafe { CStr::from_ptr(mismatch) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe { glib::ffi::g_free(mismatch.cast()) };
+        panic!("accessible description mismatch: {mismatch_text}");
+    }
+
+    #[gtk::test]
+    fn dropping_panel_releases_root_and_children() {
+        let panel = WorktreePanel::new();
+        let root = panel.root.downgrade();
+        let list = panel.list.downgrade();
+
+        drop(panel);
+
+        assert!(
+            root.upgrade().is_none(),
+            "root was retained by a controller"
+        );
+        assert!(
+            list.upgrade().is_none(),
+            "child was retained by a controller"
+        );
     }
 
     #[gtk::test]
@@ -815,6 +958,21 @@ mod tests {
     }
 
     #[gtk::test]
+    fn disabled_actions_expose_reasons_to_assistive_technology() {
+        let panel = WorktreePanel::new();
+        let mut active = WorktreeRowView::available(info("/repo/active", "active"));
+        active.workspace_active = true;
+        let mut blocked = WorktreeRowView::available(info("/repo/blocked", "blocked"));
+        blocked.remove_block_reason = Some("Close the open workspace first".into());
+        panel.set_rows("repo", vec![active, blocked]);
+
+        let active_buttons = action_buttons(&panel, 0);
+        assert_accessible_description(&active_buttons[0], "This worktree is already active");
+        let blocked_buttons = action_buttons(&panel, 1);
+        assert_accessible_description(&blocked_buttons[2], "Close the open workspace first");
+    }
+
+    #[gtk::test]
     fn badges_follow_worktree_status_policy() {
         let mut row = info("/repo/main", "main");
         row.lock_reason = Some("maintenance".into());
@@ -905,6 +1063,87 @@ mod tests {
         assert_eq!(panel.selected_path(), Some(PathBuf::from("/repo/b")));
         panel.handle_navigation_key(gdk::Key::Home);
         assert_eq!(panel.selected_path(), Some(PathBuf::from("/repo/a")));
+    }
+
+    #[gtk::test]
+    fn enter_does_not_open_a_disabled_selected_row() {
+        let panel = WorktreePanel::new();
+        let mut active = WorktreeRowView::available(info("/repo/active", "active"));
+        active.workspace_active = true;
+        let mut busy = WorktreeRowView::available(info("/repo/busy", "busy"));
+        busy.operation_in_progress = true;
+        panel.set_rows("repo", vec![active, busy]);
+        let open_count = Rc::new(Cell::new(0));
+        {
+            let open_count = open_count.clone();
+            panel.connect_open(move |_| open_count.set(open_count.get() + 1));
+        }
+
+        for index in 0..2 {
+            panel.select_index(index);
+            assert_eq!(
+                panel.handle_key(gdk::Key::Return, gdk::ModifierType::empty()),
+                glib::Propagation::Stop
+            );
+        }
+        assert_eq!(open_count.get(), 0);
+    }
+
+    #[gtk::test]
+    async fn navigation_scrolls_the_selected_row_into_view() {
+        let panel = WorktreePanel::new();
+        panel.show_loading();
+        panel.set_rows(
+            "repo",
+            (0..30)
+                .map(|index| {
+                    WorktreeRowView::available(info(
+                        &format!("/repo/worktree-{index}"),
+                        &format!("branch-{index}"),
+                    ))
+                })
+                .collect(),
+        );
+        let window = gtk::Window::new();
+        window.set_default_size(320, 180);
+        window.set_child(Some(panel.widget()));
+        window.present();
+        glib::timeout_future(Duration::from_millis(50)).await;
+
+        let scroll = panel.scroll.clone();
+        let adjustment = scroll.vadjustment();
+        let last_row = panel.list.row_at_index(29).expect("last worktree row");
+        let last_bounds = last_row
+            .compute_bounds(&panel.list)
+            .expect("allocated last-row bounds");
+        assert!(
+            last_bounds.y() + last_bounds.height() > 100.0,
+            "precondition: last row is below the synthetic viewport"
+        );
+        panel.select_index(0);
+        adjustment.set_lower(0.0);
+        adjustment.set_upper(10_000.0);
+        adjustment.set_page_size(100.0);
+        adjustment.set_value(0.0);
+
+        assert_eq!(
+            panel.handle_navigation_key(gdk::Key::End),
+            glib::Propagation::Stop
+        );
+        assert_eq!(
+            panel.selected_path(),
+            Some(PathBuf::from("/repo/worktree-29"))
+        );
+        assert!(
+            adjustment.value() > 0.0,
+            "selection did not scroll: value={}, page_size={}, upper={}, row_bottom={}",
+            adjustment.value(),
+            adjustment.page_size(),
+            adjustment.upper(),
+            last_bounds.y() + last_bounds.height()
+        );
+
+        window.close();
     }
 
     #[gtk::test]
