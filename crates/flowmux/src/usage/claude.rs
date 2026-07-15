@@ -148,22 +148,6 @@ fn parse_usage_response(value: &Value) -> Result<Vec<UsageWindow>, UsageError> {
     if let Some(window) = parse_named_window(object.get("seven_day"), Some(10_080), None)? {
         windows.push(window);
     }
-    if let Some(items) = object.get("limits").and_then(Value::as_array) {
-        for item in items {
-            let duration = item
-                .get("window_duration_mins")
-                .and_then(Value::as_u64)
-                .or_else(|| duration_from_kind(item.get("kind").and_then(Value::as_str)));
-            let scope = ["group", "model", "kind"]
-                .into_iter()
-                .find_map(|key| item.get(key).and_then(Value::as_str))
-                .filter(|scope| !scope.is_empty())
-                .map(str::to_owned);
-            if let Some(window) = parse_named_window(Some(item), duration, scope)? {
-                windows.push(window);
-            }
-        }
-    }
     deduplicate_windows(&mut windows);
     Ok(windows)
 }
@@ -204,17 +188,6 @@ fn parse_named_window(
         duration_minutes,
         resets_at,
     }))
-}
-
-fn duration_from_kind(kind: Option<&str>) -> Option<u64> {
-    let kind = kind?.to_ascii_lowercase();
-    if kind.contains("five_hour") || kind.contains("5_hour") {
-        Some(300)
-    } else if kind.contains("weekly") || kind.contains("seven_day") || kind.contains("7_day") {
-        Some(10_080)
-    } else {
-        None
-    }
 }
 
 fn deduplicate_windows(windows: &mut Vec<UsageWindow>) {
@@ -384,7 +357,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
-    fn usage_response_keeps_standard_and_scoped_limits() {
+    fn usage_response_keeps_only_five_hour_and_weekly_limits() {
         let value = serde_json::json!({
             "five_hour": {
                 "utilization": 7.0,
@@ -409,11 +382,11 @@ mod tests {
                 .iter()
                 .map(|window| window.used_percent)
                 .collect::<Vec<_>>(),
-            vec![7.0, 42.0, 78.0]
+            vec![7.0, 42.0]
         );
         assert_eq!(windows[0].duration_minutes, Some(300));
         assert_eq!(windows[1].duration_minutes, Some(10_080));
-        assert_eq!(windows[2].scope.as_deref(), Some("fable"));
+        assert!(windows.iter().all(|window| window.scope.is_none()));
     }
 
     #[test]
