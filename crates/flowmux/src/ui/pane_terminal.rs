@@ -17,8 +17,13 @@ use crate::ui::ghostty_pane::GhosttyPane;
 /// The terminal pane type used throughout the GUI.
 pub type PaneTerminal = GhosttyPane;
 
-/// Shift+Enter input sequence: insert a literal newline at the prompt without
-/// submitting, after committing any in-progress IME text.
+/// Shift+Enter input sequence (legacy form): `ESC CR`. Insert a literal
+/// newline at the prompt without submitting, after committing any
+/// in-progress IME text.
+///
+/// When the foreground application enables the Kitty keyboard protocol
+/// (`CSI > 27127 h`), `pty-tee` rewrites these bytes to
+/// `\x1b[13;2u` (Kitty CSI-u Shift+Enter).
 pub use crate::ui::ghostty_pane::INSERT_NEWLINE_BYTES;
 
 /// Per-pane callbacks the surface backends invoke to drive the window

@@ -123,7 +123,7 @@ pub mod key_modes;
 pub mod pty;
 
 pub use color::Rgb;
-pub use key_modes::TerminalInputModes;
+pub use key_modes::{TerminalInputModes, KITTY_SHIFT_ENTER, LEGACY_INSERT_NEWLINE};
 
 #[cfg(test)]
 mod tests {

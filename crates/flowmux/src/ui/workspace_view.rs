@@ -542,7 +542,9 @@ impl PaneRegistry {
             .map(|tabs| tabs.iter().map(|(id, _)| *id).collect())
             .unwrap_or_default();
         for s in surfaces {
-            self.terminals.remove(&s);
+            if let Some(terminal) = self.terminals.remove(&s) {
+                terminal.close_pty();
+            }
             if let Some(browser) = self.browsers.remove(&s) {
                 browser.prepare_for_close();
             }

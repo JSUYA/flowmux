@@ -754,6 +754,27 @@ impl GhosttyPane {
     pub fn add_controller(&self, controller: impl IsA<gtk::EventController>) {
         self.widget.add_controller(controller);
     }
+
+    /// Close the PTY child with a bounded timeout before the pane widget
+    /// is dropped. Returns the child's exit status when the Pty was
+    /// uniquely owned; returns `None` if another reference exists
+    /// (should not happen).
+    ///
+    /// Callers must call this before [`PaneRegistry::forget_pane`]
+    /// drops the terminal handle. The `Drop` implementation on Pty is a
+    /// non-blocking safety net.
+    pub fn close_pty(self) -> Option<i32> {
+        match Rc::try_unwrap(self._pty) {
+            Ok(pty) => pty.close(flowmux_terminal::pty::Pty::CLOSE_TIMEOUT).ok(),
+            Err(_) => {
+                tracing::warn!(
+                    "GhosttyPane::close_pty: Pty has multiple owners; \
+                     falling back to non-blocking Drop"
+                );
+                None
+            }
+        }
+    }
 }
 
 fn wrap_argv_with_pty_tee(argv: Vec<String>, pane: PaneId, surface: SurfaceId) -> Vec<String> {

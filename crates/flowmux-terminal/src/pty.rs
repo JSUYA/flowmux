@@ -9,6 +9,7 @@ use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::RawFd;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 /// A spawned child process attached to a PTY master fd.
 pub struct Pty {
@@ -207,12 +208,64 @@ impl Pty {
         Ok(Some(status))
     }
 
+    /// Timeout for [`Self::close`] bounded child reaping.
+    pub const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+
     /// Send SIGHUP to the child (used on pane close before reaping).
     pub fn hangup(&mut self) {
         if !self.reaped {
             // SAFETY: kill on our own child pid.
             unsafe { libc::kill(self.child, libc::SIGHUP) };
         }
+    }
+
+    /// Close the PTY with a bounded child-reap window.
+    ///
+    /// Sends SIGHUP, polls with WNOHANG for up to `timeout`. If the
+    /// child hasn't exited by the deadline it sends SIGKILL
+    /// (unignorable) and does one final blocking wait. The master fd
+    /// is closed before returning. After this call the Pty is fully
+    /// consumed — `Drop` becomes a no-op.
+    ///
+    /// Callers on the GTK main thread should either call this on a
+    /// background thread or accept the timeout-bounded block (5 s).
+    pub fn close(mut self, timeout: Duration) -> io::Result<i32> {
+        self.hangup();
+        let deadline = Instant::now() + timeout;
+        let mut last_status: Option<i32> = None;
+        loop {
+            match self.try_wait()? {
+                Some(status) => {
+                    last_status = Some(status);
+                    break;
+                }
+                None => {
+                    if Instant::now() >= deadline {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        }
+        if last_status.is_none() {
+            // Timed out: SIGKILL is unignorable and forces child exit.
+            // SAFETY: kill on our own child pid.
+            unsafe { libc::kill(self.child, libc::SIGKILL) };
+            let mut status: libc::c_int = 0;
+            // SAFETY: standard waitpid — after SIGKILL the child will
+            // become a zombie within a scheduler tick.
+            unsafe { libc::waitpid(self.child, &mut status, 0) };
+            self.reaped = true;
+            last_status = Some(status);
+        }
+        // Close the master fd now; Drop won't touch it again because
+        // self.reaped is true and we set master to -1.
+        if self.master >= 0 {
+            // SAFETY: closing our owned fd once.
+            unsafe { libc::close(self.master) };
+            self.master = -1;
+        }
+        Ok(last_status.unwrap_or(0))
     }
 }
 
@@ -226,9 +279,13 @@ impl Drop for Pty {
         }
         if !self.reaped {
             let mut status: libc::c_int = 0;
-            // Best-effort reap so we don't leak a zombie.
+            // Non-blocking best-effort reap. After the master is closed,
+            // the child will typically receive EIO on its next read/write
+            // and exit on its own. Children that ignore SIGHUP and survive
+            // EIO will be reparented to init when this process exits.
+            // This must not block — Drop runs on the GTK main thread.
             // SAFETY: standard waitpid usage on our child.
-            unsafe { libc::waitpid(self.child, &mut status, 0) };
+            unsafe { libc::waitpid(self.child, &mut status, libc::WNOHANG) };
             self.reaped = true;
         }
     }
@@ -375,6 +432,56 @@ mod tests {
         assert!(
             row.contains("30") && row.contains("100"),
             "stty size output was {row:?}"
+        );
+    }
+
+    /// Regression: a child that ignores SIGHUP must not block `close()`
+    /// indefinitely. The bounded timeout + SIGKILL fallback must complete.
+    #[test]
+    fn close_completes_for_child_that_ignores_sighup() {
+        // `trap '' HUP` makes the shell ignore SIGHUP, then `sleep 60`
+        // keeps it alive. close() must return within the timeout.
+        let pty = Pty::spawn(&["sh", "-c", "trap '' HUP; sleep 60"], None, &[], 80, 24)
+            .expect("spawn SIGHUP-ignoring child");
+
+        let start = Instant::now();
+        let status = pty
+            .close(Duration::from_secs(5))
+            .expect("close should succeed");
+        let elapsed = start.elapsed();
+
+        // Must complete within the timeout (with some slack).
+        assert!(
+            elapsed < Duration::from_secs(8),
+            "close took {elapsed:?} for SIGHUP-ignoring child"
+        );
+        // Child was killed by SIGKILL (signal 9) after timeout.
+        // WIFSIGNALED → exit status = 128 + signo.
+        // libc::WIFSIGNALED is a macro — check the raw status.
+        assert!(
+            status != 0,
+            "SIGHUP-ignoring child should not exit cleanly, got status {status}"
+        );
+    }
+
+    /// Normal well-behaved child exits on SIGHUP promptly.
+    #[test]
+    fn close_reaps_well_behaved_child_immediately() {
+        let pty = Pty::spawn(&["sh", "-c", "exit 42"], None, &[], 80, 24)
+            .expect("spawn immediate-exit child");
+
+        // Give the child a moment to exit, then close (it's already dead).
+        std::thread::sleep(Duration::from_millis(100));
+        let start = Instant::now();
+        let _status = pty
+            .close(Duration::from_secs(5))
+            .expect("close should succeed");
+        let elapsed = start.elapsed();
+
+        // Should reap almost instantly — no need for the full timeout.
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "close took {elapsed:?} for already-exited child"
         );
     }
 }
