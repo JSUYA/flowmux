@@ -245,6 +245,7 @@ impl Sidebar {
         worktree_btn.set_focus_on_click(false);
         worktree_btn.add_css_class("flowmux-sidebar-options");
         worktree_btn.set_halign(gtk::Align::End);
+        worktree_btn.set_widget_name("flowmux-worktree-button");
         let bridge_for_worktrees = bridge.clone();
         worktree_btn.connect_clicked(move |_| {
             let bridge = bridge_for_worktrees.clone();
@@ -1465,7 +1466,7 @@ mod tests {
     }
 
     #[gtk::test]
-    fn usage_button_sits_immediately_before_file_browser_button() {
+    fn footer_orders_usage_worktrees_and_file_browser_buttons() {
         if gtk::init().is_err() {
             return;
         }
@@ -1488,11 +1489,16 @@ mod tests {
             .iter()
             .position(|name| name == "flowmux-usage-button")
             .expect("usage button must exist");
+        let worktrees = names
+            .iter()
+            .position(|name| name == "flowmux-worktree-button")
+            .expect("worktree button must exist");
         let folder = names
             .iter()
             .position(|name| name == "flowmux-file-browser-button")
             .expect("file browser button must exist");
-        assert_eq!(usage + 1, folder);
+        assert_eq!(usage + 1, worktrees);
+        assert_eq!(worktrees + 1, folder);
     }
 
     #[gtk::test]
