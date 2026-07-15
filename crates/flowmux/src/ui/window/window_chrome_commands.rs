@@ -104,6 +104,19 @@ impl WindowController {
             GtkCommand::OpenWorktree { path } => {
                 self.open_worktree_workspace(path).await;
             }
+            GtkCommand::ShowWorktreeInfo { path } => {
+                self.show_worktree_info(path);
+            }
+            GtkCommand::RemoveWorktree { path } => {
+                self.request_worktree_removal(path).await;
+            }
+            GtkCommand::WorktreeRemovalFinished {
+                path,
+                force,
+                result,
+            } => {
+                self.finish_worktree_removal(path, force, result).await;
+            }
             GtkCommand::WorktreePanelFocusOut { dir } => {
                 self.focus_out_of_worktree_panel(dir);
             }

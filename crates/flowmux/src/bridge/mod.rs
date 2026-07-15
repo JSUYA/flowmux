@@ -294,6 +294,16 @@ pub enum GtkCommand {
     },
     /// Open a worktree in a new workspace or activate its existing workspace.
     OpenWorktree { path: PathBuf },
+    /// Show cached Git and workspace details for a worktree.
+    ShowWorktreeInfo { path: PathBuf },
+    /// Confirm and remove a worktree checkout while retaining its branch.
+    RemoveWorktree { path: PathBuf },
+    /// Deliver a completed background worktree removal to the GTK main thread.
+    WorktreeRemovalFinished {
+        path: PathBuf,
+        force: bool,
+        result: Result<(), flowmux_vcs::worktree::RemoveWorktreeError>,
+    },
     /// Move keyboard focus out of the right-side Git worktree panel.
     WorktreePanelFocusOut { dir: FocusDir },
     /// Close the worktree panel and restore focus to its source pane.

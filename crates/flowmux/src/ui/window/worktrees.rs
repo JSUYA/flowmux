@@ -3,7 +3,8 @@
 
 use super::*;
 use crate::ui::worktree_panel::WorktreeRowView;
-use flowmux_vcs::worktree::{WorktreeInfo, WorktreeList, WorktreeListError};
+use chrono::{DateTime, Local, Utc};
+use flowmux_vcs::worktree::{RemoveWorktreeError, WorktreeInfo, WorktreeList, WorktreeListError};
 use std::path::Path;
 
 pub(super) fn same_existing_path(left: &Path, right: &Path) -> bool {
@@ -23,11 +24,276 @@ fn repository_name(path: &Path) -> String {
         .unwrap_or_else(|| path.to_string_lossy().into_owned())
 }
 
-fn remove_block_reason(_info: &WorktreeInfo, workspace_open: bool) -> Option<String> {
-    workspace_open.then(|| "Close the matching workspace before removal".into())
+fn remove_block_reason(info: &WorktreeInfo, workspace_open: bool) -> Option<String> {
+    if info.is_main {
+        Some("Main worktree cannot be removed".into())
+    } else if info.is_current {
+        Some("Current worktree cannot be removed".into())
+    } else if info.is_bare {
+        Some("Bare repository cannot be removed as a worktree".into())
+    } else if let Some(reason) = &info.lock_reason {
+        Some(format!(
+            "Locked worktree: {}",
+            if reason.is_empty() {
+                "no reason provided"
+            } else {
+                reason
+            }
+        ))
+    } else if workspace_open {
+        Some("Close the matching workspace before removal".into())
+    } else {
+        None
+    }
+}
+
+fn confirmation_receiver(
+    dialog: &adw::AlertDialog,
+    accepted_response: &'static str,
+) -> oneshot::Receiver<bool> {
+    let (tx, rx) = oneshot::channel();
+    let tx = Rc::new(Cell::new(Some(tx)));
+    dialog.connect_response(None, move |dialog, response| {
+        if let Some(tx) = tx.take() {
+            let _ = tx.send(response == accepted_response);
+        }
+        dialog.close();
+    });
+    rx
+}
+
+fn build_remove_confirmation(_path: &Path) -> (adw::AlertDialog, oneshot::Receiver<bool>) {
+    let dialog = adw::AlertDialog::new(
+        Some("Remove worktree?"),
+        Some("The checkout directory will be removed. Its Git branch will be kept."),
+    );
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("remove", "Remove");
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+    dialog.set_response_appearance("remove", adw::ResponseAppearance::Destructive);
+    let rx = confirmation_receiver(&dialog, "remove");
+    (dialog, rx)
+}
+
+fn build_force_remove_confirmation(
+    _path: &Path,
+    reason: &str,
+) -> (adw::AlertDialog, oneshot::Receiver<bool>) {
+    let reason: String = reason.chars().take(2_000).collect();
+    let body = format!(
+        "{reason}\n\nTracked and untracked changes in this checkout will be lost. The branch will be kept."
+    );
+    let dialog = adw::AlertDialog::new(Some("Force remove dirty worktree?"), Some(&body));
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("force", "Force Remove");
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+    dialog.set_response_appearance("force", adw::ResponseAppearance::Destructive);
+    let rx = confirmation_receiver(&dialog, "force");
+    (dialog, rx)
+}
+
+fn worktree_info_heading(info: &WorktreeInfo) -> String {
+    info.branch.clone().unwrap_or_else(|| {
+        let short_head: String = info.head.chars().take(10).collect();
+        format!("Detached at {short_head}")
+    })
+}
+
+fn worktree_info_body(row: &WorktreeRowView) -> String {
+    let head = (!row.info.head.is_empty())
+        .then_some(row.info.head.as_str())
+        .unwrap_or("Unavailable");
+    let commit = row.info.commit_subject.as_deref().unwrap_or("Unavailable");
+    let committed = row
+        .info
+        .commit_time
+        .and_then(|timestamp| DateTime::<Utc>::from_timestamp(timestamp, 0))
+        .map(|timestamp| {
+            timestamp
+                .with_timezone(&Local)
+                .format("%Y-%m-%d %H:%M:%S %Z")
+                .to_string()
+        })
+        .unwrap_or_else(|| "Unavailable".into());
+    let changes = match &row.info.changes {
+        Some(changes) if changes.is_clean() => "Clean".into(),
+        Some(changes) => format!(
+            "staged {}, unstaged {}, untracked {}",
+            changes.staged, changes.unstaged, changes.untracked
+        ),
+        None => "Unavailable".into(),
+    };
+    let locked = row.info.lock_reason.as_deref().unwrap_or("No");
+    let prunable = row.info.prunable_reason.as_deref().unwrap_or("No");
+    let workspace = if row.workspace_active {
+        "Active"
+    } else if row.workspace_open {
+        "Open"
+    } else {
+        "Not open"
+    };
+
+    format!(
+        "Path: {}\nHEAD: {head}\nCommit: {commit}\nCommitted: {committed}\nChanges: {changes}\nLocked: {locked}\nPrunable: {prunable}\nWorkspace: {workspace}",
+        row.info.path.display()
+    )
 }
 
 impl WindowController {
+    fn show_worktree_alert(&self, heading: &str, body: &str) {
+        let dialog = adw::AlertDialog::new(Some(heading), Some(body));
+        dialog.add_response("close", "Close");
+        dialog.set_default_response(Some("close"));
+        dialog.set_close_response("close");
+        dialog.present(Some(&self.window));
+    }
+
+    pub(super) fn show_worktree_info(&self, path: PathBuf) {
+        let path = normalized_existing_path(&path);
+        let Some(row) = self.worktrees.panel.row_for_path(&path) else {
+            self.show_worktree_alert(
+                "Unable to show worktree information",
+                "The worktree is no longer in the current list.",
+            );
+            return;
+        };
+        let dialog = adw::AlertDialog::new(
+            Some(&worktree_info_heading(&row.info)),
+            Some(&worktree_info_body(&row)),
+        );
+        dialog.add_response("close", "Close");
+        dialog.set_default_response(Some("close"));
+        dialog.set_close_response("close");
+        dialog.present(Some(&self.window));
+    }
+
+    async fn removable_worktree_row(&self, path: &Path) -> Result<WorktreeRowView, String> {
+        let path = normalized_existing_path(path);
+        let row = self
+            .worktrees
+            .panel
+            .row_for_path(&path)
+            .ok_or_else(|| "The worktree is no longer in the current list.".to_string())?;
+        let snapshot = self.store.snapshot().await;
+        let workspace_open = snapshot
+            .workspaces
+            .iter()
+            .any(|workspace| same_existing_path(&workspace.root_dir, &row.info.path));
+        if let Some(reason) = remove_block_reason(&row.info, workspace_open) {
+            return Err(reason);
+        }
+        Ok(row)
+    }
+
+    async fn present_worktree_confirmation(
+        &self,
+        dialog: adw::AlertDialog,
+        response: oneshot::Receiver<bool>,
+    ) -> bool {
+        let _native_browser_suspend =
+            crate::ui::browser_pane::suspend_native_browser_views_for_window(
+                self.window.upcast_ref(),
+            );
+        dialog.present(Some(&self.window));
+        response.await.unwrap_or(false)
+    }
+
+    pub(super) async fn request_worktree_removal(&self, path: PathBuf) {
+        let path = normalized_existing_path(&path);
+        let row = match self.removable_worktree_row(&path).await {
+            Ok(row) => row,
+            Err(reason) => {
+                self.show_worktree_alert("Cannot remove worktree", &reason);
+                return;
+            }
+        };
+        let (dialog, response) = build_remove_confirmation(&row.info.path);
+        if self.present_worktree_confirmation(dialog, response).await {
+            self.start_worktree_removal(row.info.path, false);
+        }
+    }
+
+    fn start_worktree_removal(&self, path: PathBuf, force: bool) {
+        let Some(repository_root) = self.worktrees.repository_root.borrow().clone() else {
+            self.show_worktree_alert(
+                "Unable to remove worktree",
+                "The repository is no longer available.",
+            );
+            return;
+        };
+        let Some(handle) = self.worktrees.tokio_handle.clone() else {
+            self.show_worktree_alert(
+                "Unable to remove worktree",
+                "Tokio runtime is not available.",
+            );
+            return;
+        };
+        if !self.worktrees.panel.set_operation_in_progress(&path, true) {
+            self.show_worktree_alert(
+                "Unable to remove worktree",
+                "The worktree is no longer in the current list.",
+            );
+            return;
+        }
+        self.worktrees
+            .removals_in_progress
+            .borrow_mut()
+            .insert(path.clone());
+
+        let bridge = self.bridge.clone();
+        handle.spawn(async move {
+            let result =
+                flowmux_vcs::worktree::remove_worktree(&repository_root, &path, force).await;
+            let _ = bridge
+                .tx
+                .send(GtkCommand::WorktreeRemovalFinished {
+                    path,
+                    force,
+                    result,
+                })
+                .await;
+        });
+    }
+
+    pub(super) async fn finish_worktree_removal(
+        &self,
+        path: PathBuf,
+        force: bool,
+        result: Result<(), RemoveWorktreeError>,
+    ) {
+        self.worktrees
+            .removals_in_progress
+            .borrow_mut()
+            .remove(&normalized_existing_path(&path));
+        let still_represented = self.worktrees.panel.is_open()
+            && self.worktrees.panel.is_showing_rows()
+            && self.worktrees.panel.row_for_path(&path).is_some();
+        self.worktrees.panel.set_operation_in_progress(&path, false);
+
+        match result {
+            Ok(()) => {
+                if still_represented {
+                    self.refresh_worktrees(true).await;
+                }
+            }
+            Err(RemoveWorktreeError::RequiresForce(reason)) if !force && still_represented => {
+                let (dialog, response) = build_force_remove_confirmation(&path, &reason);
+                if self.present_worktree_confirmation(dialog, response).await {
+                    match self.removable_worktree_row(&path).await {
+                        Ok(row) => self.start_worktree_removal(row.info.path, true),
+                        Err(reason) => self.show_worktree_alert("Cannot remove worktree", &reason),
+                    }
+                }
+            }
+            Err(error) if still_represented => {
+                self.show_worktree_alert("Unable to remove worktree", &error.to_string());
+            }
+            Err(_) => {}
+        }
+    }
+
     pub(super) fn focus_worktree_panel(&self) {
         if self.worktrees.panel.widget().is_visible() {
             if let Some(pane) = self.focused_pane.get() {
@@ -158,6 +424,7 @@ impl WindowController {
 
     async fn annotate_worktree_rows(&self, list: &WorktreeList) -> Vec<WorktreeRowView> {
         let snapshot = self.store.snapshot().await;
+        let removals_in_progress = self.worktrees.removals_in_progress.borrow().clone();
         list.items
             .iter()
             .cloned()
@@ -170,12 +437,14 @@ impl WindowController {
                 let workspace_active = matching
                     .is_some_and(|workspace| Some(workspace.id) == snapshot.active_workspace);
                 let remove_block_reason = remove_block_reason(&info, workspace_open);
+                let operation_in_progress =
+                    removals_in_progress.contains(&normalized_existing_path(&info.path));
                 WorktreeRowView {
                     info,
                     workspace_open,
                     workspace_active,
                     remove_block_reason,
-                    operation_in_progress: false,
+                    operation_in_progress,
                 }
             })
             .collect()
@@ -223,5 +492,119 @@ impl WindowController {
         if self.worktrees.panel.is_open() {
             self.refresh_worktrees(true).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flowmux_vcs::worktree::WorktreeChanges;
+
+    fn sample_worktree_info(path: &str) -> WorktreeInfo {
+        WorktreeInfo {
+            path: path.into(),
+            branch: Some("feature".into()),
+            head: "1234567890abcdef".into(),
+            commit_subject: Some("sample commit".into()),
+            commit_time: Some(1_700_000_000),
+            changes: Some(WorktreeChanges::default()),
+            is_main: false,
+            is_current: false,
+            is_bare: false,
+            lock_reason: None,
+            prunable_reason: None,
+        }
+    }
+
+    #[test]
+    fn removal_gate_explains_every_blocked_state() {
+        let mut item = sample_worktree_info("/repo/main");
+        item.is_current = true;
+        assert_eq!(
+            remove_block_reason(&item, false).as_deref(),
+            Some("Current worktree cannot be removed")
+        );
+
+        item.is_current = false;
+        item.is_main = true;
+        assert_eq!(
+            remove_block_reason(&item, false).as_deref(),
+            Some("Main worktree cannot be removed")
+        );
+
+        item.is_main = false;
+        item.is_bare = true;
+        assert_eq!(
+            remove_block_reason(&item, false).as_deref(),
+            Some("Bare repository cannot be removed as a worktree")
+        );
+
+        item.is_bare = false;
+        item.lock_reason = Some("in use".into());
+        assert_eq!(
+            remove_block_reason(&item, false).as_deref(),
+            Some("Locked worktree: in use")
+        );
+
+        item.lock_reason = None;
+        assert_eq!(
+            remove_block_reason(&item, true).as_deref(),
+            Some("Close the matching workspace before removal")
+        );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[gtk::test]
+    async fn safe_remove_defaults_to_cancel_and_force_is_destructive() {
+        let (safe, safe_rx) = build_remove_confirmation(Path::new("/repo/feature"));
+        assert_eq!(safe.default_response().as_deref(), Some("cancel"));
+        assert_eq!(safe.close_response().as_str(), "cancel");
+        assert_eq!(
+            safe.response_appearance("remove"),
+            adw::ResponseAppearance::Destructive
+        );
+        safe.emit_by_name::<()>("response", &[&"cancel"]);
+        assert!(!safe_rx.await.unwrap());
+
+        let (force, force_rx) =
+            build_force_remove_confirmation(Path::new("/repo/feature"), "dirty");
+        assert_eq!(force.default_response().as_deref(), Some("cancel"));
+        assert_eq!(force.close_response().as_str(), "cancel");
+        assert_eq!(
+            force.response_appearance("force"),
+            adw::ResponseAppearance::Destructive
+        );
+        force.emit_by_name::<()>("response", &[&"force"]);
+        assert!(force_rx.await.unwrap());
+    }
+
+    #[test]
+    fn worktree_info_fields_are_ordered_and_complete() {
+        let mut info = sample_worktree_info("/repo/feature");
+        info.branch = None;
+        info.changes = Some(WorktreeChanges {
+            staged: 1,
+            unstaged: 2,
+            untracked: 3,
+        });
+        let row = WorktreeRowView {
+            info,
+            workspace_open: true,
+            workspace_active: false,
+            remove_block_reason: None,
+            operation_in_progress: false,
+        };
+
+        assert_eq!(worktree_info_heading(&row.info), "Detached at 1234567890");
+        let body = worktree_info_body(&row);
+        let lines: Vec<_> = body.lines().collect();
+        assert_eq!(lines[0], "Path: /repo/feature");
+        assert_eq!(lines[1], "HEAD: 1234567890abcdef");
+        assert_eq!(lines[2], "Commit: sample commit");
+        assert!(lines[3].starts_with("Committed: "));
+        assert_eq!(lines[4], "Changes: staged 1, unstaged 2, untracked 3");
+        assert_eq!(lines[5], "Locked: No");
+        assert_eq!(lines[6], "Prunable: No");
+        assert_eq!(lines[7], "Workspace: Open");
     }
 }

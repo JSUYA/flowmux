@@ -251,6 +251,10 @@ impl WorktreePanel {
         self.open.get()
     }
 
+    pub fn is_showing_rows(&self) -> bool {
+        self.content.visible_child_name().as_deref() == Some("list")
+    }
+
     pub fn grab_focus(&self) {
         self.root.grab_focus();
     }
@@ -267,6 +271,21 @@ impl WorktreePanel {
             .iter()
             .find(|row| row.info.path.as_path() == path)
             .cloned()
+    }
+
+    pub fn set_operation_in_progress(&self, path: &Path, in_progress: bool) -> bool {
+        let mut rows = self.rows.borrow_mut();
+        let Some(row) = rows.iter_mut().find(|row| row.info.path.as_path() == path) else {
+            return false;
+        };
+        row.operation_in_progress = in_progress;
+        let updated_rows = rows.clone();
+        drop(rows);
+        if self.is_showing_rows() {
+            let repository_name = self.repository_label.text();
+            self.set_rows(&repository_name, updated_rows);
+        }
+        true
     }
 
     pub fn connect_open<F: Fn(PathBuf) + 'static>(&self, callback: F) {
@@ -955,6 +974,34 @@ mod tests {
         assert!(busy_buttons[1].is_sensitive());
         assert!(!busy_buttons[2].is_sensitive());
         assert!(busy_buttons[2].tooltip_text().is_some());
+    }
+
+    #[gtk::test]
+    fn operation_progress_updates_only_the_target_row() {
+        let panel = WorktreePanel::new();
+        panel.set_rows(
+            "repo",
+            vec![
+                WorktreeRowView::available(info("/repo/a", "a")),
+                WorktreeRowView::available(info("/repo/b", "b")),
+            ],
+        );
+
+        assert!(panel.set_operation_in_progress(Path::new("/repo/b"), true));
+        assert!(
+            !panel
+                .row_for_path(Path::new("/repo/a"))
+                .unwrap()
+                .operation_in_progress
+        );
+        assert!(
+            panel
+                .row_for_path(Path::new("/repo/b"))
+                .unwrap()
+                .operation_in_progress
+        );
+        assert!(action_buttons(&panel, 0)[2].is_sensitive());
+        assert!(!action_buttons(&panel, 1)[2].is_sensitive());
     }
 
     #[gtk::test]

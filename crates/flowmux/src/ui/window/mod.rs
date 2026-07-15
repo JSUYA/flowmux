@@ -279,6 +279,7 @@ struct WorktreePanelState {
     active: Rc<Cell<bool>>,
     generation: Rc<Cell<u64>>,
     repository_root: Rc<RefCell<Option<PathBuf>>>,
+    removals_in_progress: Rc<RefCell<HashSet<PathBuf>>>,
     tokio_handle: Option<tokio::runtime::Handle>,
     split: gtk::Paned,
     panel: WorktreePanel,
@@ -514,6 +515,7 @@ impl WindowController {
         let worktree_active = Rc::new(Cell::new(false));
         let worktree_generation = Rc::new(Cell::new(0));
         let worktree_repository_root = Rc::new(RefCell::new(None));
+        let worktree_removals_in_progress = Rc::new(RefCell::new(HashSet::new()));
         let worktree_tokio_handle = tokio_handle.clone();
         let notifications = NotificationStore::new();
         let stack = gtk::Stack::new();
@@ -691,6 +693,20 @@ impl WindowController {
                 let _ = bridge.tx.send(GtkCommand::OpenWorktree { path }).await;
             });
         });
+        let worktree_bridge = bridge.clone();
+        worktree_panel.connect_info(move |path| {
+            let bridge = worktree_bridge.clone();
+            glib::MainContext::default().spawn_local(async move {
+                let _ = bridge.tx.send(GtkCommand::ShowWorktreeInfo { path }).await;
+            });
+        });
+        let worktree_bridge = bridge.clone();
+        worktree_panel.connect_remove(move |path| {
+            let bridge = worktree_bridge.clone();
+            glib::MainContext::default().spawn_local(async move {
+                let _ = bridge.tx.send(GtkCommand::RemoveWorktree { path }).await;
+            });
+        });
         worktree_panel.widget().set_vexpand(true);
 
         let worktree_split = gtk::Paned::builder()
@@ -764,6 +780,7 @@ impl WindowController {
                 active: worktree_active,
                 generation: worktree_generation,
                 repository_root: worktree_repository_root,
+                removals_in_progress: worktree_removals_in_progress,
                 tokio_handle: worktree_tokio_handle,
                 split: worktree_split,
                 panel: worktree_panel,
@@ -1459,6 +1476,9 @@ impl WindowController {
             | GtkCommand::RefreshWorktrees
             | GtkCommand::WorktreesLoaded { .. }
             | GtkCommand::OpenWorktree { .. }
+            | GtkCommand::ShowWorktreeInfo { .. }
+            | GtkCommand::RemoveWorktree { .. }
+            | GtkCommand::WorktreeRemovalFinished { .. }
             | GtkCommand::WorktreePanelFocusOut { .. }
             | GtkCommand::WorktreePanelCloseAndRestoreFocus
             | GtkCommand::ToggleFileBrowser { .. }
@@ -3684,6 +3704,37 @@ mod tests {
 
     #[cfg(not(target_os = "macos"))]
     #[gtk::test]
+    async fn refreshed_worktree_rows_preserve_inflight_removal() {
+        let (controller, _workspace, pane) =
+            build_single_workspace_controller("com.flowmux.App.UiTest.WorktreeRemovalRefresh")
+                .await;
+        let list = sample_worktree_list("/repo");
+        let path = list.items[0].path.clone();
+        controller
+            .worktrees
+            .removals_in_progress
+            .borrow_mut()
+            .insert(path.clone());
+        controller.worktrees.panel.show_loading();
+        controller.worktrees.source_pane.set(Some(pane));
+        controller.worktrees.generation.set(1);
+
+        controller.apply_worktrees_loaded(1, Ok(list)).await;
+
+        assert!(
+            controller
+                .worktrees
+                .panel
+                .row_for_path(&path)
+                .unwrap()
+                .operation_in_progress
+        );
+        drop(controller);
+        glib::timeout_future(std::time::Duration::from_millis(50)).await;
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[gtk::test]
     async fn right_tool_layout_places_worktrees_before_file_browser() {
         let (controller, _workspace, _pane) =
             build_single_workspace_controller("com.flowmux.App.UiTest.WorktreeLayout").await;
@@ -3726,6 +3777,8 @@ mod tests {
         controller.focus_out_of_worktree_panel(FocusDir::Left);
         assert!(!controller.worktrees.active.get());
         assert_eq!(controller.focused_pane.get(), Some(pane));
+        controller.window.close();
+        glib::timeout_future(std::time::Duration::from_millis(50)).await;
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -3743,6 +3796,8 @@ mod tests {
             .focus_direction_from_command(Some(pane), FocusDir::Right)
             .await;
         assert!(controller.file_browser.active.get());
+        controller.window.close();
+        glib::timeout_future(std::time::Duration::from_millis(50)).await;
     }
 
     #[cfg(not(target_os = "macos"))]
