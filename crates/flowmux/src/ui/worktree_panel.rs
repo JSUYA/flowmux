@@ -1155,18 +1155,23 @@ mod tests {
         window.set_default_size(320, 180);
         window.set_child(Some(panel.widget()));
         window.present();
-        glib::timeout_future(Duration::from_millis(50)).await;
 
         let scroll = panel.scroll.clone();
         let adjustment = scroll.vadjustment();
         let last_row = panel.list.row_at_index(29).expect("last worktree row");
-        let last_bounds = last_row
-            .compute_bounds(&panel.list)
-            .expect("allocated last-row bounds");
-        assert!(
-            last_bounds.y() + last_bounds.height() > 100.0,
-            "precondition: last row is below the synthetic viewport"
-        );
+        let started = std::time::Instant::now();
+        let last_bounds = loop {
+            if let Some(bounds) = last_row.compute_bounds(&panel.list) {
+                if bounds.y() + bounds.height() > 100.0 {
+                    break bounds;
+                }
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "timed out waiting for the last row to be allocated below the synthetic viewport"
+            );
+            glib::timeout_future(Duration::from_millis(10)).await;
+        };
         panel.select_index(0);
         adjustment.set_lower(0.0);
         adjustment.set_upper(10_000.0);
@@ -1191,6 +1196,7 @@ mod tests {
         );
 
         window.close();
+        glib::timeout_future(Duration::from_millis(50)).await;
     }
 
     #[gtk::test]

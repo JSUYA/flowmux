@@ -102,9 +102,11 @@ fn worktree_info_heading(info: &WorktreeInfo) -> String {
 }
 
 fn worktree_info_body(row: &WorktreeRowView) -> String {
-    let head = (!row.info.head.is_empty())
-        .then_some(row.info.head.as_str())
-        .unwrap_or("Unavailable");
+    let head = if row.info.head.is_empty() {
+        "Unavailable"
+    } else {
+        row.info.head.as_str()
+    };
     let commit = row.info.commit_subject.as_deref().unwrap_or("Unavailable");
     let committed = row
         .info

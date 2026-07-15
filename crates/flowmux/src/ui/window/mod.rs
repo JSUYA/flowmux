@@ -3601,10 +3601,7 @@ mod tests {
     #[test]
     fn normalized_paths_match_dot_segments_without_requiring_utf8() {
         let root = tempfile::tempdir().unwrap();
-        assert!(same_existing_path(
-            &root.path().join("."),
-            &root.path().to_path_buf()
-        ));
+        assert!(same_existing_path(&root.path().join("."), root.path()));
     }
 
     fn sample_worktree_list(root: &str) -> WorktreeList {
