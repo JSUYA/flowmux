@@ -284,6 +284,16 @@ pub enum GtkCommand {
     ToggleFileBrowser { pane: Option<PaneId> },
     /// Toggle the right-side Git worktree panel for the focused pane.
     ToggleWorktreePanel { pane: Option<PaneId> },
+    /// Reload worktrees for the panel's current source pane.
+    RefreshWorktrees,
+    /// Deliver a background worktree listing to the GTK main thread.
+    WorktreesLoaded {
+        generation: u64,
+        result:
+            Result<flowmux_vcs::worktree::WorktreeList, flowmux_vcs::worktree::WorktreeListError>,
+    },
+    /// Open a worktree in a new workspace or activate its existing workspace.
+    OpenWorktree { path: PathBuf },
     /// Close the worktree panel and restore focus to its source pane.
     WorktreePanelCloseAndRestoreFocus,
     /// Move keyboard focus out of the right-side FileBrowser.

@@ -278,9 +278,7 @@ struct WorktreePanelState {
     source_pane: FocusedPane,
     active: Rc<Cell<bool>>,
     generation: Rc<Cell<u64>>,
-    #[allow(dead_code)]
     repository_root: Rc<RefCell<Option<PathBuf>>>,
-    #[allow(dead_code)]
     tokio_handle: Option<tokio::runtime::Handle>,
     split: gtk::Paned,
     panel: WorktreePanel,
@@ -486,6 +484,10 @@ mod surface_ops;
 mod window_chrome_commands;
 mod workspace_commands;
 mod workspace_presenter;
+mod worktrees;
+
+#[cfg(test)]
+use worktrees::same_existing_path;
 
 impl std::ops::Deref for WindowController {
     type Target = workspace_presenter::WorkspacePresenter;
@@ -663,6 +665,20 @@ impl WindowController {
                     .tx
                     .send(GtkCommand::WorktreePanelCloseAndRestoreFocus)
                     .await;
+            });
+        });
+        let worktree_bridge = bridge.clone();
+        worktree_panel.connect_refresh(move || {
+            let bridge = worktree_bridge.clone();
+            glib::MainContext::default().spawn_local(async move {
+                let _ = bridge.tx.send(GtkCommand::RefreshWorktrees).await;
+            });
+        });
+        let worktree_bridge = bridge.clone();
+        worktree_panel.connect_open(move |path| {
+            let bridge = worktree_bridge.clone();
+            glib::MainContext::default().spawn_local(async move {
+                let _ = bridge.tx.send(GtkCommand::OpenWorktree { path }).await;
             });
         });
         worktree_panel.widget().set_vexpand(true);
@@ -1431,6 +1447,9 @@ impl WindowController {
             | GtkCommand::FileBrowserFocusOut { .. }
             | GtkCommand::FileBrowserCloseAndRestoreFocus
             | GtkCommand::ToggleWorktreePanel { .. }
+            | GtkCommand::RefreshWorktrees
+            | GtkCommand::WorktreesLoaded { .. }
+            | GtkCommand::OpenWorktree { .. }
             | GtkCommand::WorktreePanelCloseAndRestoreFocus
             | GtkCommand::ToggleFileBrowser { .. }
             | GtkCommand::OpenImageViewer { .. }
@@ -2335,6 +2354,7 @@ mod tests {
     use super::*;
     use flowmux_core::PaneContent;
     use flowmux_state::State;
+    use flowmux_vcs::worktree::{WorktreeChanges, WorktreeInfo, WorktreeList};
 
     fn agent_bar_visible(controller: &WindowController) -> bool {
         controller.agent_bar.bar.root.property::<bool>("visible")
@@ -3546,6 +3566,110 @@ mod tests {
             Some(source)
         );
         assert_eq!(file_browser_return_pane(Some(focused), None), Some(focused));
+    }
+
+    #[test]
+    fn normalized_paths_match_dot_segments_without_requiring_utf8() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(same_existing_path(
+            &root.path().join("."),
+            &root.path().to_path_buf()
+        ));
+    }
+
+    fn sample_worktree_list(root: &str) -> WorktreeList {
+        let root = PathBuf::from(root);
+        WorktreeList {
+            repository_root: root.clone(),
+            current_worktree: root.clone(),
+            items: vec![WorktreeInfo {
+                path: root,
+                branch: Some("main".into()),
+                head: "1234567890abcdef".into(),
+                commit_subject: Some("sample commit".into()),
+                commit_time: Some(1_700_000_000),
+                changes: Some(WorktreeChanges::default()),
+                is_main: true,
+                is_current: true,
+                is_bare: false,
+                lock_reason: None,
+                prunable_reason: None,
+            }],
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[gtk::test]
+    async fn open_worktree_activates_matching_workspace_without_duplication() {
+        let (controller, first, _pane) =
+            build_single_workspace_controller("com.flowmux.App.UiTest.WorktreeOpenExisting").await;
+        let target = tempfile::tempdir().unwrap();
+        let second = controller
+            .store
+            .create_workspace(Some("target".into()), target.path().to_path_buf())
+            .await;
+        let workspace = controller.store.get_workspace(second).await.unwrap();
+        controller.render_workspace_with_activation(&workspace, false);
+
+        controller
+            .open_worktree_workspace(target.path().to_path_buf())
+            .await;
+
+        assert_eq!(controller.store.list_workspaces().await.len(), 2);
+        assert_eq!(
+            controller.store.snapshot().await.active_workspace,
+            Some(second)
+        );
+        assert_ne!(first, second);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[gtk::test]
+    async fn open_worktree_creates_workspace_at_exact_path() {
+        let (controller, _first, _pane) =
+            build_single_workspace_controller("com.flowmux.App.UiTest.WorktreeOpenNew").await;
+        let target = tempfile::tempdir().unwrap();
+        controller
+            .open_worktree_workspace(target.path().to_path_buf())
+            .await;
+        let matching: Vec<_> = controller
+            .store
+            .ordered_workspaces()
+            .await
+            .into_iter()
+            .filter(|workspace| same_existing_path(&workspace.root_dir, target.path()))
+            .collect();
+        assert_eq!(matching.len(), 1);
+        assert_eq!(
+            controller.store.snapshot().await.active_workspace,
+            Some(matching[0].id)
+        );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[gtk::test]
+    async fn stale_worktree_result_cannot_replace_newer_repository() {
+        let (controller, _workspace, pane) =
+            build_single_workspace_controller("com.flowmux.App.UiTest.WorktreeStale").await;
+        controller.worktrees.panel.show_loading();
+        controller.worktrees.source_pane.set(Some(pane));
+        controller.worktrees.generation.set(2);
+
+        controller
+            .apply_worktrees_loaded(1, Ok(sample_worktree_list("/old")))
+            .await;
+        assert_ne!(
+            controller.worktrees.panel.repository_name(),
+            Some("old".into())
+        );
+
+        controller
+            .apply_worktrees_loaded(2, Ok(sample_worktree_list("/new")))
+            .await;
+        assert_eq!(
+            controller.worktrees.panel.repository_name(),
+            Some("new".into())
+        );
     }
 
     #[cfg(not(target_os = "macos"))]

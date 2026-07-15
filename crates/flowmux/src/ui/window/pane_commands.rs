@@ -347,6 +347,7 @@ impl WindowController {
                     self.sync_workspace_label(ws_id).await;
                 }
                 self.refresh_file_browser_from_focus().await;
+                self.refresh_worktrees_from_focus().await;
             }
             GtkCommand::BrowserUriChanged { pane, surface, url } => {
                 let _ = self.store.update_browser_url(pane, surface, url).await;
@@ -405,6 +406,7 @@ impl WindowController {
             GtkCommand::PaneFocused { pane } => {
                 self.on_pane_focused(pane).await;
                 self.refresh_file_browser_from_focus().await;
+                self.refresh_worktrees_from_focus().await;
             }
             GtkCommand::PaneSendKeys { pane, keys, ack } => {
                 let registry = self.pane_registry.borrow();
@@ -432,6 +434,7 @@ impl WindowController {
                     self.on_pane_focused(pane).await;
                     let _ = ack.send(Ok(()));
                     self.refresh_file_browser_from_focus().await;
+                    self.refresh_worktrees_from_focus().await;
                 } else {
                     let _ = ack.send(Err(format!("pane not found: {pane}")));
                 }

@@ -92,10 +92,17 @@ impl WindowController {
                 if self.worktrees.panel.widget().is_visible() {
                     self.close_worktree_panel_and_restore_focus();
                 } else if let Some(pane) = pane.or_else(|| self.focused_pane.get()) {
-                    self.worktrees.source_pane.set(Some(pane));
-                    self.worktrees.panel.show_loading();
-                    self.position_right_tool_splits();
+                    self.show_worktrees_for_pane(pane).await;
                 }
+            }
+            GtkCommand::RefreshWorktrees => {
+                self.refresh_worktrees(true).await;
+            }
+            GtkCommand::WorktreesLoaded { generation, result } => {
+                self.apply_worktrees_loaded(generation, result).await;
+            }
+            GtkCommand::OpenWorktree { path } => {
+                self.open_worktree_workspace(path).await;
             }
             GtkCommand::WorktreePanelCloseAndRestoreFocus => {
                 self.close_worktree_panel_and_restore_focus();
