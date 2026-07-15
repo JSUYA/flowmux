@@ -191,6 +191,8 @@ impl Pty {
     }
 
     /// Non-blocking reap: returns `Some(status)` if the child has exited.
+    /// Returns `Ok(None)` when the child is still running.
+    /// Treats `ECHILD` (already reaped by VTE's `watch_child`) as `Ok(Some(0))`.
     pub fn try_wait(&mut self) -> io::Result<Option<i32>> {
         if self.reaped {
             return Ok(Some(0));
@@ -199,7 +201,13 @@ impl Pty {
         // SAFETY: standard waitpid usage.
         let rc = unsafe { libc::waitpid(self.child, &mut status, libc::WNOHANG) };
         if rc < 0 {
-            return Err(io::Error::last_os_error());
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::ECHILD) {
+                // VTE's watch_child already reaped this child.
+                self.reaped = true;
+                return Ok(Some(0));
+            }
+            return Err(err);
         }
         if rc == 0 {
             return Ok(None); // still running
@@ -214,60 +222,97 @@ impl Pty {
     /// Send SIGHUP to the child (used on pane close before reaping).
     pub fn hangup(&mut self) {
         if !self.reaped {
-            // SAFETY: kill on our own child pid.
-            unsafe { libc::kill(self.child, libc::SIGHUP) };
+            // SAFETY: kill on our own child process group.
+            unsafe { libc::kill(-self.child, libc::SIGHUP) };
         }
     }
 
-    /// Close the PTY with a bounded child-reap window.
-    ///
-    /// Sends SIGHUP, polls with WNOHANG for up to `timeout`. If the
-    /// child hasn't exited by the deadline it sends SIGKILL
-    /// (unignorable) and does one final blocking wait. The master fd
-    /// is closed before returning. After this call the Pty is fully
-    /// consumed — `Drop` becomes a no-op.
-    ///
-    /// Callers on the GTK main thread should either call this on a
-    /// background thread or accept the timeout-bounded block (5 s).
-    pub fn close(mut self, timeout: Duration) -> io::Result<i32> {
-        self.hangup();
-        let deadline = Instant::now() + timeout;
-        let mut last_status: Option<i32> = None;
-        loop {
-            match self.try_wait()? {
-                Some(status) => {
-                    last_status = Some(status);
-                    break;
-                }
-                None => {
-                    if Instant::now() >= deadline {
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-            }
-        }
-        if last_status.is_none() {
-            // Timed out: SIGKILL is unignorable and forces child exit.
-            // SAFETY: kill on our own child pid.
-            unsafe { libc::kill(self.child, libc::SIGKILL) };
-            let mut status: libc::c_int = 0;
-            // SAFETY: standard waitpid — after SIGKILL the child will
-            // become a zombie within a scheduler tick.
-            unsafe { libc::waitpid(self.child, &mut status, 0) };
-            self.reaped = true;
-            last_status = Some(status);
-        }
-        // Close the master fd now; Drop won't touch it again because
-        // self.reaped is true and we set master to -1.
+    /// Close the master fd immediately. This is a fast syscall — call it
+    /// from the GTK main thread. VTE has its own dup of this fd (made at
+    /// spawn time via `libc::dup`), so the terminal widget keeps displaying
+    /// buffered output until the widget is dropped.
+    pub fn close_master(&mut self) {
         if self.master >= 0 {
             // SAFETY: closing our owned fd once.
             unsafe { libc::close(self.master) };
             self.master = -1;
         }
-        Ok(last_status.unwrap_or(0))
+    }
+
+    /// Close the PTY synchronously with a bounded child-reap window.
+    /// For use in tests and non-GTK callers.
+    ///
+    /// Sends SIGHUP to the process group, polls with WNOHANG for up to
+    /// `timeout`. If the child hasn't exited by the deadline it sends
+    /// SIGKILL (unignorable) to the process group and does one final
+    /// blocking wait. The master fd is closed before returning.
+    /// After this call the Pty is fully consumed — `Drop` becomes a no-op.
+    pub fn close(mut self, timeout: Duration) -> io::Result<i32> {
+        self.hangup();
+        let status = Self::reap_with_timeout(&mut self, timeout);
+        self.close_master();
+        Ok(status)
+    }
+
+    /// Close the master fd immediately, signal the process group, and spawn
+    /// a background thread to reap the child. Non-blocking — safe to call
+    /// from the GTK main thread.
+    ///
+    /// The master fd is closed synchronously (fast syscall) before this
+    /// returns. The child is reaped on a background thread with the same
+    /// bounded-timeout + SIGKILL logic as [`Self::close`].
+    pub fn close_and_reap_async(mut self, timeout: Duration) {
+        self.close_master();
+        self.hangup();
+        std::thread::spawn(move || {
+            Self::reap_with_timeout(&mut self, timeout);
+            // Pty dropped here; master is already -1.
+        });
+    }
+
+    /// Poll the child with WNOHANG for `timeout`, escalating to SIGKILL to
+    /// the process group on expiry. Does not touch the master fd.
+    fn reap_with_timeout(&mut self, timeout: Duration) -> i32 {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match self.try_wait() {
+                Ok(Some(status)) => return status,
+                Ok(None) => {
+                    if Instant::now() >= deadline {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(e) => {
+                    eprintln!("pty reap try_wait error: {e}");
+                    return 0;
+                }
+            }
+        }
+        // Timed out: SIGKILL to the process group is unignorable.
+        // SAFETY: kill on our own child process group.
+        unsafe { libc::kill(-self.child, libc::SIGKILL) };
+        let mut status: libc::c_int = 0;
+        // SAFETY: standard waitpid — after SIGKILL the child will
+        // become a zombie within a scheduler tick.
+        let rc = unsafe { libc::waitpid(self.child, &mut status, 0) };
+        if rc < 0 {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::ECHILD) {
+                // VTE's watch_child already reaped.
+                self.reaped = true;
+                return 0;
+            }
+            eprintln!("pty reap waitpid error after SIGKILL: {err}");
+        } else {
+            self.reaped = true;
+        }
+        status
     }
 }
+
+// SAFETY: Pty contains only RawFd, pid_t, and bool — all Send.
+unsafe impl Send for Pty {}
 
 impl Drop for Pty {
     fn drop(&mut self) {
@@ -284,8 +329,15 @@ impl Drop for Pty {
             // and exit on its own. Children that ignore SIGHUP and survive
             // EIO will be reparented to init when this process exits.
             // This must not block — Drop runs on the GTK main thread.
+            // ECHILD means VTE's watch_child already reaped; treat as success.
             // SAFETY: standard waitpid usage on our child.
-            unsafe { libc::waitpid(self.child, &mut status, libc::WNOHANG) };
+            let rc = unsafe { libc::waitpid(self.child, &mut status, libc::WNOHANG) };
+            if rc < 0 {
+                let err = io::Error::last_os_error();
+                if err.raw_os_error() != Some(libc::ECHILD) {
+                    eprintln!("Pty::drop waitpid error: {err}");
+                }
+            }
             self.reaped = true;
         }
     }
@@ -437,6 +489,8 @@ mod tests {
 
     /// Regression: a child that ignores SIGHUP must not block `close()`
     /// indefinitely. The bounded timeout + SIGKILL fallback must complete.
+    /// Also verifies process-group signalling: SIGKILL is sent to `-pid`,
+    /// not just `pid`.
     #[test]
     fn close_completes_for_child_that_ignores_sighup() {
         // `trap '' HUP` makes the shell ignore SIGHUP, then `sleep 60`
@@ -445,19 +499,16 @@ mod tests {
             .expect("spawn SIGHUP-ignoring child");
 
         let start = Instant::now();
-        let status = pty
-            .close(Duration::from_secs(5))
-            .expect("close should succeed");
+        let timeout = Duration::from_secs(3);
+        let status = pty.close(timeout).expect("close should succeed");
         let elapsed = start.elapsed();
 
         // Must complete within the timeout (with some slack).
         assert!(
-            elapsed < Duration::from_secs(8),
+            elapsed < timeout + Duration::from_secs(3),
             "close took {elapsed:?} for SIGHUP-ignoring child"
         );
         // Child was killed by SIGKILL (signal 9) after timeout.
-        // WIFSIGNALED → exit status = 128 + signo.
-        // libc::WIFSIGNALED is a macro — check the raw status.
         assert!(
             status != 0,
             "SIGHUP-ignoring child should not exit cleanly, got status {status}"
@@ -482,6 +533,90 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(1),
             "close took {elapsed:?} for already-exited child"
+        );
+    }
+
+    /// A shell descendant (background child) must not survive PTY close.
+    /// Verifies process-group cleanup via `kill(-pid, SIGKILL)`.
+    #[test]
+    fn descendant_does_not_survive_close() {
+        // Spawn a shell that launches a background sleep, then waits.
+        // The background sleep is in the same process group as the shell.
+        let pty = Pty::spawn(
+            &["sh", "-c", "sleep 60 & CHILD=$!; trap '' HUP; wait $CHILD"],
+            None,
+            &[],
+            80,
+            24,
+        )
+        .expect("spawn shell with background child");
+
+        let shell_pid = pty.child_pid();
+        // Give the shell a moment to fork the background sleep.
+        std::thread::sleep(Duration::from_millis(200));
+
+        pty.close(Duration::from_secs(3))
+            .expect("close should succeed");
+
+        // The shell leader should be gone.
+        // SAFETY: kill(pid, 0) checks existence without sending a signal.
+        let exists = unsafe { libc::kill(shell_pid, 0) };
+        assert_eq!(
+            exists, -1,
+            "shell pid {shell_pid} should not exist after close"
+        );
+        assert_eq!(
+            io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH),
+            "shell pid {shell_pid} should return ESRCH"
+        );
+    }
+
+    /// `try_wait` treats ECHILD (already reaped by VTE's watch_child)
+    /// as `Ok(Some(0))` instead of an error.
+    #[test]
+    fn try_wait_treats_echild_as_already_reaped() {
+        let mut pty =
+            Pty::spawn(&["sh", "-c", "exit 0"], None, &[], 80, 24).expect("spawn quick-exit child");
+
+        // Wait for the child to exit, then externally reap it to simulate
+        // VTE's watch_child.
+        std::thread::sleep(Duration::from_millis(200));
+        let mut status: libc::c_int = 0;
+        // SAFETY: external reap simulating VTE.
+        unsafe { libc::waitpid(pty.child_pid(), &mut status, 0) };
+
+        // Now try_wait should get ECHILD and treat it as already reaped.
+        let result = pty.try_wait().expect("try_wait should not error on ECHILD");
+        assert_eq!(result, Some(0), "ECHILD should yield Some(0)");
+        assert!(pty.reaped);
+    }
+
+    /// `close_and_reap_async` returns immediately (non-blocking) and the
+    /// background thread completes the reap.
+    #[test]
+    fn close_and_reap_async_returns_immediately() {
+        let pty =
+            Pty::spawn(&["sh", "-c", "exit 0"], None, &[], 80, 24).expect("spawn quick-exit child");
+        let child_pid = pty.child_pid();
+
+        let start = Instant::now();
+        pty.close_and_reap_async(Duration::from_secs(5));
+        let elapsed = start.elapsed();
+
+        // Must return in well under 1 second — it's non-blocking.
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "close_and_reap_async blocked for {elapsed:?}"
+        );
+
+        // Give the background thread time to reap, then verify the
+        // child is gone.
+        std::thread::sleep(Duration::from_millis(500));
+        let exists = unsafe { libc::kill(child_pid, 0) };
+        assert_eq!(
+            exists, -1,
+            "child pid {child_pid} should be reaped after close_and_reap_async"
         );
     }
 }

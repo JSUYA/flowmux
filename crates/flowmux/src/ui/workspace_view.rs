@@ -380,7 +380,9 @@ impl PaneRegistry {
             .filter_map(|(surface, owner)| (*owner == workspace).then_some(*surface))
             .collect();
         for surface in surfaces {
-            self.terminals.remove(&surface);
+            if let Some(terminal) = self.terminals.remove(&surface) {
+                terminal.close_pty();
+            }
             if let Some(browser) = self.browsers.remove(&surface) {
                 browser.prepare_for_close();
             }

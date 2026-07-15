@@ -53,8 +53,10 @@ pub struct GhosttyPane {
     last_selection: Rc<RefCell<Option<String>>>,
     /// Owns the forked child + PTY master. Kept alive for the pane's lifetime so
     /// the shell survives; its `Drop` hangs up and reaps the child on pane close.
-    /// VTE renders/IOs a dup of the same master.
-    _pty: Rc<flowmux_terminal::pty::Pty>,
+    /// VTE renders/IOs a dup of the same master. Wrapped in `Option` so
+    /// `close_pty` can take ownership exactly once even when the GhosttyPane
+    /// has been cloned.
+    _pty: Rc<RefCell<Option<flowmux_terminal::pty::Pty>>>,
 }
 
 /// Shift+Enter input sequence: VTE-era agent TUIs treat ESC+CR as "insert a
@@ -674,7 +676,7 @@ impl GhosttyPane {
             pid,
             last_polled_cwd: Rc::new(RefCell::new(None)),
             last_selection,
-            _pty: Rc::new(pty),
+            _pty: Rc::new(RefCell::new(Some(pty))),
         }
     }
 
@@ -755,24 +757,16 @@ impl GhosttyPane {
         self.widget.add_controller(controller);
     }
 
-    /// Close the PTY child with a bounded timeout before the pane widget
-    /// is dropped. Returns the child's exit status when the Pty was
-    /// uniquely owned; returns `None` if another reference exists
-    /// (should not happen).
+    /// Close the PTY master fd immediately and reap the child on a
+    /// background thread. Non-blocking — safe to call from the GTK
+    /// main thread. Takes the Pty out of the shared RefCell exactly
+    /// once; subsequent calls are no-ops.
     ///
     /// Callers must call this before [`PaneRegistry::forget_pane`]
-    /// drops the terminal handle. The `Drop` implementation on Pty is a
-    /// non-blocking safety net.
-    pub fn close_pty(self) -> Option<i32> {
-        match Rc::try_unwrap(self._pty) {
-            Ok(pty) => pty.close(flowmux_terminal::pty::Pty::CLOSE_TIMEOUT).ok(),
-            Err(_) => {
-                tracing::warn!(
-                    "GhosttyPane::close_pty: Pty has multiple owners; \
-                     falling back to non-blocking Drop"
-                );
-                None
-            }
+    /// drops the terminal handle.
+    pub fn close_pty(self) {
+        if let Some(pty) = self._pty.borrow_mut().take() {
+            pty.close_and_reap_async(flowmux_terminal::pty::Pty::CLOSE_TIMEOUT);
         }
     }
 }
