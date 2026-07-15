@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-3.0-or-later
 #
-# Release-build flowmux and install the binaries to the host.
+# Release-build flowmux and install the binaries, the .desktop entry and the
+# app icons to the host, so flowmux shows up in the app launcher / dock.
 #
 # flowmux uses the system GTK4/libadwaita/WebKitGTK/VTE libraries. The image
 # viewer links the system ThorVG (via the thorvg-sys crate in pkg-config mode),
@@ -27,6 +28,9 @@ fi
 echo "==> building flowmux (release)"
 cargo build --release -p flowmux -p flowmux-cli -p flowmux-md-viewer
 
+# The first directory installed to is the one the .desktop entry points at, so
+# launching from the dock runs the same binary a shell on PATH would.
+PRIMARY_BIN_DIR=""
 for dir in "$HOME/.local/bin" "$HOME/.cargo/bin"; do
     if [ -d "$dir" ]; then
         install -m755 \
@@ -35,7 +39,47 @@ for dir in "$HOME/.local/bin" "$HOME/.cargo/bin"; do
             target/release/flowmux-md-viewer \
             "$dir/"
         echo "==> installed to $dir"
+        [ -n "$PRIMARY_BIN_DIR" ] || PRIMARY_BIN_DIR="$dir"
     fi
 done
+
+if [ -z "$PRIMARY_BIN_DIR" ]; then
+    echo "error: neither ~/.local/bin nor ~/.cargo/bin exists; nothing installed." >&2
+    echo "       create one of them and re-run: mkdir -p ~/.local/bin" >&2
+    exit 1
+fi
+
+# Desktop entry + icons. A .desktop file alone is not enough — the launcher
+# resolves `Icon=com.flowmux.App` through the hicolor theme, so the PNG/SVG have
+# to land under the matching per-size apps/ directories with that basename.
+DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}"
+APP_ID="com.flowmux.App"
+
+# `Exec=flowmux` relies on the session PATH, which does not always include
+# ~/.local/bin (and never includes ~/.cargo/bin) for launcher-started apps.
+# Rewrite it to the absolute path so the dock entry works regardless.
+install -d "$DATA_DIR/applications"
+sed "s|^Exec=flowmux$|Exec=$PRIMARY_BIN_DIR/flowmux|" \
+    "resources/desktop/$APP_ID.desktop" \
+    > "$DATA_DIR/applications/$APP_ID.desktop"
+chmod 644 "$DATA_DIR/applications/$APP_ID.desktop"
+echo "==> installed desktop entry to $DATA_DIR/applications/$APP_ID.desktop"
+
+install -Dm644 resources/icons/flowmux.svg \
+    "$DATA_DIR/icons/hicolor/scalable/apps/$APP_ID.svg"
+for size in 16 24 32 48 64 96 128 256 512; do
+    install -Dm644 "resources/icons/flowmux-${size}.png" \
+        "$DATA_DIR/icons/hicolor/${size}x${size}/apps/$APP_ID.png"
+done
+echo "==> installed icons to $DATA_DIR/icons/hicolor"
+
+# Refresh the launcher caches. Both tools are optional: GNOME rescans on login
+# anyway, so a missing binary only delays the icon showing up.
+if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database "$DATA_DIR/applications" 2>/dev/null || true
+fi
+if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+    gtk-update-icon-cache -qtf "$DATA_DIR/icons/hicolor" 2>/dev/null || true
+fi
 
 echo "==> done. Fully restart the running flowmux GUI to pick up the new binary."

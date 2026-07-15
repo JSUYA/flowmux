@@ -207,11 +207,14 @@ The script installs `FlowMux.app` under `~/Applications` and copies `flowmux`,
 ### Install to the host
 
 ```bash
-./install.sh                   # release-builds flowmux → installs the binaries
+./install.sh                   # release-builds flowmux → installs binaries + app icon
 ```
 
 This installs `flowmux`, `flowmuxctl`, and `flowmux-md-viewer` binaries to
-`~/.local/bin` and `~/.cargo/bin`. It is a plain `cargo build --release` using
+`~/.local/bin` and `~/.cargo/bin`, plus the desktop entry
+(`~/.local/share/applications/com.flowmux.App.desktop`) and the app icons
+(`~/.local/share/icons/hicolor/…`) so flowmux appears in the app launcher.
+It is a plain `cargo build --release` using
 the system VTE library; no Zig toolchain or vendored terminal backend is
 required. ThorVG (image viewer) is optional and loaded at runtime, so the build
 does not depend on it; `install.sh` only prints a note if it is missing.
