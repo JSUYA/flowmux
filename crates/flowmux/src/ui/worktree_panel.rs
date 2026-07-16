@@ -190,6 +190,7 @@ impl WorktreePanel {
     }
 
     pub fn show_not_repository(&self) {
+        self.clear_repository_context();
         self.show_status(
             "Not a Git repository",
             "The focused pane is not in a Git repository",
@@ -198,6 +199,7 @@ impl WorktreePanel {
     }
 
     pub fn show_error(&self, message: &str) {
+        self.clear_repository_context();
         self.show_status("Unable to load worktrees", message, true);
     }
 
@@ -208,9 +210,7 @@ impl WorktreePanel {
         self.repository_label
             .set_tooltip_text(Some(repository_name));
 
-        while let Some(child) = self.list.first_child() {
-            self.list.remove(&child);
-        }
+        self.clear_rows();
         *self.rows.borrow_mut() = rows;
 
         for row in self.rows.borrow().iter() {
@@ -324,6 +324,19 @@ impl WorktreePanel {
             button.set_visible(retry);
         }
         self.content.set_visible_child_name("status");
+    }
+
+    fn clear_repository_context(&self) {
+        self.repository_label.set_text("");
+        self.repository_label.set_tooltip_text(None);
+        self.clear_rows();
+        self.rows.borrow_mut().clear();
+    }
+
+    fn clear_rows(&self) {
+        while let Some(child) = self.list.first_child() {
+            self.list.remove(&child);
+        }
     }
 
     fn retry_button(&self) -> Option<gtk::Button> {
@@ -895,6 +908,11 @@ mod tests {
         );
         assert_eq!(panel.content.visible_child_name().as_deref(), Some("list"));
         assert_eq!(panel.selected_path(), Some(PathBuf::from("/repo/main")));
+
+        panel.show_not_repository();
+        assert_eq!(panel.repository_name(), None);
+        assert!(panel.row_for_path(Path::new("/repo/main")).is_none());
+        assert!(panel.list.first_child().is_none());
 
         panel.hide();
         assert!(!panel.is_open());
