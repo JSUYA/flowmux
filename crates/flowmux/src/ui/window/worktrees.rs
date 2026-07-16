@@ -415,18 +415,20 @@ impl WindowController {
         };
 
         let start = normalized_existing_path(&start);
-        if !force
-            && same_source_directory(self.worktrees.source_directory.borrow().as_deref(), &start)
-        {
+        let same_source =
+            same_source_directory(self.worktrees.source_directory.borrow().as_deref(), &start);
+        if same_source && (self.worktrees.loading.get() || !force) {
             return;
         }
         *self.worktrees.source_directory.borrow_mut() = Some(start.clone());
+        self.worktrees.loading.set(true);
 
         let generation = self.worktrees.generation.get().wrapping_add(1);
         self.worktrees.generation.set(generation);
         self.worktrees.panel.show_loading();
         let bridge = self.bridge.clone();
         let Some(handle) = self.worktrees.tokio_handle.clone() else {
+            self.worktrees.loading.set(false);
             self.worktrees
                 .panel
                 .show_error("Tokio runtime is not available");
@@ -449,6 +451,7 @@ impl WindowController {
         if !self.worktrees.panel.is_open() || generation != self.worktrees.generation.get() {
             return;
         }
+        self.worktrees.loading.set(false);
 
         match result {
             Ok(list) => {

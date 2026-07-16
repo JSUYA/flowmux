@@ -277,6 +277,7 @@ struct FileBrowserState {
 struct WorktreePanelState {
     source_pane: FocusedPane,
     source_directory: Rc<RefCell<Option<PathBuf>>>,
+    loading: Rc<Cell<bool>>,
     active: Rc<Cell<bool>>,
     generation: Rc<Cell<u64>>,
     repository_root: Rc<RefCell<Option<PathBuf>>>,
@@ -514,6 +515,7 @@ impl WindowController {
         let file_browser_pane_states = Rc::new(RefCell::new(HashMap::new()));
         let worktree_source_pane: FocusedPane = Rc::new(Cell::new(None));
         let worktree_source_directory = Rc::new(RefCell::new(None));
+        let worktree_loading = Rc::new(Cell::new(false));
         let worktree_active = Rc::new(Cell::new(false));
         let worktree_generation = Rc::new(Cell::new(0));
         let worktree_repository_root = Rc::new(RefCell::new(None));
@@ -780,6 +782,7 @@ impl WindowController {
             worktrees: WorktreePanelState {
                 source_pane: worktree_source_pane,
                 source_directory: worktree_source_directory,
+                loading: worktree_loading,
                 active: worktree_active,
                 generation: worktree_generation,
                 repository_root: worktree_repository_root,
@@ -3733,6 +3736,30 @@ mod tests {
             controller.worktrees.panel.repository_name(),
             Some("new".into())
         );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[gtk::test]
+    async fn duplicate_worktree_refresh_is_coalesced_while_loading() {
+        let (controller, _workspace, pane) =
+            build_single_workspace_controller("com.flowmux.App.UiTest.WorktreeRefreshCoalesce")
+                .await;
+        let start = controller.file_browser_root_for_pane(pane).await.unwrap();
+        let start = std::fs::canonicalize(&start).unwrap_or(start);
+        controller.worktrees.panel.show_loading();
+        controller.worktrees.source_pane.set(Some(pane));
+        *controller.worktrees.source_directory.borrow_mut() = Some(start);
+        controller.worktrees.loading.set(true);
+        controller.worktrees.generation.set(7);
+
+        controller.refresh_worktrees(true).await;
+
+        assert_eq!(controller.worktrees.generation.get(), 7);
+
+        controller.worktrees.loading.set(false);
+        controller.refresh_worktrees(true).await;
+        assert_eq!(controller.worktrees.generation.get(), 8);
+        assert!(!controller.worktrees.loading.get());
     }
 
     #[cfg(not(target_os = "macos"))]

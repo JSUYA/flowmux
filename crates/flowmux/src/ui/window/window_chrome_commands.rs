@@ -264,6 +264,7 @@ impl WindowController {
         self.worktrees
             .generation
             .set(self.worktrees.generation.get().wrapping_add(1));
+        self.worktrees.loading.set(false);
         self.worktrees.active.set(false);
         self.worktrees.panel.hide();
         if let Some(pane) = self
