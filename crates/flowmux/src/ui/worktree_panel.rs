@@ -185,6 +185,7 @@ impl WorktreePanel {
     pub fn show_loading(&self) {
         self.open.set(true);
         self.root.set_visible(true);
+        self.refresh_button.set_sensitive(false);
         self.spinner.start();
         self.content.set_visible_child_name("loading");
     }
@@ -205,6 +206,7 @@ impl WorktreePanel {
 
     pub fn set_rows(&self, repository_name: &str, rows: Vec<WorktreeRowView>) {
         let selected_path = self.selected_path();
+        self.refresh_button.set_sensitive(true);
         self.spinner.stop();
         self.repository_label.set_text(repository_name);
         self.repository_label
@@ -317,6 +319,7 @@ impl WorktreePanel {
     }
 
     fn show_status(&self, title: &str, description: &str, retry: bool) {
+        self.refresh_button.set_sensitive(true);
         self.spinner.stop();
         self.status.set_title(title);
         self.status.set_description(Some(description));
@@ -875,6 +878,7 @@ mod tests {
         panel.show_loading();
         assert!(panel.is_open());
         assert!(panel.widget().is_visible());
+        assert!(!panel.refresh_button.is_sensitive());
         assert!(panel.spinner.is_spinning());
         assert_eq!(
             panel.content.visible_child_name().as_deref(),
@@ -883,6 +887,7 @@ mod tests {
 
         panel.show_not_repository();
         assert!(!panel.spinner.is_spinning());
+        assert!(panel.refresh_button.is_sensitive());
         assert_eq!(
             panel.content.visible_child_name().as_deref(),
             Some("status")
