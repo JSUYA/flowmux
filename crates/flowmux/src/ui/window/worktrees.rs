@@ -526,11 +526,17 @@ impl WindowController {
                 self.render_workspace_with_activation(&workspace, false);
             }
             self.activate_workspace(id).await;
-            let store = self.store.clone();
+            let bridge = self.bridge.clone();
             if let Some(handle) = self.worktrees.tokio_handle.clone() {
                 handle.spawn(async move {
                     if let Ok(Some(info)) = flowmux_vcs::inspect(&path).await {
-                        store.replace_git_info(id, Some(info)).await;
+                        let _ = bridge
+                            .tx
+                            .send(GtkCommand::WorkspaceGitInfoLoaded {
+                                workspace: id,
+                                info,
+                            })
+                            .await;
                     }
                 });
             }

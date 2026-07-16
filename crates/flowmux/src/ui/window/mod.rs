@@ -1431,6 +1431,7 @@ impl WindowController {
                 self.dispatch_notification_command(command).await;
             }
             command @ (GtkCommand::WorkspaceCreated { .. }
+            | GtkCommand::WorkspaceGitInfoLoaded { .. }
             | GtkCommand::NewWorkspace { .. }
             | GtkCommand::RemoveWorkspace { .. }
             | GtkCommand::RemoveAllWorkspaces { .. }
@@ -3674,6 +3675,38 @@ mod tests {
             controller.store.snapshot().await.active_workspace,
             Some(matching[0].id)
         );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[gtk::test]
+    async fn loaded_git_info_updates_the_workspace_and_side_panel() {
+        let (controller, workspace, _pane) =
+            build_single_workspace_controller("com.flowmux.App.UiTest.WorktreeGitInfo").await;
+        let info = flowmux_core::GitInfo {
+            branch: "feature".into(),
+            remote_url: Some("https://example.invalid/repo.git".into()),
+            linked_pr: Some(flowmux_core::LinkedPr {
+                number: 42,
+                state: flowmux_core::PrState::Open,
+                url: "https://example.invalid/pr/42".into(),
+            }),
+        };
+
+        controller
+            .dispatch(GtkCommand::WorkspaceGitInfoLoaded { workspace, info })
+            .await;
+
+        assert_eq!(
+            controller
+                .store
+                .get_workspace(workspace)
+                .await
+                .and_then(|workspace| workspace.git)
+                .and_then(|git| git.linked_pr)
+                .map(|pr| pr.number),
+            Some(42)
+        );
+        assert!(controller.sidebar.workspace_row_contains(workspace, "#42"));
     }
 
     #[cfg(not(target_os = "macos"))]

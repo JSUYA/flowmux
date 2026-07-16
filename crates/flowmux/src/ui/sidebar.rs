@@ -447,6 +447,33 @@ impl Sidebar {
             .find_map(|(id, row)| (row == &selected).then_some(*id))
     }
 
+    #[cfg(test)]
+    pub(crate) fn workspace_row_contains(&self, id: WorkspaceId, text: &str) -> bool {
+        fn contains(widget: &gtk::Widget, text: &str) -> bool {
+            if widget
+                .downcast_ref::<gtk::Label>()
+                .is_some_and(|label| label.text().as_str() == text)
+            {
+                return true;
+            }
+            let mut child = widget.first_child();
+            while let Some(widget) = child {
+                if contains(&widget, text) {
+                    return true;
+                }
+                child = widget.next_sibling();
+            }
+            false
+        }
+
+        self.rows
+            .borrow()
+            .iter()
+            .find(|(workspace, _)| *workspace == id)
+            .and_then(|(_, row)| row.child())
+            .is_some_and(|row| contains(&row, text))
+    }
+
     /// Tint a workspace row to flag that an agent finished there.
     /// Cleared automatically when the user selects the row, and also
     /// when [`Self::clear_attention`] is called from a programmatic
