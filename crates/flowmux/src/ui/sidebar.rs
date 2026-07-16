@@ -427,7 +427,9 @@ impl Sidebar {
             self.list.remove(&rows[idx].1);
             rows.remove(idx);
         }
+        self.attentions.borrow_mut().remove(&id);
         self.agent_status.borrow_mut().remove(&id);
+        self.subtitle_cache.borrow_mut().remove(&id);
         self.titles.borrow_mut().retain(|(tid, _)| *tid != id);
     }
 
@@ -754,20 +756,26 @@ fn attach_dnd_handlers(row: &gtk::ListBoxRow, id: WorkspaceId, bridge: Bridge, r
         tracing::debug!(workspace = %id_for_prepare, "sidebar drag prepare");
         Some(workspace_dnd_content_provider(id_for_prepare))
     });
-    let row_for_begin = row.clone();
+    let row_for_begin = row.downgrade();
     drag_source.connect_drag_begin(move |_, _| {
-        row_for_begin.set_opacity(0.4);
-        row_for_begin.add_css_class("flowmux-dragging");
+        if let Some(row) = row_for_begin.upgrade() {
+            row.set_opacity(0.4);
+            row.add_css_class("flowmux-dragging");
+        }
     });
-    let row_for_end = row.clone();
+    let row_for_end = row.downgrade();
     drag_source.connect_drag_end(move |_, _, _| {
-        row_for_end.set_opacity(1.0);
-        row_for_end.remove_css_class("flowmux-dragging");
+        if let Some(row) = row_for_end.upgrade() {
+            row.set_opacity(1.0);
+            row.remove_css_class("flowmux-dragging");
+        }
     });
-    let row_for_cancel = row.clone();
+    let row_for_cancel = row.downgrade();
     drag_source.connect_drag_cancel(move |_, _, _| {
-        row_for_cancel.set_opacity(1.0);
-        row_for_cancel.remove_css_class("flowmux-dragging");
+        if let Some(row) = row_for_cancel.upgrade() {
+            row.set_opacity(1.0);
+            row.remove_css_class("flowmux-dragging");
+        }
         false
     });
     row.add_controller(drag_source);
@@ -779,35 +787,43 @@ fn attach_dnd_handlers(row: &gtk::ListBoxRow, id: WorkspaceId, bridge: Bridge, r
     // line marks the actual drop position. Hovering the upper half of the first
     // row signals "move to the top".
     let target_id_for_motion = id;
-    let row_for_motion = row.clone();
+    let row_for_motion = row.downgrade();
     drop_target.connect_motion(move |_, _x, y| {
+        let Some(row) = row_for_motion.upgrade() else {
+            return gtk::gdk::DragAction::empty();
+        };
         tracing::trace!(target = %target_id_for_motion, y, "sidebar drop motion");
-        let height = row_for_motion.height();
+        let height = row.height();
         let above = if height > 0 {
             y < (height as f64) / 2.0
         } else {
             true
         };
         if above {
-            row_for_motion.remove_css_class("flowmux-drop-below");
-            row_for_motion.add_css_class("flowmux-drop-above");
+            row.remove_css_class("flowmux-drop-below");
+            row.add_css_class("flowmux-drop-above");
         } else {
-            row_for_motion.remove_css_class("flowmux-drop-above");
-            row_for_motion.add_css_class("flowmux-drop-below");
+            row.remove_css_class("flowmux-drop-above");
+            row.add_css_class("flowmux-drop-below");
         }
         gtk::gdk::DragAction::MOVE
     });
-    let row_for_leave = row.clone();
+    let row_for_leave = row.downgrade();
     drop_target.connect_leave(move |_| {
-        row_for_leave.remove_css_class("flowmux-drop-above");
-        row_for_leave.remove_css_class("flowmux-drop-below");
+        if let Some(row) = row_for_leave.upgrade() {
+            row.remove_css_class("flowmux-drop-above");
+            row.remove_css_class("flowmux-drop-below");
+        }
     });
-    let row_for_drop = row.clone();
+    let row_for_drop = row.downgrade();
     let target_id = id;
     drop_target.connect_drop(move |_, value, _x, y| {
+        let Some(row) = row_for_drop.upgrade() else {
+            return false;
+        };
         tracing::debug!(target = %target_id, "sidebar drop fired");
-        row_for_drop.remove_css_class("flowmux-drop-above");
-        row_for_drop.remove_css_class("flowmux-drop-below");
+        row.remove_css_class("flowmux-drop-above");
+        row.remove_css_class("flowmux-drop-below");
         let Ok(payload) = value.get::<String>() else {
             tracing::warn!(value = ?value, "sidebar drop: payload was not String — DropTarget type mismatch");
             return false;
@@ -834,7 +850,7 @@ fn attach_dnd_handlers(row: &gtk::ListBoxRow, id: WorkspaceId, bridge: Bridge, r
         };
 
         // Drop above the target if y is in the upper half, otherwise below it.
-        let row_height = row_for_drop.height();
+        let row_height = row.height();
         let above = if row_height > 0 {
             y < (row_height as f64) / 2.0
         } else {
@@ -1044,9 +1060,12 @@ fn row_widget(
     // send the right GtkCommand directly through the bridge.
     let click = gtk::GestureClick::new();
     click.set_button(gtk::gdk::BUTTON_SECONDARY);
-    let row_for_click = row.clone();
+    let row_for_click = row.downgrade();
     let on_close_for_menu = on_close.clone();
     click.connect_pressed(move |gesture, _n_press, x, y| {
+        let Some(row) = row_for_click.upgrade() else {
+            return;
+        };
         // Claim the sequence up front so the row's primary-click gesture
         // and the ListBox don't also act on this press.
         gesture.set_state(gtk::EventSequenceState::Claimed);
@@ -1144,7 +1163,7 @@ fn row_widget(
         };
 
         crate::ui::overlay_menu::show_at(
-            &row_for_click,
+            &row,
             x,
             y,
             vec![
@@ -1445,6 +1464,36 @@ mod tests {
             path_lines: vec![".../fallback/path".into()],
         };
         let _ = row_widget(&ws, &details, on_close, bridge);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[gtk::test]
+    fn redrawing_and_removing_workspace_releases_old_widgets() {
+        if gtk::init().is_err() {
+            return;
+        }
+        let bridge = crate::bridge::Bridge::new().0;
+        let sidebar = Sidebar::new(|_| {}, |_| {}, bridge, NotificationStore::new(), None);
+        let mut ws = ws_with_active_terminal_cwd(Some(PathBuf::from("/tmp/worktree")));
+        sidebar.upsert(&ws);
+
+        let row = sidebar.rows.borrow()[0].1.clone();
+        let old_child = row.child().expect("workspace row child").downgrade();
+        let old_row = row.downgrade();
+        drop(row);
+
+        ws.name = "updated".into();
+        sidebar.upsert(&ws);
+        assert!(
+            old_child.upgrade().is_none(),
+            "redraw retained the replaced widget tree"
+        );
+
+        sidebar.remove(ws.id);
+        assert!(
+            old_row.upgrade().is_none(),
+            "removal retained the detached list row"
+        );
     }
 
     #[test]
