@@ -13,6 +13,12 @@ pub(super) fn same_existing_path(left: &Path, right: &Path) -> bool {
     left == right
 }
 
+fn path_is_within(path: &Path, root: &Path) -> bool {
+    let path = normalized_existing_path(path);
+    let root = normalized_existing_path(root);
+    path == root || path.starts_with(root)
+}
+
 fn normalized_existing_path(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
@@ -28,7 +34,35 @@ fn repository_name(path: &Path) -> String {
         .unwrap_or_else(|| path.to_string_lossy().into_owned())
 }
 
-fn remove_block_reason(info: &WorktreeInfo, workspace_open: bool) -> Option<String> {
+fn pane_uses_worktree(pane: &Pane, path: &Path) -> bool {
+    match pane {
+        Pane::Leaf {
+            content: PaneContent::Tabs { surfaces, .. },
+            ..
+        } => surfaces.iter().any(|surface| {
+            matches!(
+                &surface.kind,
+                SurfaceKind::Terminal { cwd: Some(cwd), .. } if path_is_within(cwd, path)
+            )
+        }),
+        Pane::Leaf { .. } => false,
+        Pane::Split { first, second, .. } => {
+            pane_uses_worktree(first, path) || pane_uses_worktree(second, path)
+        }
+    }
+}
+
+fn workspace_uses_worktree(workspace: &Workspace, path: &Path) -> bool {
+    path_is_within(&workspace.root_dir, path)
+        || workspace.surfaces.iter().any(|surface| {
+            matches!(
+                &surface.kind,
+                SurfaceKind::Terminal { cwd: Some(cwd), .. } if path_is_within(cwd, path)
+            ) || pane_uses_worktree(&surface.root_pane, path)
+        })
+}
+
+fn remove_block_reason(info: &WorktreeInfo, worktree_in_use: bool) -> Option<String> {
     if info.is_main {
         Some("Main worktree cannot be removed".into())
     } else if info.is_current {
@@ -44,8 +78,8 @@ fn remove_block_reason(info: &WorktreeInfo, workspace_open: bool) -> Option<Stri
                 reason
             }
         ))
-    } else if workspace_open {
-        Some("Close the matching workspace before removal".into())
+    } else if worktree_in_use {
+        Some("Close tabs and workspaces using this worktree before removal".into())
     } else {
         None
     }
@@ -148,6 +182,19 @@ fn worktree_info_body(row: &WorktreeRowView) -> String {
 }
 
 impl WindowController {
+    fn worktree_in_use(&self, path: &Path, workspaces: &[Workspace]) -> bool {
+        workspaces
+            .iter()
+            .any(|workspace| workspace_uses_worktree(workspace, path))
+            || self
+                .pane_registry
+                .borrow()
+                .terminals
+                .values()
+                .filter_map(|terminal| terminal.current_dir())
+                .any(|cwd| path_is_within(&cwd, path))
+    }
+
     fn show_worktree_alert(&self, heading: &str, body: &str) {
         let dialog = adw::AlertDialog::new(Some(heading), Some(body));
         dialog.add_response("close", "Close");
@@ -183,11 +230,10 @@ impl WindowController {
             .row_for_path(&path)
             .ok_or_else(|| "The worktree is no longer in the current list.".to_string())?;
         let snapshot = self.store.snapshot().await;
-        let workspace_open = snapshot
-            .workspaces
-            .iter()
-            .any(|workspace| same_existing_path(&workspace.root_dir, &row.info.path));
-        if let Some(reason) = remove_block_reason(&row.info, workspace_open) {
+        if let Some(reason) = remove_block_reason(
+            &row.info,
+            self.worktree_in_use(&row.info.path, &snapshot.workspaces),
+        ) {
             return Err(reason);
         }
         Ok(row)
@@ -437,7 +483,10 @@ impl WindowController {
                 let workspace_open = matching.is_some();
                 let workspace_active = matching
                     .is_some_and(|workspace| Some(workspace.id) == snapshot.active_workspace);
-                let remove_block_reason = remove_block_reason(&info, workspace_open);
+                let remove_block_reason = remove_block_reason(
+                    &info,
+                    self.worktree_in_use(&info.path, &snapshot.workspaces),
+                );
                 let operation_in_progress =
                     removals_in_progress.contains(&normalized_existing_path(&info.path));
                 WorktreeRowView {
@@ -550,8 +599,32 @@ mod tests {
         item.lock_reason = None;
         assert_eq!(
             remove_block_reason(&item, true).as_deref(),
-            Some("Close the matching workspace before removal")
+            Some("Close tabs and workspaces using this worktree before removal")
         );
+    }
+
+    #[test]
+    fn worktree_usage_includes_workspace_roots_and_terminal_cwds_below_it() {
+        let root = tempfile::tempdir().unwrap();
+        let nested = root.path().join("project/subdir");
+        std::fs::create_dir_all(&nested).unwrap();
+        let workspace = Workspace {
+            id: WorkspaceId::new(),
+            name: "nested".into(),
+            custom_title: None,
+            root_dir: nested.clone(),
+            git: None,
+            listening_ports: Vec::new(),
+            surfaces: Vec::new(),
+            color: None,
+        };
+        let pane = Pane::Leaf {
+            id: PaneId::new(),
+            content: PaneContent::tabbed_terminal("shell", Some(nested)),
+        };
+
+        assert!(workspace_uses_worktree(&workspace, root.path()));
+        assert!(pane_uses_worktree(&pane, root.path()));
     }
 
     #[test]
