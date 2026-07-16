@@ -6,6 +6,8 @@
 
 **Agent Workflow Multiplexer Terminal** — *Go with the agents' flow.*
 
+[Website](https://flowmux-ai.github.io/) · [Latest release](https://github.com/flowmux-ai/flowmux-terminal/releases/latest)
+
 <img src=resources/screenshot/screenshot_1.png  width="850"/>
 
 </div>
