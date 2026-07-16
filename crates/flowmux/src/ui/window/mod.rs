@@ -276,6 +276,7 @@ struct FileBrowserState {
 #[derive(Clone)]
 struct WorktreePanelState {
     source_pane: FocusedPane,
+    source_directory: Rc<RefCell<Option<PathBuf>>>,
     active: Rc<Cell<bool>>,
     generation: Rc<Cell<u64>>,
     repository_root: Rc<RefCell<Option<PathBuf>>>,
@@ -512,6 +513,7 @@ impl WindowController {
         let file_browser_active = Rc::new(Cell::new(false));
         let file_browser_pane_states = Rc::new(RefCell::new(HashMap::new()));
         let worktree_source_pane: FocusedPane = Rc::new(Cell::new(None));
+        let worktree_source_directory = Rc::new(RefCell::new(None));
         let worktree_active = Rc::new(Cell::new(false));
         let worktree_generation = Rc::new(Cell::new(0));
         let worktree_repository_root = Rc::new(RefCell::new(None));
@@ -777,6 +779,7 @@ impl WindowController {
             sidebar_split: split,
             worktrees: WorktreePanelState {
                 source_pane: worktree_source_pane,
+                source_directory: worktree_source_directory,
                 active: worktree_active,
                 generation: worktree_generation,
                 repository_root: worktree_repository_root,

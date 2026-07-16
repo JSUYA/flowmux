@@ -17,6 +17,10 @@ fn normalized_existing_path(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
+fn same_source_directory(previous: Option<&Path>, current: &Path) -> bool {
+    previous.is_some_and(|previous| previous == current)
+}
+
 fn repository_name(path: &Path) -> String {
     path.file_name()
         .map(|name| name.to_string_lossy().into_owned())
@@ -364,18 +368,13 @@ impl WindowController {
             return;
         };
 
-        if !force {
-            let start = normalized_existing_path(&start);
-            let unchanged = self
-                .worktrees
-                .repository_root
-                .borrow()
-                .as_ref()
-                .is_some_and(|current| start == *current || start.starts_with(current));
-            if unchanged {
-                return;
-            }
+        let start = normalized_existing_path(&start);
+        if !force
+            && same_source_directory(self.worktrees.source_directory.borrow().as_deref(), &start)
+        {
+            return;
         }
+        *self.worktrees.source_directory.borrow_mut() = Some(start.clone());
 
         let generation = self.worktrees.generation.get().wrapping_add(1);
         self.worktrees.generation.set(generation);
@@ -553,6 +552,16 @@ mod tests {
             remove_block_reason(&item, true).as_deref(),
             Some("Close the matching workspace before removal")
         );
+    }
+
+    #[test]
+    fn nested_worktree_is_not_the_same_source_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let nested = root.path().join(".worktrees/feature");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        assert!(same_source_directory(Some(root.path()), root.path()));
+        assert!(!same_source_directory(Some(root.path()), &nested));
     }
 
     #[cfg(not(target_os = "macos"))]
