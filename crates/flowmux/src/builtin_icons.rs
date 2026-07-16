@@ -92,6 +92,10 @@ const SYMBOLIC_ICONS: &[SymbolicIcon] = &[
         path: "M5.5 2 6 1h4l.5 1H13v1.5H3V2zm-1 3h7l-.5 8H5zM6 6v5h1V6zm3 0v5h1V6z",
     },
     SymbolicIcon {
+        name: "utilities-system-monitor-symbolic",
+        path: "M2.3 8.5h2.2v5H2.3zM6.9 5.5h2.2v8H6.9zM11.5 2.5h2.2v11h-2.2z",
+    },
+    SymbolicIcon {
         name: "utilities-terminal-symbolic",
         path: "M2 3h12v10H2zM3.5 4.5v7h9v-7zM4.5 6l1.8 2-1.8 2h1.8L8 8 6.3 6zM8 9.5h3v1H8z",
     },

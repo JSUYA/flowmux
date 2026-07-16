@@ -58,14 +58,12 @@ async fn fetch_limits(
     credentials_path: &Path,
     client: &reqwest::Client,
 ) -> Result<Vec<UsageWindow>, UsageError> {
-    let raw = tokio::fs::read_to_string(credentials_path)
-        .await
-        .map_err(|_| {
-            UsageError::new(
-                UsageErrorKind::NotLoggedIn,
-                "The local Claude login was not found.",
-            )
-        })?;
+    let raw = match tokio::fs::read_to_string(credentials_path).await {
+        Ok(raw) => raw,
+        // macOS stores the Claude login in the Keychain, not on disk, so fall
+        // back to it before reporting the user as logged out.
+        Err(_) => keychain_credentials().await?,
+    };
     let access_token = access_token_from_credentials(&raw)?;
     drop(raw);
 
@@ -101,6 +99,43 @@ async fn fetch_limits(
                 "The Claude usage request timed out.",
             )
         })?
+}
+
+fn not_logged_in() -> UsageError {
+    UsageError::new(
+        UsageErrorKind::NotLoggedIn,
+        "The local Claude login was not found.",
+    )
+}
+
+#[cfg(target_os = "macos")]
+async fn keychain_credentials() -> Result<String, UsageError> {
+    let output = tokio::process::Command::new("security")
+        .args([
+            "find-generic-password",
+            "-s",
+            "Claude Code-credentials",
+            "-w",
+        ])
+        .output()
+        .await
+        .map_err(|_| not_logged_in())?;
+    if !output.status.success() {
+        return Err(not_logged_in());
+    }
+    let raw = String::from_utf8(output.stdout)
+        .map_err(|_| not_logged_in())?
+        .trim()
+        .to_string();
+    if raw.is_empty() {
+        return Err(not_logged_in());
+    }
+    Ok(raw)
+}
+
+#[cfg(not(target_os = "macos"))]
+async fn keychain_credentials() -> Result<String, UsageError> {
+    Err(not_logged_in())
 }
 
 #[derive(Deserialize)]
