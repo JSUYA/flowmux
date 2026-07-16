@@ -113,11 +113,65 @@ const SYMBOLIC_ICONS: &[SymbolicIcon] = &[
     },
     SymbolicIcon {
         name: "window-close-symbolic",
-        path: "M3.2 2.1 8 6.9l4.8-4.8 1.1 1.1L9.1 8l4.8 4.8-1.1 1.1L8 9.1l-4.8 4.8-1.1-1.1L6.9 8 2.1 3.2z",
+        path: X_PATH,
+    },
+    SymbolicIcon {
+        name: "dialog-question-symbolic",
+        path: "M8 2a3 3 0 0 0-3 3h1.8a1.2 1.2 0 1 1 1.6 1.1c-.7.3-1.3 1-1.3 1.9v1.2h1.8v-1c0-.3.2-.5.5-.7A2.9 2.9 0 0 0 8 2zM7.1 10.6h1.8v1.9H7.1z",
+    },
+    SymbolicIcon {
+        name: "dialog-warning-symbolic",
+        path: "M8 2 14.5 13.5H1.5zM7.2 5.5v4h1.6v-4zM7.2 10.8v1.9h1.6v-1.9z",
+    },
+    SymbolicIcon {
+        name: "edit-delete-symbolic",
+        path: X_PATH,
+    },
+    SymbolicIcon {
+        name: "edit-find-symbolic",
+        path: "M6.5 2a4.5 4.5 0 1 1 0 9 4.5 4.5 0 0 1 0-9zM6.5 3.5a3 3 0 1 0 0 6 3 3 0 0 0 0-6zM9.9 8.9 13.9 12.9 12.8 14 8.8 10z",
+    },
+    SymbolicIcon {
+        name: "emblem-ok-symbolic",
+        path: "M2 7.5 3.4 6.1 6.5 9.2 12.6 3.1 14 4.5 6.5 12z",
+    },
+    SymbolicIcon {
+        name: "folder-download-symbolic",
+        path: "M6.5 1.5h3v3h2l-3.5 3.5L4.5 4.5h2zM1.5 8h5l1 1h7v5h-13z",
+    },
+    SymbolicIcon {
+        name: "folder-open-symbolic",
+        path: "M1.5 3.5A1 1 0 0 1 2.5 3H6l1.5 1.5H13a1 1 0 0 1 1 1v1.5H4.5L2.5 12H2a.5.5 0 0 1-.5-.5zM3.5 12 5.5 7.5H15L13 12z",
+    },
+    SymbolicIcon {
+        name: "media-playback-pause-symbolic",
+        path: "M4 3h3v10H4zM9 3h3v10H9z",
+    },
+    SymbolicIcon {
+        name: "process-stop-symbolic",
+        path: "M4 3.5h8a.5.5 0 0 1 .5.5v8a.5.5 0 0 1-.5.5H4a.5.5 0 0 1-.5-.5V4a.5.5 0 0 1 .5-.5z",
+    },
+    SymbolicIcon {
+        name: "process-working-symbolic",
+        path: "M8 2a6 6 0 1 0 6 6h-2A4 4 0 1 1 8 4z",
+    },
+    SymbolicIcon {
+        name: "user-bookmarks-symbolic",
+        path: "M4 2h8v12l-4-3-4 3z",
+    },
+    SymbolicIcon {
+        name: "zoom-in-symbolic",
+        path: "M6.5 2a4.5 4.5 0 1 1 0 9 4.5 4.5 0 0 1 0-9zM6.5 3.5a3 3 0 1 0 0 6 3 3 0 0 0 0-6zM4.3 5.8h4.4v1.4H4.3zM5.8 4.3h1.4v4.4H5.8zM9.9 8.9 13.9 12.9 12.8 14 8.8 10z",
+    },
+    SymbolicIcon {
+        name: "zoom-out-symbolic",
+        path: "M6.5 2a4.5 4.5 0 1 1 0 9 4.5 4.5 0 0 1 0-9zM6.5 3.5a3 3 0 1 0 0 6 3 3 0 0 0 0-6zM4.3 5.8h4.4v1.4H4.3zM9.9 8.9 13.9 12.9 12.8 14 8.8 10z",
     },
 ];
 
 const ADD_PATH: &str = "M7 2h2v5h5v2H9v5H7V9H2V7h5z";
+const X_PATH: &str =
+    "M3.2 2.1 8 6.9l4.8-4.8 1.1 1.1L9.1 8l4.8 4.8-1.1 1.1L8 9.1l-4.8 4.8-1.1-1.1L6.9 8 2.1 3.2z";
 const GEAR_PATH: &str = "M7 1.5h2l.4 1.6c.4.1.8.3 1.1.5l1.4-.8 1.3 1.7-1.1 1.2c.1.4.2.8.2 1.2s-.1.8-.2 1.2l1.1 1.2-1.3 1.7-1.4-.8c-.3.2-.7.4-1.1.5L9 14.5H7l-.4-1.6c-.4-.1-.8-.3-1.1-.5l-1.4.8-1.3-1.7 1.1-1.2c-.1-.4-.2-.8-.2-1.2s.1-.8.2-1.2L2.8 6.7 4.1 5l1.4.8c.3-.2.7-.4 1.1-.5zM8 6a2 2 0 1 0 0 4 2 2 0 0 0 0-4z";
 
 pub fn install() {
