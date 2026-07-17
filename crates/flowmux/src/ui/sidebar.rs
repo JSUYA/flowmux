@@ -137,6 +137,8 @@ pub struct Sidebar {
     bell_popover: gtk::Popover,
     notifications: NotificationStore,
     attentions: Rc<RefCell<HashSet<WorkspaceId>>>,
+    notification_workspaces: Rc<RefCell<HashSet<WorkspaceId>>>,
+    notification_badges: Rc<RefCell<HashMap<WorkspaceId, gtk::Box>>>,
     /// Workspace-level AI agent status rollups. The classes live on reused
     /// rows, so this map keeps membership idempotent across redraws.
     agent_status: Rc<RefCell<HashMap<WorkspaceId, AgentStatus>>>,
@@ -363,6 +365,8 @@ impl Sidebar {
             bell_popover,
             notifications,
             attentions,
+            notification_workspaces: Rc::new(RefCell::new(HashSet::new())),
+            notification_badges: Rc::new(RefCell::new(HashMap::new())),
             agent_status: Rc::new(RefCell::new(HashMap::new())),
             bridge,
             subtitle_cache: Rc::new(RefCell::new(HashMap::new())),
@@ -421,23 +425,27 @@ impl Sidebar {
         }
         let mut rows = self.rows.borrow_mut();
         if let Some((_, row)) = rows.iter().find(|(id, _)| *id == ws.id).cloned() {
-            row.set_child(Some(&row_widget(
-                ws,
-                details,
-                self.on_close.clone(),
-                self.bridge.clone(),
-            )));
+            let row_widget = row_widget(ws, details, self.on_close.clone(), self.bridge.clone());
+            row_widget
+                .badge
+                .set_visible(self.notification_workspaces.borrow().contains(&ws.id));
+            self.notification_badges
+                .borrow_mut()
+                .insert(ws.id, row_widget.badge);
+            row.set_child(Some(&row_widget.root));
             let status = self.agent_status.borrow().get(&ws.id).copied();
             apply_agent_status_class(&row, status);
             return;
         }
         let row = gtk::ListBoxRow::new();
-        row.set_child(Some(&row_widget(
-            ws,
-            details,
-            self.on_close.clone(),
-            self.bridge.clone(),
-        )));
+        let row_widget = row_widget(ws, details, self.on_close.clone(), self.bridge.clone());
+        row_widget
+            .badge
+            .set_visible(self.notification_workspaces.borrow().contains(&ws.id));
+        self.notification_badges
+            .borrow_mut()
+            .insert(ws.id, row_widget.badge);
+        row.set_child(Some(&row_widget.root));
         let status = self.agent_status.borrow().get(&ws.id).copied();
         apply_agent_status_class(&row, status);
         attach_dnd_handlers(&row, ws.id, self.bridge.clone(), self.rows.clone());
@@ -501,6 +509,8 @@ impl Sidebar {
             rows.remove(idx);
         }
         self.attentions.borrow_mut().remove(&id);
+        self.notification_workspaces.borrow_mut().remove(&id);
+        self.notification_badges.borrow_mut().remove(&id);
         self.agent_status.borrow_mut().remove(&id);
         self.subtitle_cache.borrow_mut().remove(&id);
         self.titles.borrow_mut().retain(|(tid, _)| *tid != id);
@@ -582,6 +592,16 @@ impl Sidebar {
             {
                 row.remove_css_class("flowmux-attention");
             }
+        }
+    }
+
+    /// Show a compact unread dot on each workspace that currently owns an
+    /// unread notification. Replacing the set also clears stale dots after a
+    /// workspace/pane is focused or notifications are read elsewhere.
+    pub fn set_notification_workspaces(&self, workspaces: &HashSet<WorkspaceId>) {
+        *self.notification_workspaces.borrow_mut() = workspaces.clone();
+        for (workspace, badge) in self.notification_badges.borrow().iter() {
+            badge.set_visible(workspaces.contains(workspace));
         }
     }
 
@@ -1093,12 +1113,17 @@ fn sidebar_tab_drop_accepts_formats(formats: &gtk::gdk::ContentFormats) -> bool 
     !formats.contain_mime_type(WORKSPACE_DND_MIME) && tab_dnd_formats_accept_payload(formats)
 }
 
+struct WorkspaceRowWidget {
+    root: gtk::Widget,
+    badge: gtk::Box,
+}
+
 fn row_widget(
     ws: &Workspace,
     details: &WorkspaceRowDetails,
     on_close: Rc<dyn Fn(WorkspaceId)>,
     bridge: Bridge,
-) -> gtk::Widget {
+) -> WorkspaceRowWidget {
     // Row content (color bar + text column) lives in a horizontal Box;
     // the close button is layered on top via a `gtk::Overlay` rather than
     // taking a slot in that Box. Keeping it out of the linear layout lets
@@ -1124,6 +1149,16 @@ fn row_widget(
 
     let row = gtk::Overlay::new();
     row.set_child(Some(&content));
+
+    let notification_badge = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    notification_badge.add_css_class("flowmux-workspace-notification-dot");
+    notification_badge.set_halign(gtk::Align::End);
+    notification_badge.set_valign(gtk::Align::Start);
+    notification_badge.set_margin_top(7);
+    notification_badge.set_margin_end(7);
+    notification_badge.set_can_target(false);
+    notification_badge.set_visible(false);
+    row.add_overlay(&notification_badge);
 
     let close_btn = gtk::Button::from_icon_name("window-close-symbolic");
     close_btn.add_css_class("flat");
@@ -1281,7 +1316,10 @@ fn row_widget(
     });
     row.add_controller(click);
 
-    row.upcast()
+    WorkspaceRowWidget {
+        root: row.upcast(),
+        badge: notification_badge,
+    }
 }
 
 fn color_bar(color: &str) -> gtk::Widget {

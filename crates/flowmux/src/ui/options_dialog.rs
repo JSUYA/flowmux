@@ -27,7 +27,8 @@ use adw::prelude::*;
 use flowmux_config::keybindings::KeybindingOverrides;
 use flowmux_config::options::{
     BrowserEngine, Options, CURSOR_BLINK_INTERVAL_MAX, CURSOR_BLINK_INTERVAL_MIN,
-    FOCUS_BORDER_OPACITY_MAX, FOCUS_BORDER_OPACITY_MIN, ZOOM_MAX, ZOOM_MIN,
+    FOCUS_BORDER_OPACITY_MAX, FOCUS_BORDER_OPACITY_MIN, SCROLLBACK_LINES_MAX, SCROLLBACK_LINES_MIN,
+    ZOOM_MAX, ZOOM_MIN,
 };
 use flowmux_core::AgentNotificationTarget;
 use std::cell::RefCell;
@@ -109,6 +110,7 @@ fn build_dialog(
     let persist_check = build_persist_check(current.persist_browser_session);
     let auto_resume_check = build_persist_check(current.auto_resume_agent_sessions);
     let scrollback_check = build_persist_check(current.restore_terminal_scrollback);
+    let scrollback_lines_spin = build_scrollback_lines_spin(current.scrollback_lines_or_default());
     let system_notify_switch = build_system_notify_switch(current.system_notifications_enabled);
     let agent_bar_switch = build_agent_bar_switch(current.agent_bar_enabled);
     let cursor_blink_switch = build_cursor_blink_switch(current.cursor_blink);
@@ -129,6 +131,7 @@ fn build_dialog(
     general.append(&row("Keep browser session data", &persist_check));
     general.append(&row("Resume agent sessions on reopen", &auto_resume_check));
     general.append(&row("Restore terminal scrollback", &scrollback_check));
+    general.append(&row("Terminal scrollback lines", &scrollback_lines_spin));
     general.append(&row("System notifications", &system_notify_switch));
     general.append(&row("Agent Bar", &agent_bar_switch));
     general.append(&row("Cursor blink", &cursor_blink_switch));
@@ -286,6 +289,7 @@ fn build_dialog(
         let persist_check = persist_check.clone();
         let auto_resume_check = auto_resume_check.clone();
         let scrollback_check = scrollback_check.clone();
+        let scrollback_lines_spin = scrollback_lines_spin.clone();
         let system_notify_switch = system_notify_switch.clone();
         let agent_bar_switch = agent_bar_switch.clone();
         let cursor_blink_switch = cursor_blink_switch.clone();
@@ -315,6 +319,7 @@ fn build_dialog(
                 &persist_check,
                 &auto_resume_check,
                 &scrollback_check,
+                &scrollback_lines_spin,
                 &system_notify_switch,
                 &agent_bar_switch,
                 &cursor_blink_switch,
@@ -827,6 +832,7 @@ fn collect_options(
     persist_check: &gtk::CheckButton,
     auto_resume_check: &gtk::CheckButton,
     scrollback_check: &gtk::CheckButton,
+    scrollback_lines_spin: &gtk::SpinButton,
     system_notify_switch: &gtk::Switch,
     agent_bar_switch: &gtk::Switch,
     cursor_blink_switch: &gtk::Switch,
@@ -869,6 +875,9 @@ fn collect_options(
         persist_browser_session: persist_check.is_active(),
         auto_resume_agent_sessions: auto_resume_check.is_active(),
         restore_terminal_scrollback: scrollback_check.is_active(),
+        scrollback_lines: Some(Options::clamp_scrollback_lines(
+            scrollback_lines_spin.value_as_int().max(0) as u32,
+        )),
         system_notifications_enabled: system_notify_switch.is_active(),
         agent_bar_enabled: agent_bar_switch.is_active(),
         cursor_blink: cursor_blink_switch.is_active(),
@@ -1103,6 +1112,25 @@ fn build_persist_check(initial: bool) -> gtk::CheckButton {
     let check = gtk::CheckButton::with_label("Persist cookies, sign-ins, and site data");
     check.set_active(initial);
     check
+}
+
+/// Scrollback capacity for terminal tabs created after the option is saved.
+fn build_scrollback_lines_spin(initial: u32) -> gtk::SpinButton {
+    let initial = Options::clamp_scrollback_lines(initial);
+    let adjustment = gtk::Adjustment::new(
+        initial as f64,
+        SCROLLBACK_LINES_MIN as f64,
+        SCROLLBACK_LINES_MAX as f64,
+        1_000.0,
+        10_000.0,
+        0.0,
+    );
+    let spin = gtk::SpinButton::new(Some(&adjustment), 1_000.0, 0);
+    spin.set_numeric(true);
+    spin.set_snap_to_ticks(true);
+    spin.set_halign(gtk::Align::End);
+    spin.set_tooltip_text(Some("Applies to new terminal tabs only"));
+    spin
 }
 
 /// Toggle for [`Options::system_notifications_enabled`]. When off,
@@ -1340,6 +1368,7 @@ mod tests {
         let persist_off = build_persist_check(false);
         let auto_resume_off = build_persist_check(false);
         let scrollback_on = build_persist_check(true);
+        let scrollback_lines = build_scrollback_lines_spin(42_000);
         // Two-entry font picker: index 0 = inherit, index 1 = a concrete family.
         let family_drop = gtk::DropDown::from_strings(&["System default", "Fira Code"]);
         let families = vec![None, Some("Fira Code".to_string())];
@@ -1361,6 +1390,7 @@ mod tests {
             &persist_off,
             &auto_resume_off,
             &scrollback_on,
+            &scrollback_lines,
             &notify_on,
             &agent_bar_on,
             &blink_on,
@@ -1386,6 +1416,7 @@ mod tests {
         assert!(!opts.persist_browser_session);
         assert!(!opts.auto_resume_agent_sessions);
         assert!(opts.restore_terminal_scrollback);
+        assert_eq!(opts.scrollback_lines, Some(42_000));
         // Index 0 selected + size left at the theme default → font inherits.
         assert_eq!(opts.font_family, None);
         assert_eq!(opts.font_size, None);
@@ -1408,6 +1439,7 @@ mod tests {
             &persist_on,
             &auto_resume_on,
             &scrollback_off,
+            &scrollback_lines,
             &notify_off,
             &agent_bar_off,
             &blink_off,

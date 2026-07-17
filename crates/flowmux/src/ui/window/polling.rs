@@ -218,6 +218,22 @@ impl WindowController {
     /// `unread_count()` after each `await` so bursty pushes/sweeps
     /// always converge to the freshest value.
     pub(super) fn refresh_launcher_badge(&self) {
+        let unread = self
+            .notifications
+            .entries()
+            .into_iter()
+            .filter(|entry| !entry.read)
+            .collect::<Vec<_>>();
+        let workspaces = unread
+            .iter()
+            .filter_map(|entry| entry.workspace)
+            .collect::<HashSet<_>>();
+        let panes = unread
+            .iter()
+            .filter_map(|entry| entry.pane)
+            .collect::<HashSet<_>>();
+        self.sidebar.set_notification_workspaces(&workspaces);
+        self.pane_registry.borrow().set_notification_panes(&panes);
         self.notifications.refresh_launcher_badge();
     }
 }

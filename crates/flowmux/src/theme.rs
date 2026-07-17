@@ -251,7 +251,8 @@ impl ResolvedTheme {
     margin: 0;
     padding: 0;
 }}
-.flowmux-pane.focused .flowmux-pane-tabbar {{
+.flowmux-pane.focused .flowmux-pane-tabbar,
+.flowmux-pane.flowmux-notification .flowmux-pane-tabbar {{
     box-shadow: inset 0 2px {focus};
 }}
 .flowmux-pane.focused.flowmux-solo .flowmux-pane-tabbar {{
@@ -430,6 +431,12 @@ paned > separator {{
 }}
 .navigation-sidebar row.flowmux-attention {{
     background-color: rgba(245, 158, 11, 0.18);
+}}
+.flowmux-workspace-notification-dot {{
+    min-width: 7px;
+    min-height: 7px;
+    border-radius: 99px;
+    background-color: {focus_full};
 }}
 .navigation-sidebar row.flowmux-agent-blocked {{
     background-color: rgba(239, 68, 68, 0.16);
@@ -797,11 +804,26 @@ mod tests {
             .expect("solo override missing");
         let tail = &css[solo_rule_idx..];
         assert!(
-            css.contains(".flowmux-pane.focused .flowmux-pane-tabbar {")
+            css.contains(".flowmux-pane.focused .flowmux-pane-tabbar,")
                 && css.contains("box-shadow: inset 0 2px")
                 && tail.contains("box-shadow: none"),
             "focus accent must stay in the pane header and disappear for solo panes"
         );
+    }
+
+    #[test]
+    fn notification_cues_reuse_the_focus_accent() {
+        let css = sample_css();
+        assert!(css.contains(".flowmux-pane.flowmux-notification .flowmux-pane-tabbar {"));
+        assert!(css.contains(".flowmux-workspace-notification-dot {"));
+        let dot_rule = css
+            .split(".flowmux-workspace-notification-dot {")
+            .nth(1)
+            .expect("notification dot rule missing");
+        assert!(dot_rule
+            .split('}')
+            .next()
+            .is_some_and(|rule| rule.contains("background-color: rgba(")));
     }
 
     #[test]

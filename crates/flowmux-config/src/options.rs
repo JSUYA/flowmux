@@ -47,6 +47,12 @@ pub const AUTO_RESUME_AGENT_SESSIONS_DEFAULT: bool = true;
 /// Persist and replay a bounded plain-text terminal history on relaunch.
 pub const RESTORE_TERMINAL_SCROLLBACK_DEFAULT: bool = true;
 
+/// Number of terminal history lines kept by a new terminal tab when the
+/// option is not explicitly configured.
+pub const SCROLLBACK_LINES_DEFAULT: u32 = 10_000;
+pub const SCROLLBACK_LINES_MIN: u32 = 1_000;
+pub const SCROLLBACK_LINES_MAX: u32 = 1_000_000;
+
 /// Default for [`Options::system_notifications_enabled`]. Desktop toasts ship
 /// enabled so flowmux behaves like every other notifying app on first launch;
 /// the user can opt out to keep only the in-app bell list.
@@ -136,6 +142,10 @@ pub struct Options {
     pub auto_resume_agent_sessions: bool,
     #[serde(default = "default_restore_terminal_scrollback")]
     pub restore_terminal_scrollback: bool,
+    /// Scrollback capacity for newly created terminal tabs. `None` preserves
+    /// the built-in 10,000-line default for older option files.
+    #[serde(default)]
+    pub scrollback_lines: Option<u32>,
     /// When true, notifications are delivered as system desktop toasts
     /// (libnotify / D-Bus) in addition to the in-app bell list. When false,
     /// notifications still appear in the in-app bell list but no system toast
@@ -241,6 +251,7 @@ impl Default for Options {
             persist_browser_session: default_persist_browser_session(),
             auto_resume_agent_sessions: default_auto_resume_agent_sessions(),
             restore_terminal_scrollback: default_restore_terminal_scrollback(),
+            scrollback_lines: None,
             system_notifications_enabled: default_system_notifications_enabled(),
             agent_bar_enabled: default_agent_bar_enabled(),
             cursor_blink: default_cursor_blink(),
@@ -377,6 +388,19 @@ impl Options {
         self
     }
 
+    pub fn clamp_scrollback_lines(lines: u32) -> u32 {
+        lines.clamp(SCROLLBACK_LINES_MIN, SCROLLBACK_LINES_MAX)
+    }
+
+    pub fn scrollback_lines_or_default(&self) -> u32 {
+        Self::clamp_scrollback_lines(self.scrollback_lines.unwrap_or(SCROLLBACK_LINES_DEFAULT))
+    }
+
+    pub fn with_scrollback_lines(mut self, lines: Option<u32>) -> Self {
+        self.scrollback_lines = lines.map(Self::clamp_scrollback_lines);
+        self
+    }
+
     /// Builder-style setter for the system-notification (desktop toast) flag.
     pub fn with_system_notifications_enabled(mut self, enabled: bool) -> Self {
         self.system_notifications_enabled = enabled;
@@ -447,6 +471,7 @@ pub fn load() -> Options {
         zoom_percent: Options::clamp_zoom(opts.zoom_percent),
         focus_border_color,
         focus_border_opacity: Options::clamp_focus_border_opacity(opts.focus_border_opacity),
+        scrollback_lines: opts.scrollback_lines.map(Options::clamp_scrollback_lines),
         ..opts
     }
 }
@@ -857,6 +882,27 @@ mod tests {
             let back = load();
             assert!(!back.auto_resume_agent_sessions);
             assert!(!back.restore_terminal_scrollback);
+        });
+    }
+
+    #[test]
+    fn scrollback_lines_default_clamp_and_round_trip() {
+        assert_eq!(
+            Options::default().scrollback_lines_or_default(),
+            SCROLLBACK_LINES_DEFAULT
+        );
+        assert_eq!(Options::clamp_scrollback_lines(0), SCROLLBACK_LINES_MIN);
+        assert_eq!(
+            Options::clamp_scrollback_lines(u32::MAX),
+            SCROLLBACK_LINES_MAX
+        );
+
+        with_xdg(|_| {
+            let opts = Options::default().with_scrollback_lines(Some(42_000));
+            save(&opts).unwrap();
+            let back = load();
+            assert_eq!(back.scrollback_lines, Some(42_000));
+            assert_eq!(back.scrollback_lines_or_default(), 42_000);
         });
     }
 

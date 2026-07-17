@@ -547,6 +547,7 @@ impl GhosttyPane {
         argv: Vec<String>,
         cwd: Option<std::path::PathBuf>,
         extra_env: Vec<(String, String)>,
+        scrollback_lines: u32,
         callbacks: PaneCallbacks,
     ) -> Self {
         let pane_id = Rc::new(Cell::new(id));
@@ -554,7 +555,7 @@ impl GhosttyPane {
         let term = vte::Terminal::new();
         term.set_hexpand(true);
         term.set_vexpand(true);
-        term.set_scrollback_lines(10_000);
+        term.set_scrollback_lines(i64::from(scrollback_lines));
         term.set_audible_bell(false);
         // Snap the viewport back to the live cursor row whenever the user
         // types: someone who scrolled up to inspect scrollback should not

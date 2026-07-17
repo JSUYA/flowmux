@@ -15,7 +15,7 @@ use flowmux_core::{
 };
 use gtk::prelude::*;
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -211,6 +211,19 @@ impl PaneRegistry {
                 }
             } else {
                 frame.remove_css_class("focused");
+            }
+        }
+    }
+
+    /// Mirror unread notification ownership onto pane frames. The theme uses
+    /// the same top-edge focus treatment for this class, so no second renderer
+    /// or notification-specific color path is needed.
+    pub fn set_notification_panes(&self, panes: &HashSet<PaneId>) {
+        for (pane, frame) in &self.pane_frames {
+            if panes.contains(pane) {
+                frame.add_css_class("flowmux-notification");
+            } else {
+                frame.remove_css_class("flowmux-notification");
             }
         }
     }
@@ -2523,6 +2536,7 @@ fn build_panel(
                 argv,
                 cwd.clone(),
                 extra_env,
+                opts.scrollback_lines_or_default(),
                 callbacks.clone(),
             );
             theme.apply_to_ghostty(&pane);
