@@ -4,14 +4,14 @@
 # Build and install a local macOS FlowMux.app bundle.
 #
 # Usage:
-#   scripts/install-macos.sh [--check] [--debug|--release] [--launch]
+#   scripts/install-macos.sh [--check] [--fast|--debug|--release] [--launch]
 #                            [--app-dir DIR] [--bin-dir DIR]
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APP_DIR="${FLOWMUX_MACOS_APP_DIR:-$HOME/Applications}"
 BIN_DIR="${FLOWMUX_MACOS_BIN_DIR:-$HOME/.local/bin}"
-PROFILE="${FLOWMUX_MACOS_PROFILE:-release}"
+PROFILE="${FLOWMUX_MACOS_PROFILE:-fast}"
 CHECK_ONLY=false
 LAUNCH=false
 
@@ -23,6 +23,10 @@ while [ "$#" -gt 0 ]; do
     case "$1" in
         --check)
             CHECK_ONLY=true
+            shift
+            ;;
+        --fast)
+            PROFILE=fast
             shift
             ;;
         --debug)
@@ -235,14 +239,21 @@ EOF
 }
 
 build_args=()
-target_subdir="debug"
-if [ "$PROFILE" = "release" ]; then
-    build_args+=(--release)
-    target_subdir="release"
-elif [ "$PROFILE" != "debug" ]; then
-    echo "error: unsupported profile: $PROFILE" >&2
-    exit 2
-fi
+target_subdir="$PROFILE"
+case "$PROFILE" in
+    fast)
+        build_args+=(--profile fast)
+        ;;
+    release)
+        build_args+=(--release)
+        ;;
+    debug)
+        ;;
+    *)
+        echo "error: unsupported profile: $PROFILE" >&2
+        exit 2
+        ;;
+esac
 
 configure_macos_path
 preflight_macos

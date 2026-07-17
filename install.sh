@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-3.0-or-later
 #
-# Release-build flowmux and install the binaries, the .desktop entry and the
-# app icons to the host, so flowmux shows up in the app launcher / dock.
+# Build flowmux (fast profile: release optimization without LTO, for quicker
+# local installs) and install the binaries, the .desktop entry and the app
+# icons to the host, so flowmux shows up in the app launcher / dock.
 #
 # flowmux uses the system GTK4/libadwaita/WebKitGTK/VTE libraries. The image
 # viewer discovers ThorVG at runtime with libloading, so the core app builds
@@ -53,8 +54,8 @@ if ! ldconfig -p 2>/dev/null | grep -q 'libthorvg-1\.so' \
     echo "        scripts/install-thorvg.sh        # build from source (Ubuntu)" >&2
 fi
 
-echo "==> building flowmux (release)"
-cargo build --release -p flowmux -p flowmux-cli -p flowmux-md-viewer
+echo "==> building flowmux (fast profile)"
+cargo build --profile fast -p flowmux -p flowmux-cli -p flowmux-md-viewer
 
 # The first directory installed to is the one the .desktop entry points at, so
 # launching from the dock runs the same binary a shell on PATH would.
@@ -62,9 +63,9 @@ PRIMARY_BIN_DIR=""
 for dir in "$HOME/.local/bin" "$HOME/.cargo/bin"; do
     if [ -d "$dir" ]; then
         install -m755 \
-            target/release/flowmux \
-            target/release/flowmuxctl \
-            target/release/flowmux-md-viewer \
+            target/fast/flowmux \
+            target/fast/flowmuxctl \
+            target/fast/flowmux-md-viewer \
             "$dir/"
         echo "==> installed to $dir"
         [ -n "$PRIMARY_BIN_DIR" ] || PRIMARY_BIN_DIR="$dir"

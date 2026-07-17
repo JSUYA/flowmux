@@ -78,3 +78,11 @@ flowmux-browser = { path = "crates/flowmux-browser" }
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
+
+# Local installs (install.sh / scripts/install-macos.sh): release-grade
+# optimization without the slow thin-LTO + single-codegen-unit passes.
+# Dist packages (flatpak, release.yml) keep [profile.release].
+[profile.fast]
+inherits = "release"
+lto = false
+codegen-units = 16
