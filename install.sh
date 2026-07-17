@@ -14,6 +14,34 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$REPO_ROOT"
 
+# Launcher-started GUIs (and the in-app updater they spawn) inherit a session
+# PATH without ~/.cargo/bin, so a bare `cargo` below can resolve to an outdated
+# distro toolchain. Prefer the rustup toolchain unless the caller's PATH
+# already provides it.
+if [ -d "$HOME/.cargo/bin" ]; then
+    case ":$PATH:" in
+        *":$HOME/.cargo/bin:"*) ;;
+        *) PATH="$HOME/.cargo/bin:$PATH" ;;
+    esac
+fi
+
+# Fail with a clear message when cargo is missing or predates the workspace
+# MSRV — an old toolchain otherwise dies on the lock file or mid-build with
+# errors that do not name the real problem.
+MSRV="$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)"
+if ! command -v cargo >/dev/null 2>&1; then
+    echo "error: cargo not found on PATH. Install Rust via https://rustup.rs" >&2
+    exit 1
+fi
+CARGO_VERSION="$(cargo --version | awk '{print $2}')"
+if [ "$(printf '%s\n' "$MSRV" "$CARGO_VERSION" | sort -V | head -n1)" != "$MSRV" ]; then
+    echo "error: cargo $CARGO_VERSION ($(command -v cargo)) is older than the" >&2
+    echo "       required $MSRV (rust-version in Cargo.toml). This usually means" >&2
+    echo "       a distro toolchain (e.g. apt cargo) shadowed rustup's." >&2
+    echo "       Install or update Rust via rustup: https://rustup.rs" >&2
+    exit 1
+fi
+
 # ThorVG is an optional runtime dependency: flowmux builds and installs without
 # it. If it is missing, everything works except the inline image viewer, which
 # shows a "ThorVG is not installed" message until the library is present.

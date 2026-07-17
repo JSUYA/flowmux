@@ -70,6 +70,25 @@ pub fn install_script(os: &str) -> &'static str {
     }
 }
 
+/// PATH for the spawned install script. Launcher-started GUIs inherit
+/// a session PATH without `~/.cargo/bin`, so a bare `cargo` in the
+/// script can resolve to an outdated distro toolchain that cannot even
+/// parse the lock file. Returns the PATH to override with: `home`'s
+/// `.cargo/bin` prepended when it is absent from `path`, or `None`
+/// when `path` already contains it (a shell resolving cargo through
+/// that PATH is the behavior to reproduce, not to reorder) or `home`
+/// is unknown.
+pub fn install_path_env(home: Option<&Path>, path: &std::ffi::OsStr) -> Option<std::ffi::OsString> {
+    let cargo_bin = home?.join(".cargo").join("bin");
+    if std::env::split_paths(path).any(|entry| entry == cargo_bin) {
+        return None;
+    }
+    if path.is_empty() {
+        return Some(cargo_bin.into());
+    }
+    std::env::join_paths(std::iter::once(cargo_bin).chain(std::env::split_paths(path))).ok()
+}
+
 /// Ordered argv lists that bring the managed clone at `dir` to `tag`.
 /// `clone_exists` decides between a fresh shallow clone and a shallow
 /// tag fetch + detached checkout in the existing clone.
@@ -108,6 +127,7 @@ pub fn git_plan(clone_exists: bool, url: &str, dir: &Path, tag: &str) -> Vec<Vec
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::{OsStr, OsString};
     use std::path::PathBuf;
 
     #[test]
@@ -199,6 +219,41 @@ ffffeeeeddddccccbbbbaaaa9999888877776666\trefs/heads/main
                 "https://example.com/r.git".to_string(),
                 "/home/u/.cache/flowmux/src".to_string(),
             ]]
+        );
+    }
+
+    #[test]
+    fn install_path_env_prepends_missing_cargo_bin() {
+        let home = PathBuf::from("/home/u");
+        let path = OsString::from("/usr/local/bin:/usr/bin:/bin");
+        assert_eq!(
+            install_path_env(Some(&home), &path),
+            Some(OsString::from(
+                "/home/u/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
+            ))
+        );
+    }
+
+    #[test]
+    fn install_path_env_keeps_path_with_cargo_bin_untouched() {
+        let home = PathBuf::from("/home/u");
+        // Position must not matter: a shell that resolves cargo through
+        // this PATH is the behavior to reproduce, not to reorder.
+        let path = OsString::from("/usr/bin:/home/u/.cargo/bin:/bin");
+        assert_eq!(install_path_env(Some(&home), &path), None);
+    }
+
+    #[test]
+    fn install_path_env_without_home_is_noop() {
+        assert_eq!(install_path_env(None, OsStr::new("/usr/bin")), None);
+    }
+
+    #[test]
+    fn install_path_env_handles_empty_path() {
+        let home = PathBuf::from("/home/u");
+        assert_eq!(
+            install_path_env(Some(&home), OsStr::new("")),
+            Some(OsString::from("/home/u/.cargo/bin"))
         );
     }
 

@@ -108,9 +108,17 @@ async fn run_install_inner(
 
     let _ = tx.send(Event::Stage(Stage::Installing)).await;
     let script = check::install_script(std::env::consts::OS);
+    // A launcher-started GUI has no ~/.cargo/bin on PATH, so the
+    // script's bare `cargo` would hit an outdated distro toolchain.
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let path = check::install_path_env(
+        home.as_deref(),
+        &std::env::var_os("PATH").unwrap_or_default(),
+    );
     run_logged(
         vec!["bash".to_string(), script.to_string()],
         Some(dir),
+        path.map(|p| ("PATH", p)),
         &log,
     )
     .await
@@ -118,7 +126,7 @@ async fn run_install_inner(
 
 async fn run_plan(plan: Vec<Vec<String>>, log: &std::fs::File) -> anyhow::Result<()> {
     for argv in plan {
-        run_logged(argv, None, log).await?;
+        run_logged(argv, None, None, log).await?;
     }
     Ok(())
 }
@@ -132,6 +140,7 @@ async fn run_plan(plan: Vec<Vec<String>>, log: &std::fs::File) -> anyhow::Result
 async fn run_logged(
     argv: Vec<String>,
     cwd: Option<std::path::PathBuf>,
+    env: Option<(&'static str, std::ffi::OsString)>,
     log: &std::fs::File,
 ) -> anyhow::Result<()> {
     let label = argv.join(" ");
@@ -146,6 +155,9 @@ async fn run_logged(
             .stderr(stderr);
         if let Some(cwd) = cwd {
             cmd.current_dir(cwd);
+        }
+        if let Some((key, value)) = env {
+            cmd.env(key, value);
         }
         cmd.status()
     })
