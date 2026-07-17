@@ -35,6 +35,71 @@ use tokio::sync::oneshot;
 type RowsCell = Rc<RefCell<Vec<(WorkspaceId, gtk::ListBoxRow)>>>;
 
 const WORKSPACE_DND_MIME: &str = "application/x-flowmux-workspace";
+const SIDEBAR_TREE_GUTTER_WIDTH: i32 = 14;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TreeBranch {
+    Middle,
+    Last,
+}
+
+impl TreeBranch {
+    fn for_position(has_following_sibling: bool) -> Self {
+        if has_following_sibling {
+            Self::Middle
+        } else {
+            Self::Last
+        }
+    }
+}
+
+/// Connector columns drawn before one metadata row. Each boolean represents
+/// an ancestor depth and is true while that ancestor still has a following
+/// sibling. `branch` describes the row at the current (last) depth.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TreeLine {
+    ancestor_continuations: Vec<bool>,
+    branch: TreeBranch,
+}
+
+impl TreeLine {
+    fn top_level(has_following_sibling: bool) -> Self {
+        Self {
+            ancestor_continuations: Vec::new(),
+            branch: TreeBranch::for_position(has_following_sibling),
+        }
+    }
+
+    fn nested(ancestor_continues: bool, has_following_sibling: bool) -> Self {
+        Self {
+            ancestor_continuations: vec![ancestor_continues],
+            branch: TreeBranch::for_position(has_following_sibling),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MetadataTreeRow {
+    AgentHeader(usize),
+    AgentStatus(usize),
+    AgentPath(usize),
+    Path(usize),
+    Aux,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MetadataTreeRowLayout {
+    row: MetadataTreeRow,
+    line: TreeLine,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct TreeSegment {
+    x1: f64,
+    y1: f64,
+    x2: f64,
+    y2: f64,
+}
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct WorkspaceRowDetails {
@@ -1277,46 +1342,67 @@ fn build_meta_column(ws: &Workspace, details: &WorkspaceRowDetails) -> gtk::Box 
     //   line 2..: optional agent blocks followed by up to 3 shortened MRU cwd
     //             paths in .../A/B/C form.
     //   optional aux: linked PR badge / listening ports.
-    let v = gtk::Box::new(gtk::Orientation::Vertical, 1);
+    // Tree gutter segments live in each metadata row. A zero box spacing keeps
+    // adjacent 1px vertical segments continuous; the labels' own line heights
+    // still provide the same compact visual rhythm.
+    let v = gtk::Box::new(gtk::Orientation::Vertical, 0);
 
     let title = gtk::Label::new(Some(ws.display_title()));
     title.set_halign(gtk::Align::Start);
     title.set_ellipsize(gtk::pango::EllipsizeMode::End);
     title.set_xalign(0.0);
     title.add_css_class("heading");
+    title.set_margin_bottom(1);
     v.append(&title);
 
-    for block in &details.agent_blocks {
-        v.append(&agent_block_header(block));
-        let status = gtk::Label::new(Some(block.status_text.as_str()));
-        status.set_halign(gtk::Align::Start);
-        status.set_xalign(0.0);
-        status.set_ellipsize(gtk::pango::EllipsizeMode::End);
-        status.set_single_line_mode(true);
-        status.set_lines(1);
-        status.set_wrap(false);
-        status.set_margin_start(18);
-        status.add_css_class("caption");
-        status.add_css_class("dim-label");
-        v.append(&status);
-
-        if let Some(path) = block.path.as_deref() {
-            let label = sidebar_path_label(path, false);
-            label.set_margin_start(18);
-            v.append(&label);
-        }
+    let aux = workspace_aux_row(ws);
+    for layout in metadata_tree_layout(details, aux.is_some()) {
+        let child: gtk::Widget = match layout.row {
+            MetadataTreeRow::AgentHeader(index) => {
+                agent_block_header(&details.agent_blocks[index]).upcast()
+            }
+            MetadataTreeRow::AgentStatus(index) => {
+                let block = &details.agent_blocks[index];
+                let status = gtk::Label::new(Some(block.status_text.as_str()));
+                status.set_halign(gtk::Align::Start);
+                status.set_xalign(0.0);
+                status.set_ellipsize(gtk::pango::EllipsizeMode::End);
+                status.set_single_line_mode(true);
+                status.set_lines(1);
+                status.set_wrap(false);
+                status.add_css_class("caption");
+                status.add_css_class("dim-label");
+                status.upcast()
+            }
+            MetadataTreeRow::AgentPath(index) => sidebar_path_label(
+                details.agent_blocks[index]
+                    .path
+                    .as_deref()
+                    .expect("AgentPath layout requires a path"),
+                false,
+            )
+            .upcast(),
+            MetadataTreeRow::Path(index) => sidebar_path_label(
+                details.path_lines[index].as_str(),
+                index == 0 && details.agent_blocks.is_empty(),
+            )
+            .upcast(),
+            MetadataTreeRow::Aux => aux
+                .as_ref()
+                .expect("Aux layout requires an auxiliary row")
+                .clone()
+                .upcast(),
+        };
+        v.append(&sidebar_tree_row(&child, layout.line));
     }
 
-    for (i, line) in details.path_lines.iter().take(3).enumerate() {
-        v.append(&sidebar_path_label(
-            line.as_str(),
-            i == 0 && details.agent_blocks.is_empty(),
-        ));
-    }
+    v
+}
 
-    // Auxiliary line: PR badge + listening ports (kept compact).
+fn workspace_aux_row(ws: &Workspace) -> Option<gtk::Box> {
+    // Auxiliary metadata is a workspace-level child, alongside agent blocks
+    // and cwd paths, so it receives the same top-level tree connector.
     let aux = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    let mut has_aux = false;
     if let Some(git) = &ws.git {
         if let Some(pr) = &git.linked_pr {
             let badge = gtk::Label::new(Some(&format!("#{}", pr.number)));
@@ -1328,7 +1414,6 @@ fn build_meta_column(ws: &Workspace, details: &WorkspaceRowDetails) -> gtk::Box 
                 PrState::Draft => "dim-label",
             });
             aux.append(&badge);
-            has_aux = true;
         }
     }
     if !ws.listening_ports.is_empty() {
@@ -1342,13 +1427,135 @@ fn build_meta_column(ws: &Workspace, details: &WorkspaceRowDetails) -> gtk::Box 
         p.add_css_class("caption");
         p.add_css_class("dim-label");
         aux.append(&p);
-        has_aux = true;
-    }
-    if has_aux {
-        v.append(&aux);
     }
 
-    v
+    aux.first_child().map(|_| aux)
+}
+
+fn metadata_tree_layout(
+    details: &WorkspaceRowDetails,
+    has_aux: bool,
+) -> Vec<MetadataTreeRowLayout> {
+    let path_count = details.path_lines.len().min(3);
+    let top_level_count = details.agent_blocks.len() + path_count + usize::from(has_aux);
+    let mut top_level_index = 0;
+    let mut rows = Vec::new();
+
+    for (agent_index, block) in details.agent_blocks.iter().enumerate() {
+        let has_following_top_level = top_level_index + 1 < top_level_count;
+        rows.push(MetadataTreeRowLayout {
+            row: MetadataTreeRow::AgentHeader(agent_index),
+            line: TreeLine::top_level(has_following_top_level),
+        });
+        rows.push(MetadataTreeRowLayout {
+            row: MetadataTreeRow::AgentStatus(agent_index),
+            line: TreeLine::nested(has_following_top_level, block.path.is_some()),
+        });
+        if block.path.is_some() {
+            rows.push(MetadataTreeRowLayout {
+                row: MetadataTreeRow::AgentPath(agent_index),
+                line: TreeLine::nested(has_following_top_level, false),
+            });
+        }
+        top_level_index += 1;
+    }
+
+    for path_index in 0..path_count {
+        let has_following_top_level = top_level_index + 1 < top_level_count;
+        rows.push(MetadataTreeRowLayout {
+            row: MetadataTreeRow::Path(path_index),
+            line: TreeLine::top_level(has_following_top_level),
+        });
+        top_level_index += 1;
+    }
+
+    if has_aux {
+        rows.push(MetadataTreeRowLayout {
+            row: MetadataTreeRow::Aux,
+            line: TreeLine::top_level(false),
+        });
+    }
+
+    rows
+}
+
+fn sidebar_tree_row(child: &impl IsA<gtk::Widget>, line: TreeLine) -> gtk::Box {
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    row.set_hexpand(true);
+    row.add_css_class("flowmux-sidebar-tree-row");
+
+    let gutter_width =
+        (line.ancestor_continuations.len() as i32 + 1).saturating_mul(SIDEBAR_TREE_GUTTER_WIDTH);
+    let gutter = gtk::DrawingArea::builder()
+        .content_width(gutter_width)
+        .accessible_role(gtk::AccessibleRole::Presentation)
+        .build();
+    gutter.set_widget_name("flowmux-sidebar-tree-gutter");
+    gutter.add_css_class("flowmux-sidebar-tree-gutter");
+    gutter.set_can_target(false);
+    gutter.set_focusable(false);
+    gutter.set_vexpand(true);
+    gutter.set_draw_func(move |area, cr, width, height| {
+        let color = area.color();
+        cr.set_source_rgba(
+            color.red() as f64,
+            color.green() as f64,
+            color.blue() as f64,
+            color.alpha() as f64,
+        );
+        cr.set_line_width(1.0);
+        cr.set_line_cap(gtk::cairo::LineCap::Butt);
+        for segment in tree_segments(&line, width, height) {
+            cr.move_to(segment.x1, segment.y1);
+            cr.line_to(segment.x2, segment.y2);
+        }
+        let _ = cr.stroke();
+    });
+    row.append(&gutter);
+
+    child.set_hexpand(true);
+    row.append(child);
+    row
+}
+
+fn tree_segments(line: &TreeLine, width: i32, height: i32) -> Vec<TreeSegment> {
+    let width = width.max(1) as f64;
+    let height = height.max(1) as f64;
+    let mid_y = (height / 2.0).floor() + 0.5;
+    let mut segments = Vec::with_capacity(line.ancestor_continuations.len() + 2);
+
+    for (depth, continues) in line.ancestor_continuations.iter().copied().enumerate() {
+        if continues {
+            let x = depth as f64 * SIDEBAR_TREE_GUTTER_WIDTH as f64 + 6.5;
+            segments.push(TreeSegment {
+                x1: x,
+                y1: 0.0,
+                x2: x,
+                y2: height,
+            });
+        }
+    }
+
+    let depth = line.ancestor_continuations.len();
+    let x = depth as f64 * SIDEBAR_TREE_GUTTER_WIDTH as f64 + 6.5;
+    let branch_end_y = match line.branch {
+        TreeBranch::Middle => height,
+        TreeBranch::Last => mid_y,
+    };
+    segments.push(TreeSegment {
+        x1: x,
+        y1: 0.0,
+        x2: x,
+        y2: branch_end_y,
+    });
+    segments.push(TreeSegment {
+        x1: x,
+        y1: mid_y,
+        x2: width - 0.5,
+        y2: mid_y,
+    });
+
+    segments
 }
 
 fn agent_block_header(block: &WorkspaceRowAgentBlock) -> gtk::Box {
@@ -1426,6 +1633,61 @@ mod tests {
     use flowmux_core::{Pane, PaneContent, PaneId, PaneSurface, Surface, SurfaceId, SurfaceKind};
     use std::path::PathBuf;
 
+    fn agent_block(name: &str, path: Option<&str>) -> WorkspaceRowAgentBlock {
+        WorkspaceRowAgentBlock {
+            agent_name: name.into(),
+            status: AgentStatus::Working,
+            seen: true,
+            status_text: "running tests".into(),
+            path: path.map(str::to_owned),
+            overflow_count: 0,
+        }
+    }
+
+    fn layout(row: MetadataTreeRow, line: TreeLine) -> MetadataTreeRowLayout {
+        MetadataTreeRowLayout { row, line }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn tree_gutter_widths(meta: &gtk::Box) -> Vec<i32> {
+        let mut widths = Vec::new();
+        let mut child = meta.first_child();
+        while let Some(widget) = child {
+            if widget.has_css_class("flowmux-sidebar-tree-row") {
+                let row = widget
+                    .clone()
+                    .downcast::<gtk::Box>()
+                    .expect("tree row must be a box");
+                let gutter = row
+                    .first_child()
+                    .expect("tree row must have a gutter")
+                    .downcast::<gtk::DrawingArea>()
+                    .expect("tree gutter must be a drawing area");
+                widths.push(gutter.content_width());
+            }
+            child = widget.next_sibling();
+        }
+        widths
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn descendant_labels(widget: &impl IsA<gtk::Widget>) -> Vec<gtk::Label> {
+        fn visit(widget: &gtk::Widget, labels: &mut Vec<gtk::Label>) {
+            if let Ok(label) = widget.clone().downcast::<gtk::Label>() {
+                labels.push(label);
+            }
+            let mut child = widget.first_child();
+            while let Some(current) = child {
+                visit(&current, labels);
+                child = current.next_sibling();
+            }
+        }
+
+        let mut labels = Vec::new();
+        visit(widget.as_ref(), &mut labels);
+        labels
+    }
+
     fn ws_with_active_terminal_cwd(cwd: Option<PathBuf>) -> Workspace {
         let surface = PaneSurface::terminal("auto", cwd.clone());
         let surface_id = surface.id;
@@ -1453,6 +1715,156 @@ mod tests {
             }],
             color: None,
         }
+    }
+
+    #[test]
+    fn metadata_tree_layout_is_empty_without_metadata() {
+        assert!(metadata_tree_layout(&WorkspaceRowDetails::default(), false).is_empty());
+    }
+
+    #[test]
+    fn metadata_tree_layout_marks_direct_path_siblings_and_last_child() {
+        let one = WorkspaceRowDetails::path_only(&[".../one".into()]);
+        assert_eq!(
+            metadata_tree_layout(&one, false),
+            vec![layout(MetadataTreeRow::Path(0), TreeLine::top_level(false),)]
+        );
+
+        let three = WorkspaceRowDetails::path_only(&[
+            ".../one".into(),
+            ".../two".into(),
+            ".../three".into(),
+        ]);
+        assert_eq!(
+            metadata_tree_layout(&three, false),
+            vec![
+                layout(MetadataTreeRow::Path(0), TreeLine::top_level(true),),
+                layout(MetadataTreeRow::Path(1), TreeLine::top_level(true),),
+                layout(MetadataTreeRow::Path(2), TreeLine::top_level(false),),
+            ]
+        );
+    }
+
+    #[test]
+    fn metadata_tree_layout_nests_agent_status_and_optional_path() {
+        let details = WorkspaceRowDetails {
+            agent_blocks: vec![agent_block("codex", None)],
+            path_lines: vec![],
+        };
+        assert_eq!(
+            metadata_tree_layout(&details, false),
+            vec![
+                layout(MetadataTreeRow::AgentHeader(0), TreeLine::top_level(false),),
+                layout(
+                    MetadataTreeRow::AgentStatus(0),
+                    TreeLine::nested(false, false),
+                ),
+            ]
+        );
+
+        let details = WorkspaceRowDetails {
+            agent_blocks: vec![agent_block("codex", Some(".../agent/path"))],
+            path_lines: vec![".../fallback/path".into()],
+        };
+        assert_eq!(
+            metadata_tree_layout(&details, true),
+            vec![
+                layout(MetadataTreeRow::AgentHeader(0), TreeLine::top_level(true),),
+                layout(
+                    MetadataTreeRow::AgentStatus(0),
+                    TreeLine::nested(true, true),
+                ),
+                layout(MetadataTreeRow::AgentPath(0), TreeLine::nested(true, false),),
+                layout(MetadataTreeRow::Path(0), TreeLine::top_level(true),),
+                layout(MetadataTreeRow::Aux, TreeLine::top_level(false)),
+            ]
+        );
+    }
+
+    #[test]
+    fn metadata_tree_layout_keeps_first_agent_open_until_final_agent() {
+        let details = WorkspaceRowDetails {
+            agent_blocks: vec![
+                agent_block("codex", Some(".../codex")),
+                agent_block("claude", None),
+            ],
+            path_lines: vec![],
+        };
+        assert_eq!(
+            metadata_tree_layout(&details, false),
+            vec![
+                layout(MetadataTreeRow::AgentHeader(0), TreeLine::top_level(true),),
+                layout(
+                    MetadataTreeRow::AgentStatus(0),
+                    TreeLine::nested(true, true),
+                ),
+                layout(MetadataTreeRow::AgentPath(0), TreeLine::nested(true, false),),
+                layout(MetadataTreeRow::AgentHeader(1), TreeLine::top_level(false),),
+                layout(
+                    MetadataTreeRow::AgentStatus(1),
+                    TreeLine::nested(false, false),
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn metadata_tree_layout_caps_paths_and_ignores_agent_label_overflow() {
+        let mut details = WorkspaceRowDetails {
+            agent_blocks: vec![agent_block("codex", None)],
+            path_lines: vec!["one".into(), "two".into(), "three".into(), "four".into()],
+        };
+        let baseline = metadata_tree_layout(&details, false);
+        assert_eq!(
+            baseline
+                .iter()
+                .filter(|row| matches!(row.row, MetadataTreeRow::Path(_)))
+                .count(),
+            3
+        );
+        assert!(!baseline
+            .iter()
+            .any(|row| row.row == MetadataTreeRow::Path(3)));
+
+        details.agent_blocks[0].overflow_count = 42;
+        assert_eq!(metadata_tree_layout(&details, false), baseline);
+    }
+
+    #[test]
+    fn tree_segments_draw_middle_last_and_nested_connectors_within_gutter() {
+        let assert_within = |segments: &[TreeSegment], width: f64, height: f64| {
+            for segment in segments {
+                assert!((0.0..=width).contains(&segment.x1));
+                assert!((0.0..=width).contains(&segment.x2));
+                assert!((0.0..=height).contains(&segment.y1));
+                assert!((0.0..=height).contains(&segment.y2));
+            }
+        };
+
+        for height in [1, 14, 17, 32] {
+            let middle = tree_segments(&TreeLine::top_level(true), 14, height);
+            let last = tree_segments(&TreeLine::top_level(false), 14, height);
+            assert_eq!(middle.len(), 2);
+            assert_eq!(last.len(), 2);
+            assert_eq!(middle[0].y2, height.max(1) as f64);
+            assert_eq!(last[0].y2, (height.max(1) as f64 / 2.0).floor() + 0.5);
+            assert_eq!(middle[1].x2, 13.5);
+
+            let nested = tree_segments(&TreeLine::nested(true, false), 28, height);
+            assert_eq!(nested.len(), 3);
+            assert_eq!(nested[0].x1, 6.5);
+            assert_eq!(nested[1].x1, 20.5);
+            assert_eq!(nested[2].x2, 27.5);
+            assert_within(&middle, 14.0, height.max(1) as f64);
+            assert_within(&last, 14.0, height.max(1) as f64);
+            assert_within(&nested, 28.0, height.max(1) as f64);
+        }
+
+        let no_outer_continuation = tree_segments(&TreeLine::nested(false, false), 28, 16);
+        assert_eq!(no_outer_continuation.len(), 2);
+        assert!(no_outer_continuation
+            .iter()
+            .all(|segment| segment.x1 != 6.5));
     }
 
     /// Smoke test that row_widget can build a stable widget tree with a name
@@ -1499,6 +1911,66 @@ mod tests {
             path_lines: vec![".../fallback/path".into()],
         };
         let _ = row_widget(&ws, &details, on_close, bridge);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[gtk::test]
+    fn metadata_widgets_have_expected_tree_gutter_depths() {
+        if gtk::init().is_err() {
+            return;
+        }
+        let mut ws = ws_with_active_terminal_cwd(Some(PathBuf::from("/tmp/flowmux")));
+
+        let empty = build_meta_column(&ws, &WorkspaceRowDetails::default());
+        assert!(tree_gutter_widths(&empty).is_empty());
+
+        let details = WorkspaceRowDetails {
+            agent_blocks: vec![agent_block("codex", Some(".../dev/os/flowmux"))],
+            path_lines: vec![".../fallback/path".into()],
+        };
+        let with_agent = build_meta_column(&ws, &details);
+        assert_eq!(tree_gutter_widths(&with_agent), vec![14, 28, 28, 14]);
+
+        ws.listening_ports = vec![8080];
+        let aux_only = build_meta_column(&ws, &WorkspaceRowDetails::default());
+        assert_eq!(tree_gutter_widths(&aux_only), vec![14]);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[gtk::test]
+    fn long_tree_metadata_remains_ellipsized_at_narrow_widths() {
+        if gtk::init().is_err() {
+            return;
+        }
+        let mut ws = ws_with_active_terminal_cwd(Some(PathBuf::from("/tmp/flowmux")));
+        ws.name = "an-extremely-long-workspace-name-that-must-fit-a-narrow-panel".into();
+        let details = WorkspaceRowDetails {
+            agent_blocks: vec![agent_block(
+                "an-extremely-long-agent-name-that-must-be-truncated",
+                Some(".../a/very/long/agent/path/that/must/be/truncated"),
+            )],
+            path_lines: vec![".../another/very/long/fallback/path/to/truncate".into()],
+        };
+        let meta = build_meta_column(&ws, &details);
+        meta.set_size_request(96, -1);
+
+        let labels = descendant_labels(&meta);
+        assert!(labels.iter().any(|label| {
+            label.label().contains("long-agent-name")
+                && label.ellipsize() == gtk::pango::EllipsizeMode::End
+        }));
+        assert_eq!(
+            labels
+                .iter()
+                .filter(|label| label.label().contains("long/") && label.has_css_class("caption"))
+                .count(),
+            2
+        );
+        assert!(labels
+            .iter()
+            .filter(|label| label.label().contains("long/"))
+            .all(|label| label.ellipsize() == gtk::pango::EllipsizeMode::Middle));
+        assert_eq!(tree_gutter_widths(&meta), vec![14, 28, 28, 14]);
     }
 
     #[cfg(not(target_os = "macos"))]
