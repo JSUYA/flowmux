@@ -349,6 +349,19 @@ paned > separator {{
 .navigation-sidebar row label.caption {{
     color: @sidebar_fg_color;
 }}
+/* Metadata rows use a decorative Cairo-drawn tree gutter. Keep the lines
+   neutral and quieter than text/status colors; active and hovered rows lift
+   contrast slightly without competing with the workspace accent stripe. */
+.navigation-sidebar row .flowmux-sidebar-tree-gutter {{
+    color: alpha(@sidebar_fg_color, 0.24);
+}}
+.navigation-sidebar row.activatable:hover .flowmux-sidebar-tree-gutter,
+.navigation-sidebar row.activatable:active .flowmux-sidebar-tree-gutter {{
+    color: alpha(@sidebar_fg_color, 0.30);
+}}
+.navigation-sidebar row.activatable:selected .flowmux-sidebar-tree-gutter {{
+    color: alpha(@sidebar_fg_color, 0.34);
+}}
 /* Suppress libadwaita selected-row tint on workspace rows. The ListBox
    keeps SelectionMode::Single so navigation helpers can read
    selected_workspace(), but flowmux does not paint active-workspace
@@ -854,6 +867,24 @@ mod tests {
                 && css.contains(".flowmux-agent-bar-item.flowmux-drop-before")
                 && css.contains(&format!("min-width: {AGENT_BAR_ITEM_MIN_WIDTH_PX}px")),
             "agent bar must keep its bottom-bar and item sizing rules"
+        );
+    }
+
+    #[test]
+    fn sidebar_tree_connectors_stay_neutral_across_row_states() {
+        let css = sample_css();
+        assert!(
+            css.contains(".navigation-sidebar row .flowmux-sidebar-tree-gutter")
+                && css.contains("color: alpha(@sidebar_fg_color, 0.24)")
+                && css.contains(
+                    ".navigation-sidebar row.activatable:hover .flowmux-sidebar-tree-gutter"
+                )
+                && css.contains("color: alpha(@sidebar_fg_color, 0.30)")
+                && css.contains(
+                    ".navigation-sidebar row.activatable:selected .flowmux-sidebar-tree-gutter"
+                )
+                && css.contains("color: alpha(@sidebar_fg_color, 0.34)"),
+            "tree connectors must use neutral sidebar foreground contrast, independent of agent status colors"
         );
     }
 
