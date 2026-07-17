@@ -139,6 +139,7 @@ pub fn collect_offline(home: &Path, codex_home: Option<&Path>) -> Report {
     Report {
         sections: vec![
             section_agents(home, codex_home),
+            section_diagnostics(),
             section_browser_offline(),
             section_desktop(),
         ],
@@ -158,6 +159,56 @@ pub async fn collect(home: &Path, codex_home: Option<&Path>, socket: Option<Path
         report.sections.push(daemon_section);
     }
     report
+}
+
+// ---- Diagnostics ---------------------------------------------------
+
+fn section_diagnostics() -> Section {
+    Section {
+        title: "Diagnostics".into(),
+        entries: vec![log_directory_entry()],
+    }
+}
+
+fn log_directory_entry() -> Entry {
+    let Some(dir) = flowmux_config::paths::logs_dir() else {
+        return Entry {
+            name: "log directory".into(),
+            status: Status::Error,
+            detail: "XDG state directory unavailable".into(),
+        };
+    };
+    log_directory_entry_at(&dir)
+}
+
+fn log_directory_entry_at(dir: &Path) -> Entry {
+    if !dir.exists() {
+        return Entry {
+            name: "log directory".into(),
+            status: Status::Info,
+            detail: format!("{} (created on first log write)", dir.display()),
+        };
+    }
+    if !dir.is_dir() {
+        return Entry {
+            name: "log directory".into(),
+            status: Status::Error,
+            detail: format!("{} (not a directory)", dir.display()),
+        };
+    }
+    if is_writable(dir) {
+        Entry {
+            name: "log directory".into(),
+            status: Status::Ok,
+            detail: dir.display().to_string(),
+        }
+    } else {
+        Entry {
+            name: "log directory".into(),
+            status: Status::Error,
+            detail: format!("{} (not writable)", dir.display()),
+        }
+    }
 }
 
 // ---- AI agents ------------------------------------------------------
@@ -1008,6 +1059,17 @@ mod tests {
 
     fn fake_home() -> TempDir {
         TempDir::new().unwrap()
+    }
+
+    #[test]
+    fn doctor_reports_writable_log_directory() {
+        let root = TempDir::new().unwrap();
+        let logs = root.path().join("logs");
+        fs::create_dir(&logs).unwrap();
+        let entry = log_directory_entry_at(&logs);
+        assert_eq!(entry.name, "log directory");
+        assert_eq!(entry.status, Status::Ok);
+        assert_eq!(entry.detail, logs.display().to_string());
     }
 
     /// Doctor on a totally empty fake HOME: every skill row is Warn

@@ -2377,6 +2377,10 @@ impl ClipboardToast {
     /// Show the toast with a caller-supplied message. Used by the
     /// "copy pane path" chord so the user sees what was copied.
     pub fn show_with_message(&self, message: &str) {
+        self.show_with_message_for(message, Duration::from_millis(1400));
+    }
+
+    pub fn show_with_message_for(&self, message: &str, duration: Duration) {
         self.label.set_text(message);
         let current = self.generation.get().wrapping_add(1);
         self.generation.set(current);
@@ -2384,7 +2388,7 @@ impl ClipboardToast {
 
         let revealer = self.revealer.clone();
         let generation = self.generation.clone();
-        glib::timeout_add_local_once(Duration::from_millis(1400), move || {
+        glib::timeout_add_local_once(duration, move || {
             if generation.get() == current {
                 revealer.set_reveal_child(false);
             }

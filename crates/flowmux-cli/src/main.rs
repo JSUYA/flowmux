@@ -762,6 +762,7 @@ enum WorkspaceOp {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    flowmux_config::diagnostics::install_panic_hook();
     // Release builds stay quiet — only ERROR events surface so the
     // CLI never spams agent hooks (Claude/Codex/OpenCode) with info
     // chatter on stderr. `FLOWMUX_LOG` still overrides for debugging.
@@ -770,12 +771,10 @@ async fn main() -> anyhow::Result<()> {
     } else {
         "error"
     };
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_env("FLOWMUX_LOG")
-                .unwrap_or_else(|_| default_filter.into()),
-        )
-        .init();
+    let _log_guard = flowmux_config::diagnostics::init_logging("flowmuxctl.log", default_filter)?;
+    if std::env::var("FLOWMUX_DEBUG_PANIC").as_deref() == Ok("1") {
+        panic!("FLOWMUX_DEBUG_PANIC requested");
+    }
 
     let cli = Cli::parse();
     let cmd = cli.cmd;

@@ -61,6 +61,14 @@ pub fn state_dir() -> Option<PathBuf> {
     base_state_dir().map(|d| d.join("flowmux"))
 }
 
+pub fn logs_dir() -> Option<PathBuf> {
+    state_dir().map(|d| d.join("logs"))
+}
+
+pub fn crash_dir() -> Option<PathBuf> {
+    state_dir().map(|d| d.join("crash"))
+}
+
 /// True when the current process runs inside a Flatpak sandbox.
 ///
 /// Detection mirrors the helper in `flowmux::ui::terminal_pane` —

@@ -11,6 +11,7 @@
 
 pub mod cmux_json;
 pub mod debug_log;
+pub mod diagnostics;
 pub mod ghostty;
 pub mod keybindings;
 pub mod options;

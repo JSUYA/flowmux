@@ -56,7 +56,6 @@ flowmux-procmon = { workspace = true }
 anyhow = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
 async-channel = "2"
 chrono = { workspace = true }
 serde = { workspace = true }

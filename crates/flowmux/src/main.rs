@@ -57,25 +57,28 @@ const _: () = {
 };
 
 fn main() -> anyhow::Result<()> {
-    if delegate_to_cli_if_needed()? {
-        return Ok(());
-    }
-
-    // Release builds stay quiet — only ERROR events surface so a
-    // packaged binary doesn't spam the user's terminal/journald with
-    // info/debug noise. `FLOWMUX_LOG` still overrides for users who
-    // need to debug a production issue.
+    flowmux_config::diagnostics::install_panic_hook();
     let default_filter = if cfg!(debug_assertions) {
         "info,flowmux=debug"
     } else {
         "error"
     };
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_env("FLOWMUX_LOG")
-                .unwrap_or_else(|_| default_filter.into()),
-        )
-        .init();
+    let log_guard = flowmux_config::diagnostics::init_logging("flowmux.log", default_filter)?;
+    if std::env::var("FLOWMUX_DEBUG_PANIC").as_deref() == Ok("1") {
+        panic!("FLOWMUX_DEBUG_PANIC requested");
+    }
+
+    if delegate_to_cli_if_needed()? {
+        return Ok(());
+    }
+
+    let previous_crash = match flowmux_config::diagnostics::take_unreported_crash() {
+        Ok(path) => path,
+        Err(error) => {
+            tracing::warn!(%error, "could not inspect previous crash reports");
+            None
+        }
+    };
 
     // WebKitGTK 6.0's default sandbox starts bwrap + xdg-dbus-proxy. On
     // Ubuntu 24.04 with unprivileged user namespaces restricted by AppArmor,
@@ -296,6 +299,7 @@ fn main() -> anyhow::Result<()> {
     // path silently never runs.
     let tokio_handle_for_activate = rt.handle().clone();
     let shared_notifier_for_activate = shared_notifier;
+    let previous_crash_for_activate = previous_crash;
     let active_window_for_activate: Rc<
         RefCell<Option<gtk::glib::WeakRef<adw::ApplicationWindow>>>,
     > = Rc::new(RefCell::new(None));
@@ -379,6 +383,15 @@ fn main() -> anyhow::Result<()> {
         });
         *active_window_for_activate.borrow_mut() = Some(controller.window.downgrade());
         controller.window.present();
+        if let Some(path) = previous_crash_for_activate.as_ref() {
+            controller.clipboard_toast().show_with_message_for(
+                &format!(
+                    "Previous session ended unexpectedly — log: {}",
+                    path.display()
+                ),
+                std::time::Duration::from_secs(8),
+            );
+        }
     });
 
     let exit_code = app.run();
@@ -388,6 +401,7 @@ fn main() -> anyhow::Result<()> {
     // flowmux launch only sees a free lock once we have actually
     // stopped writing.
     drop(state_lock);
+    drop(log_guard);
     std::process::exit(exit_code.into());
 }
 
