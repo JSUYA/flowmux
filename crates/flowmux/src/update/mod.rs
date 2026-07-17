@@ -11,12 +11,45 @@ pub mod check;
 pub mod install;
 
 use check::Version;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 /// Newest release seen by the background check, mirrored here so the
 /// About popup can render an "update available" line without plumbing
 /// a channel into the options dialog.
 pub static AVAILABLE: Mutex<Option<Version>> = Mutex::new(None);
+
+const IGNORED_VERSION_FILE: &str = "ignored-update-version";
+
+fn ignored_version_path() -> Option<PathBuf> {
+    flowmux_config::paths::state_dir().map(|dir| dir.join(IGNORED_VERSION_FILE))
+}
+
+/// Release the user chose not to be prompted about. The marker is kept in
+/// the state directory so the choice survives restarts without becoming a
+/// permanent update preference: a strictly newer release is offered again.
+pub fn ignored_version() -> Option<Version> {
+    read_ignored_version(ignored_version_path()?.as_path())
+}
+
+fn read_ignored_version(path: &Path) -> Option<Version> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    Version::parse(raw.trim())
+}
+
+/// Persist that `version` should stay quiet until a newer release appears.
+pub fn persist_ignored_version(version: Version) -> std::io::Result<()> {
+    let path = ignored_version_path().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "state directory is unavailable",
+        )
+    })?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, format!("{version}\n"))
+}
 
 /// Progress reported by the background install task.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,6 +71,10 @@ pub enum Event {
     Done(Version),
     /// Install failed; message is a short summary for the banner.
     Failed(String),
+    /// The user does not want another prompt for this release.
+    Ignored(Version),
+    /// An install was requested from either the banner or About popup.
+    Start(Version),
 }
 
 /// Side-panel banner state. Pure so transitions stay unit-testable;
@@ -45,6 +82,8 @@ pub enum Event {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BannerState {
     Hidden,
+    /// Suppress this version and older ones; a newer release reopens the offer.
+    Ignored(Version),
     /// Update to `Version` can be started.
     Available(Version),
     /// Install running; keep the target version for retry/labels.
@@ -60,17 +99,28 @@ impl BannerState {
         match (self, event) {
             // A running install owns the banner; periodic re-checks wait.
             (state @ BannerState::Running(..), Event::Available(_)) => state,
+            // A skipped release stays quiet across periodic checks. Only a
+            // strictly newer release is news again.
+            (state @ BannerState::Ignored(ignored), Event::Available(v)) if v <= ignored => state,
             // The installed release being re-announced is not news.
             (BannerState::Done(installed), Event::Available(v)) if v <= installed => {
                 BannerState::Done(installed)
             }
             (_, Event::Available(v)) => BannerState::Available(v),
+            (_, Event::Ignored(v)) => BannerState::Ignored(v),
+            // Move to Running synchronously so a second click cannot start a
+            // duplicate installer before the async task reports its first stage.
+            (state @ BannerState::Running(..), Event::Start(_)) => state,
+            (BannerState::Done(installed), Event::Start(v)) if v <= installed => {
+                BannerState::Done(installed)
+            }
+            (_, Event::Start(v)) => BannerState::Running(Stage::Fetching, v),
             (state, Event::Stage(stage)) => match state {
                 BannerState::Available(v)
                 | BannerState::Running(_, v)
                 | BannerState::Failed(_, v)
                 | BannerState::Done(v) => BannerState::Running(stage, v),
-                BannerState::Hidden => BannerState::Hidden,
+                BannerState::Hidden | BannerState::Ignored(_) => state,
             },
             (_, Event::Done(v)) => BannerState::Done(v),
             (state, Event::Failed(message)) => match state {
@@ -78,7 +128,7 @@ impl BannerState {
                 | BannerState::Running(_, v)
                 | BannerState::Failed(_, v)
                 | BannerState::Done(v) => BannerState::Failed(message, v),
-                BannerState::Hidden => BannerState::Hidden,
+                BannerState::Hidden | BannerState::Ignored(_) => state,
             },
         }
     }
@@ -88,7 +138,10 @@ impl BannerState {
     pub fn actionable_version(&self) -> Option<Version> {
         match self {
             BannerState::Available(v) | BannerState::Failed(_, v) => Some(*v),
-            BannerState::Hidden | BannerState::Running(..) | BannerState::Done(_) => None,
+            BannerState::Hidden
+            | BannerState::Ignored(_)
+            | BannerState::Running(..)
+            | BannerState::Done(_) => None,
         }
     }
 }
@@ -114,6 +167,27 @@ mod tests {
             BannerState::Available(V1).apply(Event::Available(V2)),
             BannerState::Available(V2)
         );
+    }
+
+    #[test]
+    fn ignored_release_stays_hidden_until_a_newer_release() {
+        let ignored = BannerState::Available(V1).apply(Event::Ignored(V1));
+        assert_eq!(ignored, BannerState::Ignored(V1));
+        assert_eq!(
+            ignored.clone().apply(Event::Available(V1)),
+            BannerState::Ignored(V1)
+        );
+        assert_eq!(
+            ignored.apply(Event::Available(V2)),
+            BannerState::Available(V2)
+        );
+    }
+
+    #[test]
+    fn start_moves_offer_to_running_immediately_and_is_idempotent() {
+        let running = BannerState::Available(V1).apply(Event::Start(V1));
+        assert_eq!(running, BannerState::Running(Stage::Fetching, V1));
+        assert_eq!(running.clone().apply(Event::Start(V1)), running);
     }
 
     #[test]
@@ -167,10 +241,22 @@ mod tests {
             Some(V1)
         );
         assert_eq!(BannerState::Hidden.actionable_version(), None);
+        assert_eq!(BannerState::Ignored(V1).actionable_version(), None);
         assert_eq!(
             BannerState::Running(Stage::Fetching, V1).actionable_version(),
             None
         );
         assert_eq!(BannerState::Done(V1).actionable_version(), None);
+    }
+
+    #[test]
+    fn ignored_version_file_round_trips_and_rejects_invalid_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(IGNORED_VERSION_FILE);
+        std::fs::write(&path, "v0.8.0\n").unwrap();
+        assert_eq!(read_ignored_version(&path), Some(V2));
+
+        std::fs::write(&path, "not-a-release\n").unwrap();
+        assert_eq!(read_ignored_version(&path), None);
     }
 }
