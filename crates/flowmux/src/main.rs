@@ -14,6 +14,7 @@ mod notifications;
 mod platform;
 mod theme;
 mod ui;
+mod update;
 mod usage;
 
 use adw::prelude::*;
