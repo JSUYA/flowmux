@@ -3003,10 +3003,24 @@ Do you want to continue?";
             Some("demo")
         );
 
+        let (_, browser_surface) = store
+            .add_browser_surface_to_pane(new_pane, "https://example.test".into())
+            .await
+            .expect("second tab should be added to the new pane");
+        assert_eq!(store.tab_count_in_pane(new_pane).await, Some(2));
+
         let outcome = store.close_pane(new_pane).await.unwrap();
         assert!(matches!(outcome, CloseOutcome::PaneRemoved { workspace } if workspace == ws_id));
+        assert_eq!(store.workspace_for_pane(new_pane).await, None);
         let ws = store.get_workspace(ws_id).await.unwrap();
         assert_eq!(ws.surfaces[0].root_pane.first_leaf_id(), Some(original));
+        assert_eq!(
+            ws.surfaces[0]
+                .root_pane
+                .surface_title(new_pane, browser_surface),
+            None,
+            "closing a pane removes every tab it contained"
+        );
 
         let outcome = store.close_pane(original).await.unwrap();
         assert!(matches!(
