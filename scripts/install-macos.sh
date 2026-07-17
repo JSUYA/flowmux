@@ -66,7 +66,7 @@ EOF
     fi
 
     local missing_commands=()
-    for command in cargo pkg-config codesign iconutil install open plutil xattr xcrun; do
+    for command in cargo pkg-config codesign iconutil install launchctl open plutil xattr xcrun; do
         if ! command -v "$command" >/dev/null 2>&1; then
             missing_commands+=("$command")
         fi
@@ -131,6 +131,48 @@ configure_macos_path() {
 
 workspace_version() {
     awk -F '"' '/^version = / { print $2; exit }' "$REPO_ROOT/Cargo.toml"
+}
+
+running_flowmux_pid() {
+    local executable="$1"
+    local candidate="${FLOWMUX_UPDATE_HOST_PID:-$PPID}"
+    local pid command
+
+    while read -r pid command; do
+        if [ "$command" = "$executable" ]; then
+            printf '%s\n' "$pid"
+            return 0
+        fi
+    done < <(ps -ww -p "$candidate" -o pid=,comm= 2>/dev/null)
+
+    while read -r pid command; do
+        if [ "$command" = "$executable" ]; then
+            printf '%s\n' "$pid"
+            return 0
+        fi
+    done < <(ps -ww -axo pid=,comm=)
+    return 1
+}
+
+submit_deferred_app_swap() {
+    local running_pid="$1"
+    local staged_bundle="$2"
+    local destination_bundle="$3"
+    local backup_bundle="$4"
+    local label="com.flowmux.update.$running_pid"
+    local update_dir="$HOME/.cache/flowmux"
+    local update_log="$update_dir/update.log"
+    local swap_helper="$update_dir/deferred-macos-app-swap.sh"
+
+    mkdir -p "$update_dir"
+    install -m755 "$REPO_ROOT/scripts/deferred-macos-app-swap.sh" "$swap_helper"
+    launchctl remove "$label" >/dev/null 2>&1 || true
+    launchctl submit \
+        -l "$label" \
+        -o "$update_log" \
+        -e "$update_log" \
+        -- /bin/sh "$swap_helper" \
+        "$running_pid" "$staged_bundle" "$destination_bundle" "$backup_bundle"
 }
 
 create_icon() {
@@ -223,6 +265,8 @@ contents="$bundle_work/Contents"
 macos="$contents/MacOS"
 resources="$contents/Resources"
 bundle_dest="$APP_DIR/FlowMux.app"
+bundle_pending="$APP_DIR/.FlowMux.app.pending"
+bundle_backup="$APP_DIR/.FlowMux.app.previous"
 
 echo "==> creating $bundle_work"
 rm -rf "$bundle_work"
@@ -236,19 +280,35 @@ xattr -cr "$bundle_work" "$macos/flowmux" "$macos/flowmuxctl"
 codesign --force --sign - "$macos/flowmux" "$macos/flowmuxctl" >/dev/null
 codesign --force --deep --sign - "$bundle_work" >/dev/null
 
-echo "==> installing app to $bundle_dest"
 mkdir -p "$APP_DIR" "$BIN_DIR"
-rm -rf "$bundle_dest"
-cp -R "$bundle_work" "$bundle_dest"
+running_pid="$(running_flowmux_pid "$bundle_dest/Contents/MacOS/flowmux" || true)"
+if [ -n "$running_pid" ]; then
+    echo "==> staging app update until FlowMux exits"
+    rm -rf "$bundle_pending"
+    cp -R "$bundle_work" "$bundle_pending"
+    submit_deferred_app_swap "$running_pid" "$bundle_pending" "$bundle_dest" "$bundle_backup"
+else
+    echo "==> installing app to $bundle_dest"
+    rm -rf "$bundle_dest" "$bundle_pending" "$bundle_backup"
+    cp -R "$bundle_work" "$bundle_dest"
+fi
 install -m755 "$REPO_ROOT/target/$target_subdir/flowmux" "$BIN_DIR/flowmux"
 install -m755 "$REPO_ROOT/target/$target_subdir/flowmuxctl" "$BIN_DIR/flowmuxctl"
 
-echo "==> installed:"
-echo "    $bundle_dest"
-echo "    $BIN_DIR/flowmux"
-echo "    $BIN_DIR/flowmuxctl"
-echo "==> launch with: open \"$bundle_dest\""
+if [ -n "$running_pid" ]; then
+    echo "==> staged app update: $bundle_pending"
+    echo "==> installed CLI:"
+    echo "    $BIN_DIR/flowmux"
+    echo "    $BIN_DIR/flowmuxctl"
+    echo "==> restart FlowMux to finish installing $bundle_dest"
+else
+    echo "==> installed:"
+    echo "    $bundle_dest"
+    echo "    $BIN_DIR/flowmux"
+    echo "    $BIN_DIR/flowmuxctl"
+    echo "==> launch with: open \"$bundle_dest\""
 
-if [ "$LAUNCH" = true ]; then
-    open "$bundle_dest"
+    if [ "$LAUNCH" = true ]; then
+        open "$bundle_dest"
+    fi
 fi
