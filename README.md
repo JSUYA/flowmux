@@ -81,6 +81,24 @@ scrollable preview.
 
 ![markdown viewer](resources/screenshot/md_viewer.gif)
 
+## Files, worktrees, and AI Usage
+
+The **Files** sidebar lets you browse the current repository without leaving
+the terminal. Open a file or Markdown document directly from the tree, and use
+the file actions to copy paths, create folders, rename entries, or move copied
+files into the current directory.
+
+The **Worktrees** sidebar shows the Git worktrees attached to the repository,
+including each worktree's branch, clean/dirty status, and checkout path. From
+there you can open a worktree in flowmux or remove a worktree after confirming
+the operation, without switching to another terminal.
+
+The **AI Usage** popover summarizes token usage and activity for the current
+agent sessions. It can be opened from the workspace controls or with
+**Ctrl+Alt+U** by default (**Cmd+Alt+U** on macOS), and closes with the same
+shortcut or by clicking outside the popover. The display is informational only:
+it does not interrupt running agents, terminals, or browser tabs.
+
 ## Features
 
 - **Workspaces & panes** — side-panel workspaces hold tasks side by side, each
@@ -96,6 +114,11 @@ scrollable preview.
 - **AI agent integration** — Claude Code, Codex, OpenCode work out of the box;
   sessions persist across restarts. `claude-teams` opens a workspace pre-split
   into per-Claude panes. `flowmux doctor` / `fix` audit and repair wiring.
+- **Repository sidebars** — Files and Worktrees keep repository browsing and
+  Git worktree inspection in the same window. Open or remove worktrees from
+  the sidebar after reviewing their status.
+- **AI Usage popover** — Review current agent token/activity totals without
+  leaving the workspace; use `Ctrl+Alt+U` (or `Cmd+Alt+U` on macOS) to toggle it.
 - **Agent CLI** — scripts and agents drive flowmux over its socket:
   `flowmux browser <op>` (snapshot / click / fill / type / press /
   is-visible / count / …), `flowmux identify` and `capabilities` for context
