@@ -273,18 +273,25 @@ fn show_about_popup(parent: &impl IsA<gtk::Widget>) {
 }
 
 fn about_body() -> String {
-    about_body_with_version(&about_version())
+    about_body_with_version(&about_version(), *crate::update::AVAILABLE.lock().unwrap())
 }
 
-fn about_body_with_version(version: &str) -> String {
-    format!(
+fn about_body_with_version(
+    version: &str,
+    available: Option<crate::update::check::Version>,
+) -> String {
+    let mut body = format!(
         "FlowMux - Agent Workflow Multiplexer Terminal\n\n\
          FlowMux was inspired by the cmux (macOS) project.\n\n\
          Maintained by JSUYA (Junsu Choi).\n\
          <a href=\"https://github.com/flowmux-ai/flowmux-terminal\">https://github.com/flowmux-ai/flowmux-terminal</a>\n\n\
          Version: v{}",
         version
-    )
+    );
+    if let Some(update) = available {
+        body.push_str(&format!("\nUpdate available: v{update}"));
+    }
+    body
 }
 
 fn about_version() -> String {
@@ -760,7 +767,7 @@ mod tests {
 
     #[test]
     fn about_body_contains_requested_copy() {
-        let body = about_body_with_version("9.8.7-6");
+        let body = about_body_with_version("9.8.7-6", None);
         assert!(body.contains("FlowMux - Agent Workflow Multiplexer Terminal"));
         assert!(body.contains("FlowMux was inspired by the cmux (macOS) project."));
         assert!(body.contains("Maintained by JSUYA (Junsu Choi)."));
@@ -768,6 +775,16 @@ mod tests {
             "<a href=\"https://github.com/flowmux-ai/flowmux-terminal\">https://github.com/flowmux-ai/flowmux-terminal</a>"
         ));
         assert!(body.ends_with("Version: v9.8.7-6"));
+    }
+
+    #[test]
+    fn about_body_mentions_an_available_update() {
+        use crate::update::check::Version;
+        let body = about_body_with_version("0.7.0", Some(Version(0, 8, 0)));
+        assert!(
+            body.ends_with("Update available: v0.8.0"),
+            "body should announce the newer release: {body}"
+        );
     }
 
     #[test]

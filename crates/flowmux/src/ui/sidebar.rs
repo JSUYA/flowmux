@@ -20,6 +20,7 @@
 
 use crate::bridge::{Bridge, GtkCommand};
 use crate::notifications::{NotificationEntry, NotificationStore};
+use crate::ui::update_banner::UpdateBanner;
 use crate::ui::usage_popover::UsagePopover;
 use crate::ui::workspace_view::{
     read_tab_dnd_payload_from_drop, tab_dnd_content_formats, tab_dnd_formats_accept_payload,
@@ -236,7 +237,7 @@ impl Sidebar {
         footer_spacer.set_hexpand(true);
         footer.append(&footer_spacer);
 
-        let usage = UsagePopover::new(tokio_handle);
+        let usage = UsagePopover::new(tokio_handle.clone());
         footer.append(usage.button());
 
         let worktree_btn = gtk::Button::from_icon_name("vcs-branch-symbolic");
@@ -280,10 +281,15 @@ impl Sidebar {
         });
         footer.append(&file_browser_btn);
 
-        // ---- Outer vbox: toolbar + list + footer ----
+        // Self-update banner. Hidden until the background release check
+        // finds a newer tag; the banner owns its own check/install wiring.
+        let update_banner = UpdateBanner::new(tokio_handle);
+
+        // ---- Outer vbox: toolbar + list + update banner + footer ----
         let root_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
         root_box.append(&toolbar);
         root_box.append(&scroll);
+        root_box.append(update_banner.widget());
         root_box.append(&footer);
 
         Self {
