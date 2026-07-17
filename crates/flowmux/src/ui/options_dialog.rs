@@ -174,6 +174,7 @@ fn build_dialog(
     };
     let theme_tab = crate::ui::theme_tab::build(theme_state.clone(), preview_theme);
     let update_tab = build_update_tab(
+        &dialog,
         &about_version(),
         update_state,
         Rc::new(on_check_update),
@@ -409,12 +410,80 @@ fn render_update_tab(
     }
 }
 
-fn request_update(state: &BannerState, on_update: &dyn Fn(Version) -> bool) -> Option<BannerState> {
-    let version = update_tab_props(state).update_version?;
+#[derive(Debug, PartialEq, Eq)]
+enum PreinstallDecision {
+    Start(Version),
+    ConfirmNewer { selected: Version, latest: Version },
+    Unavailable,
+}
+
+fn preinstall_decision(selected: Version, refreshed: &BannerState) -> PreinstallDecision {
+    let latest = match refreshed {
+        BannerState::Available(version) | BannerState::Ignored(version) => *version,
+        _ => return PreinstallDecision::Unavailable,
+    };
+    match latest.cmp(&selected) {
+        std::cmp::Ordering::Less => PreinstallDecision::Unavailable,
+        std::cmp::Ordering::Equal => PreinstallDecision::Start(selected),
+        std::cmp::Ordering::Greater => PreinstallDecision::ConfirmNewer { selected, latest },
+    }
+}
+
+fn request_update(version: Version, on_update: &dyn Fn(Version) -> bool) -> Option<BannerState> {
     on_update(version).then_some(BannerState::Running(Stage::Fetching, version))
 }
 
+fn start_update_from_tab(
+    version: Version,
+    state: &Rc<RefCell<BannerState>>,
+    status_row: &adw::ActionRow,
+    check_button: &gtk::Button,
+    update_button: &gtk::Button,
+    on_update: &dyn Fn(Version) -> bool,
+) {
+    if let Some(next) = request_update(version, on_update) {
+        *state.borrow_mut() = next;
+        render_update_tab(&state.borrow(), status_row, check_button, update_button);
+    } else {
+        update_button.set_sensitive(false);
+        status_row.set_subtitle("This update is already running or installed.");
+    }
+}
+
+fn show_newer_update_prompt(
+    parent: &impl IsA<gtk::Widget>,
+    selected: Version,
+    latest: Version,
+    on_choice: impl FnOnce(Option<Version>) + 'static,
+) {
+    let body = format!(
+        "You were about to update to FlowMux v{selected}, but v{latest} is now available. Which version would you like to install?"
+    );
+    let dialog = adw::AlertDialog::new(Some("A newer version is available"), Some(&body));
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("selected", &format!("Update to v{selected}"));
+    dialog.add_response("latest", &format!("Update to v{latest}"));
+    dialog.set_default_response(Some("latest"));
+    dialog.set_close_response("cancel");
+    dialog.set_response_appearance("latest", adw::ResponseAppearance::Suggested);
+
+    let on_choice = Rc::new(RefCell::new(Some(on_choice)));
+    dialog.connect_response(None, move |dialog, response| {
+        let choice = match response {
+            "selected" => Some(selected),
+            "latest" => Some(latest),
+            _ => None,
+        };
+        if let Some(on_choice) = on_choice.borrow_mut().take() {
+            on_choice(choice);
+        }
+        dialog.close();
+    });
+    dialog.present(Some(parent));
+}
+
 fn build_update_tab(
+    parent: &adw::Window,
     current_version: &str,
     initial_state: BannerState,
     on_check: Rc<dyn Fn(UpdateCheckCompletion) -> bool>,
@@ -443,7 +512,13 @@ fn build_update_tab(
     spinner.set_valign(gtk::Align::Center);
     status_row.add_prefix(&spinner);
 
-    let check_button = gtk::Button::with_label("Check for Updates");
+    let check_button = gtk::Button::from_icon_name("view-refresh-symbolic");
+    check_button.add_css_class("flat");
+    check_button.set_tooltip_text(Some("Refresh available updates"));
+    check_button.update_property(&[gtk::accessible::Property::Label(
+        "Refresh available updates",
+    )]);
+    check_button.set_focus_on_click(false);
     check_button.set_valign(gtk::Align::Center);
     check_button.set_widget_name("flowmux-check-update-button");
     status_row.add_suffix(&check_button);
@@ -460,6 +535,7 @@ fn build_update_tab(
     render_update_tab(&state.borrow(), &status_row, &check_button, &update_button);
 
     {
+        let on_check = on_check.clone();
         let state = state.clone();
         let status_row = status_row.clone();
         let check_button = check_button.clone();
@@ -513,21 +589,108 @@ fn build_update_tab(
     }
 
     {
+        let parent = parent.clone();
         let state = state.clone();
         let status_row = status_row.clone();
         let check_button = check_button.clone();
         let update_button = update_button.clone();
+        let spinner = spinner.clone();
         update_button.clone().connect_clicked(move |_| {
-            let next = {
-                let state = state.borrow();
-                request_update(&state, on_update.as_ref())
+            let selected = {
+                let current = state.borrow();
+                update_tab_props(&current).update_version
             };
-            if let Some(next) = next {
-                *state.borrow_mut() = next;
-                render_update_tab(&state.borrow(), &status_row, &check_button, &update_button);
-            } else {
+            let Some(selected) = selected else {
                 update_button.set_sensitive(false);
                 status_row.set_subtitle("This update is already running or installed.");
+                return;
+            };
+
+            check_button.set_sensitive(false);
+            update_button.set_sensitive(false);
+            status_row.set_subtitle("Checking for a newer release…");
+            spinner.set_visible(true);
+            spinner.start();
+
+            let parent_for_result = parent.clone();
+            let state_for_result = state.clone();
+            let status_for_result = status_row.clone();
+            let check_for_result = check_button.clone();
+            let update_for_result = update_button.clone();
+            let spinner_for_result = spinner.clone();
+            let on_update_for_result = on_update.clone();
+            let started = on_check(Box::new(move |result| {
+                spinner_for_result.stop();
+                spinner_for_result.set_visible(false);
+                match result {
+                    Ok(refreshed) => {
+                        let decision = preinstall_decision(selected, &refreshed);
+                        *state_for_result.borrow_mut() = refreshed;
+                        render_update_tab(
+                            &state_for_result.borrow(),
+                            &status_for_result,
+                            &check_for_result,
+                            &update_for_result,
+                        );
+                        match decision {
+                            PreinstallDecision::Start(version) => start_update_from_tab(
+                                version,
+                                &state_for_result,
+                                &status_for_result,
+                                &check_for_result,
+                                &update_for_result,
+                                on_update_for_result.as_ref(),
+                            ),
+                            PreinstallDecision::ConfirmNewer { selected, latest } => {
+                                let state_for_choice = state_for_result.clone();
+                                let status_for_choice = status_for_result.clone();
+                                let check_for_choice = check_for_result.clone();
+                                let update_for_choice = update_for_result.clone();
+                                let on_update_for_choice = on_update_for_result.clone();
+                                show_newer_update_prompt(
+                                    &parent_for_result,
+                                    selected,
+                                    latest,
+                                    move |choice| {
+                                        if let Some(version) = choice {
+                                            start_update_from_tab(
+                                                version,
+                                                &state_for_choice,
+                                                &status_for_choice,
+                                                &check_for_choice,
+                                                &update_for_choice,
+                                                on_update_for_choice.as_ref(),
+                                            );
+                                        }
+                                    },
+                                );
+                            }
+                            PreinstallDecision::Unavailable => {
+                                status_for_result.set_subtitle(
+                                    "The selected update is no longer available. Refresh and try again.",
+                                );
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        render_update_tab(
+                            &state_for_result.borrow(),
+                            &status_for_result,
+                            &check_for_result,
+                            &update_for_result,
+                        );
+                        status_for_result.set_subtitle(&format!(
+                            "Could not verify the latest version: {error}"
+                        ));
+                    }
+                }
+            }));
+
+            if !started {
+                spinner.stop();
+                spinner.set_visible(false);
+                render_update_tab(&state.borrow(), &status_row, &check_button, &update_button);
+                status_row.set_subtitle("Update checks are unavailable in this session.");
             }
         });
     }
@@ -1072,7 +1235,7 @@ mod tests {
         use std::cell::Cell;
 
         let selected = Cell::new(None);
-        let next = request_update(&BannerState::Ignored(Version(0, 8, 0)), &|version| {
+        let next = request_update(Version(0, 8, 0), &|version| {
             selected.set(Some(version));
             true
         });
@@ -1081,6 +1244,37 @@ mod tests {
         assert_eq!(
             next,
             Some(BannerState::Running(Stage::Fetching, Version(0, 8, 0)))
+        );
+    }
+
+    #[test]
+    fn matching_refresh_starts_the_selected_update() {
+        assert_eq!(
+            preinstall_decision(Version(0, 8, 0), &BannerState::Available(Version(0, 8, 0))),
+            PreinstallDecision::Start(Version(0, 8, 0))
+        );
+        assert_eq!(
+            preinstall_decision(Version(0, 8, 0), &BannerState::Ignored(Version(0, 8, 0))),
+            PreinstallDecision::Start(Version(0, 8, 0))
+        );
+    }
+
+    #[test]
+    fn newer_refresh_asks_before_changing_the_target() {
+        assert_eq!(
+            preinstall_decision(Version(0, 8, 0), &BannerState::Available(Version(0, 9, 0))),
+            PreinstallDecision::ConfirmNewer {
+                selected: Version(0, 8, 0),
+                latest: Version(0, 9, 0),
+            }
+        );
+    }
+
+    #[test]
+    fn missing_release_after_refresh_does_not_start_an_update() {
+        assert_eq!(
+            preinstall_decision(Version(0, 8, 0), &BannerState::Current),
+            PreinstallDecision::Unavailable
         );
     }
 
