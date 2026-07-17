@@ -15,6 +15,9 @@ use std::time::Duration;
 
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+// A locked login keychain makes `security` block on a GUI unlock/authorization
+// prompt with no timeout of its own, which would wedge the whole usage refresh.
+const KEYCHAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub(crate) async fn collect(home: PathBuf, client: reqwest::Client) -> ProviderRefresh {
     let collected_at = Utc::now();
@@ -110,16 +113,26 @@ fn not_logged_in() -> UsageError {
 
 #[cfg(target_os = "macos")]
 async fn keychain_credentials() -> Result<String, UsageError> {
-    let output = tokio::process::Command::new("security")
+    // `kill_on_drop` + an explicit timeout guarantee this returns: if the
+    // keychain is locked, `security` waits on a modal prompt forever, so on
+    // timeout we drop (and kill) the child and report the user as logged out.
+    let child = tokio::process::Command::new("security")
         .args([
             "find-generic-password",
             "-s",
             "Claude Code-credentials",
             "-w",
         ])
-        .output()
-        .await
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
         .map_err(|_| not_logged_in())?;
+    let output = match tokio::time::timeout(KEYCHAIN_TIMEOUT, child.wait_with_output()).await {
+        Ok(Ok(output)) => output,
+        _ => return Err(not_logged_in()),
+    };
     if !output.status.success() {
         return Err(not_logged_in());
     }
@@ -183,8 +196,60 @@ fn parse_usage_response(value: &Value) -> Result<Vec<UsageWindow>, UsageError> {
     if let Some(window) = parse_named_window(object.get("seven_day"), Some(10_080), None)? {
         windows.push(window);
     }
+    // Model- or feature-scoped windows (e.g. "seven_day_opus", "fable") arrive
+    // as extra top-level objects; keep them all instead of the fixed two.
+    for (key, entry) in object {
+        if matches!(key.as_str(), "five_hour" | "seven_day" | "limits") || !entry.is_object() {
+            continue;
+        }
+        let (duration_minutes, scope) = window_metadata(key);
+        if let Some(window) = parse_named_window(Some(entry), duration_minutes, scope)? {
+            windows.push(window);
+        }
+    }
+    // Same for the optional "limits" array, which carries kind/group metadata.
+    if let Some(limits) = object.get("limits").and_then(Value::as_array) {
+        for limit in limits {
+            let duration_minutes = limit
+                .get("kind")
+                .and_then(Value::as_str)
+                .and_then(kind_duration_minutes);
+            let scope = limit.get("group").and_then(Value::as_str).map(scope_label);
+            if let Some(window) = parse_named_window(Some(limit), duration_minutes, scope)? {
+                windows.push(window);
+            }
+        }
+    }
     deduplicate_windows(&mut windows);
     Ok(windows)
+}
+
+fn window_metadata(key: &str) -> (Option<u64>, Option<String>) {
+    if let Some(rest) = key.strip_prefix("five_hour_") {
+        (Some(300), Some(scope_label(rest)))
+    } else if let Some(rest) = key.strip_prefix("seven_day_") {
+        (Some(10_080), Some(scope_label(rest)))
+    } else {
+        (None, Some(scope_label(key)))
+    }
+}
+
+fn kind_duration_minutes(kind: &str) -> Option<u64> {
+    match kind {
+        "five_hour" => Some(300),
+        "daily" => Some(1_440),
+        "weekly" | "seven_day" => Some(10_080),
+        _ => None,
+    }
+}
+
+fn scope_label(raw: &str) -> String {
+    let label = raw.replace('_', " ");
+    let mut chars = label.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => label,
+    }
 }
 
 fn parse_named_window(
@@ -392,7 +457,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
-    fn usage_response_keeps_only_five_hour_and_weekly_limits() {
+    fn usage_response_keeps_every_reported_window() {
         let value = serde_json::json!({
             "five_hour": {
                 "utilization": 7.0,
@@ -402,6 +467,14 @@ mod tests {
                 "utilization": 42.0,
                 "resets_at": "2026-07-20T00:00:00Z"
             },
+            "seven_day_opus": {
+                "utilization": 12.0,
+                "resets_at": "2026-07-20T00:00:00Z"
+            },
+            "extra_window": {
+                "utilization": 3.0
+            },
+            "not_a_window": "ignored",
             "limits": [{
                 "kind": "weekly",
                 "group": "fable",
@@ -412,16 +485,23 @@ mod tests {
 
         let windows = parse_usage_response(&value).unwrap();
 
-        assert_eq!(
-            windows
-                .iter()
-                .map(|window| window.used_percent)
-                .collect::<Vec<_>>(),
-            vec![7.0, 42.0]
-        );
         assert_eq!(windows[0].duration_minutes, Some(300));
+        assert_eq!(windows[0].scope, None);
         assert_eq!(windows[1].duration_minutes, Some(10_080));
-        assert!(windows.iter().all(|window| window.scope.is_none()));
+        assert_eq!(windows[1].scope, None);
+        assert!(windows.iter().any(|window| {
+            window.scope.as_deref() == Some("Opus")
+                && window.duration_minutes == Some(10_080)
+                && window.used_percent == 12.0
+        }));
+        assert!(windows.iter().any(|window| {
+            window.scope.as_deref() == Some("Extra window") && window.duration_minutes.is_none()
+        }));
+        assert!(windows.iter().any(|window| {
+            window.scope.as_deref() == Some("Fable")
+                && window.duration_minutes == Some(10_080)
+                && window.used_percent == 78.0
+        }));
     }
 
     #[test]

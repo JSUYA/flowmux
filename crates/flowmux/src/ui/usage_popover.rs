@@ -142,6 +142,15 @@ impl UsagePopover {
             );
         });
 
+        // Warm the usage cache in the background at construction time. An open
+        // popover installs a modal pointer grab, so if the first fetch only
+        // started when the user opened it, they would be held behind a spinning,
+        // undismissable popover for the whole request. Fetching ahead of time
+        // means the popover almost always opens straight to data — no loading
+        // state, no grab while spinning. `begin_refresh` throttles the on-show
+        // refresh, so opening the popover shortly after does not double-fetch.
+        request_refresh(&state, false, &tokio_handle, &result_tx);
+
         Self { button }
     }
 
@@ -184,8 +193,41 @@ fn request_refresh(
     };
     let result_tx = result_tx.clone();
     handle.spawn(async move {
-        let _ = result_tx.send(collect_all(home).await).await;
+        // Overall deadline: the popover only leaves its "Loading usage…" state
+        // when a result is sent here, and `begin_refresh` blocks any retry while
+        // `refreshing` is set, so a collector that never returns would strand the
+        // popover forever. On timeout, deliver a synthetic failure so the state
+        // machine always finishes and the user can refresh again.
+        let result = match tokio::time::timeout(REFRESH_DEADLINE, collect_all(home)).await {
+            Ok(refreshes) => refreshes,
+            Err(_) => refresh_timeout_failure(),
+        };
+        let _ = result_tx.send(result).await;
+        // Wake the GTK main loop explicitly. On the macOS backend the main loop
+        // parks in AppKit's `nextEventMatchingMask`, and async-channel readiness
+        // signalled from this worker thread does not reliably break that wait —
+        // the result then sits unprocessed (popover stuck on "Loading usage…",
+        // its modal grab swallowing input) until an unrelated event nudges the
+        // loop. An explicit wakeup guarantees the receiver runs promptly.
+        gtk::glib::MainContext::default().wakeup();
     });
+}
+
+/// Backstop deadline for a full usage refresh. Comfortably larger than the sum
+/// of the collectors' own internal timeouts so it only fires when something
+/// genuinely wedged rather than pre-empting a slow-but-live fetch.
+const REFRESH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
+
+fn refresh_timeout_failure() -> [ProviderRefresh; 2] {
+    let now = Utc::now();
+    let error = UsageError::new(UsageErrorKind::Timeout, "The usage request timed out.");
+    let refresh = |provider| ProviderRefresh {
+        provider,
+        tokens: FieldRefresh::Failure(error.clone()),
+        limits: FieldRefresh::Failure(error.clone()),
+        collected_at: now,
+    };
+    [refresh(Provider::Claude), refresh(Provider::Codex)]
 }
 
 fn apply_local_failure(state: &Rc<RefCell<UsagePanelState>>, error: UsageError) {
