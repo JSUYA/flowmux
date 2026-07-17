@@ -210,34 +210,22 @@ fn main() -> anyhow::Result<()> {
         .enable_all()
         .build()?;
 
-    // Workspace ownership is per-window, not host-wide. The first GUI
-    // on this host wins the `state.json` lock, restores the previous
-    // session, and persists future mutations. Every additional window
-    // started while the first one is alive starts from an empty
-    // workspace list and runs purely in memory — so the two windows
-    // never share, mutate, or overwrite each other's workspaces.
-    let state_lock = match flowmux_state::try_acquire_state_lock() {
-        Ok(lock) => lock,
-        Err(e) => {
-            tracing::warn!(error = %e, "state lock unavailable, running ephemeral");
-            None
+    // Each process claims only workspaces left by exited owners. Every save
+    // briefly locks state.json, reloads it, replaces this window's slice, and
+    // preserves slices owned by other live windows.
+    let owner = flowmux_state::WindowOwner::current();
+    let store = match flowmux_state::claim_window(owner) {
+        Ok(initial) => {
+            info!(
+                workspaces = initial.workspaces.len(),
+                "claimed persisted workspaces for this window"
+            );
+            StateStore::new_lazy_window(initial, owner)
         }
-    };
-    let store = if state_lock.is_some() {
-        let initial = match flowmux_state::load() {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!(error = %e, "could not load state, starting empty");
-                flowmux_state::State::default()
-            }
-        };
-        info!("state.json owner: this window restores the previous session");
-        StateStore::new_lazy(initial)
-    } else {
-        info!(
-            "another flowmux window owns state.json; this window starts with an empty workspace list and will not persist"
-        );
-        StateStore::new_lazy_ephemeral(flowmux_state::State::default())
+        Err(e) => {
+            tracing::warn!(error = %e, "could not claim persisted state, running ephemeral");
+            StateStore::new_lazy_ephemeral(flowmux_state::State::default())
+        }
     };
     store.spawn_persist(rt.handle());
 
@@ -397,10 +385,6 @@ fn main() -> anyhow::Result<()> {
     let exit_code = app.run();
     drop(rt);
     let _ = std::fs::remove_file(&socket);
-    // Hold the per-host state lock until the very end so the next
-    // flowmux launch only sees a free lock once we have actually
-    // stopped writing.
-    drop(state_lock);
     drop(log_guard);
     std::process::exit(exit_code.into());
 }
@@ -409,8 +393,8 @@ fn main() -> anyhow::Result<()> {
 /// multi-window story already relies on.
 ///
 /// `NON_UNIQUE` is load-bearing: per-PID IPC socket (`runtime_socket_for_pid`),
-/// per-host `state.lock` ownership, and the per-process `Bridge` channel all
-/// assume each flowmux window is its own OS process. Without this flag,
+/// per-window state ownership, and the per-process `Bridge` channel all assume
+/// each flowmux window is its own OS process. Without this flag,
 /// GApplication's default singleton behavior makes a second `flowmux` launch
 /// hand off to the existing process via D-Bus and exit, so the second
 /// `connect_activate` opens a window inside the same process — sharing the

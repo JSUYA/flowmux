@@ -11,7 +11,7 @@
 
 use flowmux_core::{Pane, PaneContent, PaneId, SplitDirection, SurfaceId, Workspace, WorkspaceId};
 use flowmux_daemon::state_store::StateStore;
-use flowmux_state::State;
+use flowmux_state::{load_from, save_window_to, State, WindowOwner};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -271,4 +271,56 @@ async fn state_store_create_remove_churn_does_not_leak_ids() {
         "create/remove churn: {ROUNDS} rounds in {elapsed:?} ({:.0} ops/s)",
         (ROUNDS * 2) as f64 / elapsed.as_secs_f64()
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "stress: interleaved state file read-merge-write"]
+async fn state_file_read_merge_write_preserves_window_slices() {
+    const WRITES_PER_WINDOW: usize = 500;
+    const OVERALL_BUDGET: Duration = Duration::from_secs(60);
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.json");
+    let store_a = StateStore::new_lazy(State::default());
+    let workspace_a = store_a
+        .create_workspace(Some("window-a".into()), PathBuf::from("/tmp/a"))
+        .await;
+    let state_a = store_a.snapshot().await;
+    let store_b = StateStore::new_lazy(State::default());
+    let workspace_b = store_b
+        .create_workspace(Some("window-b".into()), PathBuf::from("/tmp/b"))
+        .await;
+    let state_b = store_b.snapshot().await;
+
+    let tasks = [
+        (WindowOwner::current(), state_a),
+        (WindowOwner::current(), state_b),
+    ]
+    .into_iter()
+    .map(|(owner, state)| {
+        let path = path.clone();
+        tokio::task::spawn_blocking(move || {
+            for _ in 0..WRITES_PER_WINDOW {
+                save_window_to(&path, owner, &state).unwrap();
+            }
+        })
+    })
+    .collect::<Vec<_>>();
+
+    timeout(OVERALL_BUDGET, async {
+        for task in tasks {
+            task.await.expect("read-merge-write task panicked");
+        }
+    })
+    .await
+    .expect("read-merge-write stress timed out");
+
+    let merged = load_from(&path).unwrap();
+    let ids = merged
+        .workspaces
+        .iter()
+        .map(|workspace| workspace.id)
+        .collect::<HashSet<_>>();
+    assert_eq!(ids, [workspace_a, workspace_b].into_iter().collect());
+    assert_eq!(merged.windows.len(), 2);
 }

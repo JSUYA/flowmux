@@ -11,15 +11,17 @@
 use flowmux_config::paths;
 use flowmux_core::Workspace;
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use uuid::Uuid;
 
 pub mod agent_sessions;
 pub mod instance_lock;
 pub use agent_sessions::{default_agent_session_store, AgentSessionStore, SavedAgentSession};
 pub use instance_lock::{try_acquire_state_lock, InstanceLock};
 
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// Window size and maximized state, saved on exit and restored on next launch.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -28,6 +30,37 @@ pub struct WindowLayout {
     pub height: i32,
     #[serde(default)]
     pub maximized: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowOwner {
+    pub instance_id: Uuid,
+    pub pid: u32,
+}
+
+impl WindowOwner {
+    pub fn current() -> Self {
+        Self {
+            instance_id: Uuid::new_v4(),
+            pid: std::process::id(),
+        }
+    }
+}
+
+/// Per-process window metadata stored alongside the workspace ownership map.
+/// A later launch reclaims records whose owner PID is no longer alive.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SavedWindow {
+    pub instance_id: Uuid,
+    pub owner_pid: u32,
+    #[serde(default)]
+    pub layout: Option<WindowLayout>,
+    #[serde(default)]
+    pub sidebar_position: Option<i32>,
+    #[serde(default)]
+    pub workspace_order: Vec<flowmux_core::WorkspaceId>,
+    #[serde(default)]
+    pub active_workspace: Option<flowmux_core::WorkspaceId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,12 +73,17 @@ pub struct State {
     /// Most-recently-active workspace, used to focus on launch.
     #[serde(default)]
     pub active_workspace: Option<flowmux_core::WorkspaceId>,
-    /// Window size and maximized state from the last exit. `None` on first launch.
+    /// Legacy v1 layout field. Load migrates it into [`State::windows`]; owned
+    /// GUI saves leave it unset.
     #[serde(default)]
     pub window: Option<WindowLayout>,
-    /// Pixel position of the divider between the side panel and content. `None` on first launch.
+    /// Legacy v1 side-panel divider position.
     #[serde(default)]
     pub sidebar_position: Option<i32>,
+    #[serde(default)]
+    pub windows: Vec<SavedWindow>,
+    #[serde(default)]
+    pub workspace_owners: HashMap<flowmux_core::WorkspaceId, Uuid>,
     pub last_saved: chrono::DateTime<chrono::Utc>,
 }
 
@@ -58,6 +96,8 @@ impl Default for State {
             active_workspace: None,
             window: None,
             sidebar_position: None,
+            windows: Vec::new(),
+            workspace_owners: HashMap::new(),
             last_saved: chrono::Utc::now(),
         }
     }
@@ -94,13 +134,14 @@ pub fn load_from(path: &Path) -> Result<State, StateError> {
         return Ok(State::default());
     }
     let text = std::fs::read_to_string(path)?;
-    let state: State = serde_json::from_str(&text)?;
+    let mut state: State = serde_json::from_str(&text)?;
     if state.schema_version > SCHEMA_VERSION {
         return Err(StateError::SchemaTooNew {
             found: state.schema_version,
             supported: SCHEMA_VERSION,
         });
     }
+    migrate_legacy_state(&mut state);
     Ok(state)
 }
 
@@ -109,6 +150,7 @@ pub fn save_to(path: &Path, state: &State) -> Result<(), StateError> {
         std::fs::create_dir_all(parent)?;
     }
     let mut s = state.clone();
+    migrate_legacy_state(&mut s);
     s.last_saved = chrono::Utc::now();
     let json = serde_json::to_vec_pretty(&s)?;
 
@@ -121,6 +163,179 @@ pub fn save_to(path: &Path, state: &State) -> Result<(), StateError> {
     }
     std::fs::rename(&tmp, path)?;
     Ok(())
+}
+
+fn migrate_legacy_state(state: &mut State) {
+    let legacy_id = Uuid::nil();
+    let needs_window = state.windows.is_empty()
+        && (!state.workspaces.is_empty()
+            || state.window.is_some()
+            || state.sidebar_position.is_some());
+    if needs_window {
+        state.windows.push(SavedWindow {
+            instance_id: legacy_id,
+            owner_pid: 0,
+            layout: state.window.take(),
+            sidebar_position: state.sidebar_position.take(),
+            workspace_order: ordered_workspace_ids(state),
+            active_workspace: state.active_workspace,
+        });
+    } else {
+        state.window = None;
+        state.sidebar_position = None;
+    }
+    for workspace in &state.workspaces {
+        state
+            .workspace_owners
+            .entry(workspace.id)
+            .or_insert(legacy_id);
+    }
+    state.schema_version = SCHEMA_VERSION;
+}
+
+fn ordered_workspace_ids(state: &State) -> Vec<flowmux_core::WorkspaceId> {
+    let live = state
+        .workspaces
+        .iter()
+        .map(|workspace| workspace.id)
+        .collect::<HashSet<_>>();
+    let mut seen = HashSet::new();
+    let mut order = Vec::with_capacity(live.len());
+    for id in &state.workspace_order {
+        if live.contains(id) && seen.insert(*id) {
+            order.push(*id);
+        }
+    }
+    for workspace in &state.workspaces {
+        if seen.insert(workspace.id) {
+            order.push(workspace.id);
+        }
+    }
+    order
+}
+
+/// Atomically claim every unowned or dead-process workspace for a new GUI
+/// window. The on-disk ownership update happens before returning so two
+/// concurrent launches cannot restore the same workspace set.
+pub fn claim_window(owner: WindowOwner) -> Result<State, StateError> {
+    claim_window_from(&default_path()?, owner)
+}
+
+pub fn claim_window_from(path: &Path, owner: WindowOwner) -> Result<State, StateError> {
+    let _lock = instance_lock::acquire_for_state(path)?;
+    let mut disk = load_from(path)?;
+    let live_owners = disk
+        .windows
+        .iter()
+        .filter(|window| flowmux_procmon::pid_alive(window.owner_pid))
+        .map(|window| window.instance_id)
+        .collect::<HashSet<_>>();
+    let claimed = disk
+        .workspaces
+        .iter()
+        .filter_map(|workspace| {
+            let existing = disk.workspace_owners.get(&workspace.id);
+            existing
+                .is_none_or(|owner| !live_owners.contains(owner))
+                .then_some(workspace.id)
+        })
+        .collect::<HashSet<_>>();
+
+    let prior_window = disk.windows.iter().rev().find(|window| {
+        !live_owners.contains(&window.instance_id)
+            && window
+                .workspace_order
+                .iter()
+                .any(|workspace| claimed.contains(workspace))
+    });
+    let layout = prior_window.and_then(|window| window.layout.clone());
+    let sidebar_position = prior_window.and_then(|window| window.sidebar_position);
+    let active_workspace = prior_window
+        .and_then(|window| window.active_workspace)
+        .filter(|workspace| claimed.contains(workspace));
+    let workspace_order = ordered_workspace_ids(&disk)
+        .into_iter()
+        .filter(|workspace| claimed.contains(workspace))
+        .collect::<Vec<_>>();
+    let workspaces = disk
+        .workspaces
+        .iter()
+        .filter(|workspace| claimed.contains(&workspace.id))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    disk.windows
+        .retain(|window| live_owners.contains(&window.instance_id));
+    for workspace in &claimed {
+        disk.workspace_owners.insert(*workspace, owner.instance_id);
+    }
+    disk.windows.push(SavedWindow {
+        instance_id: owner.instance_id,
+        owner_pid: owner.pid,
+        layout: layout.clone(),
+        sidebar_position,
+        workspace_order: workspace_order.clone(),
+        active_workspace,
+    });
+    disk.window = None;
+    disk.sidebar_position = None;
+    save_to(path, &disk)?;
+
+    Ok(State {
+        schema_version: SCHEMA_VERSION,
+        workspaces,
+        workspace_order,
+        active_workspace,
+        window: layout,
+        sidebar_position,
+        windows: Vec::new(),
+        workspace_owners: HashMap::new(),
+        last_saved: disk.last_saved,
+    })
+}
+
+/// Merge one window's latest snapshot into the shared state while preserving
+/// workspace sets and layout records owned by every other live process.
+pub fn save_window(owner: WindowOwner, snapshot: &State) -> Result<(), StateError> {
+    save_window_to(&default_path()?, owner, snapshot)
+}
+
+pub fn save_window_to(path: &Path, owner: WindowOwner, snapshot: &State) -> Result<(), StateError> {
+    let _lock = instance_lock::acquire_for_state(path)?;
+    let mut disk = load_from(path)?;
+    let previously_owned = disk
+        .workspace_owners
+        .iter()
+        .filter_map(|(workspace, existing)| (*existing == owner.instance_id).then_some(*workspace))
+        .collect::<HashSet<_>>();
+    disk.workspaces
+        .retain(|workspace| !previously_owned.contains(&workspace.id));
+    disk.workspace_order
+        .retain(|workspace| !previously_owned.contains(workspace));
+    disk.workspace_owners
+        .retain(|workspace, _| !previously_owned.contains(workspace));
+
+    disk.workspaces.extend(snapshot.workspaces.iter().cloned());
+    let owned_order = ordered_workspace_ids(snapshot);
+    disk.workspace_order.extend(owned_order.iter().copied());
+    for workspace in &snapshot.workspaces {
+        disk.workspace_owners
+            .insert(workspace.id, owner.instance_id);
+    }
+    disk.windows
+        .retain(|window| window.instance_id != owner.instance_id);
+    disk.windows.push(SavedWindow {
+        instance_id: owner.instance_id,
+        owner_pid: owner.pid,
+        layout: snapshot.window.clone(),
+        sidebar_position: snapshot.sidebar_position,
+        workspace_order: owned_order,
+        active_workspace: snapshot.active_workspace,
+    });
+    disk.active_workspace = None;
+    disk.window = None;
+    disk.sidebar_position = None;
+    save_to(path, &disk)
 }
 
 #[cfg(test)]
@@ -185,15 +400,50 @@ mod tests {
         save_to(&path, &state).unwrap();
 
         let back = load_from(&path).unwrap();
+        assert_eq!(back.window, None);
+        assert_eq!(back.sidebar_position, None);
+        assert_eq!(back.windows.len(), 1);
         assert_eq!(
-            back.window,
+            back.windows[0].layout,
             Some(WindowLayout {
                 width: 1600,
                 height: 900,
                 maximized: true,
             })
         );
-        assert_eq!(back.sidebar_position, Some(312));
+        assert_eq!(back.windows[0].sidebar_position, Some(312));
+    }
+
+    #[test]
+    fn legacy_v1_state_migrates_without_workspace_or_layout_loss() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let workspace = sample_workspace();
+        let workspace_id = workspace.id;
+        let fixture = serde_json::json!({
+            "schema_version": 1,
+            "workspaces": [workspace],
+            "workspace_order": [workspace_id],
+            "active_workspace": workspace_id,
+            "window": {"width": 1440, "height": 900, "maximized": true},
+            "sidebar_position": 280,
+            "last_saved": "2026-01-01T00:00:00Z"
+        });
+        std::fs::write(&path, serde_json::to_vec_pretty(&fixture).unwrap()).unwrap();
+
+        let migrated = load_from(&path).unwrap();
+        assert_eq!(migrated.schema_version, SCHEMA_VERSION);
+        assert_eq!(migrated.workspaces.len(), 1);
+        assert_eq!(migrated.workspaces[0].id, workspace_id);
+        assert_eq!(migrated.workspace_order, vec![workspace_id]);
+        assert_eq!(migrated.active_workspace, Some(workspace_id));
+        assert_eq!(migrated.windows.len(), 1);
+        assert_eq!(migrated.windows[0].layout.as_ref().unwrap().width, 1440);
+        assert_eq!(migrated.windows[0].sidebar_position, Some(280));
+        assert_eq!(
+            migrated.workspace_owners.get(&workspace_id),
+            Some(&Uuid::nil())
+        );
     }
 
     #[test]

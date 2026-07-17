@@ -10,8 +10,10 @@ description = "Persistence for flowmux: workspace/surface/pane state under $XDG_
 [dependencies]
 flowmux-core = { workspace = true }
 flowmux-config = { workspace = true }
+flowmux-procmon = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+uuid = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

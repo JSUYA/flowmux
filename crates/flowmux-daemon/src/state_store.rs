@@ -12,9 +12,8 @@ use flowmux_core::{
     AgentStatusReport, CloseSurfaceOutcome, Pane, PaneContent, PaneId, PaneSurface, RemoveOutcome,
     SplitDirection, Surface, SurfaceId, SurfaceKind, Workspace, WorkspaceAgentBlock, WorkspaceId,
 };
-use flowmux_state::{State, WindowLayout};
+use flowmux_state::{State, WindowLayout, WindowOwner};
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Notify};
@@ -203,9 +202,23 @@ fn collapse_empty_source_locked(s: &mut State, pane: PaneId, leaf_empty: bool) -
     }
 }
 
-async fn save_snapshot_blocking(snapshot: State) -> Result<u64, flowmux_state::StateError> {
+#[derive(Debug, Clone, Copy)]
+enum PersistenceMode {
+    Full,
+    Window(WindowOwner),
+    Disabled,
+}
+
+async fn save_snapshot_blocking(
+    snapshot: State,
+    mode: PersistenceMode,
+) -> Result<u64, flowmux_state::StateError> {
     tokio::task::spawn_blocking(move || {
-        flowmux_state::save(&snapshot)?;
+        match mode {
+            PersistenceMode::Full => flowmux_state::save(&snapshot)?,
+            PersistenceMode::Window(owner) => flowmux_state::save_window(owner, &snapshot)?,
+            PersistenceMode::Disabled => return Ok(0),
+        }
         let file_size = flowmux_state::default_path()
             .ok()
             .and_then(|path| std::fs::metadata(path).ok())
@@ -248,11 +261,7 @@ pub struct StateStore {
     inner: Arc<Mutex<State>>,
     cleared_agent_surfaces: Arc<Mutex<HashSet<SurfaceId>>>,
     dirty: Arc<Notify>,
-    /// When false, all on-disk persistence is skipped — the store
-    /// behaves as a pure in-memory cache. Used by additional flowmux
-    /// windows that did not win the per-host `state.json` lock and so
-    /// must not race the lock-owning instance.
-    persist: Arc<AtomicBool>,
+    persistence: PersistenceMode,
 }
 
 impl StateStore {
@@ -265,7 +274,7 @@ impl StateStore {
             inner: Arc::new(Mutex::new(initial)),
             cleared_agent_surfaces: Arc::new(Mutex::new(HashSet::new())),
             dirty: Arc::new(Notify::new()),
-            persist: Arc::new(AtomicBool::new(true)),
+            persistence: PersistenceMode::Full,
         };
         let bg = store.clone();
         tokio::spawn(async move { bg.persist_loop().await });
@@ -285,7 +294,7 @@ impl StateStore {
             inner: Arc::new(Mutex::new(initial)),
             cleared_agent_surfaces: Arc::new(Mutex::new(HashSet::new())),
             dirty: Arc::new(Notify::new()),
-            persist: Arc::new(AtomicBool::new(true)),
+            persistence: PersistenceMode::Full,
         };
         if normalized {
             store.mark_dirty();
@@ -307,13 +316,30 @@ impl StateStore {
             inner: Arc::new(Mutex::new(initial)),
             cleared_agent_surfaces: Arc::new(Mutex::new(HashSet::new())),
             dirty: Arc::new(Notify::new()),
-            persist: Arc::new(AtomicBool::new(false)),
+            persistence: PersistenceMode::Disabled,
         }
+    }
+
+    /// Construct a GUI-window store whose writes are merged into the shared
+    /// state file under this window's ownership record.
+    pub fn new_lazy_window(initial: State, owner: WindowOwner) -> Self {
+        let mut initial = initial;
+        let normalized = normalize_state(&mut initial);
+        let store = Self {
+            inner: Arc::new(Mutex::new(initial)),
+            cleared_agent_surfaces: Arc::new(Mutex::new(HashSet::new())),
+            dirty: Arc::new(Notify::new()),
+            persistence: PersistenceMode::Window(owner),
+        };
+        if normalized {
+            store.mark_dirty();
+        }
+        store
     }
 
     /// True when this store is allowed to write to `state.json`.
     pub fn persist_enabled(&self) -> bool {
-        self.persist.load(Ordering::Acquire)
+        !matches!(self.persistence, PersistenceMode::Disabled)
     }
 
     /// Spawn the persist loop on `handle`. Pair with [`new_lazy`].
@@ -1850,7 +1876,7 @@ impl StateStore {
             let snap = self.snapshot().await;
             let workspaces = snap.workspaces.len();
             let started = Instant::now();
-            match save_snapshot_blocking(snap).await {
+            match save_snapshot_blocking(snap, self.persistence).await {
                 Ok(file_size) => info!(
                     workspaces,
                     file_size,
@@ -1867,7 +1893,9 @@ impl StateStore {
             return Ok(());
         }
         let snap = self.snapshot().await;
-        save_snapshot_blocking(snap).await.map(|_| ())
+        save_snapshot_blocking(snap, self.persistence)
+            .await
+            .map(|_| ())
     }
 
     pub fn save_now_blocking(&self) -> Result<(), flowmux_state::StateError> {
@@ -1875,7 +1903,11 @@ impl StateStore {
             return Ok(());
         }
         let snap = self.inner.blocking_lock().clone();
-        flowmux_state::save(&snap)
+        match self.persistence {
+            PersistenceMode::Full => flowmux_state::save(&snap),
+            PersistenceMode::Window(owner) => flowmux_state::save_window(owner, &snap),
+            PersistenceMode::Disabled => Ok(()),
+        }
     }
 }
 

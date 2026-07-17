@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Cross-process check for [`flowmux_state::try_acquire_state_lock`].
 //!
-//! Workspace isolation between flowmux windows depends on `flock(2)`
-//! working across two different processes. The `instance_lock` unit
-//! tests only cover same-process contention, so spawn the
+//! Atomic read/merge/write between flowmux windows depends on `flock(2)`
+//! working across two different processes. The `instance_lock` unit tests
+//! only cover same-process contention, so spawn the
 //! `instance_lock_helper` example twice against an isolated
 //! `XDG_STATE_HOME` and confirm exactly one process owns the lock.
 
