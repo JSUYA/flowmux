@@ -1,7 +1,7 @@
 
 <div align="center">
   
-# FlowMux
+# Flowmux
 ![icon](resources/icons/flowmux-180.png)
 
 **Agent Workflow Multiplexer Terminal** — *Go with the agents' flow.*
@@ -45,6 +45,21 @@ terminal and browser tabs across panes, and navigate between them from the
 keyboard.
 
 ![split](resources/screenshot/view_split.gif)
+
+## File and worktree views
+
+Open the **Files** and **Worktrees** sidebars to browse the current repository,
+inspect Git worktree status, and open or remove worktrees without leaving the
+terminal.
+
+![file and worktree views](resources/screenshot/usage_fileview_worktreeview.gif)
+
+## Themes
+
+Choose a built-in light or dark theme in **Options → Theme**, or customize the
+terminal background, text, and cursor colors.
+
+![theme settings](resources/screenshot/setting_theme.gif)
 
 ## Image viewer
 
