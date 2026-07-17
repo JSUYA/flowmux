@@ -7,6 +7,11 @@ use chrono::{DateTime, Local, Utc};
 use flowmux_vcs::worktree::{RemoveWorktreeError, WorktreeInfo, WorktreeList, WorktreeListError};
 use std::path::Path;
 
+/// Upper bound on one worktree listing (git worktree list + per-tree
+/// status/commit reads). Generous for large checkouts; only a wedged
+/// git or a bug should ever reach it.
+const WORKTREE_LIST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 pub(super) fn same_existing_path(left: &Path, right: &Path) -> bool {
     let left = std::fs::canonicalize(left).unwrap_or_else(|_| left.to_path_buf());
     let right = std::fs::canonicalize(right).unwrap_or_else(|_| right.to_path_buf());
@@ -25,6 +30,37 @@ fn normalized_existing_path(path: &Path) -> PathBuf {
 
 fn same_source_directory(previous: Option<&Path>, current: &Path) -> bool {
     previous.is_some_and(|previous| previous == current)
+}
+
+/// What an arriving worktree-list result does to the panel state.
+///
+/// The `loading` flag must reach `false` for every result of the
+/// current generation — even when the panel was closed while the list
+/// was in flight. Leaving it set makes every later same-directory
+/// [`refresh_worktrees`](WindowController::refresh_worktrees) return
+/// early, freezing the panel on "Loading worktrees…" until restart.
+#[derive(Debug, PartialEq, Eq)]
+enum WorktreesResultDisposition {
+    /// A newer refresh owns the flag; drop this result untouched.
+    IgnoreStale,
+    /// Current generation, panel closed: end the load, render nothing.
+    ClearLoadingOnly,
+    /// Current generation, panel open: end the load and render.
+    Apply,
+}
+
+fn worktrees_result_disposition(
+    generation: u64,
+    current_generation: u64,
+    panel_open: bool,
+) -> WorktreesResultDisposition {
+    if generation != current_generation {
+        WorktreesResultDisposition::IgnoreStale
+    } else if !panel_open {
+        WorktreesResultDisposition::ClearLoadingOnly
+    } else {
+        WorktreesResultDisposition::Apply
+    }
 }
 
 fn repository_name(path: &Path) -> String {
@@ -435,7 +471,25 @@ impl WindowController {
             return;
         };
         handle.spawn(async move {
-            let result = flowmux_vcs::worktree::list_worktrees(&start).await;
+            // Backstop, mirroring the usage popover fix: a result must
+            // reach the panel no matter what happens to the listing
+            // (wedged git, panic), or `loading` never clears and the
+            // panel freezes on "Loading worktrees…" until restart.
+            let mut list =
+                tokio::spawn(async move { flowmux_vcs::worktree::list_worktrees(&start).await });
+            let result = match tokio::time::timeout(WORKTREE_LIST_TIMEOUT, &mut list).await {
+                Ok(Ok(result)) => result,
+                Ok(Err(join_error)) => Err(WorktreeListError::CommandFailed(format!(
+                    "worktree listing crashed: {join_error}"
+                ))),
+                Err(_) => {
+                    list.abort();
+                    Err(WorktreeListError::CommandFailed(format!(
+                        "worktree listing timed out after {}s",
+                        WORKTREE_LIST_TIMEOUT.as_secs()
+                    )))
+                }
+            };
             let _ = bridge
                 .tx
                 .send(GtkCommand::WorktreesLoaded { generation, result })
@@ -448,8 +502,17 @@ impl WindowController {
         generation: u64,
         result: Result<WorktreeList, WorktreeListError>,
     ) {
-        if !self.worktrees.panel.is_open() || generation != self.worktrees.generation.get() {
-            return;
+        match worktrees_result_disposition(
+            generation,
+            self.worktrees.generation.get(),
+            self.worktrees.panel.is_open(),
+        ) {
+            WorktreesResultDisposition::IgnoreStale => return,
+            WorktreesResultDisposition::ClearLoadingOnly => {
+                self.worktrees.loading.set(false);
+                return;
+            }
+            WorktreesResultDisposition::Apply => {}
         }
         self.worktrees.loading.set(false);
 
@@ -634,6 +697,37 @@ mod tests {
 
         assert!(workspace_uses_worktree(&workspace, root.path()));
         assert!(pane_uses_worktree(&pane, root.path()));
+    }
+
+    #[test]
+    fn stale_result_leaves_loading_to_the_newer_refresh() {
+        assert_eq!(
+            worktrees_result_disposition(3, 4, true),
+            WorktreesResultDisposition::IgnoreStale
+        );
+        assert_eq!(
+            worktrees_result_disposition(3, 4, false),
+            WorktreesResultDisposition::IgnoreStale
+        );
+    }
+
+    #[test]
+    fn result_arriving_while_panel_closed_still_ends_the_load() {
+        // Regression: this case used to drop the result without
+        // clearing `loading`, freezing the panel on "Loading
+        // worktrees…" for the rest of the session.
+        assert_eq!(
+            worktrees_result_disposition(4, 4, false),
+            WorktreesResultDisposition::ClearLoadingOnly
+        );
+    }
+
+    #[test]
+    fn current_result_with_open_panel_is_applied() {
+        assert_eq!(
+            worktrees_result_disposition(4, 4, true),
+            WorktreesResultDisposition::Apply
+        );
     }
 
     #[test]
