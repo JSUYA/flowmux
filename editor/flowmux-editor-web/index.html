@@ -17,6 +17,15 @@
       </section>
       <div id="editor" class="editor" aria-label="Text editor"></div>
       <span id="document-state" class="document-state" aria-live="polite" hidden></span>
+      <dialog id="close-dialog" class="close-dialog" aria-labelledby="close-dialog-title">
+        <h2 id="close-dialog-title">Save changes?</h2>
+        <p><span id="close-dialog-document"></span> has unsaved changes.</p>
+        <div class="close-dialog-actions">
+          <button id="close-dialog-cancel" type="button">Cancel</button>
+          <button id="close-dialog-discard" class="destructive" type="button">Discard</button>
+          <button id="close-dialog-save" class="suggested" type="button">Save</button>
+        </div>
+      </dialog>
     </main>
     <script type="module" src="./main.js"></script>
   </body>

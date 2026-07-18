@@ -86,6 +86,66 @@ body {
   line-height: 1.5;
 }
 
+.close-dialog {
+  width: min(420px, calc(100% - 32px));
+  padding: 20px;
+  border: 1px solid color-mix(in srgb, var(--muted) 35%, transparent);
+  border-radius: 10px;
+  color: var(--text);
+  background: var(--panel);
+  box-shadow: 0 18px 48px rgb(0 0 0 / 45%);
+}
+
+.close-dialog::backdrop {
+  background: rgb(0 0 0 / 52%);
+}
+
+.close-dialog h2 {
+  margin: 0 0 8px;
+  font-size: 16px;
+}
+
+.close-dialog p {
+  margin: 0 0 20px;
+  color: var(--muted);
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.close-dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.close-dialog button {
+  min-width: 72px;
+  padding: 7px 12px;
+  border: 1px solid color-mix(in srgb, var(--muted) 35%, transparent);
+  border-radius: 6px;
+  color: var(--text);
+  background: color-mix(in srgb, var(--panel) 75%, var(--text) 8%);
+  font: inherit;
+}
+
+.close-dialog button:focus-visible {
+  outline: 2px solid #72b7a8;
+  outline-offset: 2px;
+}
+
+.close-dialog button.suggested {
+  border-color: #72b7a8;
+  background: #365c59;
+}
+
+.close-dialog button.destructive {
+  color: #ffd8d8;
+}
+
+.close-dialog button:disabled {
+  opacity: 0.5;
+}
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,

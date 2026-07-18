@@ -195,21 +195,36 @@ impl EditorSession {
                 document_id,
                 document_version,
                 ..
-            } => {
-                let id = self.checked_document(&document_id, document_version)?;
-                self.documents.close(id)?;
-                self.protocol_ids.remove(&document_id);
-                self.open_order.retain(|candidate| *candidate != id);
-                self.reported_disk_status.remove(&id);
-                if self.active == Some(id) {
-                    self.active = self.open_order.last().copied();
-                }
-                Ok(vec![HostMessage::CloseDocument {
-                    document_id,
-                    document_version,
-                }])
-            }
+            } => self.close_document(document_id, document_version, false),
+            EditorMessage::DiscardCloseRequested {
+                document_id,
+                document_version,
+            } => self.close_document(document_id, document_version, true),
         }
+    }
+
+    fn close_document(
+        &mut self,
+        document_id: String,
+        document_version: u64,
+        discard: bool,
+    ) -> Result<Vec<HostMessage>, EditorSessionError> {
+        let id = self.checked_document(&document_id, document_version)?;
+        if discard {
+            self.documents.discard(id)?;
+        } else {
+            self.documents.close(id)?;
+        }
+        self.protocol_ids.remove(&document_id);
+        self.open_order.retain(|candidate| *candidate != id);
+        self.reported_disk_status.remove(&id);
+        if self.active == Some(id) {
+            self.active = self.open_order.last().copied();
+        }
+        Ok(vec![HostMessage::CloseDocument {
+            document_id,
+            document_version,
+        }])
     }
 
     fn save_requested(
@@ -562,7 +577,7 @@ mod tests {
 
         let error = session
             .handle_editor_message(EditorMessage::CloseRequested {
-                document_id: document.id,
+                document_id: document.id.clone(),
                 document_version: 2,
                 dirty: false,
             })
@@ -571,6 +586,18 @@ mod tests {
             error,
             EditorSessionError::Document(DocumentError::Dirty(_))
         ));
+
+        let messages = session
+            .handle_editor_message(EditorMessage::DiscardCloseRequested {
+                document_id: document.id,
+                document_version: 2,
+            })
+            .unwrap();
+        assert!(matches!(
+            messages.as_slice(),
+            [HostMessage::CloseDocument { .. }]
+        ));
+        assert_eq!(fs::read_to_string(path).unwrap(), "base\n");
     }
 
     #[test]

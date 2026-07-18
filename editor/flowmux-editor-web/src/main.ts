@@ -62,12 +62,19 @@ interface OpenDocument {
 const documentState = requiredElement("document-state");
 const emptyState = requiredElement("empty-state");
 const editorContainer = requiredElement("editor");
+const closeDialog = requiredDialog("close-dialog");
+const closeDialogDocument = requiredElement("close-dialog-document");
+const closeDialogCancel = requiredButton("close-dialog-cancel");
+const closeDialogDiscard = requiredButton("close-dialog-discard");
+const closeDialogSave = requiredButton("close-dialog-save");
 
 let surfaceId = new URLSearchParams(window.location.search).get("surface") ?? "unbound";
 let activeDocumentId: string | null = null;
 let editorFontSize = 13;
 let wordWrapEnabled = false;
 let minimapEnabled = false;
+let closeDialogDocumentId: string | null = null;
+let closeAfterSaveDocumentId: string | null = null;
 const documents = new Map<string, OpenDocument>();
 
 monaco.editor.defineTheme("flowmux-dark", {
@@ -100,6 +107,14 @@ const editor = monaco.editor.create(editorContainer, {
   scrollBeyondLastLine: false,
   smoothScrolling: false,
   wordWrap: "off",
+});
+
+closeDialogCancel.addEventListener("click", () => hideCloseDialog());
+closeDialogDiscard.addEventListener("click", () => discardCloseDialogDocument());
+closeDialogSave.addEventListener("click", () => saveCloseDialogDocument());
+closeDialog.addEventListener("cancel", (event) => {
+  event.preventDefault();
+  hideCloseDialog();
 });
 
 editor.addAction({
@@ -182,6 +197,7 @@ function handleHostMessage(message: HostMessage): void {
 
   switch (message.type) {
     case "initialize_editor":
+      resetCloseDialog();
       for (const document of [...documents.values()]) {
         document.model.dispose();
       }
@@ -210,12 +226,19 @@ function handleHostMessage(message: HostMessage): void {
         document.payload.externalChange = false;
         document.diskStatus = "unchanged";
         renderState();
+        if (closeAfterSaveDocumentId === document.payload.id) {
+          closeAfterSaveDocumentId = null;
+          requestClose(document);
+        }
       }
       break;
     }
     case "save_failed": {
       const document = documents.get(message.documentId);
       if (document !== undefined && document.changeSequence === message.changeSequence) {
+        if (closeAfterSaveDocumentId === document.payload.id) {
+          closeAfterSaveDocumentId = null;
+        }
         document.payload.externalChange = true;
         document.diskStatus = "modified";
         documentState.textContent = message.reason;
@@ -269,6 +292,9 @@ function addOrReplaceDocument(payload: DocumentPayload): void {
     if (document.suppressChanges) {
       return;
     }
+    if (closeAfterSaveDocumentId === document.payload.id) {
+      closeAfterSaveDocumentId = null;
+    }
     document.payload.dirty = true;
     const edit = advanceDocumentEdit(document.payload.version, document.changeSequence);
     document.payload.version = edit.nextVersion;
@@ -306,6 +332,9 @@ function closeDocument(documentId: string): void {
   }
   const ids = [...documents.keys()];
   const index = ids.indexOf(documentId);
+  if (closeDialogDocumentId === documentId || closeAfterSaveDocumentId === documentId) {
+    resetCloseDialog();
+  }
   document.model.dispose();
   documents.delete(documentId);
   if (activeDocumentId === documentId) {
@@ -328,9 +357,65 @@ function requestClose(document: OpenDocument): void {
 
 function requestCloseActiveDocument(): void {
   const document = activeDocumentId === null ? undefined : documents.get(activeDocumentId);
-  if (document !== undefined) {
+  if (document === undefined) {
+    return;
+  }
+  if (document.payload.dirty) {
+    showCloseDialog(document);
+  } else {
     requestClose(document);
   }
+}
+
+function showCloseDialog(document: OpenDocument): void {
+  closeDialogDocumentId = document.payload.id;
+  closeDialogDocument.textContent = `“${document.payload.name}”`;
+  closeDialogSave.disabled = document.payload.readOnly;
+  if (!closeDialog.open) {
+    closeDialog.showModal();
+  }
+  (closeDialogSave.disabled ? closeDialogDiscard : closeDialogSave).focus();
+}
+
+function hideCloseDialog(): void {
+  closeDialogDocumentId = null;
+  if (closeDialog.open) {
+    closeDialog.close();
+  }
+  editor.focus();
+}
+
+function resetCloseDialog(): void {
+  closeAfterSaveDocumentId = null;
+  hideCloseDialog();
+}
+
+function saveCloseDialogDocument(): void {
+  const document =
+    closeDialogDocumentId === null ? undefined : documents.get(closeDialogDocumentId);
+  if (document === undefined || document.payload.readOnly) {
+    return;
+  }
+  closeAfterSaveDocumentId = document.payload.id;
+  hideCloseDialog();
+  requestSave(document.payload.id);
+}
+
+function discardCloseDialogDocument(): void {
+  const document =
+    closeDialogDocumentId === null ? undefined : documents.get(closeDialogDocumentId);
+  if (document === undefined) {
+    hideCloseDialog();
+    return;
+  }
+  hideCloseDialog();
+  postToHost({
+    protocolVersion: PROTOCOL_VERSION,
+    surfaceId,
+    type: "discard_close_requested",
+    documentId: document.payload.id,
+    documentVersion: document.payload.version,
+  });
 }
 
 function requestSave(documentId: string | null = activeDocumentId): void {
@@ -396,6 +481,22 @@ function requiredElement(id: string): HTMLElement {
   const element = document.getElementById(id);
   if (element === null) {
     throw new Error(`Missing required editor element: ${id}`);
+  }
+  return element;
+}
+
+function requiredDialog(id: string): HTMLDialogElement {
+  const element = requiredElement(id);
+  if (!(element instanceof HTMLDialogElement)) {
+    throw new Error(`Editor element is not a dialog: ${id}`);
+  }
+  return element;
+}
+
+function requiredButton(id: string): HTMLButtonElement {
+  const element = requiredElement(id);
+  if (!(element instanceof HTMLButtonElement)) {
+    throw new Error(`Editor element is not a button: ${id}`);
   }
   return element;
 }

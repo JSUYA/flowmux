@@ -25,8 +25,20 @@ for (const file of requiredFiles) {
 }
 
 const html = await readFile(resolve(root, "dist", "index.html"), "utf8");
-if (!html.includes("Content-Security-Policy") || !html.includes('src="./main.js"')) {
-  throw new Error("Editor entry point is missing its CSP or main script");
+if (
+  !html.includes("Content-Security-Policy") ||
+  !html.includes('src="./main.js"') ||
+  !html.includes('id="close-dialog"') ||
+  !html.includes('id="close-dialog-save"') ||
+  !html.includes('id="close-dialog-discard"') ||
+  !html.includes('id="close-dialog-cancel"')
+) {
+  throw new Error("Editor entry point is missing its security or close-guard controls");
+}
+
+const main = await readFile(resolve(root, "dist", "main.js"), "utf8");
+if (!main.includes("discard_close_requested")) {
+  throw new Error("Editor bundle is missing the explicit discard-close message");
 }
 
 console.log(`Verified ${requiredFiles.length} editor assets.`);

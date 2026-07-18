@@ -90,6 +90,11 @@ export type EditorMessage =
       documentId: string;
       documentVersion: number;
       dirty: boolean;
+    })
+  | (EditorMessageBase & {
+      type: "discard_close_requested";
+      documentId: string;
+      documentVersion: number;
     });
 
 export interface DocumentEditAdvance {

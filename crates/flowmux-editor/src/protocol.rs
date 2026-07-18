@@ -124,6 +124,10 @@ pub enum EditorMessage {
         document_version: u64,
         dirty: bool,
     },
+    DiscardCloseRequested {
+        document_id: String,
+        document_version: u64,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -209,7 +213,8 @@ fn validate_editor_message(message: &EditorMessage) -> Result<(), ProtocolError>
     match message {
         EditorMessage::EditorReady => Ok(()),
         EditorMessage::ActiveDocumentChanged { document_id, .. }
-        | EditorMessage::CloseRequested { document_id, .. } => {
+        | EditorMessage::CloseRequested { document_id, .. }
+        | EditorMessage::DiscardCloseRequested { document_id, .. } => {
             validate_identifier("document ID", document_id)
         }
         EditorMessage::DocumentChanged {
@@ -350,6 +355,29 @@ mod tests {
                 change_sequence: 2,
                 content: "한글 日本語 العربية 🙂\n".into(),
             }
+        );
+    }
+
+    #[test]
+    fn discard_close_message_is_explicit_and_versioned() {
+        let input = serde_json::json!({
+            "protocolVersion": PROTOCOL_VERSION,
+            "surfaceId": "surface-1",
+            "type": "discard_close_requested",
+            "documentId": "document-1",
+            "documentVersion": 8
+        })
+        .to_string();
+
+        assert_eq!(
+            parse_editor_message(&input).unwrap(),
+            (
+                "surface-1".into(),
+                EditorMessage::DiscardCloseRequested {
+                    document_id: "document-1".into(),
+                    document_version: 8,
+                }
+            )
         );
     }
 
