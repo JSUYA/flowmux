@@ -132,6 +132,7 @@ pub struct Sidebar {
     pub root: gtk::Box,
     pub list: gtk::ListBox,
     rows: Rc<RefCell<Vec<(WorkspaceId, gtk::ListBoxRow)>>>,
+    row_widgets: Rc<RefCell<HashMap<WorkspaceId, WorkspaceRowWidget>>>,
     on_close: Rc<dyn Fn(WorkspaceId)>,
     bell_button: gtk::MenuButton,
     bell_popover: gtk::Popover,
@@ -365,6 +366,7 @@ impl Sidebar {
             root: root_box,
             list,
             rows,
+            row_widgets: Rc::new(RefCell::new(HashMap::new())),
             on_close,
             bell_button,
             bell_popover,
@@ -435,14 +437,9 @@ impl Sidebar {
         }
         let mut rows = self.rows.borrow_mut();
         if let Some((_, row)) = rows.iter().find(|(id, _)| *id == ws.id).cloned() {
-            let row_widget = row_widget(ws, details, self.on_close.clone(), self.bridge.clone());
-            row_widget
-                .badge
-                .set_visible(self.notification_workspaces.borrow().contains(&ws.id));
-            self.notification_badges
-                .borrow_mut()
-                .insert(ws.id, row_widget.badge);
-            row.set_child(Some(&row_widget.root));
+            if let Some(row_widget) = self.row_widgets.borrow_mut().get_mut(&ws.id) {
+                row_widget.update(ws, details);
+            }
             let status = self.agent_status.borrow().get(&ws.id).copied();
             apply_agent_status_class(&row, status);
             return;
@@ -454,7 +451,7 @@ impl Sidebar {
             .set_visible(self.notification_workspaces.borrow().contains(&ws.id));
         self.notification_badges
             .borrow_mut()
-            .insert(ws.id, row_widget.badge);
+            .insert(ws.id, row_widget.badge.clone());
         row.set_child(Some(&row_widget.root));
         let status = self.agent_status.borrow().get(&ws.id).copied();
         apply_agent_status_class(&row, status);
@@ -468,6 +465,7 @@ impl Sidebar {
         );
         self.list.append(&row);
         rows.push((ws.id, row));
+        self.row_widgets.borrow_mut().insert(ws.id, row_widget);
     }
 
     /// Apply a drag-and-drop result to the side panel by moving the visual row
@@ -521,6 +519,7 @@ impl Sidebar {
         self.attentions.borrow_mut().remove(&id);
         self.notification_workspaces.borrow_mut().remove(&id);
         self.notification_badges.borrow_mut().remove(&id);
+        self.row_widgets.borrow_mut().remove(&id);
         self.agent_status.borrow_mut().remove(&id);
         self.subtitle_cache.borrow_mut().remove(&id);
         self.titles.borrow_mut().retain(|(tid, _)| *tid != id);
@@ -1123,9 +1122,82 @@ fn sidebar_tab_drop_accepts_formats(formats: &gtk::gdk::ContentFormats) -> bool 
     !formats.contain_mime_type(WORKSPACE_DND_MIME) && tab_dnd_formats_accept_payload(formats)
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WorkspaceRowRenderState {
+    title: String,
+    color: Option<String>,
+    details: WorkspaceRowDetails,
+    linked_pr: Option<(u64, PrState)>,
+    listening_ports: Vec<u16>,
+}
+
+impl WorkspaceRowRenderState {
+    fn new(ws: &Workspace, details: &WorkspaceRowDetails) -> Self {
+        Self {
+            title: ws.display_title().to_string(),
+            color: ws.color.clone(),
+            details: details.clone(),
+            linked_pr: ws
+                .git
+                .as_ref()
+                .and_then(|git| git.linked_pr.as_ref())
+                .map(|pr| (pr.number, pr.state)),
+            listening_ports: ws.listening_ports.clone(),
+        }
+    }
+
+    fn metadata_matches(&self, other: &Self) -> bool {
+        self.details == other.details
+            && self.linked_pr == other.linked_pr
+            && self.listening_ports == other.listening_ports
+    }
+}
+
+#[derive(Clone)]
 struct WorkspaceRowWidget {
     root: gtk::Widget,
     badge: gtk::Box,
+    content: gtk::Box,
+    meta: gtk::Box,
+    title: gtk::Label,
+    color_bar: Option<gtk::Widget>,
+    render_state: WorkspaceRowRenderState,
+}
+
+impl WorkspaceRowWidget {
+    fn update(&mut self, ws: &Workspace, details: &WorkspaceRowDetails) {
+        let next = WorkspaceRowRenderState::new(ws, details);
+        if self.render_state == next {
+            return;
+        }
+
+        if self.render_state.color != next.color {
+            if let Some(old) = self.color_bar.take() {
+                self.content.remove(&old);
+            }
+            if let Some(color) = next.color.as_deref() {
+                let bar = color_bar(color);
+                self.content.prepend(&bar);
+                self.color_bar = Some(bar);
+            }
+        }
+
+        if self.render_state.metadata_matches(&next) {
+            if self.render_state.title != next.title {
+                self.title.set_text(&next.title);
+            }
+        } else {
+            let metadata = build_meta_column_widget(ws, details);
+            metadata.root.set_hexpand(true);
+            metadata.root.set_margin_start(6);
+            self.content.remove(&self.meta);
+            self.content.append(&metadata.root);
+            self.meta = metadata.root;
+            self.title = metadata.title;
+        }
+
+        self.render_state = next;
+    }
 }
 
 fn row_widget(
@@ -1148,14 +1220,15 @@ fn row_widget(
     content.set_margin_start(4);
     content.set_margin_end(6);
 
-    if let Some(color) = ws.color.as_deref() {
-        content.append(&color_bar(color));
+    let color_bar = ws.color.as_deref().map(color_bar);
+    if let Some(bar) = color_bar.as_ref() {
+        content.append(bar);
     }
 
-    let meta = build_meta_column(ws, details);
-    meta.set_hexpand(true);
-    meta.set_margin_start(6);
-    content.append(&meta);
+    let metadata = build_meta_column_widget(ws, details);
+    metadata.root.set_hexpand(true);
+    metadata.root.set_margin_start(6);
+    content.append(&metadata.root);
 
     let row = gtk::Overlay::new();
     row.set_child(Some(&content));
@@ -1329,6 +1402,11 @@ fn row_widget(
     WorkspaceRowWidget {
         root: row.upcast(),
         badge: notification_badge,
+        content,
+        meta: metadata.root,
+        title: metadata.title,
+        color_bar,
+        render_state: WorkspaceRowRenderState::new(ws, details),
     }
 }
 
@@ -1385,7 +1463,17 @@ fn apply_agent_status_class(row: &gtk::ListBoxRow, status: Option<AgentStatus>) 
     }
 }
 
+struct WorkspaceMetaColumn {
+    root: gtk::Box,
+    title: gtk::Label,
+}
+
+#[cfg(all(test, not(target_os = "macos")))]
 fn build_meta_column(ws: &Workspace, details: &WorkspaceRowDetails) -> gtk::Box {
+    build_meta_column_widget(ws, details).root
+}
+
+fn build_meta_column_widget(ws: &Workspace, details: &WorkspaceRowDetails) -> WorkspaceMetaColumn {
     // Layout:
     //   line 1: workspace display title, custom_title if present, otherwise name
     //   line 2..: optional agent blocks followed by up to 3 shortened MRU cwd
@@ -1445,7 +1533,7 @@ fn build_meta_column(ws: &Workspace, details: &WorkspaceRowDetails) -> gtk::Box 
         v.append(&sidebar_tree_row(&child, layout.line));
     }
 
-    v
+    WorkspaceMetaColumn { root: v, title }
 }
 
 fn workspace_aux_row(ws: &Workspace) -> Option<gtk::Box> {
@@ -2024,7 +2112,7 @@ mod tests {
 
     #[cfg(not(target_os = "macos"))]
     #[gtk::test]
-    fn redrawing_and_removing_workspace_releases_old_widgets() {
+    fn redrawing_workspace_reuses_row_widgets_and_removal_releases_them() {
         if gtk::init().is_err() {
             return;
         }
@@ -2035,17 +2123,21 @@ mod tests {
 
         let row = sidebar.rows.borrow()[0].1.clone();
         let old_child = row.child().expect("workspace row child").downgrade();
+        let old_meta = sidebar.row_widgets.borrow()[&ws.id].meta.clone();
         let old_row = row.downgrade();
-        drop(row);
 
         ws.name = "updated".into();
         sidebar.upsert(&ws);
-        assert!(
-            old_child.upgrade().is_none(),
-            "redraw retained the replaced widget tree"
+        assert_eq!(
+            old_child.upgrade().as_ref(),
+            row.child().as_ref(),
+            "redraw replaced the stable row widget tree"
         );
+        assert_eq!(sidebar.row_widgets.borrow()[&ws.id].meta, old_meta);
+        assert!(sidebar.workspace_row_contains(ws.id, "updated"));
 
         sidebar.remove(ws.id);
+        drop(row);
         assert!(
             old_row.upgrade().is_none(),
             "removal retained the detached list row"
