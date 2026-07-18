@@ -1525,11 +1525,9 @@ impl FileBrowserPanel {
         let path = row.path.clone();
         let row_for_menu = list_row.clone();
         click.connect_pressed(
-            move |gesture, n_press, x, y| match gesture.current_button() {
+            move |gesture, _n_press, x, y| match gesture.current_button() {
                 gdk::BUTTON_PRIMARY => {
-                    if n_press >= 2 {
-                        panel.activate_path(path.clone());
-                    } else if gesture
+                    if gesture
                         .current_event_state()
                         .contains(gdk::ModifierType::CONTROL_MASK)
                     {
@@ -1540,7 +1538,7 @@ impl FileBrowserPanel {
                     {
                         panel.extend_selection_to_path(path.clone());
                     } else {
-                        panel.focus_path(path.clone());
+                        panel.activate_path(path.clone());
                     }
                 }
                 gdk::BUTTON_SECONDARY => {

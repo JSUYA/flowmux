@@ -115,13 +115,6 @@ impl EditorHostState {
         }
     }
 
-    pub(super) fn contains_document(&self, path: &Path) -> bool {
-        match &*self.session.borrow() {
-            Ok(session) => session.contains_document(path),
-            Err(_) => false,
-        }
-    }
-
     pub(super) fn open_document(&self, path: &Path) -> Result<HostMessage, String> {
         match &mut *self.session.borrow_mut() {
             Ok(session) => session

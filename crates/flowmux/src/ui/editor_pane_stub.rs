@@ -48,10 +48,6 @@ impl EditorPane {
         self.root.grab_focus();
     }
 
-    pub fn contains_file(&self, _path: &Path) -> bool {
-        false
-    }
-
     pub fn open_file(&self, _path: &Path) -> Result<(), String> {
         Err("the embedded editor is unavailable on this platform".into())
     }

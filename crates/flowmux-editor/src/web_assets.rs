@@ -177,6 +177,7 @@ fn serve(listener: TcpListener, token: String, stopping: Arc<AtomicBool>) {
 }
 
 fn handle_connection(mut stream: TcpStream, token: &str) -> io::Result<()> {
+    stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(IO_TIMEOUT))?;
     stream.set_write_timeout(Some(IO_TIMEOUT))?;
     let request = read_request_headers(&mut stream)?;
@@ -321,6 +322,19 @@ mod tests {
         assert!(worker.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(worker.contains("Content-Type: text/javascript; charset=utf-8"));
         assert!(worker.ends_with("\r\n\r\n"));
+
+        let main = request(&server, "GET", "main.js");
+        let body = main
+            .split_once("\r\n\r\n")
+            .expect("asset response must contain a header separator")
+            .1;
+        let expected = ASSETS
+            .iter()
+            .find(|asset| asset.path == "main.js")
+            .unwrap()
+            .bytes
+            .len();
+        assert_eq!(body.len(), expected);
     }
 
     #[test]

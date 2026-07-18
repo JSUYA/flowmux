@@ -12,26 +12,11 @@
   </head>
   <body>
     <main class="editor-shell" aria-label="Flowmux editor">
-      <nav id="document-tabs" class="document-tabs" aria-label="Open documents"></nav>
-      <section id="context-rail" class="context-rail" aria-live="polite">
-        <span id="workspace-name" class="workspace-name">Workspace</span>
-        <span class="rail-divider" aria-hidden="true">/</span>
-        <span id="document-path" class="document-path">No file open</span>
-        <span id="document-state" class="document-state">Ready</span>
-      </section>
       <section id="empty-state" class="empty-state">
-        <span class="empty-mark" aria-hidden="true">⌘</span>
-        <h1>Open a file to start editing</h1>
-        <p>Double-click a text file in the Flowmux file browser.</p>
+        <p>Click a text file in Files to edit it.</p>
       </section>
       <div id="editor" class="editor" aria-label="Text editor"></div>
-      <footer id="status-strip" class="status-strip" aria-live="polite">
-        <span id="cursor-status">Ln 1, Col 1</span>
-        <span id="indentation-status">Spaces: 4</span>
-        <span id="language-status">Plain text</span>
-        <span id="encoding-status">UTF-8</span>
-        <span id="eol-status">LF</span>
-      </footer>
+      <span id="document-state" class="document-state" aria-live="polite" hidden></span>
     </main>
     <script type="module" src="./main.js"></script>
   </body>

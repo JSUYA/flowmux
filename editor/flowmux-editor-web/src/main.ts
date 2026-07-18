@@ -8,8 +8,8 @@ import "monaco-editor/esm/vs/language/json/monaco.contribution.js";
 import "monaco-editor/esm/vs/language/typescript/monaco.contribution.js";
 import "./styles.css";
 
-import { adjustedFontSize, movedTabIndex, type TabMove } from "./editor_state";
-import { languageForPath, languageLabel } from "./language";
+import { adjustedFontSize } from "./editor_state";
+import { languageForPath } from "./language";
 import {
   advanceDocumentEdit,
   type DocumentPayload,
@@ -57,17 +57,9 @@ interface OpenDocument {
   suppressChanges: boolean;
 }
 
-const tabs = requiredElement("document-tabs");
-const workspaceName = requiredElement("workspace-name");
-const documentPath = requiredElement("document-path");
 const documentState = requiredElement("document-state");
 const emptyState = requiredElement("empty-state");
 const editorContainer = requiredElement("editor");
-const cursorStatus = requiredElement("cursor-status");
-const indentationStatus = requiredElement("indentation-status");
-const languageStatus = requiredElement("language-status");
-const encodingStatus = requiredElement("encoding-status");
-const eolStatus = requiredElement("eol-status");
 
 let surfaceId = new URLSearchParams(window.location.search).get("surface") ?? "unbound";
 let activeDocumentId: string | null = null;
@@ -169,26 +161,6 @@ editor.addAction({
   run: () => setEditorFontSize(13),
 });
 
-editor.onDidChangeCursorPosition(({ position }) => {
-  cursorStatus.textContent = `Ln ${position.lineNumber}, Col ${position.column}`;
-});
-
-tabs.addEventListener("keydown", (event) => {
-  const move = tabMoveForKey(event.key);
-  if (move === null) {
-    return;
-  }
-  const ids = [...documents.keys()];
-  const current = activeDocumentId === null ? 0 : Math.max(ids.indexOf(activeDocumentId), 0);
-  const next = movedTabIndex(current, ids.length, move);
-  const nextId = next === null ? undefined : ids[next];
-  if (nextId === undefined) {
-    return;
-  }
-  event.preventDefault();
-  activateDocumentAndNotify(nextId, true);
-});
-
 window.flowmuxEditorHost = {
   receive(message: unknown): void {
     if (!isHostMessage(message)) {
@@ -208,7 +180,6 @@ function handleHostMessage(message: HostMessage): void {
 
   switch (message.type) {
     case "initialize_editor":
-      workspaceName.textContent = message.workspaceName;
       for (const document of [...documents.values()]) {
         document.model.dispose();
       }
@@ -235,7 +206,7 @@ function handleHostMessage(message: HostMessage): void {
         document.payload.version = message.documentVersion;
         document.payload.dirty = false;
         document.payload.externalChange = false;
-        renderChrome();
+        renderState();
       }
       break;
     }
@@ -245,6 +216,7 @@ function handleHostMessage(message: HostMessage): void {
         document.payload.externalChange = true;
         documentState.textContent = message.reason;
         documentState.className = "document-state is-conflict";
+        documentState.hidden = false;
       }
       break;
     }
@@ -259,7 +231,7 @@ function addOrReplaceDocument(payload: DocumentPayload): void {
     monaco.editor.setModelLanguage(existing.model, payload.language ?? languageForPath(payload.relativePath));
     existing.payload = { ...payload };
     existing.suppressChanges = false;
-    renderChrome();
+    renderState();
     return;
   }
 
@@ -291,10 +263,10 @@ function addOrReplaceDocument(payload: DocumentPayload): void {
       changeSequence: edit.changeSequence,
       content: model.getValue(),
     });
-    renderChrome();
+    renderState();
   });
   documents.set(payload.id, document);
-  renderChrome();
+  renderState();
 }
 
 function activateDocument(documentId: string | null): void {
@@ -302,7 +274,7 @@ function activateDocument(documentId: string | null): void {
   activeDocumentId = document?.payload.id ?? null;
   editor.setModel(document?.model ?? null);
   editor.updateOptions({ readOnly: document?.payload.readOnly ?? false });
-  renderChrome();
+  renderState();
   if (document !== undefined) {
     editor.focus();
   }
@@ -320,7 +292,7 @@ function closeDocument(documentId: string): void {
   if (activeDocumentId === documentId) {
     activateDocument(ids[index + 1] ?? ids[index - 1] ?? null);
   } else {
-    renderChrome();
+    renderState();
   }
 }
 
@@ -366,105 +338,21 @@ function requestSaveAll(): void {
   }
 }
 
-function activateDocumentAndNotify(documentId: string, focusTab: boolean): void {
-  const document = documents.get(documentId);
-  if (document === undefined) {
-    return;
-  }
-  activateDocument(documentId);
-  postToHost({
-    protocolVersion: PROTOCOL_VERSION,
-    surfaceId,
-    type: "active_document_changed",
-    documentId,
-    documentVersion: document.payload.version,
-  });
-  if (focusTab) {
-    tabs
-      .querySelector<HTMLButtonElement>(`.tab-activate[data-document-id="${CSS.escape(documentId)}"]`)
-      ?.focus();
-  }
-}
-
 function setEditorFontSize(fontSize: number): void {
   editorFontSize = fontSize;
   editor.updateOptions({ fontSize });
 }
 
-function tabMoveForKey(key: string): TabMove | null {
-  switch (key) {
-    case "ArrowLeft":
-      return "previous";
-    case "ArrowRight":
-      return "next";
-    case "Home":
-      return "first";
-    case "End":
-      return "last";
-    default:
-      return null;
-  }
-}
-
-function renderChrome(): void {
-  tabs.replaceChildren();
-  for (const document of documents.values()) {
-    const isActive = document.payload.id === activeDocumentId;
-    const tab = window.document.createElement("div");
-    tab.className = `document-tab${isActive ? " is-active" : ""}${document.payload.dirty ? " is-dirty" : ""}`;
-    tab.title = document.payload.relativePath;
-    const activate = window.document.createElement("button");
-    activate.type = "button";
-    activate.className = "tab-activate";
-    activate.dataset.documentId = document.payload.id;
-    activate.setAttribute("role", "tab");
-    activate.setAttribute("aria-selected", String(isActive));
-    activate.tabIndex = isActive ? 0 : -1;
-    activate.addEventListener("click", () => activateDocumentAndNotify(document.payload.id, false));
-
-    const title = window.document.createElement("span");
-    title.className = "tab-title";
-    title.textContent = document.payload.name;
-    const state = window.document.createElement("span");
-    state.className = "tab-state";
-    state.setAttribute("aria-label", document.payload.dirty ? "Unsaved changes" : "Saved");
-    const close = window.document.createElement("button");
-    close.type = "button";
-    close.className = "tab-close";
-    close.textContent = "×";
-    close.setAttribute("aria-label", `Close ${document.payload.name}`);
-    close.addEventListener("click", (event) => {
-      event.stopPropagation();
-      requestClose(document);
-    });
-    activate.append(title, state);
-    tab.append(activate, close);
-    tabs.append(tab);
-  }
-
+function renderState(): void {
   const active = activeDocumentId === null ? undefined : documents.get(activeDocumentId);
   emptyState.classList.toggle("is-hidden", active !== undefined);
   editorContainer.classList.toggle("is-visible", active !== undefined);
   if (active === undefined) {
-    documentPath.textContent = "No file open";
-    documentState.textContent = "Ready";
     documentState.className = "document-state";
-    languageStatus.textContent = "Plain text";
-    indentationStatus.textContent = "Spaces: 4";
-    encodingStatus.textContent = "UTF-8";
-    eolStatus.textContent = "LF";
+    documentState.hidden = true;
     return;
   }
 
-  const language = active.payload.language ?? languageForPath(active.payload.relativePath);
-  documentPath.textContent = active.payload.relativePath;
-  languageStatus.textContent = languageLabel(language);
-  const modelOptions = active.model.getOptions();
-  indentationStatus.textContent = modelOptions.insertSpaces
-    ? `Spaces: ${modelOptions.tabSize}`
-    : `Tab Size: ${modelOptions.tabSize}`;
-  encodingStatus.textContent = active.payload.encoding;
-  eolStatus.textContent = active.payload.eol;
   if (active.payload.externalChange) {
     documentState.textContent = "Changed on disk";
     documentState.className = "document-state is-conflict";
@@ -478,6 +366,7 @@ function renderChrome(): void {
     documentState.textContent = "Saved";
     documentState.className = "document-state";
   }
+  documentState.hidden = !active.payload.externalChange && !active.payload.readOnly && !active.payload.dirty;
 }
 
 function postToHost(message: EditorMessage): void {

@@ -52,48 +52,39 @@ impl WindowController {
             return;
         };
 
-        let already_open = self
+        let mut leaves = Vec::new();
+        for surface in &workspace_state.surfaces {
+            surface.root_pane.for_each_leaf(|pane| leaves.push(pane));
+        }
+        let pane_mru = self
+            .focus_mru
+            .borrow()
+            .get(&workspace)
+            .map(|queue| queue.iter().copied().collect::<Vec<_>>())
+            .unwrap_or_default();
+        let Some(target_pane) = resolve_editor_target(source_pane, &pane_mru, &leaves) else {
+            self.clipboard_toast
+                .show_with_message("The workspace has no pane for the editor");
+            return;
+        };
+
+        let existing_surface = self
             .pane_registry
             .borrow()
-            .editor_for_file(workspace, &path);
-        let (target_pane, editor_surface) = if let Some(existing) = already_open {
-            existing
+            .editor_surface_in_pane(target_pane);
+        let editor_surface = if let Some(surface) = existing_surface {
+            surface
         } else {
-            let mut leaves = Vec::new();
-            for surface in &workspace_state.surfaces {
-                surface.root_pane.for_each_leaf(|pane| leaves.push(pane));
-            }
-            let pane_mru = self
-                .focus_mru
-                .borrow()
-                .get(&workspace)
-                .map(|queue| queue.iter().copied().collect::<Vec<_>>())
-                .unwrap_or_default();
-            let Some(target_pane) = resolve_editor_target(source_pane, &pane_mru, &leaves) else {
+            let Some((workspace_id, surface)) =
+                self.store.add_editor_surface_to_pane(target_pane).await
+            else {
                 self.clipboard_toast
-                    .show_with_message("The workspace has no pane for the editor");
+                    .show_with_message("Could not create an editor tab");
                 return;
             };
-
-            let existing_surface = self
-                .pane_registry
-                .borrow()
-                .editor_surface_in_pane(target_pane);
-            let editor_surface = if let Some(surface) = existing_surface {
-                surface
-            } else {
-                let Some((workspace_id, surface)) =
-                    self.store.add_editor_surface_to_pane(target_pane).await
-                else {
-                    self.clipboard_toast
-                        .show_with_message("Could not create an editor tab");
-                    return;
-                };
-                self.attach_or_rerender_surface(workspace_id, target_pane, surface)
-                    .await;
-                surface
-            };
-            (target_pane, editor_surface)
+            self.attach_or_rerender_surface(workspace_id, target_pane, surface)
+                .await;
+            surface
         };
 
         self.store
@@ -113,6 +104,23 @@ impl WindowController {
             tracing::warn!(path = %path.display(), %error, "failed to open file in editor");
             self.clipboard_toast
                 .show_with_message(&format!("Could not open file: {error}"));
+        } else if let Some(title) = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.trim().is_empty())
+        {
+            if self
+                .store
+                .update_surface_auto_title(target_pane, editor_surface, title.to_string())
+                .await
+                .is_some()
+            {
+                if let Some(title) = self.store.surface_title(target_pane, editor_surface).await {
+                    self.pane_registry
+                        .borrow()
+                        .set_surface_title(editor_surface, &title);
+                }
+            }
         }
         self.refresh_window_title().await;
         self.focus_pane(target_pane);

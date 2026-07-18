@@ -288,10 +288,6 @@ impl EditorPane {
         focus_native_view(&self.native.web_view);
     }
 
-    pub fn contains_file(&self, path: &Path) -> bool {
-        self.host.contains_document(path)
-    }
-
     pub fn open_file(&self, path: &Path) -> Result<(), String> {
         let message = self.host.open_document(path)?;
         self.send(message).map_err(|error| error.to_string())
