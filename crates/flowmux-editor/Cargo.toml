@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+[package]
+name = "flowmux-editor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Document and persistence services for the Flowmux editor."
+
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }
+tempfile = "3"
+
+[dev-dependencies]
+serde_json = { workspace = true }

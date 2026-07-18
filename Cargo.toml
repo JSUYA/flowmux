@@ -17,6 +17,7 @@ default-members = [
     "crates/flowmux-daemon",
     "crates/flowmux-cookies",
     "crates/flowmux-browser",
+    "crates/flowmux-editor",
 ]
 
 [workspace.package]
@@ -73,6 +74,7 @@ flowmux-procmon = { path = "crates/flowmux-procmon" }
 flowmux-daemon = { path = "crates/flowmux-daemon" }
 flowmux-cookies = { path = "crates/flowmux-cookies" }
 flowmux-browser = { path = "crates/flowmux-browser" }
+flowmux-editor = { path = "crates/flowmux-editor" }
 
 [profile.release]
 lto = "thin"

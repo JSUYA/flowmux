@@ -134,6 +134,7 @@ flowmux/
 │   ├── flowmux-state/      Persistent workspace/session state on disk
 │   ├── flowmux-terminal/   VTE terminal integration + PTY env helpers
 │   ├── flowmux-browser/    WebKitGTK 6.0 browser surface + scriptable refs
+│   ├── flowmux-editor/     Safe UTF-8 document I/O, versioning, and atomic saves
 │   ├── flowmux-cookies/    Browser cookie/session import (libsecret + sqlite)
 │   ├── flowmux-notify/     OSC 9/99/777 parser + libnotify D-Bus sender
 │   ├── flowmux-ipc/        Unix-socket IPC (cmux socket-API compatible)
