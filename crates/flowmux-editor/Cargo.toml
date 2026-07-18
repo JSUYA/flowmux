@@ -10,6 +10,7 @@ description = "Document and persistence services for the Flowmux editor."
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 thiserror = { workspace = true }
 tempfile = "3"
 uuid = { workspace = true }

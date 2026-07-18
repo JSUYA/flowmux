@@ -6,6 +6,7 @@
 //! detection, and atomic persistence.
 
 mod protocol;
+mod recovery;
 mod session;
 mod web_assets;
 
@@ -13,6 +14,9 @@ pub use protocol::{
     javascript_for_host_message, parse_editor_message, serialize_host_message, DocumentDiskStatus,
     DocumentPayload, EditorMessage, HostMessage, ProtocolError, TextDocumentEncoding,
     TextDocumentLineEnding, MAX_BRIDGE_MESSAGE_BYTES, PROTOCOL_VERSION,
+};
+pub use recovery::{
+    RecoveryDiskState, RecoveryError, RecoverySnapshot, RecoveryStore, RECOVERY_FORMAT_VERSION,
 };
 pub use session::{EditorSession, EditorSessionError};
 pub use web_assets::{EditorAssetServer, EditorAssetServerError};
