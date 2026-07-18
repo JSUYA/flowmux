@@ -2,14 +2,19 @@
 //! Linux editor surface backed by an isolated WebKitGTK WebView.
 
 use super::{
-    handle_bridge_message, is_allowed_editor_navigation, EditorBridgeState, EditorHostState,
+    handle_bridge_message, is_allowed_editor_navigation, queue_host_messages,
+    should_poll_editor_documents, EditorBridgeState, EditorHostState,
 };
 use flowmux_core::{PaneId, SurfaceId};
 use flowmux_editor::{EditorAssetServer, HostMessage, ProtocolError};
+use gtk::gio;
 use gtk::prelude::*;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::time::Duration;
 use webkit6::prelude::*;
 
 const MESSAGE_HANDLER_NAME: &str = "flowmuxEditor";
@@ -26,6 +31,8 @@ pub struct EditorPane {
     _asset_server: Rc<EditorAssetServer>,
     _network_session: webkit6::NetworkSession,
     closed: Rc<Cell<bool>>,
+    file_monitors: Rc<RefCell<HashMap<PathBuf, gio::FileMonitor>>>,
+    file_monitor_generation: Rc<Cell<u64>>,
 }
 
 impl EditorPane {
@@ -135,6 +142,8 @@ impl EditorPane {
             _asset_server: asset_server,
             _network_session: network_session,
             closed: Rc::new(Cell::new(false)),
+            file_monitors: Rc::new(RefCell::new(HashMap::new())),
+            file_monitor_generation: Rc::new(Cell::new(0)),
         };
         if let Err(error) = pane.send(
             pane.host
@@ -167,7 +176,52 @@ impl EditorPane {
 
     pub fn open_file(&self, path: &Path) -> Result<(), String> {
         let message = self.host.open_document(path)?;
+        self.install_file_monitor(path);
         self.send(message).map_err(|error| error.to_string())
+    }
+
+    fn install_file_monitor(&self, path: &Path) {
+        let Some(parent) = path.parent() else {
+            return;
+        };
+        let directory = fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
+        if self.file_monitors.borrow().contains_key(&directory) {
+            return;
+        }
+        let file = gio::File::for_path(&directory);
+        let Ok(monitor) =
+            file.monitor_directory(gio::FileMonitorFlags::WATCH_MOVES, gio::Cancellable::NONE)
+        else {
+            tracing::warn!(directory = %directory.display(), "editor file monitor unavailable");
+            return;
+        };
+        let bridge = self.bridge.clone();
+        let host = self.host.clone();
+        let web_view = self.web_view.downgrade();
+        let generation = self.file_monitor_generation.clone();
+        monitor.connect_changed(move |_, _, _, event| {
+            if !should_poll_editor_documents(event) {
+                return;
+            }
+            let expected = generation.get().wrapping_add(1);
+            generation.set(expected);
+            let generation = generation.clone();
+            let bridge = bridge.clone();
+            let host = host.clone();
+            let web_view = web_view.clone();
+            gtk::glib::timeout_add_local_once(Duration::from_millis(120), move || {
+                if generation.get() != expected {
+                    return;
+                }
+                let Some(web_view) = web_view.upgrade() else {
+                    return;
+                };
+                for script in queue_host_messages(&bridge, host.poll_external_changes()) {
+                    evaluate_script(&web_view, &script);
+                }
+            });
+        });
+        self.file_monitors.borrow_mut().insert(directory, monitor);
     }
 
     pub fn send(&self, message: HostMessage) -> Result<(), ProtocolError> {
@@ -180,6 +234,14 @@ impl EditorPane {
     pub fn prepare_for_close(&self) {
         if self.closed.replace(true) {
             return;
+        }
+        for monitor in self
+            .file_monitors
+            .borrow_mut()
+            .drain()
+            .map(|(_, monitor)| monitor)
+        {
+            monitor.cancel();
         }
         self.user_content_manager
             .unregister_script_message_handler(MESSAGE_HANDLER_NAME, None);

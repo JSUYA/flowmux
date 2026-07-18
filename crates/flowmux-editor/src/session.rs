@@ -2,9 +2,9 @@
 //! Headless document session behind one editor surface.
 
 use crate::{
-    DiskStatus, DocumentError, DocumentId, DocumentPayload, DocumentService, DocumentSnapshot,
-    EditorMessage, HostMessage, LineEnding, TextDocumentEncoding, TextDocumentLineEnding,
-    TextEncoding,
+    DiskStatus, DocumentDiskStatus, DocumentError, DocumentId, DocumentPayload, DocumentService,
+    DocumentSnapshot, EditorMessage, HostMessage, LineEnding, TextDocumentEncoding,
+    TextDocumentLineEnding, TextEncoding,
 };
 use std::collections::HashMap;
 use std::path::Path;
@@ -30,6 +30,7 @@ pub struct EditorSession {
     protocol_ids: HashMap<String, DocumentId>,
     open_order: Vec<DocumentId>,
     active: Option<DocumentId>,
+    reported_disk_status: HashMap<DocumentId, DiskStatus>,
 }
 
 impl EditorSession {
@@ -39,6 +40,7 @@ impl EditorSession {
             protocol_ids: HashMap::new(),
             open_order: Vec::new(),
             active: None,
+            reported_disk_status: HashMap::new(),
         })
     }
 
@@ -68,6 +70,9 @@ impl EditorSession {
         if !self.open_order.contains(&id) {
             self.open_order.push(id);
         }
+        if !opened.already_open {
+            self.reported_disk_status.insert(id, DiskStatus::Unchanged);
+        }
         self.active = Some(id);
 
         if opened.already_open {
@@ -80,6 +85,39 @@ impl EditorSession {
                 document: self.payload(opened.document),
             })
         }
+    }
+
+    pub fn poll_external_changes(&mut self) -> Result<Vec<HostMessage>, EditorSessionError> {
+        let mut messages = Vec::new();
+        for id in self.open_order.clone() {
+            let status = self.documents.disk_status(id)?;
+            let previous = self
+                .reported_disk_status
+                .get(&id)
+                .copied()
+                .unwrap_or(DiskStatus::Unchanged);
+            let snapshot = self.documents.snapshot(id)?;
+
+            if status == DiskStatus::Modified && !snapshot.is_dirty() {
+                if let Ok(reloaded) = self.documents.reload_from_disk(id) {
+                    self.reported_disk_status.insert(id, DiskStatus::Unchanged);
+                    messages.push(HostMessage::ReplaceDocument {
+                        document: self.payload(reloaded),
+                    });
+                    continue;
+                }
+            }
+
+            if status != previous {
+                self.reported_disk_status.insert(id, status);
+                messages.push(HostMessage::DocumentDiskStatus {
+                    document_id: protocol_id(id),
+                    document_version: snapshot.version,
+                    status: protocol_disk_status(status),
+                });
+            }
+        }
+        Ok(messages)
     }
 
     pub fn handle_editor_message(
@@ -126,6 +164,7 @@ impl EditorSession {
                 self.documents.close(id)?;
                 self.protocol_ids.remove(&document_id);
                 self.open_order.retain(|candidate| *candidate != id);
+                self.reported_disk_status.remove(&id);
                 if self.active == Some(id) {
                     self.active = self.open_order.last().copied();
                 }
@@ -243,6 +282,14 @@ impl EditorSession {
 
 fn protocol_id(id: DocumentId) -> String {
     format!("document-{}", id.get())
+}
+
+fn protocol_disk_status(status: DiskStatus) -> DocumentDiskStatus {
+    match status {
+        DiskStatus::Unchanged => DocumentDiskStatus::Unchanged,
+        DiskStatus::Modified => DocumentDiskStatus::Modified,
+        DiskStatus::Deleted => DocumentDiskStatus::Deleted,
+    }
 }
 
 #[cfg(test)]
@@ -406,6 +453,110 @@ mod tests {
         assert!(matches!(
             error,
             EditorSessionError::Document(DocumentError::Dirty(_))
+        ));
+    }
+
+    #[test]
+    fn clean_external_change_is_reloaded_once() {
+        let workspace = tempdir().unwrap();
+        let path = workspace.path().join("자동-새로고침.txt");
+        fs::write(&path, "처음\n").unwrap();
+        let mut session = EditorSession::new(workspace.path()).unwrap();
+        let document = open_payload(session.open_document(&path).unwrap());
+        fs::write(&path, "외부 변경 日本語 🙂\n").unwrap();
+
+        let messages = session.poll_external_changes().unwrap();
+        assert!(matches!(
+            messages.as_slice(),
+            [HostMessage::ReplaceDocument { document: replacement }]
+                if replacement.id == document.id
+                    && replacement.content == "외부 변경 日本語 🙂\n"
+                    && replacement.version == document.version + 1
+                    && !replacement.dirty
+                    && !replacement.external_change
+        ));
+        assert!(session.poll_external_changes().unwrap().is_empty());
+    }
+
+    #[test]
+    fn dirty_external_change_reports_conflict_without_reloading() {
+        let workspace = tempdir().unwrap();
+        let path = workspace.path().join("충돌.txt");
+        fs::write(&path, "base\n").unwrap();
+        let mut session = EditorSession::new(workspace.path()).unwrap();
+        let document = open_payload(session.open_document(&path).unwrap());
+        session
+            .handle_editor_message(EditorMessage::DocumentChanged {
+                document_id: document.id.clone(),
+                document_version: document.version,
+                change_sequence: 1,
+                content: "편집 중\n".into(),
+            })
+            .unwrap();
+        fs::write(&path, "외부 변경\n").unwrap();
+
+        let messages = session.poll_external_changes().unwrap();
+        assert!(matches!(
+            messages.as_slice(),
+            [HostMessage::DocumentDiskStatus {
+                document_id,
+                document_version: 2,
+                status: DocumentDiskStatus::Modified,
+            }] if document_id == &document.id
+        ));
+        assert!(session.poll_external_changes().unwrap().is_empty());
+        let initialized = session.initialize_message("workspace".into());
+        assert!(matches!(
+            initialized,
+            HostMessage::InitializeEditor { documents, .. }
+                if documents[0].content == "편집 중\n" && documents[0].dirty
+        ));
+        assert_eq!(fs::read_to_string(path).unwrap(), "외부 변경\n");
+    }
+
+    #[test]
+    fn deleted_document_is_reported_once() {
+        let workspace = tempdir().unwrap();
+        let path = workspace.path().join("삭제.txt");
+        fs::write(&path, "내용\n").unwrap();
+        let mut session = EditorSession::new(workspace.path()).unwrap();
+        let document = open_payload(session.open_document(&path).unwrap());
+        fs::remove_file(path).unwrap();
+
+        let messages = session.poll_external_changes().unwrap();
+        assert!(matches!(
+            messages.as_slice(),
+            [HostMessage::DocumentDiskStatus {
+                document_id,
+                status: DocumentDiskStatus::Deleted,
+                ..
+            }] if document_id == &document.id
+        ));
+        assert!(session.poll_external_changes().unwrap().is_empty());
+    }
+
+    #[test]
+    fn invalid_external_content_reports_conflict_and_retries_after_next_change() {
+        let workspace = tempdir().unwrap();
+        let path = workspace.path().join("invalid-then-valid.txt");
+        fs::write(&path, "base\n").unwrap();
+        let mut session = EditorSession::new(workspace.path()).unwrap();
+        let document = open_payload(session.open_document(&path).unwrap());
+        fs::write(&path, [0xff, 0xfe]).unwrap();
+
+        assert!(matches!(
+            session.poll_external_changes().unwrap().as_slice(),
+            [HostMessage::DocumentDiskStatus {
+                status: DocumentDiskStatus::Modified,
+                ..
+            }]
+        ));
+
+        fs::write(&path, "복구됨 日本語 🙂\n").unwrap();
+        assert!(matches!(
+            session.poll_external_changes().unwrap().as_slice(),
+            [HostMessage::ReplaceDocument { document: replacement }]
+                if replacement.id == document.id && replacement.content == "복구됨 日本語 🙂\n"
         ));
     }
 }

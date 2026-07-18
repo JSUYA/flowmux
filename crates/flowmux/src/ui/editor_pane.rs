@@ -140,6 +140,41 @@ impl EditorHostState {
             }
         }
     }
+
+    pub(super) fn poll_external_changes(&self) -> Vec<HostMessage> {
+        let result = match &mut *self.session.borrow_mut() {
+            Ok(session) => session.poll_external_changes(),
+            Err(error) => {
+                tracing::warn!(%error, "editor document session is unavailable");
+                return Vec::new();
+            }
+        };
+        match result {
+            Ok(messages) => messages,
+            Err(error) => {
+                tracing::warn!(%error, "failed to inspect open editor documents");
+                Vec::new()
+            }
+        }
+    }
+}
+
+pub(super) fn queue_host_messages(
+    bridge: &EditorBridgeState,
+    messages: Vec<HostMessage>,
+) -> Vec<String> {
+    messages
+        .into_iter()
+        .filter_map(|message| {
+            bridge
+                .queue(message)
+                .map_err(|error| {
+                    tracing::error!(%error, "failed to encode editor response");
+                })
+                .ok()
+                .flatten()
+        })
+        .collect()
 }
 
 pub(super) fn handle_bridge_message(
@@ -150,21 +185,28 @@ pub(super) fn handle_bridge_message(
     let received = bridge.receive(raw);
     let mut scripts = received.scripts;
     if let Some(message) = received.message {
-        scripts.extend(host.handle(message).into_iter().filter_map(|message| {
-            bridge
-                .queue(message)
-                .map_err(|error| {
-                    tracing::error!(%error, "failed to encode editor response");
-                })
-                .ok()
-                .flatten()
-        }));
+        scripts.extend(queue_host_messages(bridge, host.handle(message)));
     }
     scripts
 }
 
 pub(super) fn is_allowed_editor_navigation(url: &str, allowed_prefix: &str) -> bool {
     url.starts_with(allowed_prefix)
+}
+
+pub(super) fn should_poll_editor_documents(event: gtk::gio::FileMonitorEvent) -> bool {
+    matches!(
+        event,
+        gtk::gio::FileMonitorEvent::Changed
+            | gtk::gio::FileMonitorEvent::ChangesDoneHint
+            | gtk::gio::FileMonitorEvent::AttributeChanged
+            | gtk::gio::FileMonitorEvent::Created
+            | gtk::gio::FileMonitorEvent::Deleted
+            | gtk::gio::FileMonitorEvent::Moved
+            | gtk::gio::FileMonitorEvent::Renamed
+            | gtk::gio::FileMonitorEvent::MovedIn
+            | gtk::gio::FileMonitorEvent::MovedOut
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -231,5 +273,18 @@ mod tests {
         let received = bridge.receive(&ready);
         assert_eq!(received.scripts.len(), 1);
         assert!(received.scripts[0].contains("initialize_editor"));
+    }
+
+    #[test]
+    fn file_monitor_filters_events_that_can_change_document_state() {
+        assert!(should_poll_editor_documents(
+            gtk::gio::FileMonitorEvent::ChangesDoneHint
+        ));
+        assert!(should_poll_editor_documents(
+            gtk::gio::FileMonitorEvent::Deleted
+        ));
+        assert!(!should_poll_editor_documents(
+            gtk::gio::FileMonitorEvent::PreUnmount
+        ));
     }
 }

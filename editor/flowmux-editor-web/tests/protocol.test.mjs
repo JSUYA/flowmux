@@ -78,6 +78,19 @@ test("rejects negative and fractional document versions", () => {
   }
 });
 
+test("accepts only known document disk states", () => {
+  const message = {
+    protocolVersion: 1,
+    surfaceId: "surface-1",
+    type: "document_disk_status",
+    documentId: "document-1",
+    documentVersion: 2,
+  };
+  assert.equal(isHostMessage({ ...message, status: "modified" }), true);
+  assert.equal(isHostMessage({ ...message, status: "deleted" }), true);
+  assert.equal(isHostMessage({ ...message, status: "unknown" }), false);
+});
+
 test("advances the local version while sending the host's current base version", () => {
   assert.deepEqual(advanceDocumentEdit(7, 3), {
     baseVersion: 7,

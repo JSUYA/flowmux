@@ -25,6 +25,14 @@ pub enum TextDocumentLineEnding {
     CrLf,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DocumentDiskStatus {
+    Unchanged,
+    Modified,
+    Deleted,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DocumentPayload {
@@ -79,6 +87,11 @@ pub enum HostMessage {
         document_version: u64,
         change_sequence: u64,
         reason: String,
+    },
+    DocumentDiskStatus {
+        document_id: String,
+        document_version: u64,
+        status: DocumentDiskStatus,
     },
 }
 
@@ -236,7 +249,8 @@ fn validate_host_message(message: &HostMessage) -> Result<(), ProtocolError> {
         HostMessage::CloseDocument { document_id, .. }
         | HostMessage::SetActiveDocument { document_id, .. }
         | HostMessage::SaveCompleted { document_id, .. }
-        | HostMessage::SaveFailed { document_id, .. } => {
+        | HostMessage::SaveFailed { document_id, .. }
+        | HostMessage::DocumentDiskStatus { document_id, .. } => {
             validate_identifier("document ID", document_id)
         }
     }
@@ -337,6 +351,23 @@ mod tests {
                 content: "한글 日本語 العربية 🙂\n".into(),
             }
         );
+    }
+
+    #[test]
+    fn disk_status_message_uses_stable_lowercase_values() {
+        let encoded = serialize_host_message(
+            "surface-1",
+            &HostMessage::DocumentDiskStatus {
+                document_id: "document-1".into(),
+                document_version: 3,
+                status: DocumentDiskStatus::Deleted,
+            },
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+
+        assert_eq!(value["type"], "document_disk_status");
+        assert_eq!(value["status"], "deleted");
     }
 
     #[test]

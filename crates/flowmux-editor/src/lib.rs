@@ -10,9 +10,9 @@ mod session;
 mod web_assets;
 
 pub use protocol::{
-    javascript_for_host_message, parse_editor_message, serialize_host_message, DocumentPayload,
-    EditorMessage, HostMessage, ProtocolError, TextDocumentEncoding, TextDocumentLineEnding,
-    MAX_BRIDGE_MESSAGE_BYTES, PROTOCOL_VERSION,
+    javascript_for_host_message, parse_editor_message, serialize_host_message, DocumentDiskStatus,
+    DocumentPayload, EditorMessage, HostMessage, ProtocolError, TextDocumentEncoding,
+    TextDocumentLineEnding, MAX_BRIDGE_MESSAGE_BYTES, PROTOCOL_VERSION,
 };
 pub use session::{EditorSession, EditorSessionError};
 pub use web_assets::{EditorAssetServer, EditorAssetServerError};
@@ -387,6 +387,31 @@ impl DocumentService {
         }
     }
 
+    pub fn reload_from_disk(&mut self, id: DocumentId) -> Result<DocumentSnapshot, DocumentError> {
+        let document = self.documents.get(&id).ok_or(DocumentError::NotOpen(id))?;
+        if document.snapshot.is_dirty() {
+            return Err(DocumentError::Dirty(id));
+        }
+        let identity_path = document.snapshot.identity_path.clone();
+        let loaded = read_text_document(&identity_path, self.max_document_bytes)?;
+
+        let document = self
+            .documents
+            .get_mut(&id)
+            .expect("document remains open during synchronous reload");
+        let version = document.snapshot.version.saturating_add(1);
+        document.snapshot.text = loaded.text;
+        document.snapshot.version = version;
+        document.snapshot.saved_version = version;
+        document.snapshot.encoding = loaded.encoding;
+        document.snapshot.line_ending = loaded.line_ending;
+        document.snapshot.has_final_newline = document.snapshot.text.ends_with('\n');
+        document.snapshot.read_only = loaded.read_only;
+        document.base_bytes = loaded.bytes;
+        document.permissions = loaded.permissions;
+        Ok(document.snapshot.clone())
+    }
+
     pub fn close(&mut self, id: DocumentId) -> Result<(), DocumentError> {
         let document = self.documents.get(&id).ok_or(DocumentError::NotOpen(id))?;
         if document.snapshot.is_dirty() {
@@ -697,6 +722,50 @@ mod tests {
             service.save(updated.id, updated.version),
             Err(DocumentError::ExternalChange { .. })
         ));
+        assert_eq!(fs::read_to_string(path).unwrap(), "external\n");
+    }
+
+    #[test]
+    fn clean_external_change_reloads_multilingual_content() {
+        let workspace = tempdir().unwrap();
+        let path = workspace.path().join("외부-日本語.txt");
+        write(&path, "처음\n".as_bytes());
+        let mut service = DocumentService::new(workspace.path()).unwrap();
+        let opened = service.open(&path).unwrap().document;
+
+        write(&path, "외부 변경 日本語 🙂\n".as_bytes());
+        assert_eq!(
+            service.disk_status(opened.id).unwrap(),
+            DiskStatus::Modified
+        );
+
+        let reloaded = service.reload_from_disk(opened.id).unwrap();
+        assert_eq!(reloaded.text, "외부 변경 日本語 🙂\n");
+        assert_eq!(reloaded.version, opened.version + 1);
+        assert!(!reloaded.is_dirty());
+        assert_eq!(
+            service.disk_status(opened.id).unwrap(),
+            DiskStatus::Unchanged
+        );
+    }
+
+    #[test]
+    fn dirty_document_cannot_be_reloaded_from_disk() {
+        let workspace = tempdir().unwrap();
+        let path = workspace.path().join("dirty-reload.txt");
+        write(&path, b"base\n");
+        let mut service = DocumentService::new(workspace.path()).unwrap();
+        let opened = service.open(&path).unwrap().document;
+        service
+            .update_text(opened.id, opened.version, "editor\n".into())
+            .unwrap();
+        write(&path, b"external\n");
+
+        assert!(matches!(
+            service.reload_from_disk(opened.id),
+            Err(DocumentError::Dirty(id)) if id == opened.id
+        ));
+        assert_eq!(service.snapshot(opened.id).unwrap().text, "editor\n");
         assert_eq!(fs::read_to_string(path).unwrap(), "external\n");
     }
 

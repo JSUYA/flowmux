@@ -17,6 +17,8 @@ export interface DocumentPayload {
   externalChange: boolean;
 }
 
+export type DocumentDiskStatus = "unchanged" | "modified" | "deleted";
+
 interface HostMessageBase {
   protocolVersion: typeof PROTOCOL_VERSION;
   surfaceId: string;
@@ -49,6 +51,12 @@ export type HostMessage =
       documentVersion: number;
       changeSequence: number;
       reason: string;
+    })
+  | (HostMessageBase & {
+      type: "document_disk_status";
+      documentId: string;
+      documentVersion: number;
+      status: DocumentDiskStatus;
     });
 
 interface EditorMessageBase {
@@ -139,6 +147,12 @@ export function isHostMessage(value: unknown): value is HostMessage {
         isVersion(value.documentVersion) &&
         isVersion(value.changeSequence) &&
         typeof value.reason === "string"
+      );
+    case "document_disk_status":
+      return (
+        typeof value.documentId === "string" &&
+        isVersion(value.documentVersion) &&
+        (value.status === "unchanged" || value.status === "modified" || value.status === "deleted")
       );
     default:
       return false;

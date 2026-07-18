@@ -8,10 +8,11 @@ import "monaco-editor/esm/vs/language/json/monaco.contribution.js";
 import "monaco-editor/esm/vs/language/typescript/monaco.contribution.js";
 import "./styles.css";
 
-import { adjustedFontSize } from "./editor_state";
+import { adjustedFontSize, visibleDocumentState } from "./editor_state";
 import { languageForPath } from "./language";
 import {
   advanceDocumentEdit,
+  type DocumentDiskStatus,
   type DocumentPayload,
   type EditorMessage,
   type HostMessage,
@@ -55,6 +56,7 @@ interface OpenDocument {
   model: monaco.editor.ITextModel;
   changeSequence: number;
   suppressChanges: boolean;
+  diskStatus: DocumentDiskStatus;
 }
 
 const documentState = requiredElement("document-state");
@@ -206,6 +208,7 @@ function handleHostMessage(message: HostMessage): void {
         document.payload.version = message.documentVersion;
         document.payload.dirty = false;
         document.payload.externalChange = false;
+        document.diskStatus = "unchanged";
         renderState();
       }
       break;
@@ -214,9 +217,19 @@ function handleHostMessage(message: HostMessage): void {
       const document = documents.get(message.documentId);
       if (document !== undefined && document.changeSequence === message.changeSequence) {
         document.payload.externalChange = true;
+        document.diskStatus = "modified";
         documentState.textContent = message.reason;
         documentState.className = "document-state is-conflict";
         documentState.hidden = false;
+      }
+      break;
+    }
+    case "document_disk_status": {
+      const document = documents.get(message.documentId);
+      if (document !== undefined && document.payload.version === message.documentVersion) {
+        document.diskStatus = message.status;
+        document.payload.externalChange = message.status !== "unchanged";
+        renderState();
       }
       break;
     }
@@ -226,11 +239,16 @@ function handleHostMessage(message: HostMessage): void {
 function addOrReplaceDocument(payload: DocumentPayload): void {
   const existing = documents.get(payload.id);
   if (existing !== undefined) {
+    const viewState = activeDocumentId === payload.id ? editor.saveViewState() : null;
     existing.suppressChanges = true;
     existing.model.setValue(payload.content);
     monaco.editor.setModelLanguage(existing.model, payload.language ?? languageForPath(payload.relativePath));
     existing.payload = { ...payload };
+    existing.diskStatus = payload.externalChange ? "modified" : "unchanged";
     existing.suppressChanges = false;
+    if (viewState !== null) {
+      editor.restoreViewState(viewState);
+    }
     renderState();
     return;
   }
@@ -245,6 +263,7 @@ function addOrReplaceDocument(payload: DocumentPayload): void {
     model,
     changeSequence: 0,
     suppressChanges: false,
+    diskStatus: payload.externalChange ? "modified" : "unchanged",
   };
   model.onDidChangeContent(() => {
     if (document.suppressChanges) {
@@ -353,20 +372,14 @@ function renderState(): void {
     return;
   }
 
-  if (active.payload.externalChange) {
-    documentState.textContent = "Changed on disk";
-    documentState.className = "document-state is-conflict";
-  } else if (active.payload.readOnly) {
-    documentState.textContent = "Read only";
-    documentState.className = "document-state";
-  } else if (active.payload.dirty) {
-    documentState.textContent = "Unsaved";
-    documentState.className = "document-state is-dirty";
-  } else {
-    documentState.textContent = "Saved";
-    documentState.className = "document-state";
-  }
-  documentState.hidden = !active.payload.externalChange && !active.payload.readOnly && !active.payload.dirty;
+  const state = visibleDocumentState(
+    active.diskStatus,
+    active.payload.readOnly,
+    active.payload.dirty,
+  );
+  documentState.textContent = state.text;
+  documentState.className = `document-state${state.kind === "normal" ? "" : ` is-${state.kind}`}`;
+  documentState.hidden = state.hidden;
 }
 
 function postToHost(message: EditorMessage): void {
