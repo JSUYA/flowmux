@@ -7,6 +7,7 @@
 
 mod protocol;
 mod recovery;
+mod search;
 mod session;
 mod web_assets;
 
@@ -18,6 +19,11 @@ pub use protocol::{
 pub use recovery::{
     RecoveryDiskState, RecoveryError, RecoveryOperation, RecoverySnapshot, RecoveryStore,
     RECOVERY_FORMAT_VERSION,
+};
+pub use search::{
+    index_workspace_files, search_workspace, SearchCancellation, SearchDocument, SearchError,
+    SearchOptions, WorkspaceSearchMatch, WorkspaceSearchResult, DEFAULT_MAX_SEARCH_FILE_BYTES,
+    DEFAULT_MAX_SEARCH_RESULTS,
 };
 pub use session::{
     EditorFileSessionState, EditorSession, EditorSessionError, EditorSessionSnapshot,
