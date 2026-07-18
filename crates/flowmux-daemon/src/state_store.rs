@@ -14,6 +14,7 @@ use flowmux_core::{
 };
 use flowmux_state::{State, WindowLayout, WindowOwner};
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Notify};
@@ -215,8 +216,8 @@ async fn save_snapshot_blocking(
 ) -> Result<u64, flowmux_state::StateError> {
     tokio::task::spawn_blocking(move || {
         match mode {
-            PersistenceMode::Full => flowmux_state::save(&snapshot)?,
-            PersistenceMode::Window(owner) => flowmux_state::save_window(owner, &snapshot)?,
+            PersistenceMode::Full => flowmux_state::save_owned(snapshot)?,
+            PersistenceMode::Window(owner) => flowmux_state::save_window_owned(owner, snapshot)?,
             PersistenceMode::Disabled => return Ok(0),
         }
         let file_size = flowmux_state::default_path()
@@ -261,8 +262,11 @@ pub struct StateStore {
     inner: Arc<Mutex<State>>,
     cleared_agent_surfaces: Arc<Mutex<HashSet<SurfaceId>>>,
     dirty: Arc<Notify>,
+    dirty_generation: Arc<AtomicU64>,
     persistence: PersistenceMode,
 }
+
+const PERSIST_DEBOUNCE: Duration = Duration::from_millis(250);
 
 impl StateStore {
     /// Construct from inside a tokio runtime context. Spawns the
@@ -274,6 +278,7 @@ impl StateStore {
             inner: Arc::new(Mutex::new(initial)),
             cleared_agent_surfaces: Arc::new(Mutex::new(HashSet::new())),
             dirty: Arc::new(Notify::new()),
+            dirty_generation: Arc::new(AtomicU64::new(0)),
             persistence: PersistenceMode::Full,
         };
         let bg = store.clone();
@@ -294,6 +299,7 @@ impl StateStore {
             inner: Arc::new(Mutex::new(initial)),
             cleared_agent_surfaces: Arc::new(Mutex::new(HashSet::new())),
             dirty: Arc::new(Notify::new()),
+            dirty_generation: Arc::new(AtomicU64::new(0)),
             persistence: PersistenceMode::Full,
         };
         if normalized {
@@ -316,6 +322,7 @@ impl StateStore {
             inner: Arc::new(Mutex::new(initial)),
             cleared_agent_surfaces: Arc::new(Mutex::new(HashSet::new())),
             dirty: Arc::new(Notify::new()),
+            dirty_generation: Arc::new(AtomicU64::new(0)),
             persistence: PersistenceMode::Disabled,
         }
     }
@@ -329,6 +336,7 @@ impl StateStore {
             inner: Arc::new(Mutex::new(initial)),
             cleared_agent_surfaces: Arc::new(Mutex::new(HashSet::new())),
             dirty: Arc::new(Notify::new()),
+            dirty_generation: Arc::new(AtomicU64::new(0)),
             persistence: PersistenceMode::Window(owner),
         };
         if normalized {
@@ -1875,25 +1883,54 @@ impl StateStore {
     }
 
     pub fn mark_dirty(&self) {
+        self.dirty_generation.fetch_add(1, Ordering::Release);
         self.dirty.notify_one();
     }
 
-    pub async fn persist_loop(&self) {
+    async fn wait_for_stable_dirty_generation(
+        &self,
+        persisted_generation: u64,
+        debounce: Duration,
+    ) -> u64 {
+        let mut observed = loop {
+            let notified = self.dirty.notified();
+            let current = self.dirty_generation.load(Ordering::Acquire);
+            if current != persisted_generation {
+                break current;
+            }
+            notified.await;
+        };
+
         loop {
-            self.dirty.notified().await;
-            // Coalesce a flurry of mutations into a single write.
-            tokio::time::sleep(Duration::from_millis(250)).await;
+            tokio::time::sleep(debounce).await;
+            let current = self.dirty_generation.load(Ordering::Acquire);
+            if current == observed {
+                return current;
+            }
+            observed = current;
+        }
+    }
+
+    pub async fn persist_loop(&self) {
+        let mut persisted_generation = 0;
+        loop {
+            let stable_generation = self
+                .wait_for_stable_dirty_generation(persisted_generation, PERSIST_DEBOUNCE)
+                .await;
             // Ephemeral stores still observe the dirty bit so callers
             // do not need to special-case mutation paths, but they
             // never reach the disk.
             if !self.persist_enabled() {
+                persisted_generation = stable_generation;
                 continue;
             }
+            let snapshot_generation = self.dirty_generation.load(Ordering::Acquire);
             let snap = self.snapshot().await;
             let workspaces = snap.workspaces.len();
             let started = Instant::now();
             match save_snapshot_blocking(snap, self.persistence).await {
                 Ok(file_size) => info!(
+                    generation = snapshot_generation,
                     workspaces,
                     file_size,
                     elapsed_ms = started.elapsed().as_millis(),
@@ -1901,6 +1938,10 @@ impl StateStore {
                 ),
                 Err(e) => error!(error = %e, "state save failed"),
             }
+            // A mutation after the snapshot keeps a higher generation and starts
+            // a fresh debounce. Stale Notify permits from mutations already in
+            // this snapshot are consumed without scheduling another write.
+            persisted_generation = snapshot_generation;
         }
     }
 
@@ -1920,8 +1961,8 @@ impl StateStore {
         }
         let snap = self.inner.blocking_lock().clone();
         match self.persistence {
-            PersistenceMode::Full => flowmux_state::save(&snap),
-            PersistenceMode::Window(owner) => flowmux_state::save_window(owner, &snap),
+            PersistenceMode::Full => flowmux_state::save_owned(snap),
+            PersistenceMode::Window(owner) => flowmux_state::save_window_owned(owner, snap),
             PersistenceMode::Disabled => Ok(()),
         }
     }
@@ -5025,6 +5066,45 @@ Do you want to continue?";
         let snap = store.snapshot().await;
         assert_eq!(snap.workspaces.len(), 1);
         assert_eq!(snap.workspaces[0].id, id);
+    }
+
+    #[tokio::test]
+    async fn persistence_debounce_waits_for_the_last_dirty_generation() {
+        let store = StateStore::new_lazy_ephemeral(State::default());
+        store.mark_dirty();
+        let waiter = {
+            let store = store.clone();
+            tokio::spawn(async move {
+                store
+                    .wait_for_stable_dirty_generation(0, Duration::from_millis(20))
+                    .await
+            })
+        };
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        store.mark_dirty();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        store.mark_dirty();
+
+        assert_eq!(waiter.await.unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn persistence_debounce_ignores_stale_notify_permits() {
+        let store = StateStore::new_lazy_ephemeral(State::default());
+        store.mark_dirty();
+        store.mark_dirty();
+        let persisted = store
+            .wait_for_stable_dirty_generation(0, Duration::from_millis(5))
+            .await;
+        assert_eq!(persisted, 2);
+
+        let no_new_generation = tokio::time::timeout(
+            Duration::from_millis(20),
+            store.wait_for_stable_dirty_generation(persisted, Duration::from_millis(5)),
+        )
+        .await;
+        assert!(no_new_generation.is_err());
     }
 
     // --- Title-prefix fallback resolver -----------------------------

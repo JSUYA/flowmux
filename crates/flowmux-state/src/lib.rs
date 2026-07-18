@@ -129,6 +129,11 @@ pub fn save(state: &State) -> Result<(), StateError> {
     save_to(&default_path()?, state)
 }
 
+/// Persist an owned snapshot without cloning the complete state first.
+pub fn save_owned(state: State) -> Result<(), StateError> {
+    save_owned_to(&default_path()?, state)
+}
+
 pub fn load_from(path: &Path) -> Result<State, StateError> {
     if !path.exists() {
         return Ok(State::default());
@@ -146,13 +151,16 @@ pub fn load_from(path: &Path) -> Result<State, StateError> {
 }
 
 pub fn save_to(path: &Path, state: &State) -> Result<(), StateError> {
+    save_owned_to(path, state.clone())
+}
+
+fn save_owned_to(path: &Path, mut state: State) -> Result<(), StateError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let mut s = state.clone();
-    migrate_legacy_state(&mut s);
-    s.last_saved = chrono::Utc::now();
-    let json = serde_json::to_vec_pretty(&s)?;
+    migrate_legacy_state(&mut state);
+    state.last_saved = chrono::Utc::now();
+    let json = serde_json::to_vec_pretty(&state)?;
 
     // Atomic replace: write to <name>.tmp, fsync, then rename.
     let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
@@ -300,7 +308,20 @@ pub fn save_window(owner: WindowOwner, snapshot: &State) -> Result<(), StateErro
     save_window_to(&default_path()?, owner, snapshot)
 }
 
+/// Merge an owned window snapshot without cloning its workspace tree.
+pub fn save_window_owned(owner: WindowOwner, snapshot: State) -> Result<(), StateError> {
+    save_window_owned_to(&default_path()?, owner, snapshot)
+}
+
 pub fn save_window_to(path: &Path, owner: WindowOwner, snapshot: &State) -> Result<(), StateError> {
+    save_window_owned_to(path, owner, snapshot.clone())
+}
+
+fn save_window_owned_to(
+    path: &Path,
+    owner: WindowOwner,
+    snapshot: State,
+) -> Result<(), StateError> {
     let _lock = instance_lock::acquire_for_state(path)?;
     let mut disk = load_from(path)?;
     let previously_owned = disk
@@ -315,12 +336,16 @@ pub fn save_window_to(path: &Path, owner: WindowOwner, snapshot: &State) -> Resu
     disk.workspace_owners
         .retain(|workspace, _| !previously_owned.contains(workspace));
 
-    disk.workspaces.extend(snapshot.workspaces.iter().cloned());
-    let owned_order = ordered_workspace_ids(snapshot);
+    let owned_order = ordered_workspace_ids(&snapshot);
+    let owned_ids = snapshot
+        .workspaces
+        .iter()
+        .map(|workspace| workspace.id)
+        .collect::<Vec<_>>();
+    disk.workspaces.extend(snapshot.workspaces);
     disk.workspace_order.extend(owned_order.iter().copied());
-    for workspace in &snapshot.workspaces {
-        disk.workspace_owners
-            .insert(workspace.id, owner.instance_id);
+    for workspace in owned_ids {
+        disk.workspace_owners.insert(workspace, owner.instance_id);
     }
     disk.windows
         .retain(|window| window.instance_id != owner.instance_id);
@@ -335,7 +360,7 @@ pub fn save_window_to(path: &Path, owner: WindowOwner, snapshot: &State) -> Resu
     disk.active_workspace = None;
     disk.window = None;
     disk.sidebar_position = None;
-    save_to(path, &disk)
+    save_owned_to(path, disk)
 }
 
 #[cfg(test)]
@@ -382,6 +407,45 @@ mod tests {
         assert_eq!(back.workspaces.len(), 1);
         assert_eq!(back.workspaces[0].name, "demo");
         assert_eq!(back.active_workspace, Some(id));
+    }
+
+    #[test]
+    fn owned_save_then_load_roundtrips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut state = State::default();
+        let workspace = sample_workspace();
+        let id = workspace.id;
+        state.workspace_order.push(id);
+        state.workspaces.push(workspace);
+
+        save_owned_to(&path, state).unwrap();
+
+        let loaded = load_from(&path).unwrap();
+        assert_eq!(loaded.workspace_order, vec![id]);
+        assert_eq!(loaded.workspaces[0].id, id);
+    }
+
+    #[test]
+    fn owned_window_save_records_workspace_ownership() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let owner = WindowOwner::current();
+        let workspace = sample_workspace();
+        let id = workspace.id;
+        let state = State {
+            workspaces: vec![workspace],
+            workspace_order: vec![id],
+            active_workspace: Some(id),
+            ..Default::default()
+        };
+
+        save_window_owned_to(&path, owner, state).unwrap();
+
+        let loaded = load_from(&path).unwrap();
+        assert_eq!(loaded.workspace_order, vec![id]);
+        assert_eq!(loaded.workspace_owners.get(&id), Some(&owner.instance_id));
+        assert_eq!(loaded.windows[0].active_workspace, Some(id));
     }
 
     #[test]
