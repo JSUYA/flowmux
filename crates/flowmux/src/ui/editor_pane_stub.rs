@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use flowmux_core::{EditorSessionState, PaneId, SurfaceId};
-use flowmux_editor::{HostMessage, ProtocolError};
+use flowmux_editor::{EditorAppearance, HostMessage, ProtocolError};
 use gtk::prelude::*;
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
@@ -20,6 +20,7 @@ impl EditorPane {
         _surface_id: SurfaceId,
         workspace_root: PathBuf,
         _restored: EditorSessionState,
+        _appearance: EditorAppearance,
     ) -> Self {
         let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
         root.set_hexpand(true);
@@ -56,6 +57,10 @@ impl EditorPane {
     pub fn grab_focus(&self) {
         self.root.grab_focus();
     }
+
+    pub fn apply_appearance(&self, _appearance: EditorAppearance) {}
+
+    pub fn set_zoom_level(&self, _zoom: f64) {}
 
     pub fn show_workspace_search(&self) {}
 

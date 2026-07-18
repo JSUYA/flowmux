@@ -13,6 +13,7 @@
 //! Applied to:
 //!
 //! * flowmux terminal widgets — font, bg/fg/cursor, ANSI palette, selection.
+//! * embedded editor surfaces — font, bg/fg/cursor, and selection.
 //! * libadwaita color scheme — forced dark when the background is dark.
 //! * Global CSS — pane frame and sidebar tint.
 //!
@@ -209,6 +210,34 @@ impl ResolvedTheme {
 
     pub fn is_dark(&self) -> bool {
         relative_luminance(&self.bg) < 0.5
+    }
+
+    pub(crate) fn editor_appearance(
+        &self,
+        options: &flowmux_config::options::Options,
+    ) -> flowmux_editor::EditorAppearance {
+        let font = self.font_with_overrides(options.font_family.as_deref(), options.font_size);
+        let selection_bg = self
+            .selection_bg
+            .unwrap_or_else(|| blend_with_alpha(&self.fg, 0.28));
+        let selection_fg = self.selection_fg.unwrap_or(self.fg);
+        flowmux_editor::EditorAppearance {
+            dark: self.is_dark(),
+            background: rgba_hex(&self.bg),
+            foreground: rgba_hex(&self.fg),
+            cursor: rgba_hex(&self.cursor),
+            selection_background: rgba_hex(&selection_bg),
+            selection_foreground: rgba_hex(&selection_fg),
+            font_family: font
+                .family()
+                .map(|family| family.to_string())
+                .unwrap_or_else(|| "monospace".into()),
+            font_size: if font.size() > 0 {
+                font.size() as f32 / pango::SCALE as f32
+            } else {
+                12.0
+            },
+        }
     }
 
     /// CSS rules that paint the pane frame and tint the sidebar to match
@@ -626,6 +655,17 @@ fn rgba_css(c: &gdk::RGBA) -> String {
     )
 }
 
+fn rgba_hex(c: &gdk::RGBA) -> String {
+    let channel = |value: f32| (value * 255.0).round().clamp(0.0, 255.0) as u8;
+    format!(
+        "#{:02x}{:02x}{:02x}{:02x}",
+        channel(c.red()),
+        channel(c.green()),
+        channel(c.blue()),
+        channel(c.alpha())
+    )
+}
+
 /// Convert `#rrggbb` or another GTK-accepted hex/rgba color into an
 /// `rgba(...)` CSS token with the provided alpha. `alpha` is clamped to
 /// 0.0..=1.0. If parsing fails, return the input color unchanged so the
@@ -690,6 +730,27 @@ mod tests {
         assert_eq!(rgba_css(&theme.bg), "rgba(40,42,54,1)");
         assert_eq!(theme.font_family(), "Fira Code");
         assert!((theme.font_size() - 14.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn editor_appearance_uses_theme_colors_and_font_overrides() {
+        let cfg = flowmux_config::ghostty::parse(
+            "background = #f8f8f8\nforeground = #202020\ncursor-color = #005fb8\nselection-background = #4080c0\nfont-family = Theme Mono\nfont-size = 12\n",
+        );
+        let theme = ResolvedTheme::from_ghostty(&cfg);
+        let options = flowmux_config::options::Options::default()
+            .with_font_family(Some("다국어 Mono".into()))
+            .with_font_size(Some(14.0));
+
+        let appearance = theme.editor_appearance(&options);
+
+        assert!(!appearance.dark);
+        assert_eq!(appearance.background, "#f8f8f8ff");
+        assert_eq!(appearance.foreground, "#202020ff");
+        assert_eq!(appearance.cursor, "#005fb8ff");
+        assert_eq!(appearance.selection_background, "#4080c0ff");
+        assert_eq!(appearance.font_family, "다국어 Mono");
+        assert_eq!(appearance.font_size, 14.0);
     }
 
     #[test]

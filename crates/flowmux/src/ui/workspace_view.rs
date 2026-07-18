@@ -1762,7 +1762,15 @@ mod tab_dnd_tests {
         let surface = SurfaceId::new();
         let src_workspace = WorkspaceId::new();
         let dst_workspace = WorkspaceId::new();
-        let editor = EditorPane::new(src, "/tmp/다국어-プロジェクト".into());
+        let options = flowmux_config::options::Options::default();
+        let appearance = ResolvedTheme::load().editor_appearance(&options);
+        let editor = EditorPane::new(
+            src,
+            surface,
+            "/tmp/다국어-プロジェクト".into(),
+            flowmux_core::EditorSessionState::default(),
+            appearance,
+        );
         let content = editor.root.clone().upcast::<gtk::Widget>();
 
         let src_stack = gtk::Stack::new();
@@ -2821,8 +2829,15 @@ fn build_panel(
             workspace_root,
             session,
         } => {
-            let editor =
-                EditorPane::new(pane_id, surface.id, workspace_root.clone(), session.clone());
+            let options = (callbacks.read_options)();
+            let editor = EditorPane::new(
+                pane_id,
+                surface.id,
+                workspace_root.clone(),
+                session.clone(),
+                theme.editor_appearance(&options),
+            );
+            editor.set_zoom_level(options.zoom_factor());
 
             let frame_in = frame.clone();
             let frame_out = frame.clone();

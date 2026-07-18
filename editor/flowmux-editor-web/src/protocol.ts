@@ -20,6 +20,17 @@ export interface DocumentPayload {
   scrollTop: number;
 }
 
+export interface EditorAppearance {
+  dark: boolean;
+  background: string;
+  foreground: string;
+  cursor: string;
+  selectionBackground: string;
+  selectionForeground: string;
+  fontFamily: string;
+  fontSize: number;
+}
+
 export type DocumentDiskStatus = "unchanged" | "modified" | "deleted";
 export type RecoveryDiskState = "unchanged" | "changed" | "deleted";
 
@@ -55,6 +66,7 @@ interface HostMessageBase {
 }
 
 export type HostMessage =
+  | (HostMessageBase & { type: "set_appearance"; appearance: EditorAppearance })
   | (HostMessageBase & {
       type: "initialize_editor";
       workspaceName: string;
@@ -253,6 +265,8 @@ export function isHostMessage(value: unknown): value is HostMessage {
   }
 
   switch (value.type) {
+    case "set_appearance":
+      return isEditorAppearance(value.appearance);
     case "initialize_editor":
       return (
         typeof value.workspaceName === "string" &&
@@ -390,6 +404,33 @@ function isDocumentPayload(value: unknown): value is DocumentPayload {
     typeof value.scrollTop === "number" &&
     Number.isFinite(value.scrollTop) &&
     value.scrollTop >= 0
+  );
+}
+
+function isEditorAppearance(value: unknown): value is EditorAppearance {
+  if (!isRecord(value)) {
+    return false;
+  }
+  const colors = [
+    value.background,
+    value.foreground,
+    value.cursor,
+    value.selectionBackground,
+    value.selectionForeground,
+  ];
+  return (
+    typeof value.dark === "boolean" &&
+    colors.every(
+      (color) => typeof color === "string" && /^#[0-9a-f]{6}([0-9a-f]{2})?$/i.test(color),
+    ) &&
+    typeof value.fontFamily === "string" &&
+    value.fontFamily.length > 0 &&
+    value.fontFamily.length <= 512 &&
+    !/[\u0000-\u001f\u007f]/.test(value.fontFamily) &&
+    typeof value.fontSize === "number" &&
+    Number.isFinite(value.fontSize) &&
+    value.fontSize >= 4 &&
+    value.fontSize <= 96
   );
 }
 

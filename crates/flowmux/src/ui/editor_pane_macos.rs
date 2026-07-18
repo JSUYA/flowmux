@@ -6,7 +6,7 @@ use super::{
     should_poll_editor_documents, EditorBridgeState, EditorHostState,
 };
 use flowmux_core::{EditorSessionState, PaneId, SurfaceId};
-use flowmux_editor::{EditorAssetServer, HostMessage, ProtocolError};
+use flowmux_editor::{EditorAppearance, EditorAssetServer, HostMessage, ProtocolError};
 use gtk::gio;
 use gtk::glib::{self, translate::ToGlibPtr};
 use gtk::prelude::*;
@@ -199,6 +199,7 @@ impl EditorPane {
         surface_id: SurfaceId,
         workspace_root: PathBuf,
         restored: EditorSessionState,
+        appearance: EditorAppearance,
     ) -> Self {
         let asset_server = Rc::new(
             EditorAssetServer::start()
@@ -272,6 +273,7 @@ impl EditorPane {
             file_monitors: Rc::new(RefCell::new(HashMap::new())),
             file_monitor_generation: Rc::new(Cell::new(0)),
         };
+        pane.apply_appearance(appearance);
         if let Err(error) = pane.send(
             pane.host
                 .initialize_message(workspace_name(pane.workspace_root())),
@@ -333,6 +335,18 @@ impl EditorPane {
 
     pub fn grab_focus(&self) {
         focus_native_view(&self.native.web_view);
+    }
+
+    pub fn apply_appearance(&self, appearance: EditorAppearance) {
+        if let Err(error) = self.send(HostMessage::SetAppearance { appearance }) {
+            tracing::warn!(%error, "failed to apply editor appearance");
+        }
+    }
+
+    pub fn set_zoom_level(&self, zoom: f64) {
+        unsafe {
+            self.native.web_view.setPageZoom(zoom.clamp(0.1, 2.0));
+        }
     }
 
     pub fn show_workspace_search(&self) {

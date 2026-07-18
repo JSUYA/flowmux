@@ -15,6 +15,7 @@ import {
   advanceDocumentEdit,
   type DocumentDiskStatus,
   type DocumentPayload,
+  type EditorAppearance,
   type EditorMessage,
   type HostMessage,
   type WorkspaceSearchMatch,
@@ -141,26 +142,22 @@ interface SearchSelection {
   length: number;
 }
 
-monaco.editor.defineTheme("flowmux-dark", {
-  base: "vs-dark",
-  inherit: true,
-  rules: [],
-  colors: {
-    "editor.background": "#15171B",
-    "editor.foreground": "#E6E9EF",
-    "editorCursor.foreground": "#72B7A8",
-    "editorLineNumber.foreground": "#5D6470",
-    "editorLineNumber.activeForeground": "#B9BEC8",
-    "editor.selectionBackground": "#365C59A0",
-    "editor.inactiveSelectionBackground": "#2C464580",
-    "editorIndentGuide.background1": "#2B2F37",
-    "editorIndentGuide.activeBackground1": "#4A525F",
-  },
-});
+const DEFAULT_APPEARANCE: EditorAppearance = {
+  dark: true,
+  background: "#15171bff",
+  foreground: "#e6e9efff",
+  cursor: "#72b7a8ff",
+  selectionBackground: "#365c59a0",
+  selectionForeground: "#e6e9efff",
+  fontFamily: "monospace",
+  fontSize: 13,
+};
+const EDITOR_THEME = "flowmux-editor";
+defineEditorTheme(DEFAULT_APPEARANCE);
 
 const editor = monaco.editor.create(editorContainer, {
   automaticLayout: true,
-  theme: "flowmux-dark",
+  theme: EDITOR_THEME,
   fontFamily:
     "SFMono-Regular, Cascadia Code, Noto Sans Mono CJK KR, Noto Sans Mono, Apple SD Gothic Neo, Hiragino Sans, monospace",
   fontSize: 13,
@@ -320,6 +317,9 @@ function handleHostMessage(message: HostMessage): void {
   surfaceId = message.surfaceId;
 
   switch (message.type) {
+    case "set_appearance":
+      applyAppearance(message.appearance);
+      break;
     case "initialize_editor":
       clearViewStateTimer();
       resetCloseDialog();
@@ -769,7 +769,7 @@ function showDiff(document: OpenDocument, diskContent: string): void {
   if (diffEditor === null) {
     diffEditor = monaco.editor.createDiffEditor(diffEditorContainer, {
       automaticLayout: true,
-      theme: "flowmux-dark",
+      theme: EDITOR_THEME,
       fontFamily:
         "SFMono-Regular, Cascadia Code, Noto Sans Mono CJK KR, Noto Sans Mono, Apple SD Gothic Neo, Hiragino Sans, monospace",
       fontSize: editorFontSize,
@@ -1195,6 +1195,47 @@ function requestSaveAll(): void {
       requestSave(document.payload.id);
     }
   }
+}
+
+function defineEditorTheme(appearance: EditorAppearance): void {
+  monaco.editor.defineTheme(EDITOR_THEME, {
+    base: appearance.dark ? "vs-dark" : "vs",
+    inherit: true,
+    rules: [],
+    colors: {
+      "editor.background": appearance.background,
+      "editor.foreground": appearance.foreground,
+      "editorCursor.foreground": appearance.cursor,
+      "editorLineNumber.foreground": colorWithAlpha(appearance.foreground, 0.38),
+      "editorLineNumber.activeForeground": colorWithAlpha(appearance.foreground, 0.72),
+      "editor.selectionBackground": appearance.selectionBackground,
+      "editor.selectionForeground": appearance.selectionForeground,
+      "editor.inactiveSelectionBackground": colorWithAlpha(appearance.selectionBackground, 0.45),
+      "editorIndentGuide.background1": colorWithAlpha(appearance.foreground, 0.16),
+      "editorIndentGuide.activeBackground1": colorWithAlpha(appearance.foreground, 0.38),
+    },
+  });
+}
+
+function applyAppearance(appearance: EditorAppearance): void {
+  defineEditorTheme(appearance);
+  monaco.editor.setTheme(EDITOR_THEME);
+  const fontFamily = `${appearance.fontFamily}, SFMono-Regular, Cascadia Code, Noto Sans Mono CJK KR, Noto Sans Mono, monospace`;
+  editorFontSize = appearance.fontSize;
+  editor.updateOptions({ fontFamily, fontSize: editorFontSize });
+  diffEditor?.updateOptions({ fontFamily, fontSize: editorFontSize });
+
+  const root = document.documentElement;
+  root.style.colorScheme = appearance.dark ? "dark" : "light";
+  root.style.setProperty("--ink", appearance.background);
+  root.style.setProperty("--text", appearance.foreground);
+  root.style.setProperty("--accent", appearance.cursor);
+  root.style.setProperty("--selection", appearance.selectionBackground);
+}
+
+function colorWithAlpha(color: string, alpha: number): string {
+  const clamped = Math.round(Math.min(1, Math.max(0, alpha)) * 255);
+  return `${color.slice(0, 7)}${clamped.toString(16).padStart(2, "0")}`;
 }
 
 function setEditorFontSize(fontSize: number): void {

@@ -57,7 +57,7 @@ terminal.
 ## Themes
 
 Choose a built-in light or dark theme in **Options → Theme**, or customize the
-terminal background, text, and cursor colors.
+terminal and editor background, text, cursor, selection, and font.
 
 ![theme settings](resources/screenshot/setting_theme.gif)
 
@@ -97,6 +97,10 @@ current agent token and activity totals without interrupting running sessions.
   agents in a neighbouring pane (snapshot, click, type, read state). Import a
   session from Firefox / Chrome / Chromium / Brave / Edge / Arc; **Web
   Inspector** opens WebKit dev tools.
+- **Embedded editor** — single-click a text file in Files to edit it in the
+  selected pane. Supports multilingual text and paths, atomic save, find and
+  replace, Quick Open, workspace search, conflict comparison, close guards,
+  and crash recovery without a separate editor runtime.
 - **Notifications** — terminal "task complete" / "needs attention" signals
   become desktop notifications, routed to the firing workspace and quiet while
   focused. Bell popover **All Clear** clears all entries and toasts at once.

@@ -53,7 +53,8 @@ if (
   !main.includes("workspace_search_requested") ||
   !main.includes("search_result_open_requested") ||
   !main.includes("save_as_requested") ||
-  !main.includes("conflict_action_requested")
+  !main.includes("conflict_action_requested") ||
+  !main.includes("set_appearance")
 ) {
   throw new Error("Editor bundle is missing an explicit document safety message");
 }

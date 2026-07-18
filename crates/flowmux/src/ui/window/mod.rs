@@ -806,6 +806,10 @@ impl WindowController {
             resolved.apply_to_ghostty(terminal);
             terminal.set_font(&font);
         }
+        let editor_appearance = resolved.editor_appearance(opts);
+        for editor in registry.editors.values() {
+            editor.apply_appearance(editor_appearance.clone());
+        }
         drop(registry);
 
         self.css_provider.load_from_string(&resolved.css(

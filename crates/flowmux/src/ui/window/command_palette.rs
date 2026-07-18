@@ -921,6 +921,9 @@ impl WindowController {
         for browser in registry.browsers.values() {
             browser.set_zoom_level(opts.zoom_factor());
         }
+        for editor in registry.editors.values() {
+            editor.set_zoom_level(opts.zoom_factor());
+        }
         drop(registry);
 
         if let Some(app) = self

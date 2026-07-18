@@ -13,8 +13,9 @@ mod web_assets;
 
 pub use protocol::{
     javascript_for_host_message, parse_editor_message, serialize_host_message, ConflictAction,
-    DocumentDiskStatus, DocumentPayload, EditorMessage, HostMessage, ProtocolError, RecoveryChoice,
-    TextDocumentEncoding, TextDocumentLineEnding, MAX_BRIDGE_MESSAGE_BYTES, PROTOCOL_VERSION,
+    DocumentDiskStatus, DocumentPayload, EditorAppearance, EditorMessage, HostMessage,
+    ProtocolError, RecoveryChoice, TextDocumentEncoding, TextDocumentLineEnding,
+    MAX_BRIDGE_MESSAGE_BYTES, PROTOCOL_VERSION,
 };
 pub use recovery::{
     RecoveryDiskState, RecoveryError, RecoveryOperation, RecoverySnapshot, RecoveryStore,

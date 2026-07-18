@@ -29,4 +29,11 @@ The terminal IME and scroll workarounds are intentionally fixed: Shift+Enter
 flushes composed Hangul input, and PgUp/PgDn use smart scrollback behavior.
 They are not editable keybindings.
 
+When the embedded editor has focus, it also provides its local editing
+shortcuts: Ctrl/Cmd+S saves, Ctrl/Cmd+Shift+S opens Save As,
+Ctrl/Cmd+Alt+S saves all, Ctrl/Cmd+F and Ctrl/Cmd+H find and replace,
+Ctrl/Cmd+P opens a file, Ctrl/Cmd+Shift+F searches the workspace, and
+Ctrl/Cmd+W closes the current document. Flowmux surface shortcuts such as
+Alt+W remain global.
+
 See the [configuration reference](configuration.md) for the JSON shape.

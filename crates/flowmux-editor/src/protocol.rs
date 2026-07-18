@@ -12,6 +12,7 @@ const MAX_IDENTIFIER_BYTES: usize = 128;
 const MAX_SEARCH_QUERY_BYTES: usize = 4 * 1024;
 const MAX_SEARCH_PATH_BYTES: usize = 16 * 1024;
 const MAX_SEARCH_GLOBS: usize = 32;
+const MAX_FONT_FAMILY_BYTES: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TextDocumentEncoding {
@@ -59,12 +60,28 @@ pub struct DocumentPayload {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EditorAppearance {
+    pub dark: bool,
+    pub background: String,
+    pub foreground: String,
+    pub cursor: String,
+    pub selection_background: String,
+    pub selection_foreground: String,
+    pub font_family: String,
+    pub font_size: f32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(
     tag = "type",
     rename_all = "snake_case",
     rename_all_fields = "camelCase"
 )]
 pub enum HostMessage {
+    SetAppearance {
+        appearance: EditorAppearance,
+    },
     InitializeEditor {
         workspace_name: String,
         documents: Vec<DocumentPayload>,
@@ -401,6 +418,7 @@ fn validate_editor_message(message: &EditorMessage) -> Result<(), ProtocolError>
 
 fn validate_host_message(message: &HostMessage) -> Result<(), ProtocolError> {
     match message {
+        HostMessage::SetAppearance { appearance } => validate_appearance(appearance),
         HostMessage::InitializeEditor {
             documents,
             active_document_id,
@@ -458,6 +476,34 @@ fn validate_host_message(message: &HostMessage) -> Result<(), ProtocolError> {
             Ok(())
         }
     }
+}
+
+fn validate_appearance(appearance: &EditorAppearance) -> Result<(), ProtocolError> {
+    let colors = [
+        &appearance.background,
+        &appearance.foreground,
+        &appearance.cursor,
+        &appearance.selection_background,
+        &appearance.selection_foreground,
+    ];
+    if colors.iter().any(|color| !is_hex_color(color))
+        || appearance.font_family.is_empty()
+        || appearance.font_family.len() > MAX_FONT_FAMILY_BYTES
+        || appearance.font_family.chars().any(char::is_control)
+        || !appearance.font_size.is_finite()
+        || !(4.0..=96.0).contains(&appearance.font_size)
+    {
+        return Err(ProtocolError::InvalidIdentifier {
+            field: "editor appearance",
+        });
+    }
+    Ok(())
+}
+
+fn is_hex_color(value: &str) -> bool {
+    matches!(value.len(), 7 | 9)
+        && value.starts_with('#')
+        && value[1..].bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn validate_document(document: &DocumentPayload) -> Result<(), ProtocolError> {
@@ -552,6 +598,42 @@ mod tests {
             value["document"]["content"],
             multilingual_document().content
         );
+    }
+
+    #[test]
+    fn appearance_message_is_bounded_and_serializes_multilingual_font() {
+        let appearance = EditorAppearance {
+            dark: false,
+            background: "#f8f8f8ff".into(),
+            foreground: "#202020ff".into(),
+            cursor: "#005fb8ff".into(),
+            selection_background: "#005fb840".into(),
+            selection_foreground: "#202020ff".into(),
+            font_family: "Noto Sans Mono CJK KR, 일본어 고정폭".into(),
+            font_size: 13.5,
+        };
+        let encoded = serialize_host_message(
+            "surface-1",
+            &HostMessage::SetAppearance {
+                appearance: appearance.clone(),
+            },
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+
+        assert_eq!(value["type"], "set_appearance");
+        assert_eq!(value["appearance"]["dark"], false);
+        assert_eq!(value["appearance"]["fontFamily"], appearance.font_family);
+
+        let mut invalid = appearance;
+        invalid.background = "rgba(1, 2, 3, 1)".into();
+        assert!(serialize_host_message(
+            "surface-1",
+            &HostMessage::SetAppearance {
+                appearance: invalid,
+            },
+        )
+        .is_err());
     }
 
     #[test]

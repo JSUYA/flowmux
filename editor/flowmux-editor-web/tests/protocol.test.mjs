@@ -239,3 +239,34 @@ test("accepts save as and conflict response messages", () => {
     true,
   );
 });
+
+test("accepts bounded light and multilingual editor appearance", () => {
+  const message = {
+    protocolVersion: 1,
+    surfaceId: "surface-1",
+    type: "set_appearance",
+    appearance: {
+      dark: false,
+      background: "#f8f8f8ff",
+      foreground: "#202020ff",
+      cursor: "#005fb8ff",
+      selectionBackground: "#005fb840",
+      selectionForeground: "#202020ff",
+      fontFamily: "Noto Sans Mono CJK KR, 일본어 고정폭",
+      fontSize: 13.5,
+    },
+  };
+
+  assert.equal(isHostMessage(message), true);
+  assert.equal(
+    isHostMessage({
+      ...message,
+      appearance: { ...message.appearance, background: "not-a-color" },
+    }),
+    false,
+  );
+  assert.equal(
+    isHostMessage({ ...message, appearance: { ...message.appearance, fontSize: Infinity } }),
+    false,
+  );
+});
