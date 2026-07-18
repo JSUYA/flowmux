@@ -54,8 +54,11 @@ pub struct FileBrowserPanel {
     monitor_reload_in_progress: Rc<Cell<bool>>,
     pending_monitor_refreshes: Rc<RefCell<HashSet<PathBuf>>>,
     visible_row_limit: Rc<Cell<usize>>,
+    rendered_rows: Rc<RefCell<Vec<(FileBrowserRow, gtk::ListBoxRow)>>>,
     #[cfg(all(test, not(target_os = "macos")))]
     rebuild_count: Rc<Cell<usize>>,
+    #[cfg(all(test, not(target_os = "macos")))]
+    row_build_count: Rc<Cell<usize>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -78,6 +81,51 @@ struct FileBrowserRow {
     focused: bool,
     selected: bool,
     cut: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RowReconcileAction {
+    Move { from: usize, to: usize },
+    Insert { at: usize, row: FileBrowserRow },
+    Remove { at: usize },
+}
+
+fn row_reconciliation_actions(
+    current: &[FileBrowserRow],
+    desired: &[FileBrowserRow],
+) -> Vec<RowReconcileAction> {
+    let mut working = current.to_vec();
+    let mut actions = Vec::new();
+    for (index, desired_row) in desired.iter().enumerate() {
+        if working.get(index) == Some(desired_row) {
+            continue;
+        }
+        if let Some(existing) = working
+            .iter()
+            .enumerate()
+            .skip(index + 1)
+            .find_map(|(position, current)| (current == desired_row).then_some(position))
+        {
+            let row = working.remove(existing);
+            working.insert(index, row);
+            actions.push(RowReconcileAction::Move {
+                from: existing,
+                to: index,
+            });
+        } else {
+            working.insert(index, desired_row.clone());
+            actions.push(RowReconcileAction::Insert {
+                at: index,
+                row: desired_row.clone(),
+            });
+        }
+    }
+    while working.len() > desired.len() {
+        let at = working.len() - 1;
+        working.pop();
+        actions.push(RowReconcileAction::Remove { at });
+    }
+    actions
 }
 
 #[derive(Debug, Clone)]
@@ -273,8 +321,11 @@ impl FileBrowserPanel {
             monitor_reload_in_progress: Rc::new(Cell::new(false)),
             pending_monitor_refreshes: Rc::new(RefCell::new(HashSet::new())),
             visible_row_limit: Rc::new(Cell::new(ROW_BATCH_SIZE)),
+            rendered_rows: Rc::new(RefCell::new(Vec::new())),
             #[cfg(all(test, not(target_os = "macos")))]
             rebuild_count: Rc::new(Cell::new(0)),
+            #[cfg(all(test, not(target_os = "macos")))]
+            row_build_count: Rc::new(Cell::new(0)),
         };
 
         panel.install_focus_style();
@@ -692,9 +743,6 @@ impl FileBrowserPanel {
         #[cfg(all(test, not(target_os = "macos")))]
         self.rebuild_count.set(self.rebuild_count.get() + 1);
 
-        while let Some(child) = self.list.first_child() {
-            self.list.remove(&child);
-        }
         self.load_more_button.set_visible(false);
 
         let root = {
@@ -703,6 +751,7 @@ impl FileBrowserPanel {
         };
 
         let Some(root) = root else {
+            self.reconcile_rows(Vec::new());
             self.path_label.set_text("");
             self.status.set_text("No focused directory");
             self.status.set_visible(true);
@@ -714,12 +763,14 @@ impl FileBrowserPanel {
             .set_tooltip_text(Some(root.to_string_lossy().as_ref()));
 
         if let Some(error) = self.directory_error.borrow().as_deref() {
+            self.reconcile_rows(Vec::new());
             self.status.set_text(error);
             self.status.set_visible(true);
             return;
         }
 
         if !self.model.borrow().entries_by_dir.contains_key(&root) {
+            self.reconcile_rows(Vec::new());
             self.status.set_text("Loading…");
             self.status.set_visible(true);
             return;
@@ -733,6 +784,7 @@ impl FileBrowserPanel {
         let warning_count = self.directory_warnings.borrow().len();
 
         if rows.is_empty() {
+            self.reconcile_rows(Vec::new());
             if warning_count == 0 {
                 self.status.set_text("Directory is empty");
             } else {
@@ -747,30 +799,40 @@ impl FileBrowserPanel {
         let row_count = rows.len();
         let visible_count = row_count.min(self.visible_row_limit.get());
         self.update_list_status(row_count, visible_count, warning_count);
-        for row in rows.into_iter().take(visible_count) {
-            self.list.append(&self.build_row(&row));
-        }
+        self.reconcile_rows(rows.into_iter().take(visible_count).collect());
     }
 
     fn show_more_rows(&self) {
-        let rows = self.model.borrow().rows();
-        let row_count = rows.len();
-        let old_visible = row_count.min(self.visible_row_limit.get());
         let new_limit = self.visible_row_limit.get().saturating_add(ROW_BATCH_SIZE);
         self.visible_row_limit.set(new_limit);
-        let new_visible = row_count.min(new_limit);
-        for row in rows
-            .into_iter()
-            .skip(old_visible)
-            .take(new_visible - old_visible)
-        {
-            self.list.append(&self.build_row(&row));
+        self.rebuild_rows();
+    }
+
+    fn reconcile_rows(&self, desired: Vec<FileBrowserRow>) {
+        let mut rendered = self.rendered_rows.borrow_mut();
+        let current = rendered
+            .iter()
+            .map(|(row, _)| row.clone())
+            .collect::<Vec<_>>();
+        for action in row_reconciliation_actions(&current, &desired) {
+            match action {
+                RowReconcileAction::Move { from, to } => {
+                    let entry = rendered.remove(from);
+                    self.list.remove(&entry.1);
+                    self.list.insert(&entry.1, to as i32);
+                    rendered.insert(to, entry);
+                }
+                RowReconcileAction::Insert { at, row } => {
+                    let list_row = self.build_row(&row);
+                    self.list.insert(&list_row, at as i32);
+                    rendered.insert(at, (row, list_row));
+                }
+                RowReconcileAction::Remove { at } => {
+                    let (_, row) = rendered.remove(at);
+                    self.list.remove(&row);
+                }
+            }
         }
-        self.update_list_status(
-            row_count,
-            new_visible,
-            self.directory_warnings.borrow().len(),
-        );
     }
 
     fn update_list_status(&self, row_count: usize, visible_count: usize, warning_count: usize) {
@@ -1397,6 +1459,9 @@ impl FileBrowserPanel {
     }
 
     fn build_row(&self, row: &FileBrowserRow) -> gtk::ListBoxRow {
+        #[cfg(all(test, not(target_os = "macos")))]
+        self.row_build_count.set(self.row_build_count.get() + 1);
+
         let list_row = gtk::ListBoxRow::new();
         list_row.add_css_class("flowmux-file-browser-row");
         if row.focused {
@@ -2530,6 +2595,47 @@ mod tests {
     use std::cell::Cell;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+    fn reconciliation_row(name: &str) -> FileBrowserRow {
+        FileBrowserRow {
+            path: PathBuf::from(name),
+            is_dir: false,
+            icon_name: None,
+            depth: 0,
+            expanded: false,
+            focused: false,
+            selected: false,
+            cut: false,
+        }
+    }
+
+    #[test]
+    fn row_reconciliation_builds_only_inserted_or_changed_rows() {
+        let a = reconciliation_row("a");
+        let b = reconciliation_row("b");
+        let inserted = reconciliation_row("new");
+        assert_eq!(
+            row_reconciliation_actions(&[a.clone(), b.clone()], &[inserted.clone(), a, b]),
+            vec![RowReconcileAction::Insert {
+                at: 0,
+                row: inserted,
+            }]
+        );
+
+        let unchanged = reconciliation_row("same");
+        let mut changed = unchanged.clone();
+        changed.focused = true;
+        assert_eq!(
+            row_reconciliation_actions(&[unchanged], &[changed.clone()]),
+            vec![
+                RowReconcileAction::Insert {
+                    at: 0,
+                    row: changed,
+                },
+                RowReconcileAction::Remove { at: 1 },
+            ]
+        );
+    }
+
     #[cfg(not(target_os = "macos"))]
     fn wait_until(mut predicate: impl FnMut() -> bool) {
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -2809,6 +2915,7 @@ mod tests {
         panel.show_for_root(tmp.path.clone());
 
         assert_eq!(rendered_row_count(&panel), ROW_BATCH_SIZE);
+        assert_eq!(panel.row_build_count.get(), ROW_BATCH_SIZE);
         assert!(panel.load_more_button.is_visible());
         assert_eq!(panel.status.text(), "Showing 500 of 525 items");
         let first_row = panel.list.first_child().unwrap();
@@ -2816,6 +2923,7 @@ mod tests {
         panel.load_more_button.emit_clicked();
 
         assert_eq!(rendered_row_count(&panel), 525);
+        assert_eq!(panel.row_build_count.get(), 525);
         assert_eq!(panel.list.first_child().as_ref(), Some(&first_row));
         assert!(!panel.load_more_button.is_visible());
         assert!(!panel.status.is_visible());
@@ -2828,6 +2936,8 @@ mod tests {
         tmp.file("existing.txt");
         let panel = FileBrowserPanel::new();
         panel.show_for_root(tmp.path.clone());
+        let existing_row = panel.list.first_child().unwrap();
+        let initial_builds = panel.row_build_count.get();
         panel.install_directory_monitors(vec![tmp.path.clone()]);
 
         let created = tmp.file("created.txt");
@@ -2835,6 +2945,8 @@ mod tests {
 
         assert!(created.exists());
         assert_eq!(panel_row_names(&panel), vec!["created.txt", "existing.txt"]);
+        assert_eq!(panel.row_build_count.get(), initial_builds + 1);
+        assert_eq!(panel.list.last_child().as_ref(), Some(&existing_row));
     }
 
     #[test]
