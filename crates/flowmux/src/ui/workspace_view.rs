@@ -329,6 +329,21 @@ impl PaneRegistry {
             .collect()
     }
 
+    pub fn dirty_terminal_scrollback_snapshots(&self) -> Vec<(PaneId, SurfaceId, String)> {
+        self.terminals
+            .iter()
+            .filter_map(|(surface, terminal)| {
+                terminal.dirty_screen_text().map(|text| {
+                    (
+                        terminal.id(),
+                        *surface,
+                        normalize_scrollback_snapshot(&text),
+                    )
+                })
+            })
+            .collect()
+    }
+
     pub fn terminal_cwd_poll_inputs(
         &self,
     ) -> Vec<(PaneId, SurfaceId, Option<std::path::PathBuf>, Option<i32>)> {

@@ -67,7 +67,7 @@ impl WindowController {
                 let snapshots = controller
                     .pane_registry
                     .borrow()
-                    .terminal_scrollback_snapshots();
+                    .dirty_terminal_scrollback_snapshots();
                 let controller = controller.clone();
                 glib::MainContext::default().spawn_local(async move {
                     for (pane, surface, text) in snapshots {

@@ -45,6 +45,9 @@ pub struct GhosttyPane {
     /// Last cwd returned by [`Self::poll_cwd_if_changed`], so the poller only
     /// reports real changes.
     last_polled_cwd: Rc<RefCell<Option<PathBuf>>>,
+    /// Set by VTE's `contents-changed` signal. Periodic persistence consumes
+    /// the flag so unchanged terminal buffers are not extracted every cycle.
+    scrollback_dirty: Rc<Cell<bool>>,
     /// Last non-empty text selection VTE reported. Agent TUIs (Claude Code,
     /// Codex) repaint constantly; VTE clears the drag-selection on the next
     /// output frame (`deselect_all` in `process_incoming`), so by the time the
@@ -558,11 +561,16 @@ impl GhosttyPane {
     ) -> Self {
         let pane_id = Rc::new(Cell::new(id));
         let last_selection: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+        let scrollback_dirty = Rc::new(Cell::new(false));
         let term = vte::Terminal::new();
         term.set_hexpand(true);
         term.set_vexpand(true);
         term.set_scrollback_lines(i64::from(scrollback_lines));
         term.set_audible_bell(false);
+        {
+            let dirty = scrollback_dirty.clone();
+            term.connect_contents_changed(move |_| dirty.set(true));
+        }
         // Snap the viewport back to the live cursor row whenever the user
         // types: someone who scrolled up to inspect scrollback should not
         // end up typing off-screen with no visible echo. VTE's built-in
@@ -938,6 +946,7 @@ impl GhosttyPane {
             search_entry,
             pid,
             last_polled_cwd: Rc::new(RefCell::new(None)),
+            scrollback_dirty,
             last_selection,
             _pty: Rc::new(RefCell::new(Some(pty))),
         }
@@ -950,6 +959,19 @@ impl GhosttyPane {
         self.widget
             .text_format(vte::Format::Text)
             .map(|g| g.to_string())
+    }
+
+    /// Extract the terminal buffer only after VTE reported a content change.
+    /// A failed extraction restores the dirty flag so the next cycle retries.
+    pub fn dirty_screen_text(&self) -> Option<String> {
+        if !self.scrollback_dirty.replace(false) {
+            return None;
+        }
+        let text = self.screen_text();
+        if text.is_none() {
+            self.scrollback_dirty.set(true);
+        }
+        text
     }
 
     /// Feed `bytes` to the child, but only *after* any IME syllable still
