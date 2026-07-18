@@ -53,6 +53,54 @@ body {
   color: var(--danger);
 }
 
+.conflict-banner {
+  position: absolute;
+  z-index: 3;
+  top: 8px;
+  left: 10px;
+  right: 10px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  border: 1px solid color-mix(in srgb, var(--danger) 55%, transparent);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--panel) 94%, transparent);
+  box-shadow: 0 5px 20px rgb(0 0 0 / 30%);
+}
+
+.conflict-banner[hidden] {
+  display: none;
+}
+
+.conflict-banner span {
+  flex: 1;
+  min-width: 100px;
+  color: #ffd8d8;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.conflict-banner button {
+  flex: 0 0 auto;
+  padding: 4px 7px;
+  border: 1px solid color-mix(in srgb, var(--muted) 35%, transparent);
+  border-radius: 5px;
+  color: var(--text);
+  background: color-mix(in srgb, var(--panel) 75%, var(--text) 8%);
+  font: inherit;
+}
+
+.conflict-banner button:focus-visible {
+  outline: 2px solid #72b7a8;
+  outline-offset: 1px;
+}
+
+.conflict-banner button:disabled {
+  opacity: 0.45;
+}
+
 .editor,
 .empty-state {
   position: absolute;
@@ -144,6 +192,28 @@ body {
 
 .close-dialog button:disabled {
   opacity: 0.5;
+}
+
+.dialog-path {
+  width: 100%;
+  margin: 0 0 8px;
+  padding: 8px 9px;
+  border: 1px solid color-mix(in srgb, var(--muted) 35%, transparent);
+  border-radius: 5px;
+  color: var(--text);
+  background: color-mix(in srgb, var(--panel) 75%, var(--text) 8%);
+  font: inherit;
+}
+
+.dialog-path:focus-visible {
+  outline: 2px solid #72b7a8;
+  outline-offset: 1px;
+}
+
+.close-dialog .dialog-error {
+  min-height: 18px;
+  margin: 0 0 12px;
+  color: var(--danger);
 }
 
 .search-dialog {
@@ -274,6 +344,14 @@ body {
 }
 
 @media (max-width: 560px) {
+  .conflict-banner {
+    flex-wrap: wrap;
+  }
+
+  .conflict-banner span {
+    flex-basis: 100%;
+  }
+
   .search-options {
     grid-template-columns: auto auto auto;
   }

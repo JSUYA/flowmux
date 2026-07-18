@@ -94,6 +94,31 @@ export type HostMessage =
       documentVersion: number;
       diskState: RecoveryDiskState;
     })
+  | (HostMessageBase & {
+      type: "save_as_completed";
+      document: DocumentPayload;
+      changeSequence: number;
+    })
+  | (HostMessageBase & {
+      type: "save_as_failed";
+      documentId: string;
+      documentVersion: number;
+      changeSequence: number;
+      reason: string;
+      targetExists: boolean;
+    })
+  | (HostMessageBase & {
+      type: "show_diff";
+      documentId: string;
+      documentVersion: number;
+      diskContent: string;
+    })
+  | (HostMessageBase & {
+      type: "conflict_action_failed";
+      documentId: string;
+      documentVersion: number;
+      reason: string;
+    })
   | (HostMessageBase & { type: "show_workspace_search" })
   | (HostMessageBase & {
       type: "quick_open_completed";
@@ -143,6 +168,15 @@ export type EditorMessage =
       content: string;
     })
   | (EditorMessageBase & {
+      type: "save_as_requested";
+      documentId: string;
+      documentVersion: number;
+      changeSequence: number;
+      content: string;
+      path: string;
+      overwrite: boolean;
+    })
+  | (EditorMessageBase & {
       type: "close_requested";
       documentId: string;
       documentVersion: number;
@@ -181,6 +215,12 @@ export type EditorMessage =
       line: number;
       column: number;
       length: number;
+    })
+  | (EditorMessageBase & {
+      type: "conflict_action_requested";
+      documentId: string;
+      documentVersion: number;
+      action: "compare" | "keep_mine" | "reload_from_disk";
     });
 
 export interface DocumentEditAdvance {
@@ -252,6 +292,28 @@ export function isHostMessage(value: unknown): value is HostMessage {
         (value.diskState === "unchanged" ||
           value.diskState === "changed" ||
           value.diskState === "deleted")
+      );
+    case "save_as_completed":
+      return isDocumentPayload(value.document) && isVersion(value.changeSequence);
+    case "save_as_failed":
+      return (
+        typeof value.documentId === "string" &&
+        isVersion(value.documentVersion) &&
+        isVersion(value.changeSequence) &&
+        typeof value.reason === "string" &&
+        typeof value.targetExists === "boolean"
+      );
+    case "show_diff":
+      return (
+        typeof value.documentId === "string" &&
+        isVersion(value.documentVersion) &&
+        typeof value.diskContent === "string"
+      );
+    case "conflict_action_failed":
+      return (
+        typeof value.documentId === "string" &&
+        isVersion(value.documentVersion) &&
+        typeof value.reason === "string"
       );
     case "show_workspace_search":
       return true;

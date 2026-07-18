@@ -31,3 +31,32 @@ export function visibleDocumentState(
   }
   return { text: "Saved", kind: "normal", hidden: true };
 }
+
+export interface ConflictUiState {
+  hidden: boolean;
+  message: string;
+  compareDisabled: boolean;
+  reloadDisabled: boolean;
+  keepLabel: string;
+  closeCompareHidden: boolean;
+}
+
+export function conflictUiState(
+  diskStatus: DocumentDiskStatus,
+  externalChange: boolean,
+  comparing: boolean,
+): ConflictUiState {
+  const deleted = diskStatus === "deleted";
+  return {
+    hidden: !externalChange,
+    message: comparing
+      ? "Comparing the disk version with your editor changes."
+      : deleted
+        ? "This file was deleted on disk."
+        : "This file changed on disk while you were editing it.",
+    compareDisabled: deleted || comparing,
+    reloadDisabled: deleted,
+    keepLabel: deleted ? "Recreate on Save" : "Keep Mine",
+    closeCompareHidden: !comparing,
+  };
+}

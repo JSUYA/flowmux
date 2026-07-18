@@ -191,3 +191,51 @@ test("accepts quick open completion and reveal range messages", () => {
     true,
   );
 });
+
+test("accepts save as and conflict response messages", () => {
+  assert.equal(
+    isHostMessage({
+      protocolVersion: 1,
+      surfaceId: "surface-1",
+      type: "save_as_completed",
+      document: { ...koreanDocument, relativePath: "새 문서/저장🙂.rs" },
+      changeSequence: 3,
+    }),
+    true,
+  );
+  assert.equal(
+    isHostMessage({
+      protocolVersion: 1,
+      surfaceId: "surface-1",
+      type: "save_as_failed",
+      documentId: koreanDocument.id,
+      documentVersion: 3,
+      changeSequence: 3,
+      reason: "already exists",
+      targetExists: true,
+    }),
+    true,
+  );
+  assert.equal(
+    isHostMessage({
+      protocolVersion: 1,
+      surfaceId: "surface-1",
+      type: "show_diff",
+      documentId: koreanDocument.id,
+      documentVersion: 3,
+      diskContent: "디스크 日本語🙂\n",
+    }),
+    true,
+  );
+  assert.equal(
+    isHostMessage({
+      protocolVersion: 1,
+      surfaceId: "surface-1",
+      type: "conflict_action_failed",
+      documentId: koreanDocument.id,
+      documentVersion: 3,
+      reason: "deleted",
+    }),
+    true,
+  );
+});

@@ -16,7 +16,16 @@
         <p>Click a text file in Files to edit it.</p>
       </section>
       <div id="editor" class="editor" aria-label="Text editor"></div>
+      <div id="diff-editor" class="editor diff-editor" aria-label="Compare disk and editor versions"></div>
       <span id="document-state" class="document-state" aria-live="polite" hidden></span>
+      <div id="conflict-banner" class="conflict-banner" role="alert" hidden>
+        <span id="conflict-message"></span>
+        <button id="conflict-compare" type="button">Compare</button>
+        <button id="conflict-keep" type="button">Keep Mine</button>
+        <button id="conflict-reload" type="button">Reload from Disk</button>
+        <button id="conflict-save-as" type="button">Save As…</button>
+        <button id="conflict-close-diff" type="button" hidden>Close Compare</button>
+      </div>
       <dialog id="search-dialog" class="search-dialog" aria-labelledby="search-dialog-title">
         <div class="search-dialog-header">
           <h2 id="search-dialog-title">Open File</h2>
@@ -34,6 +43,16 @@
         </div>
         <p id="search-status" class="search-status" aria-live="polite"></p>
         <div id="search-results" class="search-results" role="listbox"></div>
+      </dialog>
+      <dialog id="save-as-dialog" class="close-dialog" aria-labelledby="save-as-dialog-title">
+        <h2 id="save-as-dialog-title">Save As</h2>
+        <p>Enter a path relative to this workspace.</p>
+        <input id="save-as-path" class="dialog-path" type="text" autocomplete="off" spellcheck="false">
+        <p id="save-as-error" class="dialog-error" aria-live="polite"></p>
+        <div class="close-dialog-actions">
+          <button id="save-as-cancel" type="button">Cancel</button>
+          <button id="save-as-submit" class="suggested" type="button">Save</button>
+        </div>
       </dialog>
       <dialog id="close-dialog" class="close-dialog" aria-labelledby="close-dialog-title">
         <h2 id="close-dialog-title">Save changes?</h2>

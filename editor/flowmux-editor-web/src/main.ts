@@ -8,7 +8,7 @@ import "monaco-editor/esm/vs/language/json/monaco.contribution.js";
 import "monaco-editor/esm/vs/language/typescript/monaco.contribution.js";
 import "./styles.css";
 
-import { adjustedFontSize, visibleDocumentState } from "./editor_state";
+import { adjustedFontSize, conflictUiState, visibleDocumentState } from "./editor_state";
 import { languageForPath } from "./language";
 import { commaSeparatedGlobs, rankQuickOpen } from "./search_state";
 import {
@@ -71,6 +71,14 @@ interface RecoveryProposal {
 const documentState = requiredElement("document-state");
 const emptyState = requiredElement("empty-state");
 const editorContainer = requiredElement("editor");
+const diffEditorContainer = requiredElement("diff-editor");
+const conflictBanner = requiredElement("conflict-banner");
+const conflictMessage = requiredElement("conflict-message");
+const conflictCompare = requiredButton("conflict-compare");
+const conflictKeep = requiredButton("conflict-keep");
+const conflictReload = requiredButton("conflict-reload");
+const conflictSaveAs = requiredButton("conflict-save-as");
+const conflictCloseDiff = requiredButton("conflict-close-diff");
 const searchDialog = requiredDialog("search-dialog");
 const searchDialogTitle = requiredElement("search-dialog-title");
 const searchDialogClose = requiredButton("search-dialog-close");
@@ -93,6 +101,11 @@ const recoveryDialogDocument = requiredElement("recovery-dialog-document");
 const recoveryDialogWarning = requiredElement("recovery-dialog-warning");
 const recoveryDialogDiscard = requiredButton("recovery-dialog-discard");
 const recoveryDialogRestore = requiredButton("recovery-dialog-restore");
+const saveAsDialog = requiredDialog("save-as-dialog");
+const saveAsPath = requiredInput("save-as-path");
+const saveAsError = requiredElement("save-as-error");
+const saveAsCancel = requiredButton("save-as-cancel");
+const saveAsSubmit = requiredButton("save-as-submit");
 
 let surfaceId = new URLSearchParams(window.location.search).get("surface") ?? "unbound";
 let activeDocumentId: string | null = null;
@@ -101,6 +114,11 @@ let wordWrapEnabled = false;
 let minimapEnabled = false;
 let closeDialogDocumentId: string | null = null;
 let closeAfterSaveDocumentId: string | null = null;
+let saveAsDocumentId: string | null = null;
+let saveAsOverwrite = false;
+let diffDocumentId: string | null = null;
+let diffOriginalModel: monaco.editor.ITextModel | null = null;
+let diffEditor: monaco.editor.IStandaloneDiffEditor | null = null;
 let recoveryDialogDocumentId: string | null = null;
 let recoveryDialogDocumentVersion = 0;
 const recoveryQueue: RecoveryProposal[] = [];
@@ -168,6 +186,23 @@ closeDialog.addEventListener("cancel", (event) => {
 recoveryDialogDiscard.addEventListener("click", () => resolveRecovery("discard"));
 recoveryDialogRestore.addEventListener("click", () => resolveRecovery("restore"));
 recoveryDialog.addEventListener("cancel", (event) => event.preventDefault());
+conflictCompare.addEventListener("click", () => requestConflictAction("compare"));
+conflictKeep.addEventListener("click", () => requestConflictAction("keep_mine"));
+conflictReload.addEventListener("click", () => requestConflictAction("reload_from_disk"));
+conflictSaveAs.addEventListener("click", () => showSaveAsDialog());
+conflictCloseDiff.addEventListener("click", () => closeDiffView());
+saveAsCancel.addEventListener("click", () => closeSaveAsDialog());
+saveAsSubmit.addEventListener("click", () => submitSaveAs());
+saveAsPath.addEventListener("keydown", (event) => {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    submitSaveAs();
+  }
+});
+saveAsDialog.addEventListener("cancel", (event) => {
+  event.preventDefault();
+  closeSaveAsDialog();
+});
 searchDialogClose.addEventListener("click", () => closeSearchDialog());
 searchDialog.addEventListener("cancel", (event) => {
   event.preventDefault();
@@ -211,6 +246,13 @@ editor.addAction({
   label: "Save All",
   keybindings: [monaco.KeyMod.CtrlCmd | monaco.KeyMod.Alt | monaco.KeyCode.KeyS],
   run: () => requestSaveAll(),
+});
+
+editor.addAction({
+  id: "flowmux.saveAs",
+  label: "Save As",
+  keybindings: [monaco.KeyMod.CtrlCmd | monaco.KeyMod.Shift | monaco.KeyCode.KeyS],
+  run: () => showSaveAsDialog(),
 });
 
 editor.addAction({
@@ -282,6 +324,8 @@ function handleHostMessage(message: HostMessage): void {
       clearViewStateTimer();
       resetCloseDialog();
       resetRecoveryDialog(true);
+      closeSaveAsDialog(false);
+      closeDiffView(false);
       for (const document of [...documents.values()]) {
         document.model.dispose();
       }
@@ -325,9 +369,46 @@ function handleHostMessage(message: HostMessage): void {
         }
         document.payload.externalChange = true;
         document.diskStatus = "modified";
-        documentState.textContent = message.reason;
-        documentState.className = "document-state is-conflict";
-        documentState.hidden = false;
+        renderState();
+        conflictMessage.textContent = message.reason;
+      }
+      break;
+    }
+    case "save_as_completed": {
+      const document = documents.get(message.document.id);
+      if (document !== undefined) {
+        if (document.changeSequence === message.changeSequence) {
+          addOrReplaceDocument(message.document);
+        } else {
+          document.payload = {
+            ...document.payload,
+            relativePath: message.document.relativePath,
+            name: message.document.name,
+            encoding: message.document.encoding,
+            eol: message.document.eol,
+            readOnly: message.document.readOnly,
+            externalChange: false,
+          };
+          document.diskStatus = "unchanged";
+          monaco.editor.setModelLanguage(
+            document.model,
+            message.document.language ?? languageForPath(message.document.relativePath),
+          );
+          renderState();
+        }
+      }
+      closeSaveAsDialog();
+      break;
+    }
+    case "save_as_failed": {
+      const document = documents.get(message.documentId);
+      if (document !== undefined && saveAsDocumentId === message.documentId) {
+        saveAsOverwrite = message.targetExists;
+        saveAsSubmit.textContent = message.targetExists ? "Replace" : "Save";
+        saveAsError.textContent = message.targetExists
+          ? "That file already exists. Choose Replace to overwrite it."
+          : message.reason;
+        saveAsPath.focus();
       }
       break;
     }
@@ -343,6 +424,21 @@ function handleHostMessage(message: HostMessage): void {
     case "recovery_available":
       showRecoveryDialog(message.documentId, message.documentVersion, message.diskState);
       break;
+    case "show_diff": {
+      const document = documents.get(message.documentId);
+      if (document !== undefined && document.payload.version === message.documentVersion) {
+        showDiff(document, message.diskContent);
+      }
+      break;
+    }
+    case "conflict_action_failed": {
+      const document = documents.get(message.documentId);
+      if (document !== undefined && document.payload.version === message.documentVersion) {
+        conflictMessage.textContent = message.reason;
+        conflictBanner.hidden = false;
+      }
+      break;
+    }
     case "show_workspace_search":
       showWorkspaceSearch();
       break;
@@ -384,6 +480,9 @@ function handleHostMessage(message: HostMessage): void {
 function addOrReplaceDocument(payload: DocumentPayload): void {
   const existing = documents.get(payload.id);
   if (existing !== undefined) {
+    if (diffDocumentId === payload.id) {
+      closeDiffView(false);
+    }
     const viewState = activeDocumentId === payload.id ? editor.saveViewState() : null;
     existing.suppressChanges = true;
     existing.model.setValue(payload.content);
@@ -443,6 +542,9 @@ function activateDocument(documentId: string | null): void {
     reportActiveViewState();
   }
   const document = documentId === null ? undefined : documents.get(documentId);
+  if (diffDocumentId !== null && diffDocumentId !== document?.payload.id) {
+    closeDiffView(false);
+  }
   activeDocumentId = document?.payload.id ?? null;
   editor.setModel(document?.model ?? null);
   editor.updateOptions({ readOnly: document?.payload.readOnly ?? false });
@@ -481,6 +583,12 @@ function closeDocument(documentId: string): void {
   }
   if (recoveryDialogDocumentId === documentId) {
     resetRecoveryDialog();
+  }
+  if (saveAsDocumentId === documentId) {
+    closeSaveAsDialog();
+  }
+  if (diffDocumentId === documentId) {
+    closeDiffView(false);
   }
   for (let index = recoveryQueue.length - 1; index >= 0; index -= 1) {
     if (recoveryQueue[index]?.documentId === documentId) {
@@ -634,6 +742,131 @@ function resetRecoveryDialog(clearQueue = false): void {
   editor.focus();
 }
 
+function requestConflictAction(action: "compare" | "keep_mine" | "reload_from_disk"): void {
+  const document = activeDocumentId === null ? undefined : documents.get(activeDocumentId);
+  if (document === undefined || !document.payload.externalChange) {
+    return;
+  }
+  postToHost({
+    protocolVersion: PROTOCOL_VERSION,
+    surfaceId,
+    type: "conflict_action_requested",
+    documentId: document.payload.id,
+    documentVersion: document.payload.version,
+    action,
+  });
+}
+
+function showDiff(document: OpenDocument, diskContent: string): void {
+  closeDiffView(false);
+  diffOriginalModel = monaco.editor.createModel(
+    diskContent,
+    document.payload.language ?? languageForPath(document.payload.relativePath),
+    monaco.Uri.parse(
+      `flowmux-disk://comparison/${encodeURIComponent(document.payload.id)}/${document.payload.version}`,
+    ),
+  );
+  if (diffEditor === null) {
+    diffEditor = monaco.editor.createDiffEditor(diffEditorContainer, {
+      automaticLayout: true,
+      theme: "flowmux-dark",
+      fontFamily:
+        "SFMono-Regular, Cascadia Code, Noto Sans Mono CJK KR, Noto Sans Mono, Apple SD Gothic Neo, Hiragino Sans, monospace",
+      fontSize: editorFontSize,
+      lineHeight: 20,
+      minimap: { enabled: false },
+      renderSideBySide: true,
+      scrollBeyondLastLine: false,
+      originalEditable: false,
+    });
+    diffEditor.getModifiedEditor().addAction({
+      id: "flowmux.diff.save",
+      label: "Save",
+      keybindings: [monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS],
+      run: () => requestSave(),
+    });
+    diffEditor.getModifiedEditor().addAction({
+      id: "flowmux.diff.saveAs",
+      label: "Save As",
+      keybindings: [monaco.KeyMod.CtrlCmd | monaco.KeyMod.Shift | monaco.KeyCode.KeyS],
+      run: () => showSaveAsDialog(),
+    });
+  }
+  diffEditor.setModel({ original: diffOriginalModel, modified: document.model });
+  diffDocumentId = document.payload.id;
+  renderState();
+  diffEditor.focus();
+}
+
+function closeDiffView(render = true): void {
+  diffEditor?.setModel(null);
+  diffOriginalModel?.dispose();
+  diffOriginalModel = null;
+  diffDocumentId = null;
+  if (render) {
+    renderState();
+    editor.focus();
+  }
+}
+
+function showSaveAsDialog(documentId: string | null = activeDocumentId): void {
+  const document = documentId === null ? undefined : documents.get(documentId);
+  if (document === undefined) {
+    return;
+  }
+  if (searchDialog.open) {
+    closeSearchDialog();
+  }
+  saveAsDocumentId = document.payload.id;
+  saveAsOverwrite = false;
+  saveAsPath.value = document.payload.relativePath;
+  saveAsError.textContent = "";
+  saveAsSubmit.textContent = "Save";
+  if (!saveAsDialog.open) {
+    saveAsDialog.showModal();
+  }
+  saveAsPath.focus();
+  saveAsPath.select();
+}
+
+function submitSaveAs(): void {
+  const document = saveAsDocumentId === null ? undefined : documents.get(saveAsDocumentId);
+  const path = saveAsPath.value.trim();
+  if (document === undefined) {
+    closeSaveAsDialog();
+    return;
+  }
+  if (path.length === 0) {
+    saveAsError.textContent = "Enter a workspace-relative file path.";
+    return;
+  }
+  saveAsError.textContent = "Saving…";
+  postToHost({
+    protocolVersion: PROTOCOL_VERSION,
+    surfaceId,
+    type: "save_as_requested",
+    documentId: document.payload.id,
+    documentVersion: document.payload.version,
+    changeSequence: document.changeSequence,
+    content: document.model.getValue(),
+    path,
+    overwrite: saveAsOverwrite,
+  });
+}
+
+function closeSaveAsDialog(focus = true): void {
+  saveAsDocumentId = null;
+  saveAsOverwrite = false;
+  saveAsError.textContent = "";
+  saveAsSubmit.textContent = "Save";
+  if (saveAsDialog.open) {
+    saveAsDialog.close();
+  }
+  if (focus) {
+    editor.focus();
+  }
+}
+
 function showQuickOpen(): void {
   if (!canShowSearchDialog()) {
     return;
@@ -671,7 +904,7 @@ function showWorkspaceSearch(): void {
 }
 
 function canShowSearchDialog(): boolean {
-  return !closeDialog.open && !recoveryDialog.open;
+  return !closeDialog.open && !recoveryDialog.open && !saveAsDialog.open;
 }
 
 function openSearchDialog(): void {
@@ -967,15 +1200,19 @@ function requestSaveAll(): void {
 function setEditorFontSize(fontSize: number): void {
   editorFontSize = fontSize;
   editor.updateOptions({ fontSize });
+  diffEditor?.updateOptions({ fontSize });
 }
 
 function renderState(): void {
   const active = activeDocumentId === null ? undefined : documents.get(activeDocumentId);
+  const showingDiff = active !== undefined && diffDocumentId === active.payload.id;
   emptyState.classList.toggle("is-hidden", active !== undefined);
-  editorContainer.classList.toggle("is-visible", active !== undefined);
+  editorContainer.classList.toggle("is-visible", active !== undefined && !showingDiff);
+  diffEditorContainer.classList.toggle("is-visible", showingDiff);
   if (active === undefined) {
     documentState.className = "document-state";
     documentState.hidden = true;
+    conflictBanner.hidden = true;
     return;
   }
 
@@ -986,7 +1223,21 @@ function renderState(): void {
   );
   documentState.textContent = state.text;
   documentState.className = `document-state${state.kind === "normal" ? "" : ` is-${state.kind}`}`;
-  documentState.hidden = state.hidden;
+  documentState.hidden = state.hidden || active.payload.externalChange;
+  renderConflictBanner(active, showingDiff);
+}
+
+function renderConflictBanner(active: OpenDocument, showingDiff: boolean): void {
+  const state = conflictUiState(active.diskStatus, active.payload.externalChange, showingDiff);
+  conflictBanner.hidden = state.hidden;
+  if (state.hidden) {
+    return;
+  }
+  conflictMessage.textContent = state.message;
+  conflictCompare.disabled = state.compareDisabled;
+  conflictReload.disabled = state.reloadDisabled;
+  conflictKeep.textContent = state.keepLabel;
+  conflictCloseDiff.hidden = state.closeCompareHidden;
 }
 
 function postToHost(message: EditorMessage): void {

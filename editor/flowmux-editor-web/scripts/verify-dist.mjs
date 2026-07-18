@@ -36,7 +36,10 @@ if (
   !html.includes('id="recovery-dialog-restore"') ||
   !html.includes('id="recovery-dialog-discard"') ||
   !html.includes('id="search-dialog"') ||
-  !html.includes('id="search-query"')
+  !html.includes('id="search-query"') ||
+  !html.includes('id="conflict-banner"') ||
+  !html.includes('id="save-as-dialog"') ||
+  !html.includes('id="diff-editor"')
 ) {
   throw new Error("Editor entry point is missing its security or document safety controls");
 }
@@ -48,7 +51,9 @@ if (
   !main.includes("view_state_changed") ||
   !main.includes("quick_open_requested") ||
   !main.includes("workspace_search_requested") ||
-  !main.includes("search_result_open_requested")
+  !main.includes("search_result_open_requested") ||
+  !main.includes("save_as_requested") ||
+  !main.includes("conflict_action_requested")
 ) {
   throw new Error("Editor bundle is missing an explicit document safety message");
 }
