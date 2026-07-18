@@ -143,6 +143,7 @@ pub enum DocumentError {
 struct Document {
     snapshot: DocumentSnapshot,
     base_bytes: Vec<u8>,
+    base_missing: bool,
     permissions: Permissions,
 }
 
@@ -231,6 +232,7 @@ impl DocumentService {
             Document {
                 snapshot: snapshot.clone(),
                 base_bytes: loaded.bytes,
+                base_missing: false,
                 permissions: loaded.permissions,
             },
         );
@@ -295,16 +297,18 @@ impl DocumentService {
             });
         }
 
-        let current = fs::read(&document.snapshot.identity_path).map_err(|source| {
-            if source.kind() == io::ErrorKind::NotFound {
-                DocumentError::ExternalChange {
-                    path: document.snapshot.display_path.clone(),
-                }
-            } else {
-                io_error("read before save", &document.snapshot.identity_path, source)
+        let disk_matches_base = match fs::read(&document.snapshot.identity_path) {
+            Ok(current) => !document.base_missing && current == document.base_bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => document.base_missing,
+            Err(source) => {
+                return Err(io_error(
+                    "read before save",
+                    &document.snapshot.identity_path,
+                    source,
+                ));
             }
-        })?;
-        if current != document.base_bytes {
+        };
+        if !disk_matches_base {
             return Err(DocumentError::ExternalChange {
                 path: document.snapshot.display_path.clone(),
             });
@@ -321,6 +325,7 @@ impl DocumentService {
             .get_mut(&id)
             .expect("document remains open during synchronous save");
         document.base_bytes = bytes;
+        document.base_missing = false;
         document.snapshot.saved_version = requested_version;
         document.snapshot.read_only = fs::metadata(&document.snapshot.identity_path)
             .map(|metadata| metadata.permissions().readonly())
@@ -401,14 +406,20 @@ impl DocumentService {
         document.snapshot.saved_version = requested_version;
         document.snapshot.read_only = false;
         document.base_bytes = bytes;
+        document.base_missing = false;
         Ok(document.snapshot.clone())
     }
 
     pub fn disk_status(&self, id: DocumentId) -> Result<DiskStatus, DocumentError> {
         let document = self.documents.get(&id).ok_or(DocumentError::NotOpen(id))?;
         match fs::read(&document.snapshot.identity_path) {
-            Ok(bytes) if bytes == document.base_bytes => Ok(DiskStatus::Unchanged),
+            Ok(bytes) if !document.base_missing && bytes == document.base_bytes => {
+                Ok(DiskStatus::Unchanged)
+            }
             Ok(_) => Ok(DiskStatus::Modified),
+            Err(error) if error.kind() == io::ErrorKind::NotFound && document.base_missing => {
+                Ok(DiskStatus::Unchanged)
+            }
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(DiskStatus::Deleted),
             Err(source) => Err(io_error(
                 "inspect document",
@@ -423,6 +434,61 @@ impl DocumentService {
         if document.snapshot.is_dirty() {
             return Err(DocumentError::Dirty(id));
         }
+        self.reload_from_disk_inner(id)
+    }
+
+    pub fn reload_discarding_changes(
+        &mut self,
+        id: DocumentId,
+    ) -> Result<DocumentSnapshot, DocumentError> {
+        self.reload_from_disk_inner(id)
+    }
+
+    pub fn disk_text(&self, id: DocumentId) -> Result<String, DocumentError> {
+        let document = self.documents.get(&id).ok_or(DocumentError::NotOpen(id))?;
+        read_text_document(&document.snapshot.identity_path, self.max_document_bytes)
+            .map(|loaded| loaded.text)
+    }
+
+    pub fn accept_external_as_base(
+        &mut self,
+        id: DocumentId,
+    ) -> Result<DocumentSnapshot, DocumentError> {
+        let document = self.documents.get(&id).ok_or(DocumentError::NotOpen(id))?;
+        let identity_path = document.snapshot.identity_path.clone();
+        match fs::read(&identity_path) {
+            Ok(bytes) => {
+                let metadata = fs::metadata(&identity_path)
+                    .map_err(|source| io_error("inspect", &identity_path, source))?;
+                let document = self
+                    .documents
+                    .get_mut(&id)
+                    .expect("document remains open while accepting an external version");
+                document.base_bytes = bytes;
+                document.base_missing = false;
+                document.permissions = metadata.permissions();
+                document.snapshot.read_only = document.permissions.readonly();
+                Ok(document.snapshot.clone())
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let document = self
+                    .documents
+                    .get_mut(&id)
+                    .expect("document remains open while accepting a deletion");
+                document.base_bytes.clear();
+                document.base_missing = true;
+                document.snapshot.read_only = false;
+                Ok(document.snapshot.clone())
+            }
+            Err(source) => Err(io_error("read external version", &identity_path, source)),
+        }
+    }
+
+    fn reload_from_disk_inner(
+        &mut self,
+        id: DocumentId,
+    ) -> Result<DocumentSnapshot, DocumentError> {
+        let document = self.documents.get(&id).ok_or(DocumentError::NotOpen(id))?;
         let identity_path = document.snapshot.identity_path.clone();
         let loaded = read_text_document(&identity_path, self.max_document_bytes)?;
 
@@ -439,6 +505,7 @@ impl DocumentService {
         document.snapshot.has_final_newline = document.snapshot.text.ends_with('\n');
         document.snapshot.read_only = loaded.read_only;
         document.base_bytes = loaded.bytes;
+        document.base_missing = false;
         document.permissions = loaded.permissions;
         Ok(document.snapshot.clone())
     }
@@ -798,6 +865,59 @@ mod tests {
         ));
         assert_eq!(service.snapshot(opened.id).unwrap().text, "editor\n");
         assert_eq!(fs::read_to_string(path).unwrap(), "external\n");
+    }
+
+    #[test]
+    fn explicit_conflict_actions_compare_keep_and_reload_without_silent_overwrite() {
+        let workspace = tempdir().unwrap();
+        let path = workspace.path().join("충돌-日本語.txt");
+        write(&path, "base\n".as_bytes());
+        let mut service = DocumentService::new(workspace.path()).unwrap();
+        let opened = service.open(&path).unwrap().document;
+        let edited = service
+            .update_text(opened.id, opened.version, "내 변경🙂\n".into())
+            .unwrap();
+        write(&path, "외부 변경 日本語\n".as_bytes());
+
+        assert_eq!(service.disk_text(edited.id).unwrap(), "외부 변경 日本語\n");
+        assert_eq!(service.snapshot(edited.id).unwrap().text, "내 변경🙂\n");
+        service.accept_external_as_base(edited.id).unwrap();
+        assert_eq!(
+            service.disk_status(edited.id).unwrap(),
+            DiskStatus::Unchanged
+        );
+        service.save(edited.id, edited.version).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "내 변경🙂\n");
+
+        let edited = service
+            .update_text(edited.id, edited.version, "다시 편집\n".into())
+            .unwrap();
+        write(&path, "두 번째 외부 변경\n".as_bytes());
+        let reloaded = service.reload_discarding_changes(edited.id).unwrap();
+        assert_eq!(reloaded.text, "두 번째 외부 변경\n");
+        assert!(!reloaded.is_dirty());
+    }
+
+    #[test]
+    fn accepting_external_deletion_allows_explicit_recreation() {
+        let workspace = tempdir().unwrap();
+        let path = workspace.path().join("삭제됨.txt");
+        write(&path, "base\n".as_bytes());
+        let mut service = DocumentService::new(workspace.path()).unwrap();
+        let opened = service.open(&path).unwrap().document;
+        let edited = service
+            .update_text(opened.id, opened.version, "복구할 내용🙂\n".into())
+            .unwrap();
+        fs::remove_file(&path).unwrap();
+
+        assert_eq!(service.disk_status(edited.id).unwrap(), DiskStatus::Deleted);
+        service.accept_external_as_base(edited.id).unwrap();
+        assert_eq!(
+            service.disk_status(edited.id).unwrap(),
+            DiskStatus::Unchanged
+        );
+        service.save(edited.id, edited.version).unwrap();
+        assert_eq!(fs::read_to_string(path).unwrap(), "복구할 내용🙂\n");
     }
 
     #[test]
