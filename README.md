@@ -143,6 +143,7 @@ flowmux/
 │   ├── flowmux-vcs/        Git/PR sidebar integration
 │   ├── flowmux-cli/        `flowmuxctl` helper for CLI subcommands
 │   └── flowmux/            GTK4 + libadwaita main app and public `flowmux` binary
+├── editor/flowmux-editor-web/  Monaco editor source + committed web assets
 ├── packaging/{debian,flatpak}/  Distro packaging metadata
 ├── resources/             .desktop file, icons, screenshots, themes
 ├── LICENSE                GPL-3.0-or-later (verbatim from gnu.org)
@@ -219,6 +220,19 @@ cargo run -p flowmux           # debug GUI
 cargo check --workspace        # type-check everything
 scripts/check-ubuntu-compat.sh # Docker smoke check for 24.04/26.04
 ```
+
+The Monaco editor bundle under `editor/flowmux-editor-web/dist` is committed,
+so regular Flowmux builds and installs do not require Node.js. Only developers
+who change the editor frontend need Node.js 20 or newer and npm. Rebuild and
+verify the locked assets with:
+
+```bash
+scripts/build-editor-assets.sh
+```
+
+The script uses `npm ci`, runs the TypeScript and multilingual path tests,
+builds the worker bundles, and checks the distributable asset set. Commit the
+updated `dist` directory and `package-lock.json` together.
 
 ## macOS local install
 

@@ -9,6 +9,18 @@ libraries used at runtime, such as GTK, libadwaita, WebKitGTK, D-Bus, Secret
 Service implementations, and ThorVG (image viewer), retain their own
 distribution licenses.
 
+The committed editor frontend has a separate locked npm dependency graph:
+
+- Monaco Editor 0.53.0 (MIT) is included in the distributed editor assets.
+- esbuild 0.28.1 (MIT) and TypeScript 5.9.3 (Apache-2.0) are build-only tools.
+- `@types/trusted-types` 1.0.6 (MIT) is a build-time type dependency of Monaco.
+- esbuild's platform packages use the same esbuild version and MIT license.
+
+The Monaco copyright notice and MIT license are distributed beside the editor
+assets in `editor/flowmux-editor-web/dist/THIRD_PARTY_NOTICES.md`. Exact npm
+versions and integrity hashes are recorded in
+`editor/flowmux-editor-web/package-lock.json`.
+
 ## License Overview
 
 - Apache License 2.0 (342)

@@ -1,0 +1,19 @@
+{
+  "name": "flowmux-editor-web",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "check": "tsc --noEmit",
+    "test": "npm run check && tsc -p tsconfig.test.json && node --test tests/*.test.mjs",
+    "verify": "node scripts/verify-dist.mjs"
+  },
+  "dependencies": {
+    "monaco-editor": "0.53.0"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.1",
+    "typescript": "5.9.3"
+  }
+}

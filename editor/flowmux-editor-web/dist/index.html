@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'self'; style-src 'self'; worker-src 'self'; font-src 'self'; img-src data:"
+    >
+    <title>Flowmux Editor</title>
+    <link rel="stylesheet" href="./main.css">
+  </head>
+  <body>
+    <main class="editor-shell" aria-label="Flowmux editor">
+      <nav id="document-tabs" class="document-tabs" aria-label="Open documents"></nav>
+      <section id="context-rail" class="context-rail" aria-live="polite">
+        <span id="workspace-name" class="workspace-name">Workspace</span>
+        <span class="rail-divider" aria-hidden="true">/</span>
+        <span id="document-path" class="document-path">No file open</span>
+        <span id="document-state" class="document-state">Ready</span>
+      </section>
+      <section id="empty-state" class="empty-state">
+        <span class="empty-mark" aria-hidden="true">⌘</span>
+        <h1>Open a file to start editing</h1>
+        <p>Double-click a text file in the Flowmux file browser.</p>
+      </section>
+      <div id="editor" class="editor" aria-label="Text editor"></div>
+      <footer id="status-strip" class="status-strip" aria-live="polite">
+        <span id="cursor-status">Ln 1, Col 1</span>
+        <span id="language-status">Plain text</span>
+        <span id="encoding-status">UTF-8</span>
+        <span id="eol-status">LF</span>
+      </footer>
+    </main>
+    <script type="module" src="./main.js"></script>
+  </body>
+</html>
