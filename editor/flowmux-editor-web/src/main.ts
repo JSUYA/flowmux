@@ -106,9 +106,6 @@ const documentState = requiredElement("document-state");
 const emptyState = requiredElement("empty-state");
 const editorContainer = requiredElement("editor");
 const diffEditorContainer = requiredElement("diff-editor");
-const modeSwitch = requiredElement("mode-switch");
-const modeEdit = requiredButton("mode-edit");
-const modeDiff = requiredButton("mode-diff");
 const conflictBanner = requiredElement("conflict-banner");
 const conflictMessage = requiredElement("conflict-message");
 const conflictCompare = requiredButton("conflict-compare");
@@ -303,8 +300,6 @@ conflictKeep.addEventListener("click", () => requestConflictAction("keep_mine"))
 conflictReload.addEventListener("click", () => requestConflictAction("reload_from_disk"));
 conflictSaveAs.addEventListener("click", () => showSaveAsDialog());
 conflictCloseDiff.addEventListener("click", () => closeDiffView());
-modeEdit.addEventListener("click", () => closeDiffView());
-modeDiff.addEventListener("click", () => requestDiffView());
 saveAsCancel.addEventListener("click", () => closeSaveAsDialog());
 saveAsSubmit.addEventListener("click", () => submitSaveAs());
 saveAsPath.addEventListener("keydown", (event) => {
@@ -919,21 +914,6 @@ function requestConflictAction(action: "compare" | "keep_mine" | "reload_from_di
   });
 }
 
-function requestDiffView(): void {
-  const document = activeDocumentId === null ? undefined : documents.get(activeDocumentId);
-  if (document === undefined || diffDocumentId === document.payload.id) {
-    return;
-  }
-  syncDocument(document);
-  postToHost({
-    protocolVersion: PROTOCOL_VERSION,
-    surfaceId,
-    type: "diff_requested",
-    documentId: document.payload.id,
-    documentVersion: document.payload.version,
-  });
-}
-
 function showDiff(document: OpenDocument, diskContent: string): void {
   closeDiffView(false);
   diffOriginalModel = monaco.editor.createModel(
@@ -1447,9 +1427,6 @@ function renderState(): void {
   const active = activeDocumentId === null ? undefined : documents.get(activeDocumentId);
   const showingDiff = active !== undefined && diffDocumentId === active.payload.id;
   emptyState.classList.toggle("is-hidden", active !== undefined);
-  modeSwitch.hidden = active === undefined;
-  modeEdit.setAttribute("aria-pressed", String(!showingDiff));
-  modeDiff.setAttribute("aria-pressed", String(showingDiff));
   editorContainer.classList.toggle("is-visible", active !== undefined && !showingDiff);
   diffEditorContainer.classList.toggle("is-visible", showingDiff);
   if (showingDiff) {

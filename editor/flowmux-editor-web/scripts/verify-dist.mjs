@@ -30,8 +30,6 @@ if (
   !html.includes("style-src 'self' 'unsafe-inline'") ||
   !html.includes('src="./main.js"') ||
   !html.includes('id="close-dialog"') ||
-  !html.includes('id="mode-edit"') ||
-  !html.includes('id="mode-diff"') ||
   !html.includes('id="close-dialog-save"') ||
   !html.includes('id="close-dialog-discard"') ||
   !html.includes('id="close-dialog-cancel"') ||
@@ -50,24 +48,27 @@ if (
 const main = await readFile(resolve(root, "dist", "main.js"), "utf8");
 const css = await readFile(resolve(root, "dist", "main.css"), "utf8");
 if (
+  html.includes('id="mode-switch"') ||
+  html.includes('id="mode-edit"') ||
+  html.includes('id="mode-diff"') ||
+  css.includes(".mode-switch")
+) {
+  throw new Error("Editor bundle still exposes the unfinished edit and diff controls");
+}
+if (
   !main.includes("discard_close_requested") ||
   !main.includes("recovery_decision") ||
   !main.includes("view_state_changed") ||
   !main.includes("quick_open_requested") ||
   !main.includes("workspace_search_requested") ||
   !main.includes("search_result_open_requested") ||
-  !main.includes("diff_requested") ||
   !main.includes("save_as_requested") ||
   !main.includes("conflict_action_requested") ||
   !main.includes("set_appearance")
 ) {
   throw new Error("Editor bundle is missing an explicit document safety message");
 }
-if (
-  !main.includes("actions.find") ||
-  !css.includes(".find-widget") ||
-  !css.includes(".mode-switch")
-) {
+if (!main.includes("actions.find") || !css.includes(".find-widget")) {
   throw new Error("Editor bundle is missing Monaco's built-in find contribution");
 }
 
