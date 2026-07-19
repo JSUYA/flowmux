@@ -697,6 +697,13 @@ impl WindowController {
             return Err("destination pane is not rendered".to_string());
         }
 
+        let Some(src_workspace) = self.store.workspace_of_pane(src_pane).await else {
+            return Err("source pane no longer exists".to_string());
+        };
+        if self.store.workspace_of_pane(dst_pane).await.is_none() {
+            return Err("destination pane no longer exists".to_string());
+        }
+
         let moving = self
             .pane_registry
             .borrow_mut()
@@ -718,7 +725,8 @@ impl WindowController {
             Some(outcome) => outcome,
             None => {
                 // Model rejected the move; restore the widget to its source.
-                self.reattach_surface(src_pane, surface, moving).await;
+                self.reattach_surface(src_workspace, src_pane, surface, moving)
+                    .await;
                 return Err("destination pane no longer exists".to_string());
             }
         };
@@ -842,18 +850,17 @@ impl WindowController {
     /// a move is rejected by the store.
     pub(super) async fn reattach_surface(
         &self,
+        src_workspace: WorkspaceId,
         src_pane: PaneId,
         surface: SurfaceId,
         moving: MovingSurface,
     ) {
-        let Some(ws_id) = self.store.workspace_of_pane(src_pane).await else {
-            return;
-        };
         let mounted = self
-            .mount_moved_surface(src_pane, ws_id, surface, moving, usize::MAX)
+            .mount_moved_surface(src_pane, src_workspace, surface, moving, usize::MAX)
             .await;
         if let Err(moving) = mounted {
-            self.rerender_with_moving_editor(ws_id, *moving).await;
+            self.rerender_with_moving_editor(src_workspace, *moving)
+                .await;
         }
     }
     pub(super) async fn sync_pane_active_from_store(&self, workspace: WorkspaceId, pane: PaneId) {
@@ -975,6 +982,13 @@ impl WindowController {
             return Err("destination pane is not rendered".to_string());
         }
 
+        let Some(src_workspace) = self.store.workspace_of_pane(src_pane).await else {
+            return Err("source pane no longer exists".to_string());
+        };
+        if self.store.workspace_of_pane(dst_pane).await.is_none() {
+            return Err("destination pane no longer exists".to_string());
+        }
+
         let moving = self
             .pane_registry
             .borrow_mut()
@@ -995,7 +1009,8 @@ impl WindowController {
         {
             Some(outcome) => outcome,
             None => {
-                self.reattach_surface(src_pane, surface, moving).await;
+                self.reattach_surface(src_workspace, src_pane, surface, moving)
+                    .await;
                 return Err("destination pane no longer exists".to_string());
             }
         };

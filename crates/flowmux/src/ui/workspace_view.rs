@@ -660,6 +660,9 @@ impl PaneRegistry {
         y: f64,
     ) -> Option<(PaneId, f64, f64)> {
         self.pane_frames.iter().find_map(|(pane, frame)| {
+            if !frame.is_mapped() {
+                return None;
+            }
             let bounds = frame.compute_bounds(root)?;
             let left = f64::from(bounds.x());
             let top = f64::from(bounds.y());
@@ -690,6 +693,9 @@ impl PaneRegistry {
     ) -> Option<(PaneId, SurfaceId, usize, bool)> {
         self.surface_tabs.iter().find_map(|(pane, tabs)| {
             tabs.iter().enumerate().find_map(|(index, (surface, tab))| {
+                if !tab.is_mapped() {
+                    return None;
+                }
                 let bounds = tab.compute_bounds(root)?;
                 let left = f64::from(bounds.x());
                 let top = f64::from(bounds.y());
@@ -2487,6 +2493,7 @@ fn install_macos_tab_drag_fallback(
     let tab_for_end = tab.clone();
     let resolve_pane = callbacks.pane_at_root_point.clone();
     let resolve_tab = callbacks.tab_at_root_point.clone();
+    let workspace_of_pane = callbacks.workspace_of_pane.clone();
     let position_of_surface = callbacks.position_of_surface_in_pane.clone();
     let dispatch_tab_drop = callbacks.dispatch_tab_drop.clone();
     let open_new_window = callbacks.on_tab_drag_to_new_window.clone();
@@ -2524,9 +2531,14 @@ fn install_macos_tab_drag_fallback(
         };
         let root_x = f64::from(point.x());
         let root_y = f64::from(point.y());
-        let command = if let Some((target_pane, target_surface, target_index, after)) =
-            resolve_tab(&root, root_x, root_y)
-        {
+        let source_workspace = (workspace_of_pane)(pane_id);
+        let target_tab = resolve_tab(&root, root_x, root_y).filter(|(target_pane, ..)| {
+            source_workspace.is_some() && (workspace_of_pane)(*target_pane) == source_workspace
+        });
+        let target_pane = resolve_pane(&root, root_x, root_y).filter(|(target_pane, ..)| {
+            source_workspace.is_some() && (workspace_of_pane)(*target_pane) == source_workspace
+        });
+        let command = if let Some((target_pane, target_surface, target_index, after)) = target_tab {
             if pane_id == target_pane && surface_id == target_surface {
                 native_views_for_end.borrow_mut().take();
                 return;
@@ -2548,7 +2560,7 @@ fn install_macos_tab_drag_fallback(
                     target_index: final_index,
                 }
             }
-        } else if let Some((target_pane, fx, fy)) = resolve_pane(&root, root_x, root_y) {
+        } else if let Some((target_pane, fx, fy)) = target_pane {
             let zone = drop_zone(fx, fy);
             tab_drop_command_for_pane_zone(
                 pane_id,
