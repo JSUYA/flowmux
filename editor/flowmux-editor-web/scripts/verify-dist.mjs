@@ -27,6 +27,7 @@ for (const file of requiredFiles) {
 const html = await readFile(resolve(root, "dist", "index.html"), "utf8");
 if (
   !html.includes("Content-Security-Policy") ||
+  !html.includes("style-src 'self' 'unsafe-inline'") ||
   !html.includes('src="./main.js"') ||
   !html.includes('id="close-dialog"') ||
   !html.includes('id="close-dialog-save"') ||
@@ -45,6 +46,7 @@ if (
 }
 
 const main = await readFile(resolve(root, "dist", "main.js"), "utf8");
+const css = await readFile(resolve(root, "dist", "main.css"), "utf8");
 if (
   !main.includes("discard_close_requested") ||
   !main.includes("recovery_decision") ||
@@ -57,6 +59,9 @@ if (
   !main.includes("set_appearance")
 ) {
   throw new Error("Editor bundle is missing an explicit document safety message");
+}
+if (!main.includes("actions.find") || !css.includes(".find-widget")) {
+  throw new Error("Editor bundle is missing Monaco's built-in find contribution");
 }
 
 console.log(`Verified ${requiredFiles.length} editor assets.`);

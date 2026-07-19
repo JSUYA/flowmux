@@ -25,6 +25,7 @@ await build({
   entryNames: "[name]",
   format: "esm",
   legalComments: "eof",
+  loader: { ".ttf": "dataurl" },
   minify: true,
   outdir: output,
   platform: "browser",

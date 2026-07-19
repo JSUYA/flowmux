@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+import "monaco-editor/esm/vs/editor/editor.all.js";
 import * as monaco from "monaco-editor/esm/vs/editor/editor.api.js";
 import "monaco-editor/esm/vs/basic-languages/monaco.contribution.js";
 import "monaco-editor/esm/vs/language/css/monaco.contribution.js";
@@ -1250,6 +1251,11 @@ function renderState(): void {
   emptyState.classList.toggle("is-hidden", active !== undefined);
   editorContainer.classList.toggle("is-visible", active !== undefined && !showingDiff);
   diffEditorContainer.classList.toggle("is-visible", showingDiff);
+  if (showingDiff) {
+    diffEditor?.layout();
+  } else if (active !== undefined) {
+    editor.layout();
+  }
   if (active === undefined) {
     documentState.className = "document-state";
     documentState.hidden = true;

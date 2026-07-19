@@ -13,8 +13,9 @@ use uuid::Uuid;
 const MAX_REQUEST_HEADER_BYTES: usize = 8 * 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(2);
 const SECURITY_HEADERS: &str = concat!(
-    "Content-Security-Policy: default-src 'none'; script-src 'self'; style-src 'self'; ",
-    "worker-src 'self'; font-src 'self'; img-src data:; connect-src 'none'; ",
+    "Content-Security-Policy: default-src 'none'; script-src 'self'; ",
+    "style-src 'self' 'unsafe-inline'; ",
+    "worker-src 'self'; font-src 'self' data:; img-src data:; connect-src 'none'; ",
     "base-uri 'none'; form-action 'none'\r\n",
     "X-Content-Type-Options: nosniff\r\n",
     "Cross-Origin-Resource-Policy: same-origin\r\n",
@@ -315,6 +316,9 @@ mod tests {
         assert!(index.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(index.contains("Content-Type: text/html; charset=utf-8"));
         assert!(index.contains("Content-Security-Policy: default-src 'none'"));
+        assert!(index.contains("style-src 'self' 'unsafe-inline'"));
+        assert!(index.contains("font-src 'self' data:"));
+        assert!(!index.contains("script-src 'self' 'unsafe-inline'"));
         assert!(index.contains("Cross-Origin-Resource-Policy: same-origin"));
         assert!(index.contains("Flowmux editor"));
 
