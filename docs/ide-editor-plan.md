@@ -25,6 +25,7 @@
 |---|---|---|
 | 파일 열기 | 완료 | file browser의 단일 클릭과 `Enter`가 같은 경로를 사용해 source pane, 최근 focus pane, 첫 pane 순으로 Editor surface를 생성하거나 재사용한다. |
 | 기본 편집 | 완료 | 다국어 본문·경로, syntax highlighting, undo/redo, multi-cursor, 들여쓰기, 접기, bracket matching을 지원한다. |
+| Edit/Diff 모드 | 완료 | 우측 상단 전환 버튼으로 일반 편집과 Monaco diff를 오가며, Git workspace에서는 `HEAD`, 일반 폴더에서는 디스크 내용을 기준으로 현재 편집본을 비교한다. 수정 쪽은 계속 편집할 수 있다. |
 | 저장 | 완료 | atomic save, Save As, save all, read-only 처리와 version 기반 dirty 상태를 지원한다. |
 | 찾기와 탐색 | 완료 | 파일 내 find/replace, go to line, Quick Open, 취소 가능한 workspace 검색과 결과 range 이동을 지원한다. |
 | 데이터 안전 | 완료 | 외부 변경 감지, clean reload, dirty conflict 비교·선택, 삭제 파일 재생성, 종료 guard, 비정상 종료 복구를 지원한다. |
@@ -34,7 +35,7 @@
 | Workspace Tools 패널 | 후속 | 기존 file browser와 검색 overlay로 v1 흐름이 완성되므로 별도 Files/Search/Problems panel은 추가하지 않는다. |
 | LSP와 Problems | 선택적 v1.1 | 핵심 편집·저장과 분리해 별도 결정과 검증을 거친 뒤 추가한다. 언어 서버를 자동 설치하거나 내려받지는 않는다. |
 
-현재 구현의 출시 전 남은 검증은 실제 입력 장치로 Linux와 macOS에서 단일 클릭, 한글·일본어 IME, clipboard, screen reader 흐름을 반복하는 것이다. 자동화 환경에서는 macOS bundle 실행과 창 렌더링까지 확인했지만 운영체제 보조 접근 권한이 없어 합성 클릭과 키 입력은 수행하지 못했다.
+macOS 설치 bundle에서 file browser 단일 클릭, line number와 다국어 글꼴 렌더링, Monaco find, 두벌식 한글 IME 조합, 저장, Edit/Diff 전환을 실제 키·포인터 입력으로 검증했다. Linux의 한글·일본어 IME, 양 플랫폼의 clipboard와 screen reader 흐름은 출시 전 반복 검증 항목으로 남긴다.
 
 ## 2. 확정 범위와 비목표
 
@@ -109,6 +110,14 @@ Monaco는 편집 품질과 접근 가능한 API가 충분하고, Flowmux 전용 
 | 확장 기능 | 제공하지 않음 |
 
 Monaco 또는 WebView가 Phase 0의 필수 기준을 통과하지 못하면 GtkSourceView 5를 대체 후보로 평가한다. 두 엔진을 동시에 유지하지는 않는다.
+
+Monaco 통합에는 다음 제약을 구현 기준으로 고정한다.
+
+- find/replace와 표준 편집 action이 포함되도록 전체 editor contribution을 로드한다.
+- Monaco가 줄·caret·IME 위치를 계산할 때 쓰는 runtime inline style은 허용하되 inline script는 허용하지 않는다.
+- 숨겨졌던 Editor surface가 보일 때 명시적으로 `layout()`을 호출한다.
+- Monaco 내부 class와 충돌할 수 있는 범용 CSS class 이름을 외부 container에 사용하지 않는다.
+- Codicon font는 bundle에 포함하고 CSP의 font source를 해당 local/data asset으로 제한한다.
 
 ### 4.2 pane마다 편집 화면 하나를 재사용한다
 
@@ -304,7 +313,7 @@ Flowmux Editor는 별도 IDE shell이나 activity bar를 만들지 않는다.
 
 ```text
 ┌─ current file ─────────────────────────────────────┐
-│                                                     │
+│                                      [Edit] [Diff]  │
 │                   Monaco editor                     │
 │                                                     │
 │                                      Unsaved        │
@@ -312,14 +321,24 @@ Flowmux Editor는 별도 IDE shell이나 activity bar를 만들지 않는다.
 ```
 
 - 바깥 Flowmux tab: 현재 파일 이름을 표시하고 Terminal·Browser·파일 편집 화면을 전환
-- 편집 화면: 별도 toolbar, document tab, context rail, status strip 없이 Monaco가 pane을 채움
+- 편집 화면: 우측 상단 mode switch 외 toolbar, document tab, context rail, status strip 없이 Monaco가 pane을 채움
 - 저장 상태: 평상시 숨기고 dirty, read-only, external-change일 때만 작은 상태 표시
 - 기존 file browser: 프로젝트 탐색의 유일한 기본 UI
 - 기존 right panel: v1에서는 변경하지 않으며 file browser와 검색 overlay를 그대로 사용
 
 파일 이름은 바깥 tab에서, 파일 전환은 file browser에서 담당한다. 편집 영역 안에는 현재 작업에 필요한 요소만 표시한다.
 
-### 7.2 focus와 shortcut 정책
+### 7.2 Edit/Diff 모드
+
+- `Edit`가 기본 모드이며 현재 document model을 단일 Monaco editor로 표시한다.
+- `Diff`는 같은 Editor surface 안에서 Monaco DiffEditor로 전환한다.
+- Git workspace의 기준은 `HEAD`의 같은 파일이고, 추적되지 않은 새 파일의 기준은 빈 내용이다.
+- Git이 아닌 workspace의 기준은 현재 디스크 내용이다.
+- 원본 쪽은 read-only이고 수정 쪽은 현재 document model을 그대로 사용해 계속 편집·저장할 수 있다.
+- 문서를 전환하거나 닫을 때 diff 전용 model을 즉시 해제한다.
+- 외부 변경 충돌의 `Compare`는 일반 Diff 모드와 달리 현재 디스크 내용과 편집본을 비교한다.
+
+### 7.3 focus와 shortcut 정책
 
 shortcut은 focus context에 따라 해석한다. 기존 Flowmux 전역 shortcut을 빼앗지 않는다.
 
@@ -339,7 +358,7 @@ shortcut은 focus context에 따라 해석한다. 기존 Flowmux 전역 shortcut
 
 IME 조합 중에는 전역 command가 키 입력을 가로채지 않도록 composition 상태를 반드시 확인한다.
 
-### 7.3 접근성과 테마
+### 7.4 접근성과 테마
 
 - GTK theme의 배경·전경·accent·selection token을 Editor theme로 전달한다.
 - 편집 글꼴은 사용자 설정 가능한 monospace stack을 사용한다.
@@ -557,6 +576,7 @@ workspace 일괄 바꾸기는 v1에 포함하지 않는다. 후속 구현을 결
 - theme와 focus 상태 연동
 - keyboard navigation, screen reader, IME 검증
 - external conflict banner와 diff view 완성
+- 우측 상단 Edit/Diff 전환과 editable modified view 완성
 
 완료 조건:
 
@@ -709,6 +729,7 @@ large-file mode는 syntax tokenization, minimap, semantic 기능을 단계적으
 - 파일 단일 클릭과 `Enter`가 source pane → MRU → first pane 규칙대로 동작한다.
 - 선택한 pane의 Editor surface와 열린 문서를 중복 없이 재사용한다.
 - 편집, 저장, 모두 저장, Save As, find/replace, quick open, workspace search가 동작한다.
+- Edit/Diff 전환이 동작하고 Git `HEAD` 또는 디스크 기준과 현재 편집본을 안전하게 비교한다.
 - encoding, BOM, line ending, final newline과 파일 권한을 의도치 않게 바꾸지 않는다.
 - dirty close, 외부 변경 충돌, 저장 실패, 비정상 종료에서 데이터 손실이 없다.
 - 앱 재시작 후 open file, active file, cursor와 recovery 상태를 복원한다.
@@ -727,8 +748,9 @@ large-file mode는 syntax tokenization, minimap, semantic 기능을 단계적으
 1. Monaco를 platform WebView에 직접 임베드하고 GtkSourceView를 함께 유지하지 않는다.
 2. build된 editor asset은 앱에 포함하고 version이 있는 Rust-WebView message로 문서 상태를 교환한다.
 3. Rust `DocumentService`만 파일을 읽고 쓰며 workspace 경계와 path를 검증한다.
-4. 직접 LSP와 Problems UI는 핵심 에디터와 분리해 선택적 v1.1로 둔다.
-5. workspace 일괄 바꾸기와 별도 Workspace Tools panel은 단순 pane 편집 UX의 v1 범위에서 제외한다.
+4. 기본 편집은 `Edit`, 기준본 비교는 같은 surface의 `Diff`로 제공하며 수정 쪽 model을 공유한다.
+5. 직접 LSP와 Problems UI는 핵심 에디터와 분리해 선택적 v1.1로 둔다.
+6. workspace 일괄 바꾸기와 별도 Workspace Tools panel은 단순 pane 편집 UX의 v1 범위에서 제외한다.
 
 향후 후속 기능은 현재 Editor protocol과 문서 수명주기를 깨뜨리지 않는 별도 결정으로 추가한다.
 
