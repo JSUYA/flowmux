@@ -52,6 +52,10 @@ pub enum TabDropCommand {
 pub struct PaneCallbacks {
     pub on_child_exited: Rc<RefCell<dyn FnMut(PaneId, i32)>>,
     pub on_focus: Rc<RefCell<dyn FnMut(PaneId)>>,
+    /// The embedded editor keeps ordinary keys inside Monaco and reports only
+    /// plain Alt+arrow so the window can move focus through the pane tree.
+    pub on_editor_focus_direction:
+        Rc<RefCell<dyn FnMut(PaneId, flowmux_editor::EditorFocusDirection)>>,
     /// Terminal-body right-click menu 'Close Pane'.
     pub on_close_pane: Rc<RefCell<dyn FnMut(PaneId)>>,
     /// Right-click menu 'Split Right'.
@@ -150,6 +154,7 @@ impl PaneCallbacks {
         Self {
             on_child_exited: Rc::new(RefCell::new(|_, _| {})),
             on_focus: Rc::new(RefCell::new(|_| {})),
+            on_editor_focus_direction: Rc::new(RefCell::new(|_, _| {})),
             on_close_pane: Rc::new(RefCell::new(|_| {})),
             on_split_right: Rc::new(RefCell::new(|_| {})),
             on_split_down: Rc::new(RefCell::new(|_| {})),

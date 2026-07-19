@@ -101,6 +101,24 @@ impl PaneCallbackRouter {
                     });
                 }))
             },
+            on_editor_focus_direction: {
+                let bridge = bridge.clone();
+                Rc::new(RefCell::new(move |pane, direction| {
+                    let dir = match direction {
+                        flowmux_editor::EditorFocusDirection::Left => FocusDir::Left,
+                        flowmux_editor::EditorFocusDirection::Right => FocusDir::Right,
+                        flowmux_editor::EditorFocusDirection::Up => FocusDir::Up,
+                        flowmux_editor::EditorFocusDirection::Down => FocusDir::Down,
+                    };
+                    dispatch_detached(
+                        &bridge,
+                        GtkCommand::FocusDirection {
+                            from: Some(pane),
+                            dir,
+                        },
+                    );
+                }))
+            },
             on_split_right: {
                 let bridge = bridge.clone();
                 Rc::new(RefCell::new(move |pane| {
@@ -344,6 +362,41 @@ impl PaneCallbackRouter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn editor_focus_direction_routes_to_existing_pane_command() {
+        let (bridge, command_rx) = Bridge::new();
+        let pane = PaneId::new();
+        let callbacks = PaneCallbackRouter::new(
+            Rc::new(Cell::new(Some(pane))),
+            bridge,
+            Rc::new(RefCell::new(flowmux_config::options::Options::default())),
+            Rc::new(RefCell::new(PaneRegistry::default())),
+            Rc::new(RefCell::new(Vec::new())),
+            Rc::new(Cell::new(false)),
+            Rc::new(Cell::new(false)),
+        )
+        .into_callbacks();
+
+        (callbacks.on_editor_focus_direction.borrow_mut())(
+            pane,
+            flowmux_editor::EditorFocusDirection::Up,
+        );
+
+        let context = glib::MainContext::default();
+        while context.pending() {
+            context.iteration(false);
+        }
+        let command = command_rx.try_recv();
+
+        assert!(matches!(
+            command,
+            Ok(GtkCommand::FocusDirection {
+                from: Some(actual_pane),
+                dir: FocusDir::Up,
+            }) if actual_pane == pane
+        ));
+    }
 
     #[test]
     fn tab_drop_dispatch_exposes_controller_rejection() {

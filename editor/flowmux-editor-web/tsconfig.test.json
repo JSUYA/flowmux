@@ -8,6 +8,7 @@
   "include": [
     "src/editor_actions.ts",
     "src/editor_state.ts",
+    "src/focus_navigation.ts",
     "src/language.ts",
     "src/protocol.ts",
     "src/search_state.ts"

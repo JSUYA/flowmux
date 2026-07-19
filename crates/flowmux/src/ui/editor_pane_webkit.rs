@@ -3,10 +3,12 @@
 
 use super::{
     handle_bridge_message, is_allowed_editor_navigation, queue_host_messages,
-    should_poll_editor_documents, EditorBridgeState, EditorHostState,
+    should_poll_editor_documents, EditorBridgeState, EditorFocusDirectionCallback, EditorHostState,
 };
 use flowmux_core::{EditorSessionState, PaneId, SurfaceId};
-use flowmux_editor::{EditorAppearance, EditorAssetServer, HostMessage, ProtocolError};
+use flowmux_editor::{
+    EditorAppearance, EditorAssetServer, EditorFocusDirection, HostMessage, ProtocolError,
+};
 use gtk::gio;
 use gtk::prelude::*;
 use std::cell::{Cell, RefCell};
@@ -34,6 +36,7 @@ pub struct EditorPane {
     appearance: Rc<RefCell<EditorAppearance>>,
     file_monitors: Rc<RefCell<HashMap<PathBuf, gio::FileMonitor>>>,
     file_monitor_generation: Rc<Cell<u64>>,
+    on_focus_direction: EditorFocusDirectionCallback,
 }
 
 impl EditorPane {
@@ -54,6 +57,8 @@ impl EditorPane {
             .to_string();
         let bridge = Rc::new(EditorBridgeState::new(surface_id));
         let host = Rc::new(EditorHostState::new(&workspace_root, restored));
+        let pane_id = Rc::new(Cell::new(pane_id));
+        let on_focus_direction: EditorFocusDirectionCallback = Rc::new(RefCell::new(None));
         let closed = Rc::new(Cell::new(false));
         let appearance = Rc::new(RefCell::new(appearance));
         let user_content_manager = webkit6::UserContentManager::new();
@@ -82,12 +87,19 @@ impl EditorPane {
             let bridge = bridge.clone();
             let host = host.clone();
             let web_view = web_view.downgrade();
+            let pane_id = pane_id.clone();
+            let on_focus_direction = on_focus_direction.clone();
             user_content_manager.connect_script_message_received(
                 Some(MESSAGE_HANDLER_NAME),
                 move |_, value| {
-                    let scripts = handle_bridge_message(&bridge, &host, &value.to_str());
+                    let dispatch = handle_bridge_message(&bridge, &host, &value.to_str());
+                    if let Some(direction) = dispatch.focus_direction {
+                        if let Some(callback) = on_focus_direction.borrow_mut().as_mut() {
+                            callback(pane_id.get(), direction);
+                        }
+                    }
                     if let Some(web_view) = web_view.upgrade() {
-                        for script in scripts {
+                        for script in dispatch.scripts {
                             evaluate_script(&web_view, &script);
                         }
                     }
@@ -169,7 +181,7 @@ impl EditorPane {
         web_view.load_uri(&editor_url);
 
         let pane = Self {
-            pane_id: Rc::new(Cell::new(pane_id)),
+            pane_id,
             workspace_root,
             root,
             web_view,
@@ -182,6 +194,7 @@ impl EditorPane {
             appearance,
             file_monitors: Rc::new(RefCell::new(HashMap::new())),
             file_monitor_generation: Rc::new(Cell::new(0)),
+            on_focus_direction,
         };
         let initial_appearance = pane.appearance.borrow().clone();
         pane.apply_appearance(initial_appearance);
@@ -246,6 +259,13 @@ impl EditorPane {
 
     pub fn grab_focus(&self) {
         self.web_view.grab_focus();
+    }
+
+    pub fn connect_focus_direction<F: FnMut(PaneId, EditorFocusDirection) + 'static>(
+        &self,
+        callback: F,
+    ) {
+        *self.on_focus_direction.borrow_mut() = Some(Box::new(callback));
     }
 
     pub fn apply_appearance(&self, appearance: EditorAppearance) {

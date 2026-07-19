@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Platform editor WebView and its versioned bridge state.
 
-use flowmux_core::{EditorFileState, EditorSessionState, SurfaceId};
+use flowmux_core::{EditorFileState, EditorSessionState, PaneId, SurfaceId};
 use flowmux_editor::{
     diff_base_content, index_workspace_files, javascript_for_host_message, parse_editor_message,
-    search_workspace, EditorFileSessionState, EditorMessage, EditorSession, EditorSessionSnapshot,
-    EditorViewState, HostMessage, ProtocolError, RecoveryOperation, RecoveryStore,
-    SearchCancellation, SearchOptions, WorkspaceSearchResult,
+    search_workspace, EditorFileSessionState, EditorFocusDirection, EditorMessage, EditorSession,
+    EditorSessionSnapshot, EditorViewState, HostMessage, ProtocolError, RecoveryOperation,
+    RecoveryStore, SearchCancellation, SearchOptions, WorkspaceSearchResult,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -17,6 +17,9 @@ use std::time::Duration;
 
 const RECOVERY_DEBOUNCE: Duration = Duration::from_millis(350);
 const QUICK_OPEN_LIMIT: usize = 2_000;
+
+pub(super) type EditorFocusDirectionCallback =
+    Rc<RefCell<Option<Box<dyn FnMut(PaneId, EditorFocusDirection)>>>>;
 
 enum SearchWorkerMessage {
     QuickOpen {
@@ -54,6 +57,11 @@ struct DiffWorker {
 pub(super) struct EditorBridgeReceive {
     scripts: Vec<String>,
     message: Option<EditorMessage>,
+}
+
+pub(super) struct EditorBridgeDispatch {
+    pub scripts: Vec<String>,
+    pub focus_direction: Option<EditorFocusDirection>,
 }
 
 pub(super) struct EditorBridgeState {
@@ -681,16 +689,24 @@ pub(super) fn handle_bridge_message(
     bridge: &EditorBridgeState,
     host: &Rc<EditorHostState>,
     raw: &str,
-) -> Vec<String> {
+) -> EditorBridgeDispatch {
     let received = bridge.receive(raw);
     let mut scripts = received.scripts;
+    let mut focus_direction = None;
     if let Some(message) = received.message {
-        scripts.extend(queue_host_messages(bridge, host.handle(message)));
-        if host.stage_recovery_operations() {
-            schedule_recovery_flush(host);
+        if let EditorMessage::FocusDirectionRequested { direction } = message {
+            focus_direction = Some(direction);
+        } else {
+            scripts.extend(queue_host_messages(bridge, host.handle(message)));
+            if host.stage_recovery_operations() {
+                schedule_recovery_flush(host);
+            }
         }
     }
-    scripts
+    EditorBridgeDispatch {
+        scripts,
+        focus_direction,
+    }
 }
 
 // Throttle, not debounce: the flush fires a fixed delay after the first
@@ -864,6 +880,28 @@ mod tests {
         assert!(!should_poll_editor_documents(
             gtk::gio::FileMonitorEvent::PreUnmount
         ));
+    }
+
+    #[test]
+    fn focus_navigation_message_bypasses_document_session() {
+        let workspace = tempfile::tempdir().unwrap();
+        let host = Rc::new(EditorHostState::new(
+            workspace.path(),
+            EditorSessionState::default(),
+        ));
+        let bridge = EditorBridgeState::new(SurfaceId::new());
+        let raw = serde_json::json!({
+            "protocolVersion": flowmux_editor::PROTOCOL_VERSION,
+            "surfaceId": bridge.surface_id,
+            "type": "focus_direction_requested",
+            "direction": "down"
+        })
+        .to_string();
+
+        let dispatch = handle_bridge_message(&bridge, &host, &raw);
+
+        assert_eq!(dispatch.focus_direction, Some(EditorFocusDirection::Down));
+        assert!(dispatch.scripts.is_empty());
     }
 
     #[test]

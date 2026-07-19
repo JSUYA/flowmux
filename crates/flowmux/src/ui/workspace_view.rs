@@ -3034,6 +3034,11 @@ fn build_panel(
                 editor
             };
 
+            let on_focus_direction = callbacks.on_editor_focus_direction.clone();
+            editor.connect_focus_direction(move |pane, direction| {
+                (on_focus_direction.borrow_mut())(pane, direction);
+            });
+
             let frame_in = frame.clone();
             let frame_out = frame.clone();
             let on_focus = callbacks.on_focus.clone();

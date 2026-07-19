@@ -185,6 +185,15 @@ pub enum ConflictAction {
     ReloadFromDisk,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EditorFocusDirection {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(
     tag = "type",
@@ -193,6 +202,9 @@ pub enum ConflictAction {
 )]
 pub enum EditorMessage {
     EditorReady,
+    FocusDirectionRequested {
+        direction: EditorFocusDirection,
+    },
     ActiveDocumentChanged {
         document_id: String,
         document_version: u64,
@@ -353,7 +365,7 @@ pub fn javascript_for_host_message(
 
 fn validate_editor_message(message: &EditorMessage) -> Result<(), ProtocolError> {
     match message {
-        EditorMessage::EditorReady => Ok(()),
+        EditorMessage::EditorReady | EditorMessage::FocusDirectionRequested { .. } => Ok(()),
         EditorMessage::ActiveDocumentChanged { document_id, .. }
         | EditorMessage::CloseRequested { document_id, .. }
         | EditorMessage::DiscardCloseRequested { document_id, .. }
@@ -672,6 +684,29 @@ mod tests {
                 content: "한글 日本語 العربية 🙂\n".into(),
             }
         );
+    }
+
+    #[test]
+    fn editor_focus_navigation_accepts_only_known_directions() {
+        let message = serde_json::json!({
+            "protocolVersion": PROTOCOL_VERSION,
+            "surfaceId": "surface-1",
+            "type": "focus_direction_requested",
+            "direction": "left"
+        })
+        .to_string();
+        assert_eq!(
+            parse_editor_message(&message).unwrap().1,
+            EditorMessage::FocusDirectionRequested {
+                direction: EditorFocusDirection::Left,
+            }
+        );
+
+        let invalid = message.replace("left", "diagonal");
+        assert!(matches!(
+            parse_editor_message(&invalid),
+            Err(ProtocolError::InvalidJson(_))
+        ));
     }
 
     #[test]

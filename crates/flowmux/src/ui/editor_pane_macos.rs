@@ -3,10 +3,12 @@
 
 use super::{
     handle_bridge_message, is_allowed_editor_navigation, queue_host_messages,
-    should_poll_editor_documents, EditorBridgeState, EditorHostState,
+    should_poll_editor_documents, EditorBridgeState, EditorFocusDirectionCallback, EditorHostState,
 };
 use flowmux_core::{EditorSessionState, PaneId, SurfaceId};
-use flowmux_editor::{EditorAppearance, EditorAssetServer, HostMessage, ProtocolError};
+use flowmux_editor::{
+    EditorAppearance, EditorAssetServer, EditorFocusDirection, HostMessage, ProtocolError,
+};
 use gtk::gio;
 use gtk::glib::{self, translate::ToGlibPtr};
 use gtk::prelude::*;
@@ -50,6 +52,7 @@ pub struct EditorPane {
     appearance: Rc<RefCell<EditorAppearance>>,
     file_monitors: Rc<RefCell<HashMap<PathBuf, gio::FileMonitor>>>,
     file_monitor_generation: Rc<Cell<u64>>,
+    on_focus_direction: EditorFocusDirectionCallback,
 }
 
 struct NativeEditorView {
@@ -63,6 +66,8 @@ struct NativeEditorView {
 struct EditorScriptMessageHandlerIvars {
     bridge: Rc<EditorBridgeState>,
     host: Rc<EditorHostState>,
+    pane_id: Rc<Cell<PaneId>>,
+    on_focus_direction: EditorFocusDirectionCallback,
 }
 
 define_class!(
@@ -88,12 +93,17 @@ define_class!(
                 tracing::warn!("editor WKWebView sent a non-string bridge message");
                 return;
             };
-            let scripts =
+            let dispatch =
                 handle_bridge_message(&self.ivars().bridge, &self.ivars().host, &body.to_string());
+            if let Some(direction) = dispatch.focus_direction {
+                if let Some(callback) = self.ivars().on_focus_direction.borrow_mut().as_mut() {
+                    callback(self.ivars().pane_id.get(), direction);
+                }
+            }
             let Some(web_view) = (unsafe { message.webView() }) else {
                 return;
             };
-            for script in scripts {
+            for script in dispatch.scripts {
                 evaluate_script(&web_view, &script);
             }
         }
@@ -242,6 +252,8 @@ impl EditorPane {
             .to_string();
         let bridge = Rc::new(EditorBridgeState::new(surface_id));
         let host = Rc::new(EditorHostState::new(&workspace_root, restored));
+        let pane_id = Rc::new(Cell::new(pane_id));
+        let on_focus_direction: EditorFocusDirectionCallback = Rc::new(RefCell::new(None));
         let appearance = Rc::new(RefCell::new(appearance));
         let mtm = MainThreadMarker::new().expect("WKWebView must be created on the main thread");
         let native = Rc::new(create_native_editor_view(
@@ -251,6 +263,8 @@ impl EditorPane {
             &allowed_prefix,
             workspace_root.clone(),
             appearance.clone(),
+            pane_id.clone(),
+            on_focus_direction.clone(),
         ));
 
         let viewport = gtk::DrawingArea::new();
@@ -293,7 +307,7 @@ impl EditorPane {
 
         load_uri_native(&native.web_view, &editor_url);
         let pane = Self {
-            pane_id: Rc::new(Cell::new(pane_id)),
+            pane_id,
             workspace_root,
             root,
             web_widget,
@@ -304,6 +318,7 @@ impl EditorPane {
             appearance,
             file_monitors: Rc::new(RefCell::new(HashMap::new())),
             file_monitor_generation: Rc::new(Cell::new(0)),
+            on_focus_direction,
         };
         let initial_appearance = pane.appearance.borrow().clone();
         pane.apply_appearance(initial_appearance);
@@ -368,6 +383,13 @@ impl EditorPane {
 
     pub fn grab_focus(&self) {
         focus_native_view(&self.native.web_view);
+    }
+
+    pub fn connect_focus_direction<F: FnMut(PaneId, EditorFocusDirection) + 'static>(
+        &self,
+        callback: F,
+    ) {
+        *self.on_focus_direction.borrow_mut() = Some(Box::new(callback));
     }
 
     pub fn apply_appearance(&self, appearance: EditorAppearance) {
@@ -502,6 +524,8 @@ fn create_native_editor_view(
     allowed_prefix: &str,
     workspace_root: PathBuf,
     appearance: Rc<RefCell<EditorAppearance>>,
+    pane_id: Rc<Cell<PaneId>>,
+    on_focus_direction: EditorFocusDirectionCallback,
 ) -> NativeEditorView {
     let configuration = unsafe { WKWebViewConfiguration::new(mtm) };
     let preferences = unsafe { WKPreferences::new(mtm) };
@@ -510,6 +534,8 @@ fn create_native_editor_view(
         EditorScriptMessageHandler::alloc(mtm).set_ivars(EditorScriptMessageHandlerIvars {
             bridge: bridge.clone(),
             host: host.clone(),
+            pane_id,
+            on_focus_direction,
         });
     let script_message_handler: Retained<EditorScriptMessageHandler> =
         unsafe { msg_send![super(script_message_handler), init] };

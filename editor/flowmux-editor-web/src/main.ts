@@ -15,6 +15,7 @@ import {
   type EditorActionRunner,
 } from "./editor_actions";
 import { adjustedFontSize, conflictUiState, visibleDocumentState } from "./editor_state";
+import { focusDirectionForKey } from "./focus_navigation";
 import { languageForPath } from "./language";
 import { commaSeparatedGlobs, rankQuickOpen } from "./search_state";
 import {
@@ -197,6 +198,25 @@ const editor = monaco.editor.create(editorContainer, {
   smoothScrolling: false,
   wordWrap: "off",
 });
+
+window.addEventListener(
+  "keydown",
+  (event) => {
+    const direction = focusDirectionForKey(event);
+    if (direction === null) {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    postToHost({
+      protocolVersion: PROTOCOL_VERSION,
+      surfaceId,
+      type: "focus_direction_requested",
+      direction,
+    });
+  },
+  true,
+);
 
 editor.onDidChangeCursorPosition(() => scheduleViewStateReport());
 editor.onDidScrollChange(() => scheduleViewStateReport());

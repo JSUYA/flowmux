@@ -33,6 +33,7 @@ export interface EditorAppearance {
 
 export type DocumentDiskStatus = "unchanged" | "modified" | "deleted";
 export type RecoveryDiskState = "unchanged" | "changed" | "deleted";
+export type EditorFocusDirection = "left" | "right" | "up" | "down";
 
 export interface SearchOptions {
   caseSensitive: boolean;
@@ -161,6 +162,10 @@ interface EditorMessageBase {
 
 export type EditorMessage =
   | (EditorMessageBase & { type: "editor_ready" })
+  | (EditorMessageBase & {
+      type: "focus_direction_requested";
+      direction: EditorFocusDirection;
+    })
   | (EditorMessageBase & {
       type: "active_document_changed";
       documentId: string;
