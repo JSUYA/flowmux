@@ -3251,6 +3251,14 @@ fn build_panel(
                 (on_focus_direction.borrow_mut())(pane, direction);
             });
 
+            #[cfg(target_os = "macos")]
+            {
+                let on_focus = callbacks.on_focus.clone();
+                editor.connect_native_focus(move |pane| {
+                    (on_focus.borrow_mut())(pane);
+                });
+            }
+
             let frame_in = frame.clone();
             let frame_out = frame.clone();
             let on_focus = callbacks.on_focus.clone();

@@ -38,6 +38,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 const MESSAGE_HANDLER_NAME: &str = "flowmuxEditor";
+type EditorFocusCallback = Rc<RefCell<Option<Box<dyn FnMut(PaneId)>>>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EditorKeyAction {
@@ -69,6 +70,7 @@ pub struct EditorPane {
     appearance: Rc<RefCell<EditorAppearance>>,
     file_monitors: Rc<RefCell<HashMap<PathBuf, gio::FileMonitor>>>,
     file_monitor_generation: Rc<Cell<u64>>,
+    on_focus: EditorFocusCallback,
     on_focus_direction: EditorFocusDirectionCallback,
 }
 
@@ -273,6 +275,7 @@ impl EditorPane {
         let bridge = Rc::new(EditorBridgeState::new(surface_id));
         let host = Rc::new(EditorHostState::new(&workspace_root, restored));
         let pane_id = Rc::new(Cell::new(pane_id));
+        let on_focus: EditorFocusCallback = Rc::new(RefCell::new(None));
         let on_focus_direction: EditorFocusDirectionCallback = Rc::new(RefCell::new(None));
         let appearance = Rc::new(RefCell::new(appearance));
         let mtm = MainThreadMarker::new().expect("WKWebView must be created on the main thread");
@@ -315,6 +318,9 @@ impl EditorPane {
         {
             let native = Rc::downgrade(&native);
             let web_widget = web_widget.downgrade();
+            let pane_id = pane_id.clone();
+            let on_focus = on_focus.clone();
+            let native_focused = Cell::new(false);
             glib::timeout_add_local(Duration::from_millis(50), move || {
                 let Some(native) = native.upgrade() else {
                     return glib::ControlFlow::Break;
@@ -323,6 +329,12 @@ impl EditorPane {
                     return glib::ControlFlow::Break;
                 };
                 sync_native_view_frame(&native, &web_widget);
+                let focused = web_widget.is_mapped() && native_view_has_focus(&native.web_view);
+                if native_focus_entered(&native_focused, focused) {
+                    if let Some(callback) = on_focus.borrow_mut().as_mut() {
+                        callback(pane_id.get());
+                    }
+                }
                 glib::ControlFlow::Continue
             });
         }
@@ -340,6 +352,7 @@ impl EditorPane {
             appearance,
             file_monitors: Rc::new(RefCell::new(HashMap::new())),
             file_monitor_generation: Rc::new(Cell::new(0)),
+            on_focus,
             on_focus_direction,
         };
         let initial_appearance = pane.appearance.borrow().clone();
@@ -409,14 +422,11 @@ impl EditorPane {
     }
 
     pub(crate) fn has_native_focus(&self) -> bool {
-        let web_view = self.native.web_view.as_super();
-        let Some(responder) = web_view.window().and_then(|window| window.firstResponder()) else {
-            return false;
-        };
-        let Some(responder_view) = responder.downcast_ref::<NSView>() else {
-            return false;
-        };
-        std::ptr::eq(responder_view, web_view) || responder_view.isDescendantOf(web_view)
+        native_view_has_focus(&self.native.web_view)
+    }
+
+    pub(crate) fn connect_native_focus<F: FnMut(PaneId) + 'static>(&self, callback: F) {
+        *self.on_focus.borrow_mut() = Some(Box::new(callback));
     }
 
     pub(crate) fn resign_native_focus(&self) {
@@ -753,6 +763,22 @@ fn native_content_view(window: &gtk::Window) -> Option<Retained<NSView>> {
     unsafe { (&*(ns_window as *mut NSWindow)).contentView() }
 }
 
+fn native_view_has_focus(web_view: &WKWebView) -> bool {
+    let web_view = web_view.as_super();
+    let Some(responder) = web_view.window().and_then(|window| window.firstResponder()) else {
+        return false;
+    };
+    let Some(responder_view) = responder.downcast_ref::<NSView>() else {
+        return false;
+    };
+    std::ptr::eq(responder_view, web_view) || responder_view.isDescendantOf(web_view)
+}
+
+fn native_focus_entered(previous: &Cell<bool>, focused: bool) -> bool {
+    let was_focused = previous.replace(focused);
+    focused && !was_focused
+}
+
 fn focus_native_view(web_view: &WKWebView) {
     let view = web_view.as_super();
     if let Some(window) = view.window() {
@@ -904,6 +930,16 @@ fn workspace_name(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_focus_reports_each_editor_entry() {
+        let focused = Cell::new(false);
+
+        assert!(native_focus_entered(&focused, true));
+        assert!(!native_focus_entered(&focused, true));
+        assert!(!native_focus_entered(&focused, false));
+        assert!(native_focus_entered(&focused, true));
+    }
 
     #[test]
     fn editor_key_compatibility_covers_navigation_and_control_chords() {
