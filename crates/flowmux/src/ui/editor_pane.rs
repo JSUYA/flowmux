@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 const RECOVERY_DEBOUNCE: Duration = Duration::from_millis(350);
@@ -190,6 +191,7 @@ pub(super) struct EditorHostState {
     session: RefCell<Result<EditorSession, String>>,
     startup_messages: RefCell<Vec<HostMessage>>,
     recovery_sender: Option<Sender<RecoveryOperation>>,
+    recovery_worker: Option<JoinHandle<()>>,
     pending_recovery: RefCell<HashMap<PathBuf, RecoveryOperation>>,
     recovery_flush_pending: Cell<bool>,
     search_worker: RefCell<Option<SearchWorker>>,
@@ -241,12 +243,17 @@ impl EditorHostState {
                 session.activate_path(active_file);
             }
         }
-        let recovery_sender = recovery_store.and_then(start_recovery_worker);
+        let (recovery_sender, recovery_worker) = recovery_store
+            .and_then(start_recovery_worker)
+            .map_or((None, None), |(sender, worker)| {
+                (Some(sender), Some(worker))
+            });
         let host = Self {
             workspace_root: workspace_root.to_path_buf(),
             session: RefCell::new(session),
             startup_messages: RefCell::new(startup_messages),
             recovery_sender,
+            recovery_worker,
             pending_recovery: RefCell::new(HashMap::new()),
             recovery_flush_pending: Cell::new(false),
             search_worker: RefCell::new(None),
@@ -701,6 +708,12 @@ impl Drop for EditorHostState {
         // close, workspace rerender, app quit).
         self.stage_recovery_operations();
         self.flush_recovery();
+        self.recovery_sender.take();
+        if let Some(worker) = self.recovery_worker.take() {
+            if worker.join().is_err() {
+                tracing::warn!("editor recovery worker panicked during shutdown");
+            }
+        }
         if let Some(worker) = self.search_worker.get_mut().take() {
             worker.cancellation.cancel();
         }
@@ -777,7 +790,9 @@ fn schedule_recovery_flush(host: &Rc<EditorHostState>) {
     });
 }
 
-fn start_recovery_worker(store: RecoveryStore) -> Option<Sender<RecoveryOperation>> {
+fn start_recovery_worker(
+    store: RecoveryStore,
+) -> Option<(Sender<RecoveryOperation>, JoinHandle<()>)> {
     let (sender, receiver) = mpsc::channel::<RecoveryOperation>();
     let result = std::thread::Builder::new()
         .name("flowmux-editor-recovery".into())
@@ -789,7 +804,7 @@ fn start_recovery_worker(store: RecoveryStore) -> Option<Sender<RecoveryOperatio
             }
         });
     match result {
-        Ok(_) => Some(sender),
+        Ok(worker) => Some((sender, worker)),
         Err(error) => {
             tracing::warn!(%error, "failed to start editor recovery worker");
             None
@@ -1012,6 +1027,36 @@ mod tests {
         );
         assert_eq!(dispatch.native_edit_text.as_deref(), Some("선택한 text"));
         assert!(dispatch.scripts.is_empty());
+    }
+
+    #[test]
+    fn recovery_worker_drains_queued_snapshot_before_shutdown() {
+        let workspace = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let path = workspace.path().join("recovery.txt");
+        let base = b"base\n";
+        fs::write(&path, base).unwrap();
+        let store = RecoveryStore::new(state.path(), workspace.path()).unwrap();
+        let snapshot = flowmux_editor::RecoverySnapshot::new(
+            store.workspace_id().to_string(),
+            fs::canonicalize(&path).unwrap(),
+            base,
+            2,
+            "unsaved\n".into(),
+            flowmux_editor::TextEncoding::Utf8,
+            flowmux_editor::LineEnding::Lf,
+        );
+        let (sender, worker) = start_recovery_worker(store.clone()).unwrap();
+
+        sender.send(RecoveryOperation::Write(snapshot)).unwrap();
+        drop(sender);
+        worker.join().unwrap();
+
+        let (recovered, _) = store
+            .read(fs::canonicalize(path).unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.content, "unsaved\n");
     }
 
     #[test]
