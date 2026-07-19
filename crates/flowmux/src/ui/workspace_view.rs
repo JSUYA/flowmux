@@ -2469,24 +2469,19 @@ fn install_macos_tab_drag_fallback(
     gesture.set_propagation_phase(gtk::PropagationPhase::Capture);
     gesture.set_button(gtk::gdk::BUTTON_PRIMARY);
     let drag_origin = Rc::new(Cell::new(None::<(f64, f64)>));
-    let native_views_suspend = Rc::new(RefCell::new(None));
 
     let tab_for_begin = tab.clone();
     let saw_target_for_begin = saw_tab_drop_target.clone();
     let committed_for_begin = committed_tab_drop.clone();
     let opened_for_begin = opened_new_window.clone();
     let origin_for_begin = drag_origin.clone();
-    let native_views_for_begin = native_views_suspend.clone();
     gesture.connect_drag_begin(move |_, x, y| {
+        // The coordinate fallback owns the pointer sequence from the GTK tab;
+        // hiding every native WebView here only blanks unrelated panes.
         saw_target_for_begin.set(false);
         committed_for_begin.set(false);
         opened_for_begin.set(false);
         origin_for_begin.set(Some((x, y)));
-        native_views_for_begin.borrow_mut().take();
-        if let Some(window) = tab_for_begin.root().and_downcast::<gtk::Window>() {
-            *native_views_for_begin.borrow_mut() =
-                Some(crate::ui::browser_pane::suspend_native_browser_views_for_window(&window));
-        }
         set_tab_drag_visual_state(&tab_for_begin, true);
     });
 
@@ -2500,7 +2495,6 @@ fn install_macos_tab_drag_fallback(
     let surface_model = surface.clone();
     let surface_id = surface.id;
     let origin_for_end = drag_origin.clone();
-    let native_views_for_end = native_views_suspend.clone();
     let saw_target_for_end = saw_tab_drop_target.clone();
     let committed_for_end = committed_tab_drop.clone();
     let opened_for_end = opened_new_window.clone();
@@ -2508,25 +2502,20 @@ fn install_macos_tab_drag_fallback(
         set_tab_drag_visual_state(&tab_for_end, false);
         if committed_for_end.get() || opened_for_end.get() {
             origin_for_end.take();
-            native_views_for_end.borrow_mut().take();
             return;
         }
         let Some((start_x, start_y)) = origin_for_end.take() else {
-            native_views_for_end.borrow_mut().take();
             return;
         };
         if dx.hypot(dy) < 8.0 {
-            native_views_for_end.borrow_mut().take();
             return;
         }
         let Some(window) = tab_for_end.root().and_downcast::<gtk::Window>() else {
-            native_views_for_end.borrow_mut().take();
             return;
         };
         let root = window.upcast::<gtk::Widget>();
         let point = gtk::graphene::Point::new((start_x + dx) as f32, (start_y + dy) as f32);
         let Some(point) = tab_for_end.compute_point(&root, &point) else {
-            native_views_for_end.borrow_mut().take();
             return;
         };
         let root_x = f64::from(point.x());
@@ -2540,7 +2529,6 @@ fn install_macos_tab_drag_fallback(
         });
         let command = if let Some((target_pane, target_surface, target_index, after)) = target_tab {
             if pane_id == target_pane && surface_id == target_surface {
-                native_views_for_end.borrow_mut().take();
                 return;
             }
             let src_index = (position_of_surface)(target_pane, surface_id);
@@ -2578,7 +2566,6 @@ fn install_macos_tab_drag_fallback(
                 opened_for_end.set(true);
                 (open_new_window.borrow_mut())(pane_id, surface_id);
             }
-            native_views_for_end.borrow_mut().take();
             return;
         };
         saw_target_for_end.set(true);
@@ -2601,19 +2588,16 @@ fn install_macos_tab_drag_fallback(
         } else {
             tracing::warn!("macOS tab drop command bridge is unavailable");
         }
-        native_views_for_end.borrow_mut().take();
     });
 
     let tab_for_cancel = tab.clone();
     let origin_for_cancel = drag_origin.clone();
-    let native_views_for_cancel = native_views_suspend.clone();
     gesture.connect_cancel(move |_, _| {
         set_tab_drag_visual_state(&tab_for_cancel, false);
         origin_for_cancel.take();
         saw_tab_drop_target.set(false);
         committed_tab_drop.set(false);
         opened_new_window.set(false);
-        native_views_for_cancel.borrow_mut().take();
     });
 
     drag_widget.add_controller(gesture);
