@@ -43,6 +43,12 @@ use thiserror::Error;
 pub const DEFAULT_MAX_DOCUMENT_BYTES: u64 = 16 * 1024 * 1024;
 const UTF8_BOM: &[u8] = b"\xef\xbb\xbf";
 
+/// Whether the embedded editor can open this file under the same validation
+/// rules used by [`DocumentService`].
+pub fn is_editable_text_file(path: &Path) -> bool {
+    read_text_document(path, DEFAULT_MAX_DOCUMENT_BYTES).is_ok()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct DocumentId(u64);

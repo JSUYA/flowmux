@@ -23,9 +23,16 @@ fn resolve_editor_target(
 
 impl WindowController {
     pub(super) async fn open_file_in_editor(&self, path: PathBuf, source_pane: Option<PaneId>) {
-        if !crate::ui::file_browser::should_open_in_editor(&path) {
-            crate::ui::file_browser::open_file(&path);
-            return;
+        match crate::ui::file_browser::file_open_target(&path) {
+            crate::ui::file_browser::FileOpenTarget::Editor => {}
+            crate::ui::file_browser::FileOpenTarget::ImageViewer => {
+                crate::ui::image_viewer::open_image_viewer(&self.window, path);
+                return;
+            }
+            crate::ui::file_browser::FileOpenTarget::Binary => {
+                crate::ui::file_browser::open_binary(&path);
+                return;
+            }
         }
 
         let mut workspace = {

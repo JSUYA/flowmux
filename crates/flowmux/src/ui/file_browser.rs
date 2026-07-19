@@ -163,6 +163,33 @@ enum FileBrowserActivation {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FileOpenTarget {
+    Editor,
+    ImageViewer,
+    Binary,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrimaryClickAction {
+    Focus,
+    Activate,
+    ToggleSelection,
+    ExtendSelection,
+}
+
+fn primary_click_action(n_press: i32, state: gdk::ModifierType) -> PrimaryClickAction {
+    if state.contains(gdk::ModifierType::CONTROL_MASK) {
+        PrimaryClickAction::ToggleSelection
+    } else if state.contains(gdk::ModifierType::SHIFT_MASK) {
+        PrimaryClickAction::ExtendSelection
+    } else if n_press >= 2 {
+        PrimaryClickAction::Activate
+    } else {
+        PrimaryClickAction::Focus
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ClipboardOperation {
     Copy,
     Cut,
@@ -1089,6 +1116,15 @@ impl FileBrowserPanel {
         self.activate_focused();
     }
 
+    fn handle_primary_click(&self, path: PathBuf, n_press: i32, state: gdk::ModifierType) {
+        match primary_click_action(n_press, state) {
+            PrimaryClickAction::Focus => self.focus_path(path),
+            PrimaryClickAction::Activate => self.activate_path(path),
+            PrimaryClickAction::ToggleSelection => self.toggle_path_selection(path),
+            PrimaryClickAction::ExtendSelection => self.extend_selection_to_path(path),
+        }
+    }
+
     fn copy_focused(&self) {
         if self.model.borrow_mut().copy_focused() {
             self.sync_focus_classes();
@@ -1525,21 +1561,13 @@ impl FileBrowserPanel {
         let path = row.path.clone();
         let row_for_menu = list_row.clone();
         click.connect_pressed(
-            move |gesture, _n_press, x, y| match gesture.current_button() {
+            move |gesture, n_press, x, y| match gesture.current_button() {
                 gdk::BUTTON_PRIMARY => {
-                    if gesture
-                        .current_event_state()
-                        .contains(gdk::ModifierType::CONTROL_MASK)
-                    {
-                        panel.toggle_path_selection(path.clone());
-                    } else if gesture
-                        .current_event_state()
-                        .contains(gdk::ModifierType::SHIFT_MASK)
-                    {
-                        panel.extend_selection_to_path(path.clone());
-                    } else {
-                        panel.activate_path(path.clone());
-                    }
+                    panel.handle_primary_click(
+                        path.clone(),
+                        n_press,
+                        gesture.current_event_state(),
+                    );
                 }
                 gdk::BUTTON_SECONDARY => {
                     panel.focus_path(path.clone());
@@ -2441,26 +2469,26 @@ pub(crate) fn open_file(path: &Path) {
     }
 }
 
-pub(crate) fn should_open_in_editor(path: &Path) -> bool {
+pub(crate) fn file_open_target(path: &Path) -> FileOpenTarget {
+    if crate::ui::image_viewer::supports_path(path) {
+        return FileOpenTarget::ImageViewer;
+    }
+
     let Some(extension) = path
         .extension()
         .and_then(|extension| extension.to_str())
         .map(str::to_ascii_lowercase)
     else {
-        return true;
+        return if flowmux_editor::is_editable_text_file(path) {
+            FileOpenTarget::Editor
+        } else {
+            FileOpenTarget::Binary
+        };
     };
 
-    !matches!(
+    let known_binary_format = matches!(
         extension.as_str(),
-        "png"
-            | "jpg"
-            | "jpeg"
-            | "gif"
-            | "webp"
-            | "bmp"
-            | "ico"
-            | "svg"
-            | "pdf"
+        "pdf"
             | "mp3"
             | "wav"
             | "flac"
@@ -2489,7 +2517,38 @@ pub(crate) fn should_open_in_editor(path: &Path) -> bool {
             | "class"
             | "jar"
             | "wasm"
-    )
+    );
+    if known_binary_format || !flowmux_editor::is_editable_text_file(path) {
+        FileOpenTarget::Binary
+    } else {
+        FileOpenTarget::Editor
+    }
+}
+
+pub(crate) fn open_binary(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let executable = fs::metadata(path)
+            .ok()
+            .filter(|metadata| metadata.is_file())
+            .is_some_and(|metadata| metadata.permissions().mode() & 0o111 != 0);
+        if executable {
+            let mut command = Command::new(path);
+            if let Some(parent) = path.parent() {
+                command.current_dir(parent);
+            }
+            match command.spawn() {
+                Ok(_) => return,
+                Err(error) => {
+                    tracing::warn!(path = %path.display(), %error, "failed to execute binary; falling back to default app");
+                }
+            }
+        }
+    }
+
+    open_file(path);
 }
 
 fn is_markdown_file(path: &Path) -> bool {
@@ -2926,13 +2985,42 @@ mod tests {
     }
 
     #[test]
-    fn editor_routing_keeps_text_and_markdown_but_excludes_viewer_formats() {
-        for path in ["main.rs", "README.md", "설정.json", "Dockerfile"] {
-            assert!(should_open_in_editor(Path::new(path)), "{path}");
+    fn file_open_routing_uses_content_and_supported_viewer_formats() {
+        let tmp = TestDir::new("open-routing");
+        for name in ["main.rs", "README.md", "설정.json", "Dockerfile"] {
+            let path = tmp.file(name);
+            assert_eq!(file_open_target(&path), FileOpenTarget::Editor, "{name}");
         }
-        for path in ["image.png", "manual.pdf", "movie.mp4", "archive.zip"] {
-            assert!(!should_open_in_editor(Path::new(path)), "{path}");
-        }
+
+        let image = tmp.file("image.png");
+        assert_eq!(file_open_target(&image), FileOpenTarget::ImageViewer);
+
+        let pdf = tmp.file("manual.pdf");
+        assert_eq!(file_open_target(&pdf), FileOpenTarget::Binary);
+
+        let binary = tmp.path.join("program");
+        fs::write(&binary, b"text\0binary").unwrap();
+        assert_eq!(file_open_target(&binary), FileOpenTarget::Binary);
+    }
+
+    #[test]
+    fn plain_primary_click_requires_two_presses_to_activate() {
+        assert_eq!(
+            primary_click_action(1, gdk::ModifierType::empty()),
+            PrimaryClickAction::Focus
+        );
+        assert_eq!(
+            primary_click_action(2, gdk::ModifierType::empty()),
+            PrimaryClickAction::Activate
+        );
+        assert_eq!(
+            primary_click_action(1, gdk::ModifierType::CONTROL_MASK),
+            PrimaryClickAction::ToggleSelection
+        );
+        assert_eq!(
+            primary_click_action(1, gdk::ModifierType::SHIFT_MASK),
+            PrimaryClickAction::ExtendSelection
+        );
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -2950,6 +3038,27 @@ mod tests {
 
         panel.activate_focused();
 
+        assert_eq!(*opened.borrow(), Some(path));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[gtk::test]
+    fn primary_click_selects_and_double_click_opens() {
+        let tmp = TestDir::new("double-click-open");
+        let path = tmp.file("문서.rs");
+        let opened = Rc::new(RefCell::new(None));
+        let panel = FileBrowserPanel::new();
+        {
+            let opened = opened.clone();
+            panel.connect_open_file(move |path| *opened.borrow_mut() = Some(path));
+        }
+        panel.show_for_root(tmp.path.clone());
+
+        panel.handle_primary_click(path.clone(), 1, gdk::ModifierType::empty());
+        assert_eq!(*opened.borrow(), None);
+        assert_eq!(panel_focused_path(&panel), Some(path.clone()));
+
+        panel.handle_primary_click(path.clone(), 2, gdk::ModifierType::empty());
         assert_eq!(*opened.borrow(), Some(path));
     }
 

@@ -22,7 +22,14 @@ const DEFAULT_LOTTIE_WIDTH: u32 = 640;
 const DEFAULT_LOTTIE_HEIGHT: u32 = 480;
 
 pub fn open_image_viewer(parent: &adw::ApplicationWindow, path: PathBuf) {
-    let result = load_viewer_content(&path);
+    let content = match load_viewer_content(&path) {
+        Ok(content) => content,
+        Err(error) => {
+            tracing::warn!(path = %path.display(), %error, "ThorVG image open failed; falling back to default app");
+            crate::ui::file_browser::open_file(&path);
+            return;
+        }
+    };
     let title = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -38,14 +45,14 @@ pub fn open_image_viewer(parent: &adw::ApplicationWindow, path: PathBuf) {
     }
     let window = builder.build();
 
-    match result {
-        Ok(ViewerContent::Static(frame)) => {
+    match content {
+        ViewerContent::Static(frame) => {
             window.set_default_size(frame.width as i32, frame.height as i32);
             let picture = image_picture(&path);
             picture.set_paintable(Some(&texture_from_frame(&frame)));
             set_viewer_content(&window, &picture);
         }
-        Ok(ViewerContent::Animated(renderer)) => {
+        ViewerContent::Animated(renderer) => {
             let initial = renderer.borrow().frame();
             window.set_default_size(initial.width as i32, initial.height as i32);
 
@@ -73,21 +80,6 @@ pub fn open_image_viewer(parent: &adw::ApplicationWindow, path: PathBuf) {
                     }
                 }
             });
-        }
-        Err(err) => {
-            window.set_default_size(520, 180);
-            let label = gtk::Label::new(Some(&format!(
-                "Could not open image with ThorVG:\n{}\n\n{}",
-                path.display(),
-                err
-            )));
-            label.set_wrap(true);
-            label.set_selectable(true);
-            label.set_margin_top(18);
-            label.set_margin_bottom(18);
-            label.set_margin_start(18);
-            label.set_margin_end(18);
-            set_viewer_content(&window, &label);
         }
     }
 
@@ -140,6 +132,16 @@ enum ImageKind {
     NativeRaster,
     Svg,
     Lottie,
+}
+
+pub(crate) fn supports_path(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("svg" | "png" | "jpg" | "jpeg" | "webp" | "lottie")
+    )
 }
 
 fn image_kind(path: &Path) -> ImageKind {
@@ -662,6 +664,23 @@ mod tests {
             fit_size(0, 0),
             (DEFAULT_LOTTIE_WIDTH, DEFAULT_LOTTIE_HEIGHT)
         );
+    }
+
+    #[test]
+    fn internal_viewer_accepts_only_formats_its_thorvg_path_handles() {
+        for path in [
+            "image.svg",
+            "image.png",
+            "image.JPG",
+            "image.jpeg",
+            "image.webp",
+            "animation.lottie",
+        ] {
+            assert!(supports_path(Path::new(path)), "{path}");
+        }
+        for path in ["settings.json", "manual.pdf", "movie.mp4", "archive.zip"] {
+            assert!(!supports_path(Path::new(path)), "{path}");
+        }
     }
 
     #[test]
