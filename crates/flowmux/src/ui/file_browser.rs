@@ -2541,28 +2541,9 @@ pub(crate) fn file_open_target(path: &Path) -> FileOpenTarget {
 }
 
 pub(crate) fn open_binary(path: &Path) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        let executable = fs::metadata(path)
-            .ok()
-            .filter(|metadata| metadata.is_file())
-            .is_some_and(|metadata| metadata.permissions().mode() & 0o111 != 0);
-        if executable {
-            let mut command = Command::new(path);
-            if let Some(parent) = path.parent() {
-                command.current_dir(parent);
-            }
-            match command.spawn() {
-                Ok(_) => return,
-                Err(error) => {
-                    tracing::warn!(path = %path.display(), %error, "failed to execute binary; falling back to default app");
-                }
-            }
-        }
-    }
-
+    // Opening a file from the viewer must never execute it merely because its
+    // Unix mode has an executable bit. Let the desktop's registered handler
+    // decide how to display non-editable content.
     open_file(path);
 }
 
