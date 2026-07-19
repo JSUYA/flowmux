@@ -4708,6 +4708,57 @@ mod tests {
 
     #[cfg(not(target_os = "macos"))]
     #[gtk::test]
+    async fn file_browser_uses_active_editor_root_over_inactive_terminal_cwd() {
+        adw::init().expect("libadwaita should initialize in GTK test");
+        let workspace_root = std::env::temp_dir().join("flowmux-editor-browser-root");
+        let terminal_cwd = std::env::temp_dir().join("flowmux-editor-browser-terminal-cwd");
+        std::fs::create_dir_all(&workspace_root).unwrap();
+        std::fs::create_dir_all(&terminal_cwd).unwrap();
+
+        let store = StateStore::new_lazy(State::default());
+        let ws_id = store
+            .create_workspace(Some("editor-root".into()), workspace_root.clone())
+            .await;
+        let ws = store.get_workspace(ws_id).await.unwrap();
+        let pane = ws.surfaces[0].root_pane.first_leaf_id().unwrap();
+        let terminal = ws.surfaces[0].root_pane.active_surface_id(pane).unwrap();
+        store
+            .update_surface_cwd(pane, terminal, terminal_cwd.clone())
+            .await;
+        store
+            .add_editor_surface_to_pane(pane)
+            .await
+            .expect("editor surface should be added");
+
+        let ws = store.get_workspace(ws_id).await.unwrap();
+        let (bridge, _rx) = Bridge::new();
+        let app = adw::Application::builder()
+            .application_id("com.flowmux.App.UiTest.EditorFileBrowserRoot")
+            .build();
+        app.register(None::<&gtk::gio::Cancellable>).unwrap();
+        let controller = WindowController::new(
+            &app,
+            store,
+            Arc::new(ResolvedTheme::load()),
+            bridge,
+            gtk::CssProvider::new(),
+            None,
+        );
+        controller.render_workspace(&ws);
+
+        assert_eq!(
+            controller.pane_registry.borrow().current_dir_for_pane(pane),
+            Some(terminal_cwd),
+            "the inactive terminal must reproduce the competing cwd"
+        );
+        assert_eq!(
+            controller.file_browser_root_for_pane(pane).await,
+            Some(workspace_root)
+        );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[gtk::test]
     async fn file_browser_same_pane_root_refresh_does_not_rebuild_rows() {
         let (controller, ws_id, pane) =
             build_single_workspace_controller("com.flowmux.App.UiTest.FileBrowserRefreshNoop")

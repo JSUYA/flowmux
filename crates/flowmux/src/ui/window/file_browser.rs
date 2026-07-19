@@ -147,6 +147,15 @@ impl WindowController {
         &self,
         pane: PaneId,
     ) -> Option<std::path::PathBuf> {
+        if let Some(root) = self
+            .pane_registry
+            .borrow()
+            .active_editor(pane)
+            .map(|editor| editor.workspace_root().to_path_buf())
+        {
+            return Some(root);
+        }
+
         if let Some(dir) = self.pane_registry.borrow().current_dir_for_pane(pane) {
             return Some(dir);
         }
