@@ -21,6 +21,19 @@ fn resolve_editor_target(
         .or_else(|| workspace_leaves.first().copied())
 }
 
+fn editor_file_browser_root(
+    session: &flowmux_core::EditorSessionState,
+    workspace_root: &std::path::Path,
+) -> std::path::PathBuf {
+    session
+        .active_file
+        .as_deref()
+        .and_then(std::path::Path::parent)
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or(workspace_root)
+        .to_path_buf()
+}
+
 impl WindowController {
     pub(super) async fn open_file_in_editor(&self, path: PathBuf, source_pane: Option<PaneId>) {
         match crate::ui::file_browser::file_open_target(&path) {
@@ -151,7 +164,9 @@ impl WindowController {
             .pane_registry
             .borrow()
             .active_editor(pane)
-            .map(|editor| editor.workspace_root().to_path_buf())
+            .map(|editor| {
+                editor_file_browser_root(&editor.session_state(), editor.workspace_root())
+            })
         {
             return Some(root);
         }
@@ -345,5 +360,23 @@ mod tests {
             Some(first)
         );
         assert_eq!(resolve_editor_target(None, &[], &[]), None);
+    }
+
+    #[test]
+    fn editor_file_browser_uses_active_file_directory() {
+        let workspace_root = std::path::Path::new("/workspace");
+        let session = flowmux_core::EditorSessionState {
+            open_files: Vec::new(),
+            active_file: Some("/workspace/src/main.rs".into()),
+        };
+
+        assert_eq!(
+            editor_file_browser_root(&session, workspace_root),
+            std::path::PathBuf::from("/workspace/src")
+        );
+        assert_eq!(
+            editor_file_browser_root(&flowmux_core::EditorSessionState::default(), workspace_root,),
+            workspace_root
+        );
     }
 }
