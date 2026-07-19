@@ -1844,6 +1844,7 @@ fn attach_tab_dnd_handlers(
     let committed_tab_drop = callbacks.tab_drag_drop_committed.clone();
     let split_candidate = callbacks.tab_drag_split_candidate.clone();
     let opened_new_window = Rc::new(Cell::new(false));
+    let native_views_suspend = Rc::new(RefCell::new(None));
 
     let drag_source = gtk::DragSource::new();
     drag_source.set_actions(gtk::gdk::DragAction::MOVE);
@@ -1861,11 +1862,17 @@ fn attach_tab_dnd_handlers(
     let committed_for_begin = committed_tab_drop.clone();
     let split_candidate_for_begin = split_candidate.clone();
     let opened_for_begin = opened_new_window.clone();
+    let native_views_suspend_for_begin = native_views_suspend.clone();
     drag_source.connect_drag_begin(move |_, _| {
         saw_target_for_begin.set(false);
         committed_for_begin.set(false);
         split_candidate_for_begin.borrow_mut().take();
         opened_for_begin.set(false);
+        native_views_suspend_for_begin.borrow_mut().take();
+        if let Some(window) = tab_for_begin.root().and_downcast::<gtk::Window>() {
+            *native_views_suspend_for_begin.borrow_mut() =
+                Some(crate::ui::browser_pane::suspend_native_browser_views_for_window(&window));
+        }
         tab_for_begin.set_opacity(0.4);
         tab_for_begin.add_css_class("flowmux-pane-tab-dragging");
     });
@@ -1878,6 +1885,7 @@ fn attach_tab_dnd_handlers(
     let split_candidate_for_end = split_candidate.clone();
     let split_cb_for_end = callbacks.on_split_surface_into_pane.clone();
     let surface_for_end = surface.clone();
+    let native_views_suspend_for_end = native_views_suspend.clone();
     drag_source.connect_drag_end(move |_, drag, delete_data| {
         let selected_action = drag.selected_action();
         tracing::debug!(
@@ -1937,6 +1945,7 @@ fn attach_tab_dnd_handlers(
         saw_target_for_end.set(false);
         tab_for_end.set_opacity(1.0);
         tab_for_end.remove_css_class("flowmux-pane-tab-dragging");
+        native_views_suspend_for_end.borrow_mut().take();
     });
     let tab_for_cancel = tab.clone();
     let saw_target_for_cancel = saw_tab_drop_target.clone();
@@ -1946,6 +1955,7 @@ fn attach_tab_dnd_handlers(
     let split_candidate_for_cancel = split_candidate.clone();
     let split_cb_for_cancel = callbacks.on_split_surface_into_pane.clone();
     let surface_for_cancel = surface.clone();
+    let native_views_suspend_for_cancel = native_views_suspend.clone();
     drag_source.connect_drag_cancel(move |_, drag, reason| {
         let selected_action = drag.selected_action();
         tab_for_cancel.set_opacity(1.0);
@@ -1996,6 +2006,7 @@ fn attach_tab_dnd_handlers(
         }
         split_candidate_for_cancel.borrow_mut().take();
         saw_target_for_cancel.set(false);
+        native_views_suspend_for_cancel.borrow_mut().take();
         false
     });
     drag_widget.add_controller(drag_source);
