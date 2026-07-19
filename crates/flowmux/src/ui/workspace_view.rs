@@ -762,6 +762,7 @@ impl PaneRegistry {
             if let Some(editor) = self.editors.remove(&s) {
                 editor.prepare_for_close();
             }
+            self.editor_focus_controllers.remove(&s);
             self.surface_tab_labels.remove(&s);
             self.surface_workspace.remove(&s);
         }
@@ -831,6 +832,7 @@ impl PaneRegistry {
         if let Some(editor) = self.editors.remove(&surface) {
             editor.prepare_for_close();
         }
+        self.editor_focus_controllers.remove(&surface);
         self.surface_tab_labels.remove(&surface);
         self.surface_workspace.remove(&surface);
         if self.active_terminal_by_pane.get(&pane) == Some(&surface) {
@@ -2050,6 +2052,44 @@ mod tab_dnd_tests {
             std::path::Path::new("/tmp/다국어-プロジェクト")
         );
         assert_eq!(registry.active_surface(dst), Some(surface));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[gtk::test]
+    fn closing_surface_and_pane_release_editor_focus_controllers() {
+        let pane = PaneId::new();
+        let surface = SurfaceId::new();
+        let stack = gtk::Stack::new();
+        let content = gtk::Label::new(None).upcast::<gtk::Widget>();
+        stack.add_named(&content, Some(&surface.to_string()));
+        let tab = gtk::Button::new().upcast::<gtk::Widget>();
+        let tabs = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        tabs.append(&tab);
+
+        let mut registry = PaneRegistry::default();
+        registry.surface_stacks.insert(pane, stack);
+        registry.surface_tabs.insert(pane, vec![(surface, tab)]);
+        registry.pane_tab_containers.insert(pane, tabs);
+        registry
+            .editor_focus_controllers
+            .insert(surface, gtk::EventControllerFocus::new());
+
+        registry.detach_surface_widget(pane, surface);
+        assert!(!registry.editor_focus_controllers.contains_key(&surface));
+
+        let next_surface = SurfaceId::new();
+        registry.surface_tabs.insert(
+            pane,
+            vec![(next_surface, gtk::Button::new().upcast::<gtk::Widget>())],
+        );
+        registry
+            .editor_focus_controllers
+            .insert(next_surface, gtk::EventControllerFocus::new());
+
+        registry.forget_pane(pane);
+        assert!(!registry
+            .editor_focus_controllers
+            .contains_key(&next_surface));
     }
 }
 
