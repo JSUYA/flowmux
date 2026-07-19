@@ -117,6 +117,28 @@ impl WindowController {
             .and_then(|editor| editor.open_file(&path));
         if let Err(error) = open_result {
             tracing::warn!(path = %path.display(), %error, "failed to open file in editor");
+            match self.store.close_surface(target_pane, editor_surface).await {
+                Some(flowmux_daemon::CloseOutcome::SurfaceRemoved { workspace }) => {
+                    self.pane_registry
+                        .borrow_mut()
+                        .detach_surface_widget(target_pane, editor_surface);
+                    if let Some(workspace) = self.store.get_workspace(workspace).await {
+                        if let Some(active) = workspace
+                            .surfaces
+                            .iter()
+                            .find_map(|root| root.root_pane.active_surface_id(target_pane))
+                        {
+                            self.pane_registry
+                                .borrow_mut()
+                                .activate_surface(target_pane, active);
+                        }
+                        self.refresh_workspace_solo(&workspace);
+                    }
+                }
+                outcome => {
+                    tracing::error!(?outcome, %target_pane, %editor_surface, "failed to discard unusable editor tab");
+                }
+            }
             self.clipboard_toast
                 .show_with_message(&format!("Could not open file: {error}"));
         } else if let Some(title) = path

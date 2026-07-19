@@ -4920,6 +4920,47 @@ mod tests {
 
     #[cfg(not(target_os = "macos"))]
     #[gtk::test]
+    async fn failed_editor_open_removes_the_new_empty_tab() {
+        adw::init().expect("libadwaita should initialize in GTK test");
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_file = outside.path().join("outside.txt");
+        std::fs::write(&outside_file, "outside\n").unwrap();
+
+        let store = StateStore::new_lazy(State::default());
+        let ws_id = store
+            .create_workspace(
+                Some("editor-open-failure".into()),
+                workspace.path().to_path_buf(),
+            )
+            .await;
+        let ws = store.get_workspace(ws_id).await.unwrap();
+        let pane = ws.surfaces[0].root_pane.first_leaf_id().unwrap();
+        let (bridge, _rx) = Bridge::new();
+        let app = adw::Application::builder()
+            .application_id("com.flowmux.App.UiTest.EditorOpenFailure")
+            .build();
+        app.register(None::<&gtk::gio::Cancellable>).unwrap();
+        let controller = WindowController::new(
+            &app,
+            store.clone(),
+            Arc::new(ResolvedTheme::load()),
+            bridge,
+            gtk::CssProvider::new(),
+            None,
+        );
+        controller.render_workspace(&ws);
+
+        controller
+            .open_file_in_editor(outside_file, Some(pane))
+            .await;
+
+        assert_eq!(store.tab_count_in_pane(pane).await, Some(1));
+        assert!(controller.pane_registry.borrow().editors.is_empty());
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[gtk::test]
     async fn file_browser_escape_hides_panel_and_restores_saved_source_focus() {
         let (controller, _ws_id, pane) =
             build_single_workspace_controller("com.flowmux.App.UiTest.FileBrowserEscape").await;
