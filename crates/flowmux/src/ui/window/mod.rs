@@ -3408,10 +3408,10 @@ mod tests {
             panic!("target pane should contain tabs");
         };
         assert_eq!(surfaces.len(), 2);
-        assert_ne!(*active, initial_surface);
+        assert_ne!(active, initial_surface);
         let tig_surface = surfaces
             .iter()
-            .find(|surface| surface.id == *active)
+            .find(|surface| surface.id == active)
             .expect("new tig tab should be active");
         assert!(matches!(
             &tig_surface.kind,
@@ -3421,7 +3421,7 @@ mod tests {
             .pane_registry
             .borrow()
             .terminals
-            .contains_key(active));
+            .contains_key(&active));
     }
 
     /// ActivateSurface dispatch alone recomputes the window title from the active tab.
