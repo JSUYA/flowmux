@@ -11,6 +11,9 @@ on:
       - about.hbs
       - THIRD_PARTY_LICENSES.md
       - scripts/generate-third-party-licenses.sh
+      - editor/flowmux-editor-web/package.json
+      - editor/flowmux-editor-web/package-lock.json
+      - editor/flowmux-editor-web/THIRD_PARTY_NOTICES.md
   schedule:
     - cron: '17 3 * * 1'
   workflow_dispatch:
@@ -39,3 +42,28 @@ jobs:
         run: |
           scripts/generate-third-party-licenses.sh
           git diff --exit-code THIRD_PARTY_LICENSES.md
+
+      - name: Check editor dependency notice
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs');
+          const root = 'editor/flowmux-editor-web';
+          const manifest = JSON.parse(fs.readFileSync(`${root}/package.json`, 'utf8'));
+          const lock = JSON.parse(fs.readFileSync(`${root}/package-lock.json`, 'utf8'));
+          const dependencies = Object.keys(manifest.dependencies ?? {});
+          if (dependencies.length !== 1 || dependencies[0] !== 'monaco-editor') {
+            throw new Error('Review and document the editor production dependencies');
+          }
+          const dependency = lock.packages['node_modules/monaco-editor'];
+          if (dependency?.license !== 'MIT') {
+            throw new Error('The editor dependency license is not approved');
+          }
+          const notice = fs.readFileSync(`${root}/THIRD_PARTY_NOTICES.md`, 'utf8');
+          if (!notice.includes(`Monaco Editor ${dependency.version}`)) {
+            throw new Error('The editor dependency notice is out of date');
+          }
+          const distributed = fs.readFileSync(`${root}/dist/THIRD_PARTY_NOTICES.md`, 'utf8');
+          if (distributed !== notice) {
+            throw new Error('The distributed editor dependency notice is out of date');
+          }
+          NODE

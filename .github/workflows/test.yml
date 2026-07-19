@@ -10,6 +10,36 @@ on:
   workflow_dispatch:
 
 jobs:
+  editor-web:
+    name: editor web
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: editor/flowmux-editor-web
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: editor/flowmux-editor-web/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Test and rebuild editor assets
+        run: |
+          npm test
+          npm run build
+          npm run verify
+
+      - name: Check committed editor assets
+        working-directory: .
+        run: git diff --exit-code -- editor/flowmux-editor-web/dist
+
   cargo-test:
     name: cargo test
     runs-on: ubuntu-latest
