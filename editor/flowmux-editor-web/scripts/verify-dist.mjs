@@ -30,6 +30,8 @@ if (
   !html.includes("style-src 'self' 'unsafe-inline'") ||
   !html.includes('src="./main.js"') ||
   !html.includes('id="close-dialog"') ||
+  !html.includes('id="mode-edit"') ||
+  !html.includes('id="mode-diff"') ||
   !html.includes('id="close-dialog-save"') ||
   !html.includes('id="close-dialog-discard"') ||
   !html.includes('id="close-dialog-cancel"') ||
@@ -54,13 +56,18 @@ if (
   !main.includes("quick_open_requested") ||
   !main.includes("workspace_search_requested") ||
   !main.includes("search_result_open_requested") ||
+  !main.includes("diff_requested") ||
   !main.includes("save_as_requested") ||
   !main.includes("conflict_action_requested") ||
   !main.includes("set_appearance")
 ) {
   throw new Error("Editor bundle is missing an explicit document safety message");
 }
-if (!main.includes("actions.find") || !css.includes(".find-widget")) {
+if (
+  !main.includes("actions.find") ||
+  !css.includes(".find-widget") ||
+  !css.includes(".mode-switch")
+) {
   throw new Error("Editor bundle is missing Monaco's built-in find contribution");
 }
 

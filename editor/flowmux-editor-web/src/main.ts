@@ -74,6 +74,9 @@ const documentState = requiredElement("document-state");
 const emptyState = requiredElement("empty-state");
 const editorContainer = requiredElement("editor");
 const diffEditorContainer = requiredElement("diff-editor");
+const modeSwitch = requiredElement("mode-switch");
+const modeEdit = requiredButton("mode-edit");
+const modeDiff = requiredButton("mode-diff");
 const conflictBanner = requiredElement("conflict-banner");
 const conflictMessage = requiredElement("conflict-message");
 const conflictCompare = requiredButton("conflict-compare");
@@ -154,17 +157,22 @@ const DEFAULT_APPEARANCE: EditorAppearance = {
   fontSize: 13,
 };
 const EDITOR_THEME = "flowmux-editor";
+const EDITOR_FONT_FALLBACKS =
+  'SFMono-Regular, "Cascadia Code", "Noto Sans Mono CJK KR", "Noto Sans Mono", "Apple SD Gothic Neo", "Hiragino Sans", monospace';
 defineEditorTheme(DEFAULT_APPEARANCE);
 
 const editor = monaco.editor.create(editorContainer, {
   automaticLayout: true,
   theme: EDITOR_THEME,
-  fontFamily:
-    "SFMono-Regular, Cascadia Code, Noto Sans Mono CJK KR, Noto Sans Mono, Apple SD Gothic Neo, Hiragino Sans, monospace",
+  fontFamily: editorFontFamily(DEFAULT_APPEARANCE.fontFamily),
   fontSize: 13,
   lineHeight: 20,
+  lineNumbers: "on",
+  cursorBlinking: "blink",
+  cursorSmoothCaretAnimation: "off",
   minimap: { enabled: false },
   padding: { top: 10, bottom: 10 },
+  renderLineHighlight: "line",
   renderWhitespace: "selection",
   scrollBeyondLastLine: false,
   smoothScrolling: false,
@@ -189,6 +197,8 @@ conflictKeep.addEventListener("click", () => requestConflictAction("keep_mine"))
 conflictReload.addEventListener("click", () => requestConflictAction("reload_from_disk"));
 conflictSaveAs.addEventListener("click", () => showSaveAsDialog());
 conflictCloseDiff.addEventListener("click", () => closeDiffView());
+modeEdit.addEventListener("click", () => closeDiffView());
+modeDiff.addEventListener("click", () => requestDiffView());
 saveAsCancel.addEventListener("click", () => closeSaveAsDialog());
 saveAsSubmit.addEventListener("click", () => submitSaveAs());
 saveAsPath.addEventListener("keydown", (event) => {
@@ -758,6 +768,20 @@ function requestConflictAction(action: "compare" | "keep_mine" | "reload_from_di
   });
 }
 
+function requestDiffView(): void {
+  const document = activeDocumentId === null ? undefined : documents.get(activeDocumentId);
+  if (document === undefined || diffDocumentId === document.payload.id) {
+    return;
+  }
+  postToHost({
+    protocolVersion: PROTOCOL_VERSION,
+    surfaceId,
+    type: "diff_requested",
+    documentId: document.payload.id,
+    documentVersion: document.payload.version,
+  });
+}
+
 function showDiff(document: OpenDocument, diskContent: string): void {
   closeDiffView(false);
   diffOriginalModel = monaco.editor.createModel(
@@ -771,11 +795,14 @@ function showDiff(document: OpenDocument, diskContent: string): void {
     diffEditor = monaco.editor.createDiffEditor(diffEditorContainer, {
       automaticLayout: true,
       theme: EDITOR_THEME,
-      fontFamily:
-        "SFMono-Regular, Cascadia Code, Noto Sans Mono CJK KR, Noto Sans Mono, Apple SD Gothic Neo, Hiragino Sans, monospace",
+      fontFamily: editorFontFamily(DEFAULT_APPEARANCE.fontFamily),
       fontSize: editorFontSize,
       lineHeight: 20,
+      lineNumbers: "on",
+      cursorBlinking: "blink",
+      cursorSmoothCaretAnimation: "off",
       minimap: { enabled: false },
+      renderLineHighlight: "line",
       renderSideBySide: true,
       scrollBeyondLastLine: false,
       originalEditable: false,
@@ -1221,7 +1248,7 @@ function defineEditorTheme(appearance: EditorAppearance): void {
 function applyAppearance(appearance: EditorAppearance): void {
   defineEditorTheme(appearance);
   monaco.editor.setTheme(EDITOR_THEME);
-  const fontFamily = `${appearance.fontFamily}, SFMono-Regular, Cascadia Code, Noto Sans Mono CJK KR, Noto Sans Mono, monospace`;
+  const fontFamily = editorFontFamily(appearance.fontFamily);
   editorFontSize = appearance.fontSize;
   editor.updateOptions({ fontFamily, fontSize: editorFontSize });
   diffEditor?.updateOptions({ fontFamily, fontSize: editorFontSize });
@@ -1232,6 +1259,10 @@ function applyAppearance(appearance: EditorAppearance): void {
   root.style.setProperty("--text", appearance.foreground);
   root.style.setProperty("--accent", appearance.cursor);
   root.style.setProperty("--selection", appearance.selectionBackground);
+}
+
+function editorFontFamily(primary: string): string {
+  return `${primary}, ${EDITOR_FONT_FALLBACKS}`;
 }
 
 function colorWithAlpha(color: string, alpha: number): string {
@@ -1249,6 +1280,9 @@ function renderState(): void {
   const active = activeDocumentId === null ? undefined : documents.get(activeDocumentId);
   const showingDiff = active !== undefined && diffDocumentId === active.payload.id;
   emptyState.classList.toggle("is-hidden", active !== undefined);
+  modeSwitch.hidden = active === undefined;
+  modeEdit.setAttribute("aria-pressed", String(!showingDiff));
+  modeDiff.setAttribute("aria-pressed", String(showingDiff));
   editorContainer.classList.toggle("is-visible", active !== undefined && !showingDiff);
   diffEditorContainer.classList.toggle("is-visible", showingDiff);
   if (showingDiff) {

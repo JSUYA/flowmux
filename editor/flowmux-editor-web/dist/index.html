@@ -15,8 +15,16 @@
       <section id="empty-state" class="empty-state">
         <p>Click a text file in Files to edit it.</p>
       </section>
-      <div id="editor" class="editor" aria-label="Text editor"></div>
-      <div id="diff-editor" class="editor diff-editor" aria-label="Compare disk and editor versions"></div>
+      <div id="mode-switch" class="mode-switch" role="group" aria-label="Editor mode" hidden>
+        <button id="mode-edit" type="button" aria-pressed="true">Edit</button>
+        <button id="mode-diff" type="button" aria-pressed="false">Diff</button>
+      </div>
+      <div id="editor" class="editor-surface" aria-label="Text editor"></div>
+      <div
+        id="diff-editor"
+        class="editor-surface diff-editor"
+        aria-label="Compare base and working versions"
+      ></div>
       <span id="document-state" class="document-state" aria-live="polite" hidden></span>
       <div id="conflict-banner" class="conflict-banner" role="alert" hidden>
         <span id="conflict-message"></span>
