@@ -356,9 +356,9 @@ impl EditorSession {
         message: EditorMessage,
     ) -> Result<Vec<HostMessage>, EditorSessionError> {
         match message {
-            EditorMessage::EditorReady | EditorMessage::FocusDirectionRequested { .. } => {
-                Ok(Vec::new())
-            }
+            EditorMessage::EditorReady
+            | EditorMessage::NativeEditRequested { .. }
+            | EditorMessage::FocusDirectionRequested { .. } => Ok(Vec::new()),
             EditorMessage::ActiveDocumentChanged {
                 document_id,
                 document_version,

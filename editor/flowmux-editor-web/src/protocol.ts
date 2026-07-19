@@ -163,6 +163,15 @@ interface EditorMessageBase {
 export type EditorMessage =
   | (EditorMessageBase & { type: "editor_ready" })
   | (EditorMessageBase & {
+      type: "native_edit_requested";
+      action: "copy";
+      text: string;
+    })
+  | (EditorMessageBase & {
+      type: "native_edit_requested";
+      action: "paste";
+    })
+  | (EditorMessageBase & {
       type: "focus_direction_requested";
       direction: EditorFocusDirection;
     })

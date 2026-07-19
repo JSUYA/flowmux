@@ -4,9 +4,10 @@
 use flowmux_core::{EditorFileState, EditorSessionState, PaneId, SurfaceId};
 use flowmux_editor::{
     diff_base_content, index_workspace_files, javascript_for_host_message, parse_editor_message,
-    search_workspace, EditorFileSessionState, EditorFocusDirection, EditorMessage, EditorSession,
-    EditorSessionSnapshot, EditorViewState, HostMessage, ProtocolError, RecoveryOperation,
-    RecoveryStore, SearchCancellation, SearchOptions, WorkspaceSearchResult,
+    search_workspace, EditorFileSessionState, EditorFocusDirection, EditorMessage,
+    EditorNativeEditAction, EditorSession, EditorSessionSnapshot, EditorViewState, HostMessage,
+    ProtocolError, RecoveryOperation, RecoveryStore, SearchCancellation, SearchOptions,
+    WorkspaceSearchResult,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -62,6 +63,8 @@ pub(super) struct EditorBridgeReceive {
 pub(super) struct EditorBridgeDispatch {
     pub scripts: Vec<String>,
     pub focus_direction: Option<EditorFocusDirection>,
+    pub native_edit_action: Option<EditorNativeEditAction>,
+    pub native_edit_text: Option<String>,
 }
 
 pub(super) struct EditorBridgeState {
@@ -693,19 +696,30 @@ pub(super) fn handle_bridge_message(
     let received = bridge.receive(raw);
     let mut scripts = received.scripts;
     let mut focus_direction = None;
+    let mut native_edit_action = None;
+    let mut native_edit_text = None;
     if let Some(message) = received.message {
-        if let EditorMessage::FocusDirectionRequested { direction } = message {
-            focus_direction = Some(direction);
-        } else {
-            scripts.extend(queue_host_messages(bridge, host.handle(message)));
-            if host.stage_recovery_operations() {
-                schedule_recovery_flush(host);
+        match message {
+            EditorMessage::FocusDirectionRequested { direction } => {
+                focus_direction = Some(direction);
+            }
+            EditorMessage::NativeEditRequested { action, text } => {
+                native_edit_action = Some(action);
+                native_edit_text = text;
+            }
+            message => {
+                scripts.extend(queue_host_messages(bridge, host.handle(message)));
+                if host.stage_recovery_operations() {
+                    schedule_recovery_flush(host);
+                }
             }
         }
     }
     EditorBridgeDispatch {
         scripts,
         focus_direction,
+        native_edit_action,
+        native_edit_text,
     }
 }
 
@@ -901,6 +915,33 @@ mod tests {
         let dispatch = handle_bridge_message(&bridge, &host, &raw);
 
         assert_eq!(dispatch.focus_direction, Some(EditorFocusDirection::Down));
+        assert!(dispatch.scripts.is_empty());
+    }
+
+    #[test]
+    fn native_copy_message_preserves_the_monaco_selection() {
+        let workspace = tempfile::tempdir().unwrap();
+        let host = Rc::new(EditorHostState::new(
+            workspace.path(),
+            EditorSessionState::default(),
+        ));
+        let bridge = EditorBridgeState::new(SurfaceId::new());
+        let raw = serde_json::json!({
+            "protocolVersion": flowmux_editor::PROTOCOL_VERSION,
+            "surfaceId": bridge.surface_id,
+            "type": "native_edit_requested",
+            "action": "copy",
+            "text": "선택한 text",
+        })
+        .to_string();
+
+        let dispatch = handle_bridge_message(&bridge, &host, &raw);
+
+        assert_eq!(
+            dispatch.native_edit_action,
+            Some(EditorNativeEditAction::Copy)
+        );
+        assert_eq!(dispatch.native_edit_text.as_deref(), Some("선택한 text"));
         assert!(dispatch.scripts.is_empty());
     }
 

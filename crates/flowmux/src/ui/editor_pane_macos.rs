@@ -7,7 +7,8 @@ use super::{
 };
 use flowmux_core::{EditorSessionState, PaneId, SurfaceId};
 use flowmux_editor::{
-    EditorAppearance, EditorAssetServer, EditorFocusDirection, HostMessage, ProtocolError,
+    EditorAppearance, EditorAssetServer, EditorFocusDirection, EditorNativeEditAction, HostMessage,
+    ProtocolError,
 };
 use gtk::gio;
 use gtk::glib::{self, translate::ToGlibPtr};
@@ -34,6 +35,19 @@ use std::rc::Rc;
 use std::time::Duration;
 
 const MESSAGE_HANDLER_NAME: &str = "flowmuxEditor";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditorKeyAction {
+    CursorLeft,
+    CursorRight,
+    CursorUp,
+    CursorDown,
+    Copy,
+    Paste,
+    Find,
+    Undo,
+    Redo,
+}
 
 unsafe extern "C" {
     fn gdk_macos_surface_get_native_window(surface: *mut gtk::gdk::ffi::GdkSurface) -> *mut c_void;
@@ -103,6 +117,9 @@ define_class!(
             let Some(web_view) = (unsafe { message.webView() }) else {
                 return;
             };
+            if let Some(action) = dispatch.native_edit_action {
+                perform_native_edit(&web_view, action, dispatch.native_edit_text.as_deref());
+            }
             for script in dispatch.scripts {
                 evaluate_script(&web_view, &script);
             }
@@ -277,6 +294,8 @@ impl EditorPane {
         root.set_vexpand(true);
         root.append(&viewport);
 
+        install_editor_key_compatibility(&web_widget, &native);
+
         {
             let native = native.clone();
             let web_widget = web_widget.clone();
@@ -382,6 +401,7 @@ impl EditorPane {
     }
 
     pub fn grab_focus(&self) {
+        self.web_widget.grab_focus();
         focus_native_view(&self.native.web_view);
     }
 
@@ -405,17 +425,17 @@ impl EditorPane {
         }
     }
 
-    /// Copy the editor selection when the app-level copy shortcut fires while
-    /// this surface is focused. WKWebView implements the standard responder
-    /// editing actions, so this mirrors what Cmd+C does natively.
+    /// Copy the Monaco selection when an app-level copy shortcut fires while
+    /// this surface is focused.
     pub fn copy_selection(&self) {
-        let _: () =
-            unsafe { msg_send![&*self.native.web_view, copy: None::<&objc2::runtime::AnyObject>] };
+        evaluate_script(
+            &self.native.web_view,
+            "window.flowmuxEditorKeyboard?.('copy')",
+        );
     }
 
     pub fn paste_clipboard(&self) {
-        let _: () =
-            unsafe { msg_send![&*self.native.web_view, paste: None::<&objc2::runtime::AnyObject>] };
+        perform_native_edit(&self.native.web_view, EditorNativeEditAction::Paste, None);
     }
 
     pub fn show_workspace_search(&self) {
@@ -687,9 +707,177 @@ fn focus_native_view(web_view: &WKWebView) {
     }
 }
 
+fn install_editor_key_compatibility(web_widget: &gtk::Widget, native: &Rc<NativeEditorView>) {
+    let controller = gtk::EventControllerKey::new();
+    controller.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let weak_web_widget = web_widget.downgrade();
+    let native = Rc::downgrade(native);
+    controller.connect_key_pressed(move |_, keyval, _, state| {
+        let Some(web_widget) = weak_web_widget.upgrade() else {
+            return glib::Propagation::Proceed;
+        };
+        if !web_widget.has_focus() {
+            return glib::Propagation::Proceed;
+        }
+        let Some(action) = editor_key_action(keyval, state) else {
+            return glib::Propagation::Proceed;
+        };
+        let Some(native) = native.upgrade() else {
+            return glib::Propagation::Proceed;
+        };
+        run_editor_key_action(&native.web_view, action);
+        glib::Propagation::Stop
+    });
+    web_widget.add_controller(controller);
+}
+
+fn editor_key_action(
+    keyval: gtk::gdk::Key,
+    state: gtk::gdk::ModifierType,
+) -> Option<EditorKeyAction> {
+    use gtk::gdk::ModifierType;
+
+    let relevant = state
+        & (ModifierType::CONTROL_MASK
+            | ModifierType::ALT_MASK
+            | ModifierType::SHIFT_MASK
+            | ModifierType::SUPER_MASK
+            | ModifierType::META_MASK);
+    if relevant.is_empty() {
+        return match keyval {
+            gtk::gdk::Key::Left => Some(EditorKeyAction::CursorLeft),
+            gtk::gdk::Key::Right => Some(EditorKeyAction::CursorRight),
+            gtk::gdk::Key::Up => Some(EditorKeyAction::CursorUp),
+            gtk::gdk::Key::Down => Some(EditorKeyAction::CursorDown),
+            _ => None,
+        };
+    }
+
+    let key = keyval.to_unicode()?.to_ascii_lowercase();
+    if relevant == ModifierType::CONTROL_MASK {
+        return match key {
+            'c' => Some(EditorKeyAction::Copy),
+            'v' => Some(EditorKeyAction::Paste),
+            'f' => Some(EditorKeyAction::Find),
+            'z' => Some(EditorKeyAction::Undo),
+            _ => None,
+        };
+    }
+    if relevant == (ModifierType::CONTROL_MASK | ModifierType::SHIFT_MASK) && key == 'z' {
+        return Some(EditorKeyAction::Redo);
+    }
+    None
+}
+
+fn run_editor_key_action(web_view: &WKWebView, action: EditorKeyAction) {
+    match action {
+        EditorKeyAction::Copy => {
+            evaluate_script(web_view, "window.flowmuxEditorKeyboard?.('copy')")
+        }
+        EditorKeyAction::Paste => {
+            perform_native_edit(web_view, EditorNativeEditAction::Paste, None)
+        }
+        EditorKeyAction::CursorLeft => {
+            evaluate_script(web_view, "window.flowmuxEditorKeyboard?.('cursorLeft')")
+        }
+        EditorKeyAction::CursorRight => {
+            evaluate_script(web_view, "window.flowmuxEditorKeyboard?.('cursorRight')")
+        }
+        EditorKeyAction::CursorUp => {
+            evaluate_script(web_view, "window.flowmuxEditorKeyboard?.('cursorUp')")
+        }
+        EditorKeyAction::CursorDown => {
+            evaluate_script(web_view, "window.flowmuxEditorKeyboard?.('cursorDown')")
+        }
+        EditorKeyAction::Find => {
+            evaluate_script(web_view, "window.flowmuxEditorKeyboard?.('find')")
+        }
+        EditorKeyAction::Undo => {
+            evaluate_script(web_view, "window.flowmuxEditorKeyboard?.('undo')")
+        }
+        EditorKeyAction::Redo => {
+            evaluate_script(web_view, "window.flowmuxEditorKeyboard?.('redo')")
+        }
+    }
+}
+
+fn perform_native_edit(
+    web_view: &WKWebView,
+    action: EditorNativeEditAction,
+    copy_text: Option<&str>,
+) {
+    if action == EditorNativeEditAction::Copy {
+        if let Some(text) = copy_text {
+            if let Some(display) = gtk::gdk::Display::default() {
+                display.clipboard().set_text(text);
+            }
+            return;
+        }
+    }
+    let Some(responder) = web_view
+        .as_super()
+        .window()
+        .and_then(|window| window.firstResponder())
+    else {
+        return;
+    };
+    match action {
+        EditorNativeEditAction::Copy => {
+            let _: () = unsafe { msg_send![&responder, copy: None::<&objc2::runtime::AnyObject>] };
+        }
+        EditorNativeEditAction::Paste => {
+            let _: () = unsafe { msg_send![&responder, paste: None::<&objc2::runtime::AnyObject>] };
+        }
+    }
+}
+
 fn workspace_name(path: &Path) -> String {
     path.file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| path.display().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn editor_key_compatibility_covers_navigation_and_control_chords() {
+        use gtk::gdk::{Key, ModifierType};
+
+        assert_eq!(
+            editor_key_action(Key::Left, ModifierType::empty()),
+            Some(EditorKeyAction::CursorLeft)
+        );
+        assert_eq!(
+            editor_key_action(Key::Up, ModifierType::empty()),
+            Some(EditorKeyAction::CursorUp)
+        );
+        assert_eq!(
+            editor_key_action(Key::c, ModifierType::CONTROL_MASK),
+            Some(EditorKeyAction::Copy)
+        );
+        assert_eq!(
+            editor_key_action(Key::v, ModifierType::CONTROL_MASK),
+            Some(EditorKeyAction::Paste)
+        );
+        assert_eq!(
+            editor_key_action(Key::f, ModifierType::CONTROL_MASK),
+            Some(EditorKeyAction::Find)
+        );
+        assert_eq!(
+            editor_key_action(Key::z, ModifierType::CONTROL_MASK),
+            Some(EditorKeyAction::Undo)
+        );
+        assert_eq!(
+            editor_key_action(
+                Key::z,
+                ModifierType::CONTROL_MASK | ModifierType::SHIFT_MASK
+            ),
+            Some(EditorKeyAction::Redo)
+        );
+        assert_eq!(editor_key_action(Key::Right, ModifierType::ALT_MASK), None);
+        assert_eq!(editor_key_action(Key::Down, ModifierType::SHIFT_MASK), None);
+    }
 }

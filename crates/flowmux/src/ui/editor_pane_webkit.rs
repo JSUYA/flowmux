@@ -7,7 +7,8 @@ use super::{
 };
 use flowmux_core::{EditorSessionState, PaneId, SurfaceId};
 use flowmux_editor::{
-    EditorAppearance, EditorAssetServer, EditorFocusDirection, HostMessage, ProtocolError,
+    EditorAppearance, EditorAssetServer, EditorFocusDirection, EditorNativeEditAction, HostMessage,
+    ProtocolError,
 };
 use gtk::gio;
 use gtk::prelude::*;
@@ -99,6 +100,13 @@ impl EditorPane {
                         }
                     }
                     if let Some(web_view) = web_view.upgrade() {
+                        if let Some(action) = dispatch.native_edit_action {
+                            perform_native_edit(
+                                &web_view,
+                                action,
+                                dispatch.native_edit_text.as_deref(),
+                            );
+                        }
                         for script in dispatch.scripts {
                             evaluate_script(&web_view, &script);
                         }
@@ -283,12 +291,11 @@ impl EditorPane {
     /// this surface is focused (plain Ctrl+C reaches the WebView natively;
     /// this covers the global Ctrl+Shift+C accelerator).
     pub fn copy_selection(&self) {
-        // WebKit's built-in editing command names ("Copy"/"Paste").
-        self.web_view.execute_editing_command("Copy");
+        evaluate_script(&self.web_view, "window.flowmuxEditorKeyboard?.('copy')");
     }
 
     pub fn paste_clipboard(&self) {
-        self.web_view.execute_editing_command("Paste");
+        perform_native_edit(&self.web_view, EditorNativeEditAction::Paste, None);
     }
 
     pub fn show_workspace_search(&self) {
@@ -399,6 +406,25 @@ fn evaluate_script(web_view: &webkit6::WebView, script: &str) {
         if let Err(error) = result {
             tracing::warn!(%error, "failed to deliver message to editor WebView");
         }
+    });
+}
+
+fn perform_native_edit(
+    web_view: &webkit6::WebView,
+    action: EditorNativeEditAction,
+    copy_text: Option<&str>,
+) {
+    if action == EditorNativeEditAction::Copy {
+        if let Some(text) = copy_text {
+            if let Some(display) = gtk::gdk::Display::default() {
+                display.clipboard().set_text(text);
+            }
+            return;
+        }
+    }
+    web_view.execute_editing_command(match action {
+        EditorNativeEditAction::Copy => "Copy",
+        EditorNativeEditAction::Paste => "Paste",
     });
 }
 

@@ -194,6 +194,13 @@ pub enum EditorFocusDirection {
     Down,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EditorNativeEditAction {
+    Copy,
+    Paste,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(
     tag = "type",
@@ -202,6 +209,11 @@ pub enum EditorFocusDirection {
 )]
 pub enum EditorMessage {
     EditorReady,
+    NativeEditRequested {
+        action: EditorNativeEditAction,
+        #[serde(default)]
+        text: Option<String>,
+    },
     FocusDirectionRequested {
         direction: EditorFocusDirection,
     },
@@ -310,6 +322,8 @@ pub enum ProtocolError {
     DocumentTooLarge { limit: usize },
     #[error("invalid editor document view state")]
     InvalidViewState,
+    #[error("invalid editor native editing request")]
+    InvalidNativeEditRequest,
     #[error("invalid editor workspace search request")]
     InvalidSearchRequest,
     #[error("invalid editor workspace search path")]
@@ -366,6 +380,11 @@ pub fn javascript_for_host_message(
 fn validate_editor_message(message: &EditorMessage) -> Result<(), ProtocolError> {
     match message {
         EditorMessage::EditorReady | EditorMessage::FocusDirectionRequested { .. } => Ok(()),
+        EditorMessage::NativeEditRequested { action, text } => match (action, text) {
+            (EditorNativeEditAction::Copy, Some(text)) => validate_document_size(text),
+            (EditorNativeEditAction::Paste, None) => Ok(()),
+            _ => Err(ProtocolError::InvalidNativeEditRequest),
+        },
         EditorMessage::ActiveDocumentChanged { document_id, .. }
         | EditorMessage::CloseRequested { document_id, .. }
         | EditorMessage::DiscardCloseRequested { document_id, .. }
@@ -706,6 +725,64 @@ mod tests {
         assert!(matches!(
             parse_editor_message(&invalid),
             Err(ProtocolError::InvalidJson(_))
+        ));
+    }
+
+    #[test]
+    fn editor_native_edit_accepts_only_copy_and_paste() {
+        for (action, text, expected) in [
+            ("copy", Some("selected text"), EditorNativeEditAction::Copy),
+            ("paste", None, EditorNativeEditAction::Paste),
+        ] {
+            let message = serde_json::json!({
+                "protocolVersion": PROTOCOL_VERSION,
+                "surfaceId": "surface-1",
+                "type": "native_edit_requested",
+                "action": action,
+                "text": text,
+            })
+            .to_string();
+            assert_eq!(
+                parse_editor_message(&message).unwrap().1,
+                EditorMessage::NativeEditRequested {
+                    action: expected,
+                    text: text.map(str::to_string),
+                }
+            );
+        }
+
+        let unknown = serde_json::json!({
+            "protocolVersion": PROTOCOL_VERSION,
+            "surfaceId": "surface-1",
+            "type": "native_edit_requested",
+            "action": "cut",
+        })
+        .to_string();
+        assert!(parse_editor_message(&unknown).is_err());
+
+        let copy_without_text = serde_json::json!({
+            "protocolVersion": PROTOCOL_VERSION,
+            "surfaceId": "surface-1",
+            "type": "native_edit_requested",
+            "action": "copy",
+        })
+        .to_string();
+        assert!(matches!(
+            parse_editor_message(&copy_without_text),
+            Err(ProtocolError::InvalidNativeEditRequest)
+        ));
+
+        let paste_with_text = serde_json::json!({
+            "protocolVersion": PROTOCOL_VERSION,
+            "surfaceId": "surface-1",
+            "type": "native_edit_requested",
+            "action": "paste",
+            "text": "ignored",
+        })
+        .to_string();
+        assert!(matches!(
+            parse_editor_message(&paste_with_text),
+            Err(ProtocolError::InvalidNativeEditRequest)
         ));
     }
 

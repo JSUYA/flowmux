@@ -30,10 +30,22 @@ import {
   PROTOCOL_VERSION,
 } from "./protocol";
 
+type NativeEditorAction =
+  | "cursorLeft"
+  | "cursorRight"
+  | "cursorUp"
+  | "cursorDown"
+  | "copy"
+  | "paste"
+  | "find"
+  | "undo"
+  | "redo";
+
 declare global {
   interface Window {
     MonacoEnvironment: monaco.Environment;
     flowmuxEditorHost: { receive: (message: unknown) => void };
+    flowmuxEditorKeyboard: (action: NativeEditorAction) => void;
     __flowmuxEditorMessages?: EditorMessage[];
     webkit?: {
       messageHandlers?: {
@@ -217,6 +229,61 @@ window.addEventListener(
   },
   true,
 );
+
+function focusedCodeEditor(): monaco.editor.ICodeEditor | null {
+  const target = diffDocumentId === null ? editor : diffEditor?.getModifiedEditor();
+  return target?.hasTextFocus() === true ? target : null;
+}
+
+function runNativeEditorAction(
+  target: monaco.editor.ICodeEditor,
+  action: NativeEditorAction,
+): void {
+  switch (action) {
+    case "cursorLeft":
+    case "cursorRight":
+    case "cursorUp":
+    case "cursorDown":
+    case "undo":
+    case "redo":
+      target.trigger("keyboard", action, null);
+      break;
+    case "find":
+      void target.getAction("actions.find")?.run();
+      break;
+    case "copy": {
+      const model = target.getModel();
+      const selection = target.getSelection();
+      const text = model === null || selection === null ? "" : model.getValueInRange(selection);
+      if (text.length === 0) {
+        break;
+      }
+      postToHost({
+        protocolVersion: PROTOCOL_VERSION,
+        surfaceId,
+        type: "native_edit_requested",
+        action: "copy",
+        text,
+      });
+      break;
+    }
+    case "paste":
+      postToHost({
+        protocolVersion: PROTOCOL_VERSION,
+        surfaceId,
+        type: "native_edit_requested",
+        action: "paste",
+      });
+      break;
+  }
+}
+
+window.flowmuxEditorKeyboard = (action) => {
+  const target = focusedCodeEditor();
+  if (target !== null) {
+    runNativeEditorAction(target, action);
+  }
+};
 
 editor.onDidChangeCursorPosition(() => scheduleViewStateReport());
 editor.onDidScrollChange(() => scheduleViewStateReport());
