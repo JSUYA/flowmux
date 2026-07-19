@@ -14,9 +14,25 @@ staged_bundle="$2"
 destination_bundle="$3"
 backup_bundle="$4"
 
-if [ "$(basename "$staged_bundle")" != ".FlowMux.app.pending" ] || \
+valid_staged_name() {
+    name="$(basename "$1")"
+    base="$2"
+    if [ "$name" = "$base" ]; then
+        return 0
+    fi
+    suffix="${name#"$base".}"
+    if [ "$suffix" = "$name" ]; then
+        return 1
+    fi
+    case "$suffix" in
+        ""|*[!0-9]*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+if ! valid_staged_name "$staged_bundle" ".FlowMux.app.pending" || \
     [ "$(basename "$destination_bundle")" != "FlowMux.app" ] || \
-    [ "$(basename "$backup_bundle")" != ".FlowMux.app.previous" ]; then
+    ! valid_staged_name "$backup_bundle" ".FlowMux.app.previous"; then
     echo "refusing deferred app swap with unexpected bundle paths" >&2
     exit 0
 fi

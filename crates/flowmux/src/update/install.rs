@@ -344,14 +344,18 @@ mod tests {
     fn deferred_macos_swap_waits_for_the_running_app() {
         let temp = tempfile::tempdir().unwrap();
         let destination = temp.path().join("FlowMux.app");
-        let staged = temp.path().join(".FlowMux.app.pending");
-        let backup = temp.path().join(".FlowMux.app.previous");
+        let mut host = Command::new("sleep").arg("30").spawn().unwrap();
+        let staged = temp
+            .path()
+            .join(format!(".FlowMux.app.pending.{}", host.id()));
+        let backup = temp
+            .path()
+            .join(format!(".FlowMux.app.previous.{}", host.id()));
         std::fs::create_dir_all(&destination).unwrap();
         std::fs::create_dir_all(&staged).unwrap();
         std::fs::write(destination.join("version"), "old").unwrap();
         std::fs::write(staged.join("version"), "new").unwrap();
 
-        let mut host = Command::new("sleep").arg("30").spawn().unwrap();
         let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../scripts/deferred-macos-app-swap.sh");
         let mut swap = Command::new("sh")
