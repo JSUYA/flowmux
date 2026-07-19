@@ -477,11 +477,19 @@ impl PaneRegistry {
         self.editor_focus_controllers.insert(surface, controller);
     }
 
+    fn remove_editor_focus_controller(&mut self, surface: SurfaceId, editor: &EditorPane) {
+        if let Some(controller) = self.editor_focus_controllers.remove(&surface) {
+            editor.root.remove_controller(&controller);
+        }
+    }
+
     /// Close detached editors the rebuilt tree did not re-adopt (their
     /// surfaces no longer exist in the workspace).
     pub fn discard_unused_detached_editors(&mut self) {
         for (surface, editor) in self.pending_editor_reuse.drain() {
-            self.editor_focus_controllers.remove(&surface);
+            if let Some(controller) = self.editor_focus_controllers.remove(&surface) {
+                editor.root.remove_controller(&controller);
+            }
             editor.prepare_for_close();
         }
     }
@@ -527,8 +535,10 @@ impl PaneRegistry {
                 browser.prepare_for_close();
             }
             if let Some(editor) = self.editors.remove(&surface) {
-                self.editor_focus_controllers.remove(&surface);
+                self.remove_editor_focus_controller(surface, &editor);
                 editor.prepare_for_close();
+            } else {
+                self.editor_focus_controllers.remove(&surface);
             }
             self.surface_tab_labels.remove(&surface);
             self.surface_workspace.remove(&surface);
@@ -760,9 +770,11 @@ impl PaneRegistry {
                 browser.prepare_for_close();
             }
             if let Some(editor) = self.editors.remove(&s) {
+                self.remove_editor_focus_controller(s, &editor);
                 editor.prepare_for_close();
+            } else {
+                self.editor_focus_controllers.remove(&s);
             }
-            self.editor_focus_controllers.remove(&s);
             self.surface_tab_labels.remove(&s);
             self.surface_workspace.remove(&s);
         }
@@ -830,9 +842,11 @@ impl PaneRegistry {
             browser.prepare_for_close();
         }
         if let Some(editor) = self.editors.remove(&surface) {
+            self.remove_editor_focus_controller(surface, &editor);
             editor.prepare_for_close();
+        } else {
+            self.editor_focus_controllers.remove(&surface);
         }
-        self.editor_focus_controllers.remove(&surface);
         self.surface_tab_labels.remove(&surface);
         self.surface_workspace.remove(&surface);
         if self.active_terminal_by_pane.get(&pane) == Some(&surface) {
@@ -895,7 +909,7 @@ impl PaneRegistry {
                 None,
             )
         } else if let Some(editor) = self.editors.remove(&surface) {
-            self.editor_focus_controllers.remove(&surface);
+            self.remove_editor_focus_controller(surface, &editor);
             let session = editor.session_state();
             (
                 editor.focus_widget(),
@@ -2057,39 +2071,65 @@ mod tab_dnd_tests {
     #[cfg(not(target_os = "macos"))]
     #[gtk::test]
     fn closing_surface_and_pane_release_editor_focus_controllers() {
+        let workspace = tempfile::tempdir().unwrap();
+        let options = flowmux_config::options::Options::default();
+        let appearance = ResolvedTheme::load().editor_appearance(&options);
         let pane = PaneId::new();
         let surface = SurfaceId::new();
+        let editor = EditorPane::new(
+            pane,
+            surface,
+            workspace.path().to_path_buf(),
+            flowmux_core::EditorSessionState::default(),
+            appearance.clone(),
+        )
+        .unwrap();
         let stack = gtk::Stack::new();
-        let content = gtk::Label::new(None).upcast::<gtk::Widget>();
-        stack.add_named(&content, Some(&surface.to_string()));
+        stack.add_named(&editor.root, Some(&surface.to_string()));
         let tab = gtk::Button::new().upcast::<gtk::Widget>();
         let tabs = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         tabs.append(&tab);
+        let focus = gtk::EventControllerFocus::new();
+        editor.root.add_controller(focus.clone());
 
         let mut registry = PaneRegistry::default();
         registry.surface_stacks.insert(pane, stack);
         registry.surface_tabs.insert(pane, vec![(surface, tab)]);
         registry.pane_tab_containers.insert(pane, tabs);
+        registry.editors.insert(surface, editor);
         registry
             .editor_focus_controllers
-            .insert(surface, gtk::EventControllerFocus::new());
+            .insert(surface, focus.clone());
 
         registry.detach_surface_widget(pane, surface);
         assert!(!registry.editor_focus_controllers.contains_key(&surface));
+        assert!(focus.widget().is_none());
 
         let next_surface = SurfaceId::new();
+        let next_editor = EditorPane::new(
+            pane,
+            next_surface,
+            workspace.path().to_path_buf(),
+            flowmux_core::EditorSessionState::default(),
+            appearance,
+        )
+        .unwrap();
+        let next_focus = gtk::EventControllerFocus::new();
+        next_editor.root.add_controller(next_focus.clone());
         registry.surface_tabs.insert(
             pane,
             vec![(next_surface, gtk::Button::new().upcast::<gtk::Widget>())],
         );
+        registry.editors.insert(next_surface, next_editor);
         registry
             .editor_focus_controllers
-            .insert(next_surface, gtk::EventControllerFocus::new());
+            .insert(next_surface, next_focus.clone());
 
         registry.forget_pane(pane);
         assert!(!registry
             .editor_focus_controllers
             .contains_key(&next_surface));
+        assert!(next_focus.widget().is_none());
     }
 }
 
