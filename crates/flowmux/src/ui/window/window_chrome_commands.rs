@@ -112,9 +112,6 @@ impl WindowController {
             GtkCommand::WorktreesLoaded { generation, result } => {
                 self.apply_worktrees_loaded(generation, result).await;
             }
-            GtkCommand::OpenWorktree { path } => {
-                self.open_worktree_workspace(path).await;
-            }
             GtkCommand::ShowWorktreeInfo { path } => {
                 self.show_worktree_info(path);
             }

@@ -13,9 +13,6 @@ use std::rc::Rc;
 #[derive(Clone, Debug)]
 pub struct WorktreeRowView {
     pub info: WorktreeInfo,
-    pub workspace_open: bool,
-    pub workspace_active: bool,
-    pub workspace_ambiguous: bool,
     pub remove_block_reason: Option<String>,
     pub operation_in_progress: bool,
 }
@@ -24,9 +21,6 @@ impl WorktreeRowView {
     pub fn available(info: WorktreeInfo) -> Self {
         Self {
             info,
-            workspace_open: false,
-            workspace_active: false,
-            workspace_ambiguous: false,
             remove_block_reason: None,
             operation_in_progress: false,
         }
@@ -48,7 +42,6 @@ pub struct WorktreePanel {
     refresh_button: gtk::Button,
     rows: Rc<RefCell<Vec<WorktreeRowView>>>,
     open: Rc<Cell<bool>>,
-    on_open: PathCallback,
     on_info: PathCallback,
     on_remove: PathCallback,
     on_refresh: Rc<RefCell<Option<Box<dyn Fn()>>>>,
@@ -146,7 +139,6 @@ impl WorktreePanel {
             refresh_button,
             rows: Rc::new(RefCell::new(Vec::new())),
             open: Rc::new(Cell::new(false)),
-            on_open: Rc::new(RefCell::new(None)),
             on_info: Rc::new(RefCell::new(None)),
             on_remove: Rc::new(RefCell::new(None)),
             on_refresh: Rc::new(RefCell::new(None)),
@@ -292,10 +284,6 @@ impl WorktreePanel {
         true
     }
 
-    pub fn connect_open<F: Fn(PathBuf) + 'static>(&self, callback: F) {
-        *self.on_open.borrow_mut() = Some(Box::new(callback));
-    }
-
     pub fn connect_info<F: Fn(PathBuf) + 'static>(&self, callback: F) {
         *self.on_info.borrow_mut() = Some(Box::new(callback));
     }
@@ -392,20 +380,9 @@ impl WorktreePanel {
 
         let actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         actions.set_halign(gtk::Align::End);
-        let open = gtk::Button::with_label(open_action_label(row));
         let info = gtk::Button::with_label("Info");
         let remove = gtk::Button::with_label("Remove");
 
-        let open_block_reason = open_block_reason(row);
-        open.set_sensitive(open_block_reason.is_none());
-        open.set_tooltip_text(Some(open_block_reason.unwrap_or(if row.workspace_open {
-            "Switch to this worktree's workspace"
-        } else {
-            "Open worktree in a new workspace"
-        })));
-        if let Some(reason) = open_block_reason {
-            open.update_property(&[gtk::accessible::Property::Description(reason)]);
-        }
         info.set_tooltip_text(Some("Show worktree information"));
 
         let remove_block_reason = row.remove_block_reason.as_deref().or(row
@@ -417,13 +394,6 @@ impl WorktreePanel {
             remove.update_property(&[gtk::accessible::Property::Description(reason)]);
         }
 
-        let path_for_open = row.info.path.clone();
-        let on_open = self.on_open.clone();
-        open.connect_clicked(move |_| {
-            if let Some(callback) = on_open.borrow().as_ref() {
-                callback(path_for_open.clone());
-            }
-        });
         let path_for_info = row.info.path.clone();
         let on_info = self.on_info.clone();
         info.connect_clicked(move |_| {
@@ -439,7 +409,6 @@ impl WorktreePanel {
             }
         });
 
-        actions.append(&open);
         actions.append(&info);
         actions.append(&remove);
         content.append(&branch);
@@ -495,43 +464,19 @@ impl WorktreePanel {
         let list = self.list.downgrade();
         let scroll = self.scroll.downgrade();
         let rows = Rc::downgrade(&self.rows);
-        let on_open = Rc::downgrade(&self.on_open);
         let on_close = Rc::downgrade(&self.on_close);
         let on_focus_out = Rc::downgrade(&self.on_focus_out);
         key.connect_key_pressed(move |_, key, _, state| {
-            let (
-                Some(list),
-                Some(scroll),
-                Some(rows),
-                Some(on_open),
-                Some(on_close),
-                Some(on_focus_out),
-            ) = (
+            let (Some(list), Some(scroll), Some(rows), Some(on_close), Some(on_focus_out)) = (
                 list.upgrade(),
                 scroll.upgrade(),
                 rows.upgrade(),
-                on_open.upgrade(),
                 on_close.upgrade(),
                 on_focus_out.upgrade(),
-            )
-            else {
+            ) else {
                 return glib::Propagation::Proceed;
             };
-            let button_focused = list
-                .root()
-                .and_then(|root| root.focus())
-                .is_some_and(|focus| focus.is::<gtk::Button>());
-            dispatch_key(
-                &list,
-                &scroll,
-                &rows,
-                &on_open,
-                &on_close,
-                &on_focus_out,
-                key,
-                state,
-                button_focused,
-            )
+            dispatch_key(&list, &scroll, &rows, &on_close, &on_focus_out, key, state)
         });
         self.root.add_controller(key);
     }
@@ -541,17 +486,15 @@ impl WorktreePanel {
             &self.list,
             &self.scroll,
             &self.rows,
-            &self.on_open,
             &self.on_close,
             &self.on_focus_out,
             key,
             state,
-            false,
         )
     }
 
     fn handle_navigation_key(&self, key: gdk::Key) -> glib::Propagation {
-        dispatch_navigation_key(&self.list, &self.scroll, &self.rows, &self.on_open, key)
+        dispatch_navigation_key(&self.list, &self.scroll, &self.rows, key)
     }
 
     fn select_index_internal(&self, index: usize) {
@@ -601,12 +544,10 @@ fn dispatch_key(
     list: &gtk::ListBox,
     scroll: &gtk::ScrolledWindow,
     rows: &RefCell<Vec<WorktreeRowView>>,
-    on_open: &RefCell<Option<Box<dyn Fn(PathBuf)>>>,
     on_close: &RefCell<Option<Box<dyn Fn()>>>,
     on_focus_out: &RefCell<Option<Box<dyn Fn(FocusDir)>>>,
     key: gdk::Key,
     state: gdk::ModifierType,
-    button_focused: bool,
 ) -> glib::Propagation {
     if key == gdk::Key::Escape {
         if let Some(callback) = on_close.borrow().as_ref() {
@@ -635,17 +576,13 @@ fn dispatch_key(
     ) {
         return glib::Propagation::Proceed;
     }
-    if button_focused && (key == gdk::Key::Return || key == gdk::Key::KP_Enter) {
-        return glib::Propagation::Proceed;
-    }
-    dispatch_navigation_key(list, scroll, rows, on_open, key)
+    dispatch_navigation_key(list, scroll, rows, key)
 }
 
 fn dispatch_navigation_key(
     list: &gtk::ListBox,
     scroll: &gtk::ScrolledWindow,
     rows: &RefCell<Vec<WorktreeRowView>>,
-    on_open: &RefCell<Option<Box<dyn Fn(PathBuf)>>>,
     key: gdk::Key,
 ) -> glib::Propagation {
     let row_count = rows.borrow().len();
@@ -676,20 +613,6 @@ fn dispatch_navigation_key(
         return glib::Propagation::Stop;
     }
 
-    if key == gdk::Key::Return || key == gdk::Key::KP_Enter {
-        let selected = list
-            .selected_row()
-            .and_then(|row| usize::try_from(row.index()).ok())
-            .and_then(|index| rows.borrow().get(index).cloned());
-        if let Some(row) = selected {
-            if open_block_reason(&row).is_none() {
-                if let Some(callback) = on_open.borrow().as_ref() {
-                    callback(row.info.path);
-                }
-            }
-            return glib::Propagation::Stop;
-        }
-    }
     glib::Propagation::Proceed
 }
 
@@ -718,34 +641,6 @@ fn scroll_row_into_view(list: &gtk::ListBox, scroll: &gtk::ScrolledWindow, row: 
     }
 }
 
-fn open_block_reason(row: &WorktreeRowView) -> Option<&'static str> {
-    if row.workspace_active {
-        Some("This worktree is already active")
-    } else if row.workspace_ambiguous {
-        Some("Multiple workspaces use this worktree; choose one from the side panel")
-    } else if row.operation_in_progress {
-        Some("A worktree operation is in progress")
-    } else if row.info.is_bare {
-        Some("Bare repositories cannot be opened as workspaces")
-    } else if row.info.prunable_reason.is_some() {
-        Some("This worktree checkout is unavailable")
-    } else {
-        None
-    }
-}
-
-fn open_action_label(row: &WorktreeRowView) -> &'static str {
-    if row.workspace_active {
-        "Active"
-    } else if row.info.is_bare || row.info.prunable_reason.is_some() {
-        "Unavailable"
-    } else if row.workspace_open {
-        "Switch"
-    } else {
-        "Open as Workspace"
-    }
-}
-
 fn branch_label(info: &WorktreeInfo) -> String {
     info.branch.clone().unwrap_or_else(|| {
         let short_head: String = info.head.chars().take(8).collect();
@@ -756,7 +651,7 @@ fn branch_label(info: &WorktreeInfo) -> String {
 fn badge_labels(info: &WorktreeInfo) -> Vec<String> {
     let mut labels = Vec::new();
     if info.is_current {
-        labels.push("Current".into());
+        labels.push("Activated".into());
     }
     if info.lock_reason.is_some() {
         labels.push("Locked".into());
@@ -961,10 +856,7 @@ mod tests {
         panel.select_index(1);
         assert_eq!(panel.selected_path(), Some(PathBuf::from("/repo/feature")));
         assert_eq!(panel.row_count(), 2);
-        assert_eq!(
-            panel.action_labels(1),
-            vec!["Open as Workspace", "Info", "Remove"]
-        );
+        assert_eq!(panel.action_labels(1), vec!["Info", "Remove"]);
 
         panel.set_rows(
             "repo",
@@ -1007,72 +899,24 @@ mod tests {
     #[gtk::test]
     fn action_sensitivity_and_tooltips_explain_disabled_buttons() {
         let panel = WorktreePanel::new();
-        let mut active = WorktreeRowView::available(info("/repo/active", "active"));
-        active.workspace_open = true;
-        active.workspace_active = true;
-        let mut opened = WorktreeRowView::available(info("/repo/opened", "opened"));
-        opened.workspace_open = true;
-        let mut ambiguous = WorktreeRowView::available(info("/repo/ambiguous", "ambiguous"));
-        ambiguous.workspace_open = true;
-        ambiguous.workspace_ambiguous = true;
-        let mut prunable = WorktreeRowView::available(info("/repo/prunable", "prunable"));
-        prunable.info.prunable_reason = Some("checkout is missing".into());
-        let mut bare = WorktreeRowView::available(info("/repo/bare", "bare"));
-        bare.info.is_bare = true;
         let mut blocked = WorktreeRowView::available(info("/repo/blocked", "blocked"));
         blocked.remove_block_reason = Some("Close the open workspace first".into());
         let mut busy = WorktreeRowView::available(info("/repo/busy", "busy"));
         busy.operation_in_progress = true;
-        panel.set_rows(
-            "repo",
-            vec![active, opened, ambiguous, prunable, bare, blocked, busy],
-        );
+        panel.set_rows("repo", vec![blocked, busy]);
 
-        let active_buttons = action_buttons(&panel, 0);
-        assert_eq!(active_buttons[0].label().as_deref(), Some("Active"));
-        assert!(!active_buttons[0].is_sensitive());
-        assert!(active_buttons[0].tooltip_text().is_some());
-        assert!(active_buttons[1].is_sensitive());
-        assert!(active_buttons[2].is_sensitive());
-
-        let opened_buttons = action_buttons(&panel, 1);
-        assert_eq!(opened_buttons[0].label().as_deref(), Some("Switch"));
-        assert!(opened_buttons[0].is_sensitive());
-        assert_eq!(
-            opened_buttons[0].tooltip_text().as_deref(),
-            Some("Switch to this worktree's workspace")
-        );
-
-        let ambiguous_buttons = action_buttons(&panel, 2);
-        assert_eq!(ambiguous_buttons[0].label().as_deref(), Some("Switch"));
-        assert!(!ambiguous_buttons[0].is_sensitive());
-
-        for index in [3, 4] {
-            let unavailable_buttons = action_buttons(&panel, index);
-            assert_eq!(
-                unavailable_buttons[0].label().as_deref(),
-                Some("Unavailable")
-            );
-            assert!(!unavailable_buttons[0].is_sensitive());
-        }
-
-        let blocked_buttons = action_buttons(&panel, 5);
-        assert_eq!(
-            blocked_buttons[0].label().as_deref(),
-            Some("Open as Workspace")
-        );
+        let blocked_buttons = action_buttons(&panel, 0);
         assert!(blocked_buttons[0].is_sensitive());
-        assert!(!blocked_buttons[2].is_sensitive());
+        assert!(!blocked_buttons[1].is_sensitive());
         assert_eq!(
-            blocked_buttons[2].tooltip_text().as_deref(),
+            blocked_buttons[1].tooltip_text().as_deref(),
             Some("Close the open workspace first")
         );
 
-        let busy_buttons = action_buttons(&panel, 6);
-        assert!(!busy_buttons[0].is_sensitive());
-        assert!(busy_buttons[1].is_sensitive());
-        assert!(!busy_buttons[2].is_sensitive());
-        assert!(busy_buttons[2].tooltip_text().is_some());
+        let busy_buttons = action_buttons(&panel, 1);
+        assert!(busy_buttons[0].is_sensitive());
+        assert!(!busy_buttons[1].is_sensitive());
+        assert!(busy_buttons[1].tooltip_text().is_some());
     }
 
     #[gtk::test]
@@ -1099,23 +943,19 @@ mod tests {
                 .unwrap()
                 .operation_in_progress
         );
-        assert!(action_buttons(&panel, 0)[2].is_sensitive());
-        assert!(!action_buttons(&panel, 1)[2].is_sensitive());
+        assert!(action_buttons(&panel, 0)[1].is_sensitive());
+        assert!(!action_buttons(&panel, 1)[1].is_sensitive());
     }
 
     #[gtk::test]
     fn disabled_actions_expose_reasons_to_assistive_technology() {
         let panel = WorktreePanel::new();
-        let mut active = WorktreeRowView::available(info("/repo/active", "active"));
-        active.workspace_active = true;
         let mut blocked = WorktreeRowView::available(info("/repo/blocked", "blocked"));
         blocked.remove_block_reason = Some("Close the open workspace first".into());
-        panel.set_rows("repo", vec![active, blocked]);
+        panel.set_rows("repo", vec![blocked]);
 
-        let active_buttons = action_buttons(&panel, 0);
-        assert_accessible_description(&active_buttons[0], "This worktree is already active");
-        let blocked_buttons = action_buttons(&panel, 1);
-        assert_accessible_description(&blocked_buttons[2], "Close the open workspace first");
+        let blocked_buttons = action_buttons(&panel, 0);
+        assert_accessible_description(&blocked_buttons[1], "Close the open workspace first");
     }
 
     #[gtk::test]
@@ -1129,7 +969,7 @@ mod tests {
         });
         assert_eq!(
             badge_labels(&row),
-            ["Current", "Locked", "Modified 5", "Untracked 4"]
+            ["Activated", "Locked", "Modified 5", "Untracked 4"]
         );
 
         row.is_current = false;
@@ -1145,16 +985,11 @@ mod tests {
             "repo",
             vec![WorktreeRowView::available(info("/repo/feature", "feature"))],
         );
-        let opened = Rc::new(RefCell::new(Vec::new()));
         let inspected = Rc::new(RefCell::new(Vec::new()));
         let removed = Rc::new(RefCell::new(Vec::new()));
         let refreshed = Rc::new(Cell::new(0));
         let closed = Rc::new(Cell::new(0));
 
-        {
-            let opened = opened.clone();
-            panel.connect_open(move |path| opened.borrow_mut().push(path));
-        }
         {
             let inspected = inspected.clone();
             panel.connect_info(move |path| inspected.borrow_mut().push(path));
@@ -1175,12 +1010,10 @@ mod tests {
         let buttons = action_buttons(&panel, 0);
         buttons[0].emit_clicked();
         buttons[1].emit_clicked();
-        buttons[2].emit_clicked();
         panel.refresh_button.emit_clicked();
         panel.close_button.emit_clicked();
 
         let expected = vec![PathBuf::from("/repo/feature")];
-        assert_eq!(*opened.borrow(), expected);
         assert_eq!(*inspected.borrow(), expected);
         assert_eq!(*removed.borrow(), expected);
         assert_eq!(refreshed.get(), 1);
@@ -1209,34 +1042,6 @@ mod tests {
         assert_eq!(panel.selected_path(), Some(PathBuf::from("/repo/b")));
         panel.handle_navigation_key(gdk::Key::Home);
         assert_eq!(panel.selected_path(), Some(PathBuf::from("/repo/a")));
-    }
-
-    #[gtk::test]
-    fn enter_does_not_open_a_disabled_selected_row() {
-        let panel = WorktreePanel::new();
-        let mut active = WorktreeRowView::available(info("/repo/active", "active"));
-        active.workspace_active = true;
-        let mut busy = WorktreeRowView::available(info("/repo/busy", "busy"));
-        busy.operation_in_progress = true;
-        let mut prunable = WorktreeRowView::available(info("/repo/prunable", "prunable"));
-        prunable.info.prunable_reason = Some("checkout is missing".into());
-        let mut ambiguous = WorktreeRowView::available(info("/repo/ambiguous", "ambiguous"));
-        ambiguous.workspace_ambiguous = true;
-        panel.set_rows("repo", vec![active, busy, prunable, ambiguous]);
-        let open_count = Rc::new(Cell::new(0));
-        {
-            let open_count = open_count.clone();
-            panel.connect_open(move |_| open_count.set(open_count.get() + 1));
-        }
-
-        for index in 0..4 {
-            panel.select_index(index);
-            assert_eq!(
-                panel.handle_key(gdk::Key::Return, gdk::ModifierType::empty()),
-                glib::Propagation::Stop
-            );
-        }
-        assert_eq!(open_count.get(), 0);
     }
 
     #[gtk::test]
@@ -1309,13 +1114,8 @@ mod tests {
             "repo",
             vec![WorktreeRowView::available(info("/repo/feature", "feature"))],
         );
-        let opened = Rc::new(RefCell::new(None));
         let focus_out = Rc::new(RefCell::new(None));
         let closed = Rc::new(Cell::new(false));
-        {
-            let opened = opened.clone();
-            panel.connect_open(move |path| *opened.borrow_mut() = Some(path));
-        }
         {
             let focus_out = focus_out.clone();
             panel.connect_focus_out(move |direction| *focus_out.borrow_mut() = Some(direction));
@@ -1327,26 +1127,21 @@ mod tests {
 
         assert_eq!(
             panel.handle_key(gdk::Key::Return, gdk::ModifierType::empty()),
-            glib::Propagation::Stop
+            glib::Propagation::Proceed
         );
-        assert_eq!(*opened.borrow(), Some(PathBuf::from("/repo/feature")));
 
-        *opened.borrow_mut() = None;
         assert_eq!(
             dispatch_key(
                 &panel.list,
                 &panel.scroll,
                 &panel.rows,
-                &panel.on_open,
                 &panel.on_close,
                 &panel.on_focus_out,
                 gdk::Key::Return,
                 gdk::ModifierType::empty(),
-                true,
             ),
             glib::Propagation::Proceed
         );
-        assert_eq!(*opened.borrow(), None);
 
         for (key, direction) in [
             (gdk::Key::Left, FocusDir::Left),

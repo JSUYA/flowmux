@@ -713,9 +713,6 @@ mod workspace_commands;
 mod workspace_presenter;
 mod worktrees;
 
-#[cfg(test)]
-use worktrees::same_existing_path;
-
 impl std::ops::Deref for WindowController {
     type Target = workspace_presenter::WorkspacePresenter;
 
@@ -1016,13 +1013,6 @@ impl WindowController {
             let bridge = worktree_bridge.clone();
             glib::MainContext::default().spawn_local(async move {
                 let _ = bridge.tx.send(GtkCommand::RefreshWorktrees).await;
-            });
-        });
-        let worktree_bridge = bridge.clone();
-        worktree_panel.connect_open(move |path| {
-            let bridge = worktree_bridge.clone();
-            glib::MainContext::default().spawn_local(async move {
-                let _ = bridge.tx.send(GtkCommand::OpenWorktree { path }).await;
             });
         });
         let worktree_bridge = bridge.clone();
@@ -1860,7 +1850,6 @@ impl WindowController {
                 self.dispatch_notification_command(command).await;
             }
             command @ (GtkCommand::WorkspaceCreated { .. }
-            | GtkCommand::WorkspaceGitInfoLoaded { .. }
             | GtkCommand::NewWorkspace { .. }
             | GtkCommand::RemoveWorkspace { .. }
             | GtkCommand::RemoveAllWorkspaces { .. }
@@ -1912,7 +1901,6 @@ impl WindowController {
             | GtkCommand::ToggleWorktreePanel { .. }
             | GtkCommand::RefreshWorktrees
             | GtkCommand::WorktreesLoaded { .. }
-            | GtkCommand::OpenWorktree { .. }
             | GtkCommand::ShowWorktreeInfo { .. }
             | GtkCommand::RemoveWorktree { .. }
             | GtkCommand::WorktreeRemovalFinished { .. }
@@ -4193,12 +4181,6 @@ mod tests {
         assert_eq!(file_browser_return_pane(Some(focused), None), Some(focused));
     }
 
-    #[test]
-    fn normalized_paths_match_dot_segments_without_requiring_utf8() {
-        let root = tempfile::tempdir().unwrap();
-        assert!(same_existing_path(&root.path().join("."), root.path()));
-    }
-
     fn sample_worktree_list(root: &str) -> WorktreeList {
         let root = PathBuf::from(root);
         WorktreeList {
@@ -4218,134 +4200,6 @@ mod tests {
                 prunable_reason: None,
             }],
         }
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    #[gtk::test]
-    async fn open_worktree_activates_matching_workspace_without_duplication() {
-        let (controller, first, _pane) =
-            build_single_workspace_controller("com.flowmux.App.UiTest.WorktreeOpenExisting").await;
-        let target = tempfile::tempdir().unwrap();
-        let second = controller
-            .store
-            .create_workspace(Some("target".into()), target.path().to_path_buf())
-            .await;
-        let workspace = controller.store.get_workspace(second).await.unwrap();
-        controller.render_workspace_with_activation(&workspace, false);
-
-        controller
-            .open_worktree_workspace(target.path().to_path_buf())
-            .await;
-
-        assert_eq!(controller.store.list_workspaces().await.len(), 2);
-        assert_eq!(
-            controller.store.snapshot().await.active_workspace,
-            Some(second)
-        );
-        assert_ne!(first, second);
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    #[gtk::test]
-    async fn open_worktree_creates_workspace_at_exact_path() {
-        let (controller, _first, _pane) =
-            build_single_workspace_controller("com.flowmux.App.UiTest.WorktreeOpenNew").await;
-        let target = tempfile::tempdir().unwrap();
-        controller
-            .open_worktree_workspace(target.path().to_path_buf())
-            .await;
-        let matching: Vec<_> = controller
-            .store
-            .ordered_workspaces()
-            .await
-            .into_iter()
-            .filter(|workspace| same_existing_path(&workspace.root_dir, target.path()))
-            .collect();
-        assert_eq!(matching.len(), 1);
-        assert_eq!(
-            controller.store.snapshot().await.active_workspace,
-            Some(matching[0].id)
-        );
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    #[gtk::test]
-    async fn open_worktree_rejects_an_unavailable_checkout() {
-        let (controller, first, _pane) =
-            build_single_workspace_controller("com.flowmux.App.UiTest.WorktreeOpenMissing").await;
-        let missing = tempfile::tempdir().unwrap().path().join("missing");
-
-        controller.open_worktree_workspace(missing).await;
-
-        assert_eq!(controller.store.list_workspaces().await.len(), 1);
-        assert_eq!(
-            controller.store.snapshot().await.active_workspace,
-            Some(first)
-        );
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    #[gtk::test]
-    async fn active_duplicate_worktree_workspace_is_not_switched_away() {
-        let (controller, _first, _pane) =
-            build_single_workspace_controller("com.flowmux.App.UiTest.WorktreeOpenActiveDuplicate")
-                .await;
-        let target = tempfile::tempdir().unwrap();
-        let _older = controller
-            .store
-            .create_workspace(Some("older".into()), target.path().to_path_buf())
-            .await;
-        let active = controller
-            .store
-            .create_workspace(Some("active".into()), target.path().to_path_buf())
-            .await;
-        controller.store.set_active_workspace(Some(active)).await;
-
-        let rows = controller
-            .annotate_worktree_rows(&sample_worktree_list(target.path().to_str().unwrap()))
-            .await;
-        controller
-            .open_worktree_workspace(target.path().to_path_buf())
-            .await;
-
-        assert!(rows[0].workspace_active);
-        assert!(rows[0].workspace_ambiguous);
-        assert_eq!(
-            controller.store.snapshot().await.active_workspace,
-            Some(active)
-        );
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    #[gtk::test]
-    async fn loaded_git_info_updates_the_workspace_and_side_panel() {
-        let (controller, workspace, _pane) =
-            build_single_workspace_controller("com.flowmux.App.UiTest.WorktreeGitInfo").await;
-        let info = flowmux_core::GitInfo {
-            branch: "feature".into(),
-            remote_url: Some("https://example.invalid/repo.git".into()),
-            linked_pr: Some(flowmux_core::LinkedPr {
-                number: 42,
-                state: flowmux_core::PrState::Open,
-                url: "https://example.invalid/pr/42".into(),
-            }),
-        };
-
-        controller
-            .dispatch(GtkCommand::WorkspaceGitInfoLoaded { workspace, info })
-            .await;
-
-        assert_eq!(
-            controller
-                .store
-                .get_workspace(workspace)
-                .await
-                .and_then(|workspace| workspace.git)
-                .and_then(|git| git.linked_pr)
-                .map(|pr| pr.number),
-            Some(42)
-        );
-        assert!(controller.sidebar.workspace_row_contains(workspace, "#42"));
     }
 
     #[cfg(not(target_os = "macos"))]

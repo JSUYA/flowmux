@@ -303,13 +303,6 @@ pub enum GtkCommand {
         result:
             Result<flowmux_vcs::worktree::WorktreeList, flowmux_vcs::worktree::WorktreeListError>,
     },
-    /// Open a worktree in a new workspace or activate its existing workspace.
-    OpenWorktree { path: PathBuf },
-    /// Apply background Git enrichment to a workspace and its side-panel row.
-    WorkspaceGitInfoLoaded {
-        workspace: WorkspaceId,
-        info: flowmux_core::GitInfo,
-    },
     /// Show cached Git and workspace details for a worktree.
     ShowWorktreeInfo { path: PathBuf },
     /// Confirm and remove a worktree checkout while retaining its branch.

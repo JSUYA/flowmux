@@ -12,12 +12,6 @@ use std::path::Path;
 /// git or a bug should ever reach it.
 const WORKTREE_LIST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-pub(super) fn same_existing_path(left: &Path, right: &Path) -> bool {
-    let left = std::fs::canonicalize(left).unwrap_or_else(|_| left.to_path_buf());
-    let right = std::fs::canonicalize(right).unwrap_or_else(|_| right.to_path_buf());
-    left == right
-}
-
 fn path_is_within(path: &Path, root: &Path) -> bool {
     let path = normalized_existing_path(path);
     let root = normalized_existing_path(root);
@@ -203,16 +197,8 @@ fn worktree_info_body(row: &WorktreeRowView) -> String {
     };
     let locked = row.info.lock_reason.as_deref().unwrap_or("No");
     let prunable = row.info.prunable_reason.as_deref().unwrap_or("No");
-    let workspace = if row.workspace_active {
-        "Active"
-    } else if row.workspace_open {
-        "Open"
-    } else {
-        "Not open"
-    };
-
     format!(
-        "Path: {}\nHEAD: {head}\nCommit: {commit}\nCommitted: {committed}\nChanges: {changes}\nLocked: {locked}\nPrunable: {prunable}\nWorkspace: {workspace}",
+        "Path: {}\nHEAD: {head}\nCommit: {commit}\nCommitted: {committed}\nChanges: {changes}\nLocked: {locked}\nPrunable: {prunable}",
         row.info.path.display()
     )
 }
@@ -551,23 +537,13 @@ impl WindowController {
         }
     }
 
-    pub(super) async fn annotate_worktree_rows(&self, list: &WorktreeList) -> Vec<WorktreeRowView> {
+    async fn annotate_worktree_rows(&self, list: &WorktreeList) -> Vec<WorktreeRowView> {
         let snapshot = self.store.snapshot().await;
         let removals_in_progress = self.worktrees.removals_in_progress.borrow().clone();
         list.items
             .iter()
             .cloned()
             .map(|info| {
-                let matching_count = snapshot
-                    .workspaces
-                    .iter()
-                    .filter(|workspace| same_existing_path(&workspace.root_dir, &info.path))
-                    .count();
-                let workspace_open = matching_count > 0;
-                let workspace_active = snapshot.workspaces.iter().any(|workspace| {
-                    Some(workspace.id) == snapshot.active_workspace
-                        && same_existing_path(&workspace.root_dir, &info.path)
-                });
                 let remove_block_reason = remove_block_reason(
                     &info,
                     self.worktree_in_use(&info.path, &snapshot.workspaces),
@@ -576,9 +552,6 @@ impl WindowController {
                     removals_in_progress.contains(&normalized_existing_path(&info.path));
                 WorktreeRowView {
                     info,
-                    workspace_open,
-                    workspace_active,
-                    workspace_ambiguous: matching_count > 1,
                     remove_block_reason,
                     operation_in_progress,
                 }
@@ -594,79 +567,6 @@ impl WindowController {
         if let Some(pane) = self.focused_pane.get() {
             self.worktrees.source_pane.set(Some(pane));
             self.refresh_worktrees(false).await;
-        }
-    }
-
-    pub(super) async fn open_worktree_workspace(&self, path: PathBuf) {
-        let path = normalized_existing_path(&path);
-        let listed_unavailable = self
-            .worktrees
-            .panel
-            .row_for_path(&path)
-            .is_some_and(|row| row.info.is_bare || row.info.prunable_reason.is_some());
-        if listed_unavailable || !path.is_dir() {
-            self.show_worktree_alert(
-                "Unable to open worktree",
-                "The worktree checkout is unavailable. Refresh the list and repair or prune it in Git.",
-            );
-            self.reannotate_visible_worktrees().await;
-            return;
-        }
-
-        let snapshot = self.store.snapshot().await;
-        if snapshot.workspaces.iter().any(|workspace| {
-            Some(workspace.id) == snapshot.active_workspace
-                && same_existing_path(&workspace.root_dir, &path)
-        }) {
-            self.reannotate_visible_worktrees().await;
-            return;
-        }
-
-        let matching: Vec<_> = self
-            .store
-            .ordered_workspaces()
-            .await
-            .into_iter()
-            .filter(|workspace| same_existing_path(&workspace.root_dir, &path))
-            .collect();
-        if matching.len() > 1 {
-            self.show_worktree_alert(
-                "Unable to switch workspace",
-                "Multiple workspaces use this worktree. Choose one from the side panel.",
-            );
-            self.reannotate_visible_worktrees().await;
-            return;
-        }
-
-        if let Some(existing) = matching.first() {
-            self.activate_workspace(existing.id).await;
-        } else {
-            let id = self.store.create_workspace(None, path.clone()).await;
-            if let Some(workspace) = self.store.get_workspace(id).await {
-                self.render_workspace_with_activation(&workspace, false);
-            }
-            self.activate_workspace(id).await;
-            let bridge = self.bridge.clone();
-            if let Some(handle) = self.worktrees.tokio_handle.clone() {
-                handle.spawn(async move {
-                    if let Ok(Some(info)) = flowmux_vcs::inspect(&path).await {
-                        let _ = bridge
-                            .tx
-                            .send(GtkCommand::WorkspaceGitInfoLoaded {
-                                workspace: id,
-                                info,
-                            })
-                            .await;
-                    }
-                });
-            }
-        }
-        self.reannotate_visible_worktrees().await;
-    }
-
-    async fn reannotate_visible_worktrees(&self) {
-        if self.worktrees.panel.is_open() {
-            self.refresh_worktrees(true).await;
         }
     }
 }
@@ -830,9 +730,6 @@ mod tests {
         });
         let row = WorktreeRowView {
             info,
-            workspace_open: true,
-            workspace_active: false,
-            workspace_ambiguous: false,
             remove_block_reason: None,
             operation_in_progress: false,
         };
@@ -847,6 +744,6 @@ mod tests {
         assert_eq!(lines[4], "Changes: staged 1, unstaged 2, untracked 3");
         assert_eq!(lines[5], "Locked: No");
         assert_eq!(lines[6], "Prunable: No");
-        assert_eq!(lines[7], "Workspace: Open");
+        assert_eq!(lines.len(), 7);
     }
 }

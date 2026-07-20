@@ -49,8 +49,7 @@ keyboard.
 ## File and worktree views
 
 Open the **Files** and **Worktrees** sidebars to browse the current repository,
-inspect Git worktree status, and open or remove worktrees without leaving the
-terminal.
+inspect Git worktree status, and remove worktrees without leaving the terminal.
 
 ![file and worktree views](resources/screenshot/usage_fileview_worktreeview.gif)
 
@@ -84,9 +83,9 @@ scrollable preview.
 ## File and worktree views
 
 Open the Files and Worktrees sidebars to browse the current repository,
-inspect Git worktree status, and open or remove worktrees without leaving the
-terminal. Open the AI Usage popover from the workspace controls to review
-current agent token and activity totals without interrupting running sessions.
+inspect Git worktree status, and remove worktrees without leaving the terminal.
+Open the AI Usage popover from the workspace controls to review current agent
+token and activity totals without interrupting running sessions.
 
 ## Features
 

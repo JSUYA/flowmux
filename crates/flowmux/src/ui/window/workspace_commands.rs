@@ -21,12 +21,6 @@ impl WindowController {
                 }
                 let _ = ack.send(());
             }
-            GtkCommand::WorkspaceGitInfoLoaded { workspace, info } => {
-                self.store.replace_git_info(workspace, Some(info)).await;
-                if let Some(workspace) = self.store.get_workspace(workspace).await {
-                    self.sidebar.upsert(&workspace);
-                }
-            }
             GtkCommand::NewWorkspace { root } => {
                 // Prefer the focused pane's cwd so a new tab opens
                 // where the user was working, falling back to the
