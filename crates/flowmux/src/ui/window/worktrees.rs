@@ -551,20 +551,23 @@ impl WindowController {
         }
     }
 
-    async fn annotate_worktree_rows(&self, list: &WorktreeList) -> Vec<WorktreeRowView> {
+    pub(super) async fn annotate_worktree_rows(&self, list: &WorktreeList) -> Vec<WorktreeRowView> {
         let snapshot = self.store.snapshot().await;
         let removals_in_progress = self.worktrees.removals_in_progress.borrow().clone();
         list.items
             .iter()
             .cloned()
             .map(|info| {
-                let matching = snapshot
+                let matching_count = snapshot
                     .workspaces
                     .iter()
-                    .find(|workspace| same_existing_path(&workspace.root_dir, &info.path));
-                let workspace_open = matching.is_some();
-                let workspace_active = matching
-                    .is_some_and(|workspace| Some(workspace.id) == snapshot.active_workspace);
+                    .filter(|workspace| same_existing_path(&workspace.root_dir, &info.path))
+                    .count();
+                let workspace_open = matching_count > 0;
+                let workspace_active = snapshot.workspaces.iter().any(|workspace| {
+                    Some(workspace.id) == snapshot.active_workspace
+                        && same_existing_path(&workspace.root_dir, &info.path)
+                });
                 let remove_block_reason = remove_block_reason(
                     &info,
                     self.worktree_in_use(&info.path, &snapshot.workspaces),
@@ -575,6 +578,7 @@ impl WindowController {
                     info,
                     workspace_open,
                     workspace_active,
+                    workspace_ambiguous: matching_count > 1,
                     remove_block_reason,
                     operation_in_progress,
                 }
@@ -594,13 +598,47 @@ impl WindowController {
     }
 
     pub(super) async fn open_worktree_workspace(&self, path: PathBuf) {
-        if let Some(existing) = self
+        let path = normalized_existing_path(&path);
+        let listed_unavailable = self
+            .worktrees
+            .panel
+            .row_for_path(&path)
+            .is_some_and(|row| row.info.is_bare || row.info.prunable_reason.is_some());
+        if listed_unavailable || !path.is_dir() {
+            self.show_worktree_alert(
+                "Unable to open worktree",
+                "The worktree checkout is unavailable. Refresh the list and repair or prune it in Git.",
+            );
+            self.reannotate_visible_worktrees().await;
+            return;
+        }
+
+        let snapshot = self.store.snapshot().await;
+        if snapshot.workspaces.iter().any(|workspace| {
+            Some(workspace.id) == snapshot.active_workspace
+                && same_existing_path(&workspace.root_dir, &path)
+        }) {
+            self.reannotate_visible_worktrees().await;
+            return;
+        }
+
+        let matching: Vec<_> = self
             .store
             .ordered_workspaces()
             .await
             .into_iter()
-            .find(|workspace| same_existing_path(&workspace.root_dir, &path))
-        {
+            .filter(|workspace| same_existing_path(&workspace.root_dir, &path))
+            .collect();
+        if matching.len() > 1 {
+            self.show_worktree_alert(
+                "Unable to switch workspace",
+                "Multiple workspaces use this worktree. Choose one from the side panel.",
+            );
+            self.reannotate_visible_worktrees().await;
+            return;
+        }
+
+        if let Some(existing) = matching.first() {
             self.activate_workspace(existing.id).await;
         } else {
             let id = self.store.create_workspace(None, path.clone()).await;
@@ -794,6 +832,7 @@ mod tests {
             info,
             workspace_open: true,
             workspace_active: false,
+            workspace_ambiguous: false,
             remove_block_reason: None,
             operation_in_progress: false,
         };

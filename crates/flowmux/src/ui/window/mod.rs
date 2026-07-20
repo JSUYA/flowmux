@@ -4270,6 +4270,54 @@ mod tests {
 
     #[cfg(not(target_os = "macos"))]
     #[gtk::test]
+    async fn open_worktree_rejects_an_unavailable_checkout() {
+        let (controller, first, _pane) =
+            build_single_workspace_controller("com.flowmux.App.UiTest.WorktreeOpenMissing").await;
+        let missing = tempfile::tempdir().unwrap().path().join("missing");
+
+        controller.open_worktree_workspace(missing).await;
+
+        assert_eq!(controller.store.list_workspaces().await.len(), 1);
+        assert_eq!(
+            controller.store.snapshot().await.active_workspace,
+            Some(first)
+        );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[gtk::test]
+    async fn active_duplicate_worktree_workspace_is_not_switched_away() {
+        let (controller, _first, _pane) =
+            build_single_workspace_controller("com.flowmux.App.UiTest.WorktreeOpenActiveDuplicate")
+                .await;
+        let target = tempfile::tempdir().unwrap();
+        let _older = controller
+            .store
+            .create_workspace(Some("older".into()), target.path().to_path_buf())
+            .await;
+        let active = controller
+            .store
+            .create_workspace(Some("active".into()), target.path().to_path_buf())
+            .await;
+        controller.store.set_active_workspace(Some(active)).await;
+
+        let rows = controller
+            .annotate_worktree_rows(&sample_worktree_list(target.path().to_str().unwrap()))
+            .await;
+        controller
+            .open_worktree_workspace(target.path().to_path_buf())
+            .await;
+
+        assert!(rows[0].workspace_active);
+        assert!(rows[0].workspace_ambiguous);
+        assert_eq!(
+            controller.store.snapshot().await.active_workspace,
+            Some(active)
+        );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[gtk::test]
     async fn loaded_git_info_updates_the_workspace_and_side_panel() {
         let (controller, workspace, _pane) =
             build_single_workspace_controller("com.flowmux.App.UiTest.WorktreeGitInfo").await;

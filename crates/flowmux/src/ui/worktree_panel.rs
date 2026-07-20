@@ -15,6 +15,7 @@ pub struct WorktreeRowView {
     pub info: WorktreeInfo,
     pub workspace_open: bool,
     pub workspace_active: bool,
+    pub workspace_ambiguous: bool,
     pub remove_block_reason: Option<String>,
     pub operation_in_progress: bool,
 }
@@ -25,6 +26,7 @@ impl WorktreeRowView {
             info,
             workspace_open: false,
             workspace_active: false,
+            workspace_ambiguous: false,
             remove_block_reason: None,
             operation_in_progress: false,
         }
@@ -390,13 +392,17 @@ impl WorktreePanel {
 
         let actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         actions.set_halign(gtk::Align::End);
-        let open = gtk::Button::with_label("Open");
+        let open = gtk::Button::with_label(open_action_label(row));
         let info = gtk::Button::with_label("Info");
         let remove = gtk::Button::with_label("Remove");
 
         let open_block_reason = open_block_reason(row);
         open.set_sensitive(open_block_reason.is_none());
-        open.set_tooltip_text(Some(open_block_reason.unwrap_or("Open worktree")));
+        open.set_tooltip_text(Some(open_block_reason.unwrap_or(if row.workspace_open {
+            "Switch to this worktree's workspace"
+        } else {
+            "Open worktree in a new workspace"
+        })));
         if let Some(reason) = open_block_reason {
             open.update_property(&[gtk::accessible::Property::Description(reason)]);
         }
@@ -715,10 +721,28 @@ fn scroll_row_into_view(list: &gtk::ListBox, scroll: &gtk::ScrolledWindow, row: 
 fn open_block_reason(row: &WorktreeRowView) -> Option<&'static str> {
     if row.workspace_active {
         Some("This worktree is already active")
+    } else if row.workspace_ambiguous {
+        Some("Multiple workspaces use this worktree; choose one from the side panel")
     } else if row.operation_in_progress {
         Some("A worktree operation is in progress")
+    } else if row.info.is_bare {
+        Some("Bare repositories cannot be opened as workspaces")
+    } else if row.info.prunable_reason.is_some() {
+        Some("This worktree checkout is unavailable")
     } else {
         None
+    }
+}
+
+fn open_action_label(row: &WorktreeRowView) -> &'static str {
+    if row.workspace_active {
+        "Active"
+    } else if row.info.is_bare || row.info.prunable_reason.is_some() {
+        "Unavailable"
+    } else if row.workspace_open {
+        "Switch"
+    } else {
+        "Open as Workspace"
     }
 }
 
@@ -937,7 +961,10 @@ mod tests {
         panel.select_index(1);
         assert_eq!(panel.selected_path(), Some(PathBuf::from("/repo/feature")));
         assert_eq!(panel.row_count(), 2);
-        assert_eq!(panel.action_labels(1), vec!["Open", "Info", "Remove"]);
+        assert_eq!(
+            panel.action_labels(1),
+            vec!["Open as Workspace", "Info", "Remove"]
+        );
 
         panel.set_rows(
             "repo",
@@ -981,20 +1008,59 @@ mod tests {
     fn action_sensitivity_and_tooltips_explain_disabled_buttons() {
         let panel = WorktreePanel::new();
         let mut active = WorktreeRowView::available(info("/repo/active", "active"));
+        active.workspace_open = true;
         active.workspace_active = true;
+        let mut opened = WorktreeRowView::available(info("/repo/opened", "opened"));
+        opened.workspace_open = true;
+        let mut ambiguous = WorktreeRowView::available(info("/repo/ambiguous", "ambiguous"));
+        ambiguous.workspace_open = true;
+        ambiguous.workspace_ambiguous = true;
+        let mut prunable = WorktreeRowView::available(info("/repo/prunable", "prunable"));
+        prunable.info.prunable_reason = Some("checkout is missing".into());
+        let mut bare = WorktreeRowView::available(info("/repo/bare", "bare"));
+        bare.info.is_bare = true;
         let mut blocked = WorktreeRowView::available(info("/repo/blocked", "blocked"));
         blocked.remove_block_reason = Some("Close the open workspace first".into());
         let mut busy = WorktreeRowView::available(info("/repo/busy", "busy"));
         busy.operation_in_progress = true;
-        panel.set_rows("repo", vec![active, blocked, busy]);
+        panel.set_rows(
+            "repo",
+            vec![active, opened, ambiguous, prunable, bare, blocked, busy],
+        );
 
         let active_buttons = action_buttons(&panel, 0);
+        assert_eq!(active_buttons[0].label().as_deref(), Some("Active"));
         assert!(!active_buttons[0].is_sensitive());
         assert!(active_buttons[0].tooltip_text().is_some());
         assert!(active_buttons[1].is_sensitive());
         assert!(active_buttons[2].is_sensitive());
 
-        let blocked_buttons = action_buttons(&panel, 1);
+        let opened_buttons = action_buttons(&panel, 1);
+        assert_eq!(opened_buttons[0].label().as_deref(), Some("Switch"));
+        assert!(opened_buttons[0].is_sensitive());
+        assert_eq!(
+            opened_buttons[0].tooltip_text().as_deref(),
+            Some("Switch to this worktree's workspace")
+        );
+
+        let ambiguous_buttons = action_buttons(&panel, 2);
+        assert_eq!(ambiguous_buttons[0].label().as_deref(), Some("Switch"));
+        assert!(!ambiguous_buttons[0].is_sensitive());
+
+        for index in [3, 4] {
+            let unavailable_buttons = action_buttons(&panel, index);
+            assert_eq!(
+                unavailable_buttons[0].label().as_deref(),
+                Some("Unavailable")
+            );
+            assert!(!unavailable_buttons[0].is_sensitive());
+        }
+
+        let blocked_buttons = action_buttons(&panel, 5);
+        assert_eq!(
+            blocked_buttons[0].label().as_deref(),
+            Some("Open as Workspace")
+        );
         assert!(blocked_buttons[0].is_sensitive());
         assert!(!blocked_buttons[2].is_sensitive());
         assert_eq!(
@@ -1002,7 +1068,7 @@ mod tests {
             Some("Close the open workspace first")
         );
 
-        let busy_buttons = action_buttons(&panel, 2);
+        let busy_buttons = action_buttons(&panel, 6);
         assert!(!busy_buttons[0].is_sensitive());
         assert!(busy_buttons[1].is_sensitive());
         assert!(!busy_buttons[2].is_sensitive());
@@ -1152,14 +1218,18 @@ mod tests {
         active.workspace_active = true;
         let mut busy = WorktreeRowView::available(info("/repo/busy", "busy"));
         busy.operation_in_progress = true;
-        panel.set_rows("repo", vec![active, busy]);
+        let mut prunable = WorktreeRowView::available(info("/repo/prunable", "prunable"));
+        prunable.info.prunable_reason = Some("checkout is missing".into());
+        let mut ambiguous = WorktreeRowView::available(info("/repo/ambiguous", "ambiguous"));
+        ambiguous.workspace_ambiguous = true;
+        panel.set_rows("repo", vec![active, busy, prunable, ambiguous]);
         let open_count = Rc::new(Cell::new(0));
         {
             let open_count = open_count.clone();
             panel.connect_open(move |_| open_count.set(open_count.get() + 1));
         }
 
-        for index in 0..2 {
+        for index in 0..4 {
             panel.select_index(index);
             assert_eq!(
                 panel.handle_key(gdk::Key::Return, gdk::ModifierType::empty()),
