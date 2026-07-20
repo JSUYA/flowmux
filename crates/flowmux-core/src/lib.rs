@@ -318,6 +318,8 @@ pub struct EditorSessionState {
     pub open_files: Vec<EditorFileState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_file: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zoom_percent: Option<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

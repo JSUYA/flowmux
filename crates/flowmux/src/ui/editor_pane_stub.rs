@@ -66,8 +66,6 @@ impl EditorPane {
 
     pub fn apply_appearance(&self, _appearance: EditorAppearance) {}
 
-    pub fn set_zoom_level(&self, _zoom: f64) {}
-
     pub fn copy_selection(&self) {}
 
     pub fn paste_clipboard(&self) {}

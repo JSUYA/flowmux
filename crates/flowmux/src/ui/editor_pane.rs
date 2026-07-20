@@ -7,10 +7,11 @@ use flowmux_editor::{
     search_workspace, EditorFileSessionState, EditorFocusDirection, EditorMessage,
     EditorNativeEditAction, EditorSession, EditorSessionSnapshot, EditorViewState, HostMessage,
     ProtocolError, RecoveryOperation, RecoveryStore, SearchCancellation, SearchOptions,
-    WorkspaceSearchResult,
+    WorkspaceSearchResult, EDITOR_ZOOM_DEFAULT, EDITOR_ZOOM_MAX, EDITOR_ZOOM_MIN,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
@@ -19,6 +20,7 @@ use std::time::Duration;
 
 const RECOVERY_DEBOUNCE: Duration = Duration::from_millis(350);
 const QUICK_OPEN_LIMIT: usize = 2_000;
+const LAST_EDITOR_ZOOM_FILE: &str = "editor-zoom-percent";
 
 #[cfg(target_os = "macos")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -103,6 +105,7 @@ pub(super) struct EditorBridgeDispatch {
     pub focus_direction: Option<EditorFocusDirection>,
     pub native_edit_action: Option<EditorNativeEditAction>,
     pub native_edit_text: Option<String>,
+    pub zoom_percent: Option<u16>,
 }
 
 pub(super) struct EditorBridgeState {
@@ -189,6 +192,7 @@ impl EditorBridgeState {
 pub(super) struct EditorHostState {
     workspace_root: PathBuf,
     session: RefCell<Result<EditorSession, String>>,
+    zoom_percent: Cell<u16>,
     startup_messages: RefCell<Vec<HostMessage>>,
     recovery_sender: Option<Sender<RecoveryOperation>>,
     recovery_worker: Option<JoinHandle<()>>,
@@ -200,6 +204,10 @@ pub(super) struct EditorHostState {
 
 impl EditorHostState {
     pub(super) fn new(workspace_root: &Path, restored: EditorSessionState) -> Self {
+        let zoom_percent = restored
+            .zoom_percent
+            .map(clamp_editor_zoom)
+            .unwrap_or_else(load_last_editor_zoom);
         let recovery_store = flowmux_config::paths::state_dir().and_then(|state_root| {
             match RecoveryStore::new(state_root, workspace_root) {
                 Ok(store) => Some(store),
@@ -251,6 +259,7 @@ impl EditorHostState {
         let host = Self {
             workspace_root: workspace_root.to_path_buf(),
             session: RefCell::new(session),
+            zoom_percent: Cell::new(zoom_percent),
             startup_messages: RefCell::new(startup_messages),
             recovery_sender,
             recovery_worker,
@@ -265,11 +274,12 @@ impl EditorHostState {
 
     pub(super) fn initialize_message(&self, workspace_name: String) -> HostMessage {
         match &*self.session.borrow() {
-            Ok(session) => session.initialize_message(workspace_name),
+            Ok(session) => session.initialize_message(workspace_name, self.zoom_percent.get()),
             Err(_) => HostMessage::InitializeEditor {
                 workspace_name,
                 documents: Vec::new(),
                 active_document_id: None,
+                zoom_percent: self.zoom_percent.get(),
             },
         }
     }
@@ -290,8 +300,22 @@ impl EditorHostState {
 
     pub(super) fn session_state(&self) -> EditorSessionState {
         match &*self.session.borrow() {
-            Ok(session) => core_session_state(session.session_snapshot()),
-            Err(_) => EditorSessionState::default(),
+            Ok(session) => core_session_state(session.session_snapshot(), self.zoom_percent.get()),
+            Err(_) => EditorSessionState {
+                zoom_percent: Some(self.zoom_percent.get()),
+                ..Default::default()
+            },
+        }
+    }
+
+    pub(super) fn zoom_factor(&self) -> f64 {
+        self.zoom_percent.get() as f64 / 100.0
+    }
+
+    fn set_zoom_percent(&self, zoom_percent: u16) {
+        self.zoom_percent.set(clamp_editor_zoom(zoom_percent));
+        if let Err(error) = save_last_editor_zoom(zoom_percent) {
+            tracing::warn!(%error, "failed to persist the editor zoom default");
         }
     }
 
@@ -748,8 +772,15 @@ pub(super) fn handle_bridge_message(
     let mut focus_direction = None;
     let mut native_edit_action = None;
     let mut native_edit_text = None;
+    let mut zoom_percent = None;
     if let Some(message) = received.message {
         match message {
+            EditorMessage::ZoomChanged {
+                zoom_percent: changed,
+            } => {
+                host.set_zoom_percent(changed);
+                zoom_percent = Some(changed);
+            }
             EditorMessage::FocusDirectionRequested { direction } => {
                 focus_direction = Some(direction);
             }
@@ -770,6 +801,7 @@ pub(super) fn handle_bridge_message(
         focus_direction,
         native_edit_action,
         native_edit_text,
+        zoom_percent,
     }
 }
 
@@ -812,7 +844,7 @@ fn start_recovery_worker(
     }
 }
 
-fn core_session_state(snapshot: EditorSessionSnapshot) -> EditorSessionState {
+fn core_session_state(snapshot: EditorSessionSnapshot, zoom_percent: u16) -> EditorSessionState {
     EditorSessionState {
         open_files: snapshot
             .open_files
@@ -835,7 +867,40 @@ fn core_session_state(snapshot: EditorSessionSnapshot) -> EditorSessionState {
             )
             .collect(),
         active_file: snapshot.active_file,
+        zoom_percent: Some(zoom_percent),
     }
+}
+
+fn clamp_editor_zoom(zoom_percent: u16) -> u16 {
+    zoom_percent.clamp(EDITOR_ZOOM_MIN, EDITOR_ZOOM_MAX)
+}
+
+fn load_last_editor_zoom() -> u16 {
+    flowmux_config::paths::state_dir()
+        .map(|dir| load_editor_zoom(&dir.join(LAST_EDITOR_ZOOM_FILE)))
+        .unwrap_or(EDITOR_ZOOM_DEFAULT)
+}
+
+fn load_editor_zoom(path: &Path) -> u16 {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+        .map(clamp_editor_zoom)
+        .unwrap_or(EDITOR_ZOOM_DEFAULT)
+}
+
+fn save_last_editor_zoom(zoom_percent: u16) -> std::io::Result<()> {
+    let Some(dir) = flowmux_config::paths::state_dir() else {
+        return Ok(());
+    };
+    save_editor_zoom(&dir.join(LAST_EDITOR_ZOOM_FILE), zoom_percent)
+}
+
+fn save_editor_zoom(path: &Path, zoom_percent: u16) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, clamp_editor_zoom(zoom_percent).to_string())
 }
 
 pub(super) fn is_allowed_editor_navigation(url: &str, allowed_prefix: &str) -> bool {
@@ -950,6 +1015,7 @@ mod tests {
                 workspace_name: "다국어".into(),
                 documents: Vec::new(),
                 active_document_id: None,
+                zoom_percent: 100,
             })
             .unwrap()
             .is_none());
@@ -1027,6 +1093,39 @@ mod tests {
         );
         assert_eq!(dispatch.native_edit_text.as_deref(), Some("선택한 text"));
         assert!(dispatch.scripts.is_empty());
+    }
+
+    #[test]
+    fn editor_zoom_persists_as_the_next_editor_default() {
+        let state = tempfile::tempdir().unwrap();
+        let path = state.path().join(LAST_EDITOR_ZOOM_FILE);
+
+        save_editor_zoom(&path, 140).unwrap();
+        assert_eq!(load_editor_zoom(&path), 140);
+        fs::write(&path, "invalid").unwrap();
+        assert_eq!(load_editor_zoom(&path), EDITOR_ZOOM_DEFAULT);
+    }
+
+    #[test]
+    fn restored_editors_keep_independent_zoom_values() {
+        let workspace = tempfile::tempdir().unwrap();
+        let first = EditorHostState::new(
+            workspace.path(),
+            EditorSessionState {
+                zoom_percent: Some(80),
+                ..Default::default()
+            },
+        );
+        let second = EditorHostState::new(
+            workspace.path(),
+            EditorSessionState {
+                zoom_percent: Some(150),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(first.session_state().zoom_percent, Some(80));
+        assert_eq!(second.session_state().zoom_percent, Some(150));
     }
 
     #[test]

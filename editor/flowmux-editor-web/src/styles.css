@@ -55,6 +55,26 @@ body {
   color: var(--danger);
 }
 
+.zoom-toast {
+  position: absolute;
+  z-index: 4;
+  left: 50%;
+  bottom: 24px;
+  padding: 7px 12px;
+  border: 1px solid color-mix(in srgb, var(--muted) 35%, transparent);
+  border-radius: 999px;
+  color: var(--text);
+  background: color-mix(in srgb, var(--panel) 96%, transparent);
+  box-shadow: 0 5px 20px rgb(0 0 0 / 30%);
+  font-weight: 600;
+  pointer-events: none;
+  transform: translateX(-50%);
+}
+
+.zoom-toast[hidden] {
+  display: none;
+}
+
 .conflict-banner {
   position: absolute;
   z-index: 3;

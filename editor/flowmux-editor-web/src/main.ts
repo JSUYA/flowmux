@@ -14,7 +14,12 @@ import {
   monacoKeybinding,
   type EditorActionRunner,
 } from "./editor_actions";
-import { adjustedFontSize, conflictUiState, visibleDocumentState } from "./editor_state";
+import {
+  adjustedZoomPercent,
+  conflictUiState,
+  editorZoomDirectionForKey,
+  visibleDocumentState,
+} from "./editor_state";
 import { focusDirectionForKey } from "./focus_navigation";
 import { languageForPath } from "./language";
 import { commaSeparatedGlobs, rankQuickOpen } from "./search_state";
@@ -115,6 +120,7 @@ interface RecoveryProposal {
 }
 
 const documentState = requiredElement("document-state");
+const zoomToast = requiredElement("zoom-toast");
 const emptyState = requiredElement("empty-state");
 const editorContainer = requiredElement("editor");
 const diffEditorContainer = requiredElement("diff-editor");
@@ -156,6 +162,8 @@ const saveAsSubmit = requiredButton("save-as-submit");
 let surfaceId = new URLSearchParams(window.location.search).get("surface") ?? "unbound";
 let activeDocumentId: string | null = null;
 let editorFontSize = 13;
+let editorZoomPercent = 100;
+let zoomToastTimer: ReturnType<typeof setTimeout> | null = null;
 let wordWrapEnabled = false;
 let minimapEnabled = false;
 let closeDialogDocumentId: string | null = null;
@@ -223,6 +231,13 @@ const editor = monaco.editor.create(editorContainer, {
 window.addEventListener(
   "keydown",
   (event) => {
+    const zoomDirection = editorZoomDirectionForKey(event);
+    if (zoomDirection !== null) {
+      event.preventDefault();
+      event.stopPropagation();
+      setEditorZoom(adjustedZoomPercent(editorZoomPercent, zoomDirection), true);
+      return;
+    }
     const direction = focusDirectionForKey(event);
     if (direction === null) {
       return;
@@ -389,9 +404,9 @@ const editorActionRunners: Record<
     minimapEnabled = !minimapEnabled;
     editor.updateOptions({ minimap: { enabled: minimapEnabled } });
   },
-  increaseFontSize: () => setEditorFontSize(adjustedFontSize(editorFontSize, 1)),
-  decreaseFontSize: () => setEditorFontSize(adjustedFontSize(editorFontSize, -1)),
-  resetFontSize: () => setEditorFontSize(13),
+  increaseFontSize: () => setEditorZoom(adjustedZoomPercent(editorZoomPercent, 1), true),
+  decreaseFontSize: () => setEditorZoom(adjustedZoomPercent(editorZoomPercent, -1), true),
+  resetFontSize: () => setEditorZoom(100, true),
 };
 
 // Registered on the main editor and on the diff editor's modified pane so
@@ -442,6 +457,7 @@ function handleHostMessage(message: HostMessage): void {
       applyAppearance(message.appearance);
       break;
     case "initialize_editor":
+      setEditorZoom(message.zoomPercent, false);
       clearViewStateTimer();
       resetCloseDialog();
       resetRecoveryDialog(true);
@@ -1441,10 +1457,32 @@ function colorWithAlpha(color: string, alpha: number): string {
   return `${color.slice(0, 7)}${clamped.toString(16).padStart(2, "0")}`;
 }
 
-function setEditorFontSize(fontSize: number): void {
-  editorFontSize = fontSize;
-  editor.updateOptions({ fontSize });
-  diffEditor?.updateOptions({ fontSize });
+function setEditorZoom(zoomPercent: number, announce: boolean): void {
+  const changed = zoomPercent !== editorZoomPercent;
+  if (!changed && !announce) {
+    return;
+  }
+  editorZoomPercent = zoomPercent;
+  if (!announce) {
+    return;
+  }
+  zoomToast.textContent = `Editor zoom: ${zoomPercent}%`;
+  zoomToast.hidden = false;
+  if (zoomToastTimer !== null) {
+    clearTimeout(zoomToastTimer);
+  }
+  zoomToastTimer = setTimeout(() => {
+    zoomToast.hidden = true;
+    zoomToastTimer = null;
+  }, 1200);
+  if (changed) {
+    postToHost({
+      protocolVersion: PROTOCOL_VERSION,
+      surfaceId,
+      type: "zoom_changed",
+      zoomPercent: editorZoomPercent,
+    });
+  }
 }
 
 function renderState(): void {

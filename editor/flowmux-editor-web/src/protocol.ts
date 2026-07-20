@@ -73,6 +73,7 @@ export type HostMessage =
       workspaceName: string;
       documents: DocumentPayload[];
       activeDocumentId: string | null;
+      zoomPercent: number;
     })
   | (HostMessageBase & { type: "open_document"; document: DocumentPayload })
   | (HostMessageBase & { type: "replace_document"; document: DocumentPayload })
@@ -162,6 +163,7 @@ interface EditorMessageBase {
 
 export type EditorMessage =
   | (EditorMessageBase & { type: "editor_ready" })
+  | (EditorMessageBase & { type: "zoom_changed"; zoomPercent: number })
   | (EditorMessageBase & {
       type: "native_edit_requested";
       action: "copy";
@@ -292,7 +294,10 @@ export function isHostMessage(value: unknown): value is HostMessage {
         typeof value.workspaceName === "string" &&
         Array.isArray(value.documents) &&
         value.documents.every(isDocumentPayload) &&
-        (value.activeDocumentId === null || typeof value.activeDocumentId === "string")
+        (value.activeDocumentId === null || typeof value.activeDocumentId === "string") &&
+        isVersion(value.zoomPercent) &&
+        value.zoomPercent >= 50 &&
+        value.zoomPercent <= 200
       );
     case "open_document":
     case "replace_document":

@@ -73,6 +73,7 @@ impl EditorPane {
             .network_session(&network_session)
             .user_content_manager(&user_content_manager)
             .build();
+        web_view.set_zoom_level(host.zoom_factor());
         web_view.set_hexpand(true);
         web_view.set_vexpand(true);
         if let Some(settings) = webkit6::prelude::WebViewExt::settings(&web_view) {
@@ -100,6 +101,9 @@ impl EditorPane {
                         }
                     }
                     if let Some(web_view) = web_view.upgrade() {
+                        if let Some(zoom_percent) = dispatch.zoom_percent {
+                            web_view.set_zoom_level(zoom_percent as f64 / 100.0);
+                        }
                         if let Some(action) = dispatch.native_edit_action {
                             perform_native_edit(
                                 &web_view,
@@ -281,10 +285,6 @@ impl EditorPane {
         if let Err(error) = self.send(HostMessage::SetAppearance { appearance }) {
             tracing::warn!(%error, "failed to apply editor appearance");
         }
-    }
-
-    pub fn set_zoom_level(&self, zoom: f64) {
-        self.web_view.set_zoom_level(zoom.clamp(0.1, 2.0));
     }
 
     /// Copy the editor selection when the app-level copy shortcut fires while

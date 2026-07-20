@@ -17,6 +17,9 @@ const MAX_SEARCH_QUERY_BYTES: usize = 4 * 1024;
 const MAX_SEARCH_PATH_BYTES: usize = 16 * 1024;
 const MAX_SEARCH_GLOBS: usize = 32;
 const MAX_FONT_FAMILY_BYTES: usize = 512;
+pub const EDITOR_ZOOM_MIN: u16 = 50;
+pub const EDITOR_ZOOM_MAX: u16 = 200;
+pub const EDITOR_ZOOM_DEFAULT: u16 = 100;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TextDocumentEncoding {
@@ -90,6 +93,7 @@ pub enum HostMessage {
         workspace_name: String,
         documents: Vec<DocumentPayload>,
         active_document_id: Option<String>,
+        zoom_percent: u16,
     },
     OpenDocument {
         document: DocumentPayload,
@@ -209,6 +213,9 @@ pub enum EditorNativeEditAction {
 )]
 pub enum EditorMessage {
     EditorReady,
+    ZoomChanged {
+        zoom_percent: u16,
+    },
     NativeEditRequested {
         action: EditorNativeEditAction,
         #[serde(default)]
@@ -380,6 +387,12 @@ pub fn javascript_for_host_message(
 fn validate_editor_message(message: &EditorMessage) -> Result<(), ProtocolError> {
     match message {
         EditorMessage::EditorReady | EditorMessage::FocusDirectionRequested { .. } => Ok(()),
+        EditorMessage::ZoomChanged { zoom_percent }
+            if (EDITOR_ZOOM_MIN..=EDITOR_ZOOM_MAX).contains(zoom_percent) =>
+        {
+            Ok(())
+        }
+        EditorMessage::ZoomChanged { .. } => Err(ProtocolError::InvalidViewState),
         EditorMessage::NativeEditRequested { action, text } => match (action, text) {
             (EditorNativeEditAction::Copy, Some(text)) => validate_document_size(text),
             (EditorNativeEditAction::Paste, None) => Ok(()),
@@ -465,8 +478,12 @@ fn validate_host_message(message: &HostMessage) -> Result<(), ProtocolError> {
         HostMessage::InitializeEditor {
             documents,
             active_document_id,
+            zoom_percent,
             ..
         } => {
+            if !(EDITOR_ZOOM_MIN..=EDITOR_ZOOM_MAX).contains(zoom_percent) {
+                return Err(ProtocolError::InvalidViewState);
+            }
             for document in documents {
                 validate_document(document)?;
             }
@@ -703,6 +720,26 @@ mod tests {
                 content: "한글 日本語 العربية 🙂\n".into(),
             }
         );
+    }
+
+    #[test]
+    fn editor_zoom_accepts_supported_percentages_only() {
+        let message = |zoom_percent| {
+            serde_json::json!({
+                "protocolVersion": PROTOCOL_VERSION,
+                "surfaceId": "surface-1",
+                "type": "zoom_changed",
+                "zoomPercent": zoom_percent,
+            })
+            .to_string()
+        };
+
+        assert_eq!(
+            parse_editor_message(&message(130)).unwrap().1,
+            EditorMessage::ZoomChanged { zoom_percent: 130 }
+        );
+        assert!(parse_editor_message(&message(EDITOR_ZOOM_MIN - 1)).is_err());
+        assert!(parse_editor_message(&message(EDITOR_ZOOM_MAX + 1)).is_err());
     }
 
     #[test]

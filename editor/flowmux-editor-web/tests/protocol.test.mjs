@@ -35,6 +35,7 @@ test("accepts a complete multilingual initialization message", () => {
       workspaceName: "다국어 프로젝트",
       documents: [koreanDocument],
       activeDocumentId: koreanDocument.id,
+      zoomPercent: 130,
     }),
     true,
   );

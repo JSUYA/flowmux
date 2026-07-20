@@ -3322,7 +3322,6 @@ fn build_panel(
                         return label.upcast::<gtk::Widget>();
                     }
                 };
-                editor.set_zoom_level(options.zoom_factor());
                 editor
             };
 

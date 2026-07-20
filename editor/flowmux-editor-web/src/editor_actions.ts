@@ -88,19 +88,19 @@ export const EDITOR_ACTION_SPECS: readonly EditorActionSpec[] = [
   },
   {
     id: "flowmux.increaseFontSize",
-    label: "Increase Editor Font Size",
-    chord: { ctrlCmd: true, key: "Equal" },
+    label: "Zoom In",
+    chord: { ctrlCmd: true, shift: true, key: "Equal" },
     run: "increaseFontSize",
   },
   {
     id: "flowmux.decreaseFontSize",
-    label: "Decrease Editor Font Size",
+    label: "Zoom Out",
     chord: { ctrlCmd: true, key: "Minus" },
     run: "decreaseFontSize",
   },
   {
     id: "flowmux.resetFontSize",
-    label: "Reset Editor Font Size",
+    label: "Reset Editor Zoom",
     chord: { ctrlCmd: true, key: "Digit0" },
     run: "resetFontSize",
   },

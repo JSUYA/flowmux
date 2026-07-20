@@ -4628,7 +4628,7 @@ mod tests {
             .update_surface_cwd(pane, terminal, terminal_cwd.clone())
             .await;
         store
-            .add_editor_surface_to_pane(pane)
+            .add_editor_surface_to_pane(pane, workspace_root.clone())
             .await
             .expect("editor surface should be added");
 
@@ -4825,25 +4825,22 @@ mod tests {
 
     #[cfg(not(target_os = "macos"))]
     #[gtk::test]
-    async fn failed_editor_open_removes_the_new_empty_tab() {
+    async fn file_browser_opens_a_file_outside_the_static_workspace_root() {
         adw::init().expect("libadwaita should initialize in GTK test");
         let workspace = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        let outside_file = outside.path().join("outside.txt");
-        std::fs::write(&outside_file, "outside\n").unwrap();
+        let current_dir = tempfile::tempdir().unwrap();
+        let file = current_dir.path().join("current.txt");
+        std::fs::write(&file, "current\n").unwrap();
 
         let store = StateStore::new_lazy(State::default());
         let ws_id = store
-            .create_workspace(
-                Some("editor-open-failure".into()),
-                workspace.path().to_path_buf(),
-            )
+            .create_workspace(Some("cwd-moved".into()), workspace.path().to_path_buf())
             .await;
         let ws = store.get_workspace(ws_id).await.unwrap();
         let pane = ws.surfaces[0].root_pane.first_leaf_id().unwrap();
         let (bridge, _rx) = Bridge::new();
         let app = adw::Application::builder()
-            .application_id("com.flowmux.App.UiTest.EditorOpenFailure")
+            .application_id("com.flowmux.App.UiTest.EditorOutsideStaticRoot")
             .build();
         app.register(None::<&gtk::gio::Cancellable>).unwrap();
         let controller = WindowController::new(
@@ -4857,11 +4854,21 @@ mod tests {
         controller.render_workspace(&ws);
 
         controller
-            .open_file_in_editor(outside_file, Some(pane))
+            .open_file_in_editor(file.clone(), Some(pane))
             .await;
 
-        assert_eq!(store.tab_count_in_pane(pane).await, Some(1));
-        assert!(controller.pane_registry.borrow().editors.is_empty());
+        assert_eq!(store.tab_count_in_pane(pane).await, Some(2));
+        let surface = store.get_workspace(ws_id).await.unwrap().surfaces[0]
+            .root_pane
+            .active_surface_id(pane)
+            .unwrap();
+        let registry = controller.pane_registry.borrow();
+        let editor = registry.editors.get(&surface).unwrap();
+        assert_eq!(editor.workspace_root(), current_dir.path());
+        assert_eq!(
+            editor.session_state().active_file.as_deref(),
+            Some(file.as_path())
+        );
     }
 
     #[cfg(not(target_os = "macos"))]

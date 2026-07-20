@@ -32,6 +32,18 @@ test("core editing shortcuts cover save as, save all, quick open, workspace sear
   assert.deepEqual(spec("flowmux.closeDocument").chord, { ctrlCmd: true, key: "KeyW" });
 });
 
+test("editor zoom uses Ctrl++ and Ctrl+-", () => {
+  assert.deepEqual(spec("flowmux.increaseFontSize").chord, {
+    ctrlCmd: true,
+    shift: true,
+    key: "Equal",
+  });
+  assert.deepEqual(spec("flowmux.decreaseFontSize").chord, {
+    ctrlCmd: true,
+    key: "Minus",
+  });
+});
+
 test("action ids are unique and namespaced", () => {
   const ids = EDITOR_ACTION_SPECS.map((candidate) => candidate.id);
   assert.equal(new Set(ids).size, ids.length);

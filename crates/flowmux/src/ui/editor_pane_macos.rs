@@ -122,6 +122,9 @@ define_class!(
             let Some(web_view) = (unsafe { message.webView() }) else {
                 return;
             };
+            if let Some(zoom_percent) = dispatch.zoom_percent {
+                unsafe { web_view.setPageZoom(zoom_percent as f64 / 100.0) };
+            }
             if let Some(action) = dispatch.native_edit_action {
                 perform_native_edit(&web_view, action, dispatch.native_edit_text.as_deref());
             }
@@ -450,12 +453,6 @@ impl EditorPane {
         }
     }
 
-    pub fn set_zoom_level(&self, zoom: f64) {
-        unsafe {
-            self.native.web_view.setPageZoom(zoom.clamp(0.1, 2.0));
-        }
-    }
-
     /// Copy the Monaco selection when an app-level copy shortcut fires while
     /// this surface is focused.
     pub fn copy_selection(&self) {
@@ -639,7 +636,7 @@ fn create_native_editor_view(
     };
     unsafe {
         web_view.setAllowsBackForwardNavigationGestures(false);
-        web_view.setPageZoom(1.0);
+        web_view.setPageZoom(host.zoom_factor());
     }
     let navigation_delegate =
         EditorNavigationDelegate::alloc(mtm).set_ivars(EditorNavigationDelegateIvars {

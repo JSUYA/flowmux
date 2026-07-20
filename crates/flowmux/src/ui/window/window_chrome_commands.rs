@@ -43,9 +43,6 @@ impl WindowController {
                         for browser in registry.browsers.values() {
                             browser.set_zoom_level(opts.zoom_factor());
                         }
-                        for editor in registry.editors.values() {
-                            editor.set_zoom_level(opts.zoom_factor());
-                        }
                         drop(registry);
                         // Re-install keybindings so the user does not have to
                         // restart for shortcut edits to take effect.

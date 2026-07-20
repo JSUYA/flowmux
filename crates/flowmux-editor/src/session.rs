@@ -120,7 +120,7 @@ impl EditorSession {
         }
     }
 
-    pub fn initialize_message(&self, workspace_name: String) -> HostMessage {
+    pub fn initialize_message(&self, workspace_name: String, zoom_percent: u16) -> HostMessage {
         let documents = self
             .open_order
             .iter()
@@ -131,6 +131,7 @@ impl EditorSession {
             workspace_name,
             documents,
             active_document_id: self.active.map(protocol_id),
+            zoom_percent,
         }
     }
 
@@ -357,6 +358,7 @@ impl EditorSession {
     ) -> Result<Vec<HostMessage>, EditorSessionError> {
         match message {
             EditorMessage::EditorReady
+            | EditorMessage::ZoomChanged { .. }
             | EditorMessage::NativeEditRequested { .. }
             | EditorMessage::FocusDirectionRequested { .. } => Ok(Vec::new()),
             EditorMessage::ActiveDocumentChanged {
@@ -1000,12 +1002,14 @@ mod tests {
         let HostMessage::InitializeEditor {
             documents,
             active_document_id,
+            zoom_percent,
             ..
-        } = session.initialize_message("workspace".into())
+        } = session.initialize_message("workspace".into(), 125)
         else {
             panic!("expected editor initialization");
         };
         assert_eq!(active_document_id.as_deref(), Some(first.id.as_str()));
+        assert_eq!(zoom_percent, 125);
         assert_eq!(documents[0].cursor_line, 7);
         assert_eq!(documents[0].cursor_column, 3);
         assert_eq!(documents[0].scroll_top, 88.5);
@@ -1503,7 +1507,7 @@ mod tests {
             }] if document_id == &document.id
         ));
         assert!(session.poll_external_changes().unwrap().is_empty());
-        let initialized = session.initialize_message("workspace".into());
+        let initialized = session.initialize_message("workspace".into(), 100);
         assert!(matches!(
             initialized,
             HostMessage::InitializeEditor { documents, .. }

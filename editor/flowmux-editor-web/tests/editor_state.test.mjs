@@ -3,15 +3,35 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
-  adjustedFontSize,
+  adjustedZoomPercent,
   conflictUiState,
+  editorZoomDirectionForKey,
   visibleDocumentState,
 } from "../.test-build/editor_state.js";
 
-test("font zoom stays inside a readable supported range", () => {
-  assert.equal(adjustedFontSize(13, 1), 14);
-  assert.equal(adjustedFontSize(32, 1), 32);
-  assert.equal(adjustedFontSize(10, -1), 10);
+test("editor zoom moves in ten percent steps inside its supported range", () => {
+  assert.equal(adjustedZoomPercent(100, 1), 110);
+  assert.equal(adjustedZoomPercent(200, 1), 200);
+  assert.equal(adjustedZoomPercent(50, -1), 50);
+});
+
+test("editor zoom recognizes Ctrl plus and minus before Monaco handles them", () => {
+  const key = (overrides) => ({
+    altKey: false,
+    ctrlKey: true,
+    metaKey: false,
+    shiftKey: false,
+    key: "",
+    code: "",
+    ...overrides,
+  });
+  assert.equal(
+    editorZoomDirectionForKey(key({ shiftKey: true, key: "+", code: "Equal" })),
+    1,
+  );
+  assert.equal(editorZoomDirectionForKey(key({ key: "-", code: "Minus" })), -1);
+  assert.equal(editorZoomDirectionForKey(key({ key: "=", code: "Equal" })), null);
+  assert.equal(editorZoomDirectionForKey(key({ altKey: true, key: "-", code: "Minus" })), null);
 });
 
 test("conflict actions distinguish changed deleted and compare states", () => {

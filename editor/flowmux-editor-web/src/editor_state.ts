@@ -2,8 +2,37 @@
 
 import type { DocumentDiskStatus } from "./protocol";
 
-export function adjustedFontSize(current: number, delta: number): number {
-  return Math.min(32, Math.max(10, current + delta));
+export const EDITOR_ZOOM_MIN = 50;
+export const EDITOR_ZOOM_MAX = 200;
+export const EDITOR_ZOOM_STEP = 10;
+
+export function adjustedZoomPercent(current: number, direction: number): number {
+  const delta = Math.sign(direction) * EDITOR_ZOOM_STEP;
+  return Math.min(EDITOR_ZOOM_MAX, Math.max(EDITOR_ZOOM_MIN, current + delta));
+}
+
+export function editorZoomDirectionForKey(event: {
+  altKey: boolean;
+  ctrlKey: boolean;
+  metaKey: boolean;
+  shiftKey: boolean;
+  key: string;
+  code: string;
+}): number | null {
+  if (event.altKey || (!event.ctrlKey && !event.metaKey)) {
+    return null;
+  }
+  if (
+    event.key === "+" ||
+    event.code === "NumpadAdd" ||
+    (event.shiftKey && event.code === "Equal")
+  ) {
+    return 1;
+  }
+  if (event.key === "-" || event.code === "NumpadSubtract") {
+    return -1;
+  }
+  return null;
 }
 
 export interface VisibleDocumentState {

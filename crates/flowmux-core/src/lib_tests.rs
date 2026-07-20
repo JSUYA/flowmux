@@ -2928,6 +2928,7 @@ fn editor_surface_round_trips_multilingual_session_state() {
         scroll_top: 128.5,
     });
     session.active_file = session.open_files.first().map(|file| file.path.clone());
+    session.zoom_percent = Some(130);
 
     let json = serde_json::to_string(&surface).unwrap();
     let restored: PaneSurface = serde_json::from_str(&json).unwrap();
@@ -2943,6 +2944,7 @@ fn editor_surface_round_trips_multilingual_session_state() {
     assert_eq!(session.open_files[0].cursor_line, 42);
     assert_eq!(session.open_files[0].cursor_column, 7);
     assert_eq!(session.open_files[0].scroll_top, 128.5);
+    assert_eq!(session.zoom_percent, Some(130));
     assert_eq!(
         session.active_file,
         Some(workspace_root.join("소스/日本語.rs"))
@@ -2983,6 +2985,7 @@ fn editor_session_update_persists_view_and_tracks_active_title() {
             scroll_top: 44.5,
         }],
         active_file: Some("/tmp/project/문서-日本語.rs".into()),
+        zoom_percent: Some(140),
     };
 
     assert!(pane.set_surface_editor_session(pane_id, editor_id, state.clone()));
@@ -2993,6 +2996,7 @@ fn editor_session_update_persists_view_and_tracks_active_title() {
         panic!("expected editor surface");
     };
     assert_eq!(session.open_files[0].cursor_line, 8);
+    assert_eq!(session.zoom_percent, Some(140));
 
     let empty = EditorSessionState::default();
     assert!(pane.set_surface_editor_session(pane_id, editor_id, empty));

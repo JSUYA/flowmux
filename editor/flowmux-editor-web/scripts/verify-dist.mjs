@@ -39,6 +39,7 @@ if (
   !html.includes('id="search-dialog"') ||
   !html.includes('id="search-query"') ||
   !html.includes('id="conflict-banner"') ||
+  !html.includes('id="zoom-toast"') ||
   !html.includes('id="save-as-dialog"') ||
   !html.includes('id="diff-editor"')
 ) {
@@ -64,7 +65,8 @@ if (
   !main.includes("search_result_open_requested") ||
   !main.includes("save_as_requested") ||
   !main.includes("conflict_action_requested") ||
-  !main.includes("set_appearance")
+  !main.includes("set_appearance") ||
+  !main.includes("zoom_changed")
 ) {
   throw new Error("Editor bundle is missing an explicit document safety message");
 }

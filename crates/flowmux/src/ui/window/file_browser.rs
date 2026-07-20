@@ -34,6 +34,17 @@ fn editor_file_browser_root(
         .to_path_buf()
 }
 
+fn editor_workspace_root(path: &std::path::Path, workspace_root: &std::path::Path) -> PathBuf {
+    let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let workspace_root =
+        std::fs::canonicalize(workspace_root).unwrap_or_else(|_| workspace_root.to_path_buf());
+    if path.starts_with(&workspace_root) {
+        workspace_root
+    } else {
+        path.parent().unwrap_or(&workspace_root).to_path_buf()
+    }
+}
+
 impl WindowController {
     pub(super) async fn open_file_in_editor(&self, path: PathBuf, source_pane: Option<PaneId>) {
         match crate::ui::file_browser::file_open_target(&path) {
@@ -92,8 +103,11 @@ impl WindowController {
         // Never reuse an existing editor for a different file: doing so hides
         // the previous document inside the WebView instead of leaving a visible
         // FlowMux tab the user can move, split, or return to.
-        let Some((workspace_id, editor_surface)) =
-            self.store.add_editor_surface_to_pane(target_pane).await
+        let editor_root = editor_workspace_root(&path, &workspace_state.root_dir);
+        let Some((workspace_id, editor_surface)) = self
+            .store
+            .add_editor_surface_to_pane(target_pane, editor_root)
+            .await
         else {
             self.clipboard_toast
                 .show_with_message("Could not create an editor tab");
@@ -391,6 +405,7 @@ mod tests {
         let session = flowmux_core::EditorSessionState {
             open_files: Vec::new(),
             active_file: Some("/workspace/src/main.rs".into()),
+            zoom_percent: None,
         };
 
         assert_eq!(
@@ -400,6 +415,27 @@ mod tests {
         assert_eq!(
             editor_file_browser_root(&flowmux_core::EditorSessionState::default(), workspace_root,),
             workspace_root
+        );
+    }
+
+    #[test]
+    fn editor_root_moves_only_when_the_file_is_outside_the_workspace() {
+        let workspace = tempfile::tempdir().unwrap();
+        let nested = workspace.path().join("src");
+        std::fs::create_dir(&nested).unwrap();
+        let inside = nested.join("inside.rs");
+        std::fs::write(&inside, "inside\n").unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let external = outside.path().join("outside.rs");
+        std::fs::write(&external, "outside\n").unwrap();
+
+        assert_eq!(
+            editor_workspace_root(&inside, workspace.path()),
+            workspace.path()
+        );
+        assert_eq!(
+            editor_workspace_root(&external, workspace.path()),
+            outside.path()
         );
     }
 }

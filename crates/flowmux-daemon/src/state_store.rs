@@ -1833,17 +1833,16 @@ impl StateStore {
         Some(surface_id)
     }
 
-    /// Add an editor surface to a specific pane. The containing workspace's
-    /// root is persisted with the surface so editor sessions restore without
-    /// depending on the process cwd.
+    /// Add an editor surface to a specific pane using the supplied document root.
     pub async fn add_editor_surface_to_pane(
         &self,
         pane: PaneId,
+        editor_root: std::path::PathBuf,
     ) -> Option<(WorkspaceId, SurfaceId)> {
         let mut s = self.inner.lock().await;
         for ws in s.workspaces.iter_mut() {
             for surface in ws.surfaces.iter_mut() {
-                let tab = PaneSurface::editor("Editor", ws.root_dir.clone());
+                let tab = PaneSurface::editor("Editor", editor_root.clone());
                 if let Some(surface_id) = surface.root_pane.add_surface_to_leaf(pane, tab) {
                     let ws_id = ws.id;
                     drop(s);
@@ -3667,7 +3666,10 @@ Do you want to continue?";
             .create_workspace(Some("project".into()), "/tmp/project".into())
             .await;
         let pane = first_pane(&store.get_workspace(ws_id).await.unwrap());
-        let (_, editor) = store.add_editor_surface_to_pane(pane).await.unwrap();
+        let (_, editor) = store
+            .add_editor_surface_to_pane(pane, "/tmp/project".into())
+            .await
+            .unwrap();
         let session = EditorSessionState {
             open_files: vec![flowmux_core::EditorFileState {
                 path: "/tmp/project/문서-日本語.rs".into(),
@@ -3676,6 +3678,7 @@ Do you want to continue?";
                 scroll_top: 72.0,
             }],
             active_file: Some("/tmp/project/문서-日本語.rs".into()),
+            zoom_percent: Some(135),
         };
 
         assert_eq!(
@@ -4115,16 +4118,17 @@ Do you want to continue?";
     }
 
     #[tokio::test]
-    async fn add_editor_surface_to_pane_uses_workspace_root_and_activates() {
+    async fn add_editor_surface_to_pane_uses_supplied_root_and_activates() {
         let store = StateStore::new_lazy(State::default());
-        let root = std::path::PathBuf::from("/tmp/다국어-プロジェクト");
+        let workspace_root = std::path::PathBuf::from("/tmp/다국어-プロジェクト");
+        let editor_root = std::path::PathBuf::from("/tmp/현재-ディレクトリ");
         let ws_id = store
-            .create_workspace(Some("demo".into()), root.clone())
+            .create_workspace(Some("demo".into()), workspace_root)
             .await;
         let pane = first_pane(&store.get_workspace(ws_id).await.unwrap());
 
         let (returned_ws, editor_surface) = store
-            .add_editor_surface_to_pane(pane)
+            .add_editor_surface_to_pane(pane, editor_root.clone())
             .await
             .expect("editor tab should be added to existing pane");
         assert_eq!(returned_ws, ws_id);
@@ -4141,7 +4145,7 @@ Do you want to continue?";
             SurfaceKind::Editor {
                 workspace_root,
                 session
-            } if workspace_root == root && session.open_files.is_empty()
+            } if workspace_root == editor_root && session.open_files.is_empty()
         ));
     }
 
@@ -4153,8 +4157,12 @@ Do you want to continue?";
             .await;
         let pane = first_pane(&store.get_workspace(ws_id).await.unwrap());
 
-        let (_, first_editor) = store.add_editor_surface_to_pane(pane).await.unwrap();
-        let (_, second_editor) = store.add_editor_surface_to_pane(pane).await.unwrap();
+        let root = std::path::PathBuf::from("/tmp/demo");
+        let (_, first_editor) = store
+            .add_editor_surface_to_pane(pane, root.clone())
+            .await
+            .unwrap();
+        let (_, second_editor) = store.add_editor_surface_to_pane(pane, root).await.unwrap();
 
         let ws = store.get_workspace(ws_id).await.unwrap();
         assert_ne!(first_editor, second_editor);
@@ -4170,7 +4178,7 @@ Do you want to continue?";
             .await;
 
         assert!(store
-            .add_editor_surface_to_pane(PaneId::new())
+            .add_editor_surface_to_pane(PaneId::new(), "/tmp/demo".into())
             .await
             .is_none());
     }
@@ -5857,7 +5865,10 @@ Do you want to continue?";
             .split_pane(src, SplitDirection::Vertical)
             .await
             .unwrap();
-        let (_, editor) = store.add_editor_surface_to_pane(src).await.unwrap();
+        let (_, editor) = store
+            .add_editor_surface_to_pane(src, root.clone())
+            .await
+            .unwrap();
         let (_, browser) = store
             .add_browser_surface_to_pane(src, "https://example.test".into())
             .await
