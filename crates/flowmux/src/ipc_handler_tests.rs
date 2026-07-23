@@ -57,17 +57,9 @@ async fn workspace_create_dispatches_workspace_created_and_waits_for_ack() {
         response = &mut response => panic!("workspace create completed before bridge ack: {response:?}"),
         command = rx.recv() => command.expect("workspace create should dispatch to GTK"),
     };
-    let GtkCommand::WorkspaceCreated {
-        id,
-        name,
-        root: command_root,
-        ack,
-    } = command
-    else {
+    let GtkCommand::WorkspaceCreated { id, ack } = command else {
         panic!("expected WorkspaceCreated command");
     };
-    assert_eq!(name, "created");
-    assert_eq!(command_root, root);
     ack.send(()).unwrap();
 
     assert!(matches!(
@@ -682,17 +674,9 @@ async fn claude_teams_uses_incremental_splits_after_initial_workspace_render() {
         response = &mut response => panic!("claude-teams completed before initial render ack: {response:?}"),
         command = rx.recv() => command.expect("claude-teams should dispatch initial render"),
     };
-    let GtkCommand::WorkspaceCreated {
-        id: ws_id,
-        name,
-        root: command_root,
-        ack,
-    } = command
-    else {
+    let GtkCommand::WorkspaceCreated { id: ws_id, ack } = command else {
         panic!("expected WorkspaceCreated command");
     };
-    assert_eq!(name, "claude-teams");
-    assert_eq!(command_root, root);
     ack.send(()).unwrap();
 
     let mut panes = Vec::new();

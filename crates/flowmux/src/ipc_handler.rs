@@ -224,7 +224,7 @@ impl GuiHandler {
     /// Dispatch for the workspace verb group (split out of the `handle` match).
     async fn handle_workspace_verb(&self, req: Request) -> Response {
         match req {
-            Request::WorkspaceCreate { ref name, ref root } => {
+            Request::WorkspaceCreate { .. } => {
                 // Persist via the headless handler first so state.json is consistent...
                 let resp = self.inner.handle(req.clone()).await;
                 let id = match &resp {
@@ -236,17 +236,7 @@ impl GuiHandler {
                 if let Err(e) = self
                     .bridge
                     .tx
-                    .send(GtkCommand::WorkspaceCreated {
-                        id,
-                        name: name.clone().unwrap_or_else(|| {
-                            root.file_name()
-                                .and_then(|n| n.to_str())
-                                .unwrap_or("workspace")
-                                .into()
-                        }),
-                        root: root.clone(),
-                        ack: tx,
-                    })
+                    .send(GtkCommand::WorkspaceCreated { id, ack: tx })
                     .await
                 {
                     warn!(error = %e, "bridge closed");
@@ -608,7 +598,6 @@ impl GuiHandler {
             Request::ClaudeTeams { count, args, root } => {
                 let count = count.clamp(1, 8);
                 let store = self.inner.store();
-                let root_for_ui = root.clone();
                 // Create a fresh workspace.
                 let ws_id = store
                     .create_workspace(Some("claude-teams".into()), root)
@@ -618,12 +607,7 @@ impl GuiHandler {
                 let _ = self
                     .bridge
                     .tx
-                    .send(GtkCommand::WorkspaceCreated {
-                        id: ws_id,
-                        name: "claude-teams".into(),
-                        root: root_for_ui,
-                        ack: tx,
-                    })
+                    .send(GtkCommand::WorkspaceCreated { id: ws_id, ack: tx })
                     .await;
                 let _ = rx.await;
 
@@ -1024,19 +1008,14 @@ impl flowmux_daemon::tmux_compat::TmuxCompatUi for GuiTmuxUi<'_> {
     async fn workspace_created(
         &self,
         id: flowmux_core::WorkspaceId,
-        name: &str,
-        root: &std::path::Path,
+        _name: &str,
+        _root: &std::path::Path,
     ) {
         let (tx, rx) = oneshot::channel();
         let _ = self
             .bridge
             .tx
-            .send(GtkCommand::WorkspaceCreated {
-                id,
-                name: name.to_string(),
-                root: root.to_path_buf(),
-                ack: tx,
-            })
+            .send(GtkCommand::WorkspaceCreated { id, ack: tx })
             .await;
         let _ = rx.await;
     }

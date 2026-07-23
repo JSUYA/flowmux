@@ -214,10 +214,6 @@ pub enum GtkCommand {
     /// Render a freshly-created workspace in the sidebar + open its first pane.
     WorkspaceCreated {
         id: WorkspaceId,
-        #[allow(dead_code)]
-        name: String,
-        #[allow(dead_code)]
-        root: PathBuf,
         ack: oneshot::Sender<()>,
     },
     /// Apply a split that was already committed to the store.

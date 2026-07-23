@@ -6,12 +6,7 @@ use super::*;
 impl WindowController {
     pub(super) async fn dispatch_workspace_command(&self, cmd: GtkCommand) {
         match cmd {
-            GtkCommand::WorkspaceCreated {
-                id,
-                name: _,
-                root: _,
-                ack,
-            } => {
+            GtkCommand::WorkspaceCreated { id, ack } => {
                 // Pull the authoritative workspace (with the store's
                 // pane ids) instead of fabricating new ones — otherwise
                 // `focused_pane` gets a UUID that doesn't exist in the
