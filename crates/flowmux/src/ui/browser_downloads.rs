@@ -167,7 +167,7 @@ pub(crate) struct DownloadManager {
 
 struct DownloadManagerInner {
     button: gtk::MenuButton,
-    #[cfg_attr(any(not(test), target_os = "macos"), allow(dead_code))]
+    #[cfg(all(test, not(target_os = "macos")))]
     scroll: gtk::ScrolledWindow,
     list: gtk::Box,
     empty: gtk::Label,
@@ -232,6 +232,7 @@ impl DownloadManager {
 
         let inner = Rc::new(DownloadManagerInner {
             button,
+            #[cfg(all(test, not(target_os = "macos")))]
             scroll,
             list,
             empty,
@@ -345,17 +346,17 @@ impl DownloadManager {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, not(target_os = "macos")))]
     fn scroll_policy(&self) -> gtk::PolicyType {
         self.inner.scroll.hscrollbar_policy()
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, not(target_os = "macos")))]
     fn max_content_height(&self) -> i32 {
         self.inner.scroll.max_content_height()
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, not(target_os = "macos")))]
     fn propagates_natural_height(&self) -> bool {
         self.inner.scroll.propagates_natural_height()
     }
