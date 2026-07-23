@@ -295,32 +295,6 @@ impl GhosttyPane {
         self.id.set(id);
     }
 
-    /// Compile and install a scrollback search pattern on this terminal.
-    #[allow(dead_code)]
-    pub fn search_set(
-        &self,
-        pattern: &str,
-        case_sensitive: bool,
-        is_regex: bool,
-    ) -> Result<(), glib::Error> {
-        set_terminal_search(&self.widget, pattern, case_sensitive, is_regex)
-    }
-
-    #[allow(dead_code)]
-    pub fn search_next(&self) -> bool {
-        self.widget.search_find_next()
-    }
-
-    #[allow(dead_code)]
-    pub fn search_prev(&self) -> bool {
-        self.widget.search_find_previous()
-    }
-
-    #[allow(dead_code)]
-    pub fn search_clear(&self) {
-        self.widget.search_set_regex(None, 0);
-    }
-
     pub fn show_search(&self) {
         self.search_revealer.set_reveal_child(true);
         self.search_entry.grab_focus();
@@ -360,7 +334,7 @@ impl GhosttyPane {
 
     /// The widget used for focus tracking / identity comparisons in the window
     /// controller. With VTE this is the terminal widget itself.
-    #[allow(dead_code)]
+    #[cfg(all(test, not(target_os = "macos")))]
     pub fn render_area(&self) -> gtk::Widget {
         self.widget.clone().upcast::<gtk::Widget>()
     }
