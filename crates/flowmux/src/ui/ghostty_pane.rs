@@ -51,9 +51,9 @@ pub struct GhosttyPane {
     /// made while a foreground application owns the terminal.
     timeline_state: Rc<RefCell<TerminalTimelineState>>,
     timeline_rail: gtk::DrawingArea,
-    /// Read-only VTE used when the foreground app owns an alternate-screen
-    /// scrollback that the outer terminal cannot address directly.
-    timeline_preview: vte::Terminal,
+    /// Lazily-created read-only VTE used only when the foreground app owns an
+    /// alternate-screen scrollback that the outer terminal cannot address.
+    timeline_preview: Rc<RefCell<Option<vte::Terminal>>>,
     /// Last non-empty text selection VTE reported. Agent TUIs (Claude Code,
     /// Codex) repaint constantly; VTE clears the drag-selection on the next
     /// output frame (`deselect_all` in `process_incoming`), so by the time the
@@ -325,22 +325,10 @@ fn build_terminal_timeline(
 ) -> (
     Rc<RefCell<TerminalTimelineState>>,
     gtk::DrawingArea,
-    vte::Terminal,
+    Rc<RefCell<Option<vte::Terminal>>>,
 ) {
     let state = Rc::new(RefCell::new(TerminalTimelineState::default()));
-
-    let preview = vte::Terminal::new();
-    preview.set_hexpand(true);
-    preview.set_vexpand(true);
-    preview.set_input_enabled(false);
-    preview.set_cursor_blink_mode(vte::CursorBlinkMode::Off);
-    preview.set_scrollback_lines(0);
-    preview.set_tooltip_text(Some(
-        "Terminal input history — press Esc to return to live output",
-    ));
-    preview.set_visible(false);
-    container.add_overlay(&preview);
-    container.set_measure_overlay(&preview, false);
+    let preview = Rc::new(RefCell::new(None));
 
     let rail = gtk::DrawingArea::new();
     rail.set_width_request(18);
@@ -423,18 +411,19 @@ fn build_terminal_timeline(
     click.connect_pressed({
         let state = state.clone();
         let term = term.downgrade();
-        let preview = preview.downgrade();
+        let preview = preview.clone();
         let rail = rail.downgrade();
+        let container = container.downgrade();
         move |_, _, _, y| {
-            let (Some(term), Some(preview), Some(rail)) =
-                (term.upgrade(), preview.upgrade(), rail.upgrade())
+            let (Some(term), Some(rail), Some(container)) =
+                (term.upgrade(), rail.upgrade(), container.upgrade())
             else {
                 return;
             };
             let count = state.borrow().marks.len();
             if let Some(index) = terminal_timeline_index_at_y(y, rail.height() as f64, count) {
                 rail.grab_focus();
-                show_terminal_timeline_mark(&term, &preview, &rail, &state, index);
+                show_terminal_timeline_mark(&term, &container, &preview, &rail, &state, index);
             }
         }
     });
@@ -445,15 +434,16 @@ fn build_terminal_timeline(
     scroll.connect_scroll({
         let state = state.clone();
         let term = term.downgrade();
-        let preview = preview.downgrade();
+        let preview = preview.clone();
         let rail = rail.downgrade();
+        let container = container.downgrade();
         let scroll_accumulator = scroll_accumulator.clone();
         move |_, _, dy| {
             if dy == 0.0 {
                 return glib::Propagation::Proceed;
             }
-            let (Some(term), Some(preview), Some(rail)) =
-                (term.upgrade(), preview.upgrade(), rail.upgrade())
+            let (Some(term), Some(rail), Some(container)) =
+                (term.upgrade(), rail.upgrade(), container.upgrade())
             else {
                 return glib::Propagation::Proceed;
             };
@@ -466,6 +456,7 @@ fn build_terminal_timeline(
             rail.grab_focus();
             step_terminal_timeline(
                 &term,
+                &container,
                 &preview,
                 &rail,
                 &state,
@@ -480,26 +471,27 @@ fn build_terminal_timeline(
     rail_keys.connect_key_pressed({
         let state = state.clone();
         let term = term.downgrade();
-        let preview = preview.downgrade();
+        let preview = preview.clone();
         let rail = rail.downgrade();
+        let container = container.downgrade();
         move |_, key, _, _| {
-            let (Some(term), Some(preview), Some(rail)) =
-                (term.upgrade(), preview.upgrade(), rail.upgrade())
+            let (Some(term), Some(rail), Some(container)) =
+                (term.upgrade(), rail.upgrade(), container.upgrade())
             else {
                 return glib::Propagation::Proceed;
             };
             match key {
                 gtk::gdk::Key::Up | gtk::gdk::Key::Page_Up => {
-                    step_terminal_timeline(&term, &preview, &rail, &state, -1);
+                    step_terminal_timeline(&term, &container, &preview, &rail, &state, -1);
                     glib::Propagation::Stop
                 }
                 gtk::gdk::Key::Down | gtk::gdk::Key::Page_Down => {
-                    step_terminal_timeline(&term, &preview, &rail, &state, 1);
+                    step_terminal_timeline(&term, &container, &preview, &rail, &state, 1);
                     glib::Propagation::Stop
                 }
                 gtk::gdk::Key::Home => {
                     if !state.borrow().marks.is_empty() {
-                        show_terminal_timeline_mark(&term, &preview, &rail, &state, 0);
+                        show_terminal_timeline_mark(&term, &container, &preview, &rail, &state, 0);
                     }
                     glib::Propagation::Stop
                 }
@@ -513,42 +505,19 @@ fn build_terminal_timeline(
     });
     rail.add_controller(rail_keys);
 
-    let preview_escape = gtk::ShortcutController::new();
-    preview_escape.set_propagation_phase(gtk::PropagationPhase::Capture);
-    for key in [gtk::gdk::Key::Escape, gtk::gdk::Key::End] {
-        let trigger = gtk::KeyvalTrigger::new(key, gtk::gdk::ModifierType::empty());
-        let state = state.clone();
-        let term = term.downgrade();
-        let preview_weak = preview.downgrade();
-        let rail = rail.downgrade();
-        let action = gtk::CallbackAction::new(move |_, _| {
-            let (Some(term), Some(preview), Some(rail)) =
-                (term.upgrade(), preview_weak.upgrade(), rail.upgrade())
-            else {
-                return glib::Propagation::Proceed;
-            };
-            exit_terminal_timeline(&term, &preview, &rail, &state);
-            glib::Propagation::Stop
-        });
-        preview_escape.add_shortcut(gtk::Shortcut::new(Some(trigger), Some(action)));
-    }
-    preview.add_controller(preview_escape);
-
     let live_escape = gtk::ShortcutController::new();
     live_escape.set_propagation_phase(gtk::PropagationPhase::Capture);
     let trigger = gtk::KeyvalTrigger::new(gtk::gdk::Key::Escape, gtk::gdk::ModifierType::empty());
     let action = gtk::CallbackAction::new({
         let state = state.clone();
         let term = term.downgrade();
-        let preview = preview.downgrade();
+        let preview = preview.clone();
         let rail = rail.downgrade();
         move |_, _| {
             if state.borrow().selected.is_none() {
                 return glib::Propagation::Proceed;
             }
-            let (Some(term), Some(preview), Some(rail)) =
-                (term.upgrade(), preview.upgrade(), rail.upgrade())
-            else {
+            let (Some(term), Some(rail)) = (term.upgrade(), rail.upgrade()) else {
                 return glib::Propagation::Proceed;
             };
             exit_terminal_timeline(&term, &preview, &rail, &state);
@@ -565,11 +534,13 @@ fn build_terminal_timeline(
 
 fn capture_terminal_timeline_mark(
     term: &vte::Terminal,
-    preview: &vte::Terminal,
+    preview: &Rc<RefCell<Option<vte::Terminal>>>,
     rail: &gtk::DrawingArea,
     state: &Rc<RefCell<TerminalTimelineState>>,
 ) {
-    preview.set_visible(false);
+    if let Some(preview) = preview.borrow().as_ref() {
+        preview.set_visible(false);
+    }
     scroll_terminal_to_bottom(term);
     let scroll_value = term.vadjustment().map(|adj| adj.value()).unwrap_or(0.0);
     let viewport = terminal_viewport_text(term);
@@ -608,7 +579,8 @@ fn terminal_viewport_text(term: &vte::Terminal) -> String {
 
 fn step_terminal_timeline(
     term: &vte::Terminal,
-    preview: &vte::Terminal,
+    container: &gtk::Overlay,
+    preview: &Rc<RefCell<Option<vte::Terminal>>>,
     rail: &gtk::DrawingArea,
     state: &Rc<RefCell<TerminalTimelineState>>,
     direction: i32,
@@ -621,15 +593,70 @@ fn step_terminal_timeline(
         return;
     }
     if let Some(index) = target {
-        show_terminal_timeline_mark(term, preview, rail, state, index);
+        show_terminal_timeline_mark(term, container, preview, rail, state, index);
     } else {
         exit_terminal_timeline(term, preview, rail, state);
     }
 }
 
+fn ensure_terminal_timeline_preview(
+    term: &vte::Terminal,
+    container: &gtk::Overlay,
+    preview: &Rc<RefCell<Option<vte::Terminal>>>,
+    rail: &gtk::DrawingArea,
+    state: &Rc<RefCell<TerminalTimelineState>>,
+) -> vte::Terminal {
+    if let Some(preview) = preview.borrow().as_ref() {
+        return preview.clone();
+    }
+
+    let widget = vte::Terminal::new();
+    widget.set_hexpand(true);
+    widget.set_vexpand(true);
+    widget.set_input_enabled(false);
+    widget.set_cursor_blink_mode(vte::CursorBlinkMode::Off);
+    widget.set_scrollback_lines(0);
+    widget.set_tooltip_text(Some(
+        "Terminal input history — press Esc to return to live output",
+    ));
+    if let Some(font) = term.font() {
+        widget.set_font(Some(&font));
+    }
+    widget.set_font_scale(term.font_scale());
+    widget.set_color_foreground(&state.borrow().color);
+    widget.set_color_background(&term.color_background_for_draw());
+
+    let escape = gtk::ShortcutController::new();
+    escape.set_propagation_phase(gtk::PropagationPhase::Capture);
+    for key in [gtk::gdk::Key::Escape, gtk::gdk::Key::End] {
+        let trigger = gtk::KeyvalTrigger::new(key, gtk::gdk::ModifierType::empty());
+        let state = state.clone();
+        let term = term.downgrade();
+        let preview = widget.downgrade();
+        let rail = rail.downgrade();
+        let action = gtk::CallbackAction::new(move |_, _| {
+            let (Some(term), Some(preview), Some(rail)) =
+                (term.upgrade(), preview.upgrade(), rail.upgrade())
+            else {
+                return glib::Propagation::Proceed;
+            };
+            exit_terminal_timeline_with_preview(&term, Some(&preview), &rail, &state);
+            glib::Propagation::Stop
+        });
+        escape.add_shortcut(gtk::Shortcut::new(Some(trigger), Some(action)));
+    }
+    widget.add_controller(escape);
+    widget.set_visible(false);
+    container.add_overlay(&widget);
+    container.set_measure_overlay(&widget, false);
+    *preview.borrow_mut() = Some(widget.clone());
+    widget
+}
+
 fn show_terminal_timeline_mark(
     term: &vte::Terminal,
-    preview: &vte::Terminal,
+    container: &gtk::Overlay,
+    preview: &Rc<RefCell<Option<vte::Terminal>>>,
     rail: &gtk::DrawingArea,
     state: &Rc<RefCell<TerminalTimelineState>>,
     index: usize,
@@ -645,7 +672,9 @@ fn show_terminal_timeline_mark(
             && mark.scroll_value >= adj.lower()
             && mark.scroll_value <= maximum
         {
-            preview.set_visible(false);
+            if let Some(preview) = preview.borrow().as_ref() {
+                preview.set_visible(false);
+            }
             adj.set_value(mark.scroll_value);
             true
         } else {
@@ -653,6 +682,7 @@ fn show_terminal_timeline_mark(
         }
     });
     if !scrolled {
+        let preview = ensure_terminal_timeline_preview(term, container, preview, rail, state);
         preview.reset(true, true);
         preview.feed(&scrollback_replay_bytes(&mark.viewport));
         preview.set_visible(true);
@@ -663,11 +693,22 @@ fn show_terminal_timeline_mark(
 
 fn exit_terminal_timeline(
     term: &vte::Terminal,
-    preview: &vte::Terminal,
+    preview: &Rc<RefCell<Option<vte::Terminal>>>,
     rail: &gtk::DrawingArea,
     state: &Rc<RefCell<TerminalTimelineState>>,
 ) {
-    preview.set_visible(false);
+    exit_terminal_timeline_with_preview(term, preview.borrow().as_ref(), rail, state);
+}
+
+fn exit_terminal_timeline_with_preview(
+    term: &vte::Terminal,
+    preview: Option<&vte::Terminal>,
+    rail: &gtk::DrawingArea,
+    state: &Rc<RefCell<TerminalTimelineState>>,
+) {
+    if let Some(preview) = preview {
+        preview.set_visible(false);
+    }
     state.borrow_mut().selected = None;
     scroll_terminal_to_bottom(term);
     update_terminal_timeline_accessibility(rail, state);
@@ -852,11 +893,15 @@ impl GhosttyPane {
         let bg_c = rgb_to_rgba(bg);
         let pal: Vec<gtk::gdk::RGBA> = palette.iter().copied().map(rgb_to_rgba).collect();
         let palette_refs = pal.iter().collect::<Vec<_>>();
-        for terminal in [&self.widget, &self.timeline_preview] {
+        let apply = |terminal: &vte::Terminal| {
             terminal.set_colors(Some(&fg_c), Some(&bg_c), &palette_refs);
             terminal.set_color_cursor(Some(&rgb_to_rgba(cursor)));
             terminal.set_color_highlight(selection_bg.map(rgb_to_rgba).as_ref());
             terminal.set_color_highlight_foreground(selection_fg.map(rgb_to_rgba).as_ref());
+        };
+        apply(&self.widget);
+        if let Some(preview) = self.timeline_preview.borrow().as_ref() {
+            apply(preview);
         }
         self.timeline_state.borrow_mut().color = fg_c;
         self.timeline_rail.queue_draw();
@@ -903,14 +948,18 @@ impl GhosttyPane {
 
     pub fn set_font_scale(&self, scale: f64) {
         self.widget.set_font_scale(scale);
-        self.timeline_preview.set_font_scale(scale);
+        if let Some(preview) = self.timeline_preview.borrow().as_ref() {
+            preview.set_font_scale(scale);
+        }
     }
 
     /// Replace the base terminal font. The independent font scale set by
     /// [`Self::set_font_scale`] (global zoom) still multiplies this size.
     pub fn set_font(&self, desc: &gtk::pango::FontDescription) {
         self.widget.set_font(Some(desc));
-        self.timeline_preview.set_font(Some(desc));
+        if let Some(preview) = self.timeline_preview.borrow().as_ref() {
+            preview.set_font(Some(desc));
+        }
     }
 
     /// Copy the current selection to the clipboard, returning `true` when text
@@ -3528,7 +3577,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_timeline_capture_reveals_rail_and_preview() {
+    fn terminal_timeline_preview_is_created_only_when_needed() {
         gtk::init().expect("GTK display for terminal timeline test");
         let term = vte::Terminal::new();
         let overlay = gtk::Overlay::new();
@@ -3539,13 +3588,20 @@ mod tests {
         capture_terminal_timeline_mark(&term, &preview, &rail, &state);
         assert_eq!(state.borrow().marks.len(), 1);
         assert!(rail.is_visible());
+        assert!(preview.borrow().is_none());
 
-        show_terminal_timeline_mark(&term, &preview, &rail, &state, 0);
+        show_terminal_timeline_mark(&term, &overlay, &preview, &rail, &state, 0);
         assert_eq!(state.borrow().selected, Some(0));
-        assert!(preview.is_visible());
+        assert!(preview
+            .borrow()
+            .as_ref()
+            .is_some_and(|preview| preview.is_visible()));
 
         exit_terminal_timeline(&term, &preview, &rail, &state);
         assert_eq!(state.borrow().selected, None);
-        assert!(!preview.is_visible());
+        assert!(preview
+            .borrow()
+            .as_ref()
+            .is_some_and(|preview| !preview.is_visible()));
     }
 }
