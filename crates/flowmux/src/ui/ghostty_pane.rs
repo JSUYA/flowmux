@@ -3550,9 +3550,8 @@ mod tests {
         assert_eq!(terminal_timeline_index_at_y(20.0, height, 0), None);
     }
 
-    #[test]
+    #[gtk::test]
     fn terminal_timeline_preview_is_created_only_when_needed() {
-        gtk::init().expect("GTK display for terminal timeline test");
         let term = vte::Terminal::new();
         let overlay = gtk::Overlay::new();
         overlay.set_child(Some(&term));
