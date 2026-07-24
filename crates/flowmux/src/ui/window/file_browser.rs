@@ -421,21 +421,23 @@ mod tests {
     #[test]
     fn editor_root_moves_only_when_the_file_is_outside_the_workspace() {
         let workspace = tempfile::tempdir().unwrap();
+        let workspace_root = std::fs::canonicalize(workspace.path()).unwrap();
         let nested = workspace.path().join("src");
         std::fs::create_dir(&nested).unwrap();
         let inside = nested.join("inside.rs");
         std::fs::write(&inside, "inside\n").unwrap();
         let outside = tempfile::tempdir().unwrap();
+        let outside_root = std::fs::canonicalize(outside.path()).unwrap();
         let external = outside.path().join("outside.rs");
         std::fs::write(&external, "outside\n").unwrap();
 
         assert_eq!(
             editor_workspace_root(&inside, workspace.path()),
-            workspace.path()
+            workspace_root
         );
         assert_eq!(
             editor_workspace_root(&external, workspace.path()),
-            outside.path()
+            outside_root
         );
     }
 }
